@@ -8,6 +8,7 @@
 
 pub mod ansi;
 pub mod apply;
+pub mod calibration;
 pub mod db;
 pub mod editor;
 pub mod format;

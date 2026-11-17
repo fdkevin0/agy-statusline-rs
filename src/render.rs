@@ -191,6 +191,11 @@ fn render_quota(
         q.label,
         crate::metrics::format_quota_pct(q.remaining_pct)
     );
+    if let Some(tok) = q.est_remaining_tokens {
+        text.push_str(" (~");
+        format_tokens(tok, &mut text);
+        text.push(')');
+    }
     if let Some(reset) = &q.reset_compact {
         text.push(' ');
         text.push_str(glyphs.reset);
@@ -967,6 +972,27 @@ pub fn write_statusline<W: IoWrite>(
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
+    write_statusline_with_quotas(
+        payload,
+        meta,
+        git,
+        resolve_quota_5h(payload),
+        resolve_quota_weekly(payload),
+        cfg,
+        out,
+    )
+}
+
+/// Renders all non-empty configured rows using pre-resolved (e.g. calibrated) quota views.
+pub fn write_statusline_with_quotas<W: IoWrite>(
+    payload: &StatuslinePayload,
+    meta: &SessionMetadata,
+    git: &GitInfo,
+    quota_5h: Option<QuotaView>,
+    quota_weekly: Option<QuotaView>,
+    cfg: &LayoutConfig,
+    out: &mut W,
+) -> io::Result<()> {
     let pal = Palette::for_theme(cfg.theme);
     let glyphs = GlyphSet::for_mode(cfg.glyph_mode);
     let geom = compute_geometry(cfg, &glyphs);
@@ -1006,8 +1032,8 @@ pub fn write_statusline<W: IoWrite>(
         eff_limit,
         speed,
         ttft_secs: meta.ttft_secs,
-        quota_5h: resolve_quota_5h(payload),
-        quota_weekly: resolve_quota_weekly(payload),
+        quota_5h,
+        quota_weekly,
         git,
     };
 

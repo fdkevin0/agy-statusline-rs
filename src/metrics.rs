@@ -34,6 +34,8 @@ pub struct QuotaView {
     pub reset_compact: Option<String>,
     /// True when remaining quota is lagging behind remaining time by `> 15%`.
     pub pace_behind: bool,
+    /// Calibrated estimated remaining tokens for this bucket, when available.
+    pub est_remaining_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,26 +376,45 @@ fn resolve_reset_secs(bucket: &QuotaBucket, now_unix_secs: u64) -> Option<u64> {
     }
 }
 
+fn resolve_reset_at_secs(bucket: &QuotaBucket, now_unix_secs: u64) -> Option<u64> {
+    if let Some(ts) = bucket
+        .reset_time
+        .as_deref()
+        .and_then(parse_rfc3339_unix_secs)
+    {
+        return (ts >= 0).then_some(ts as u64);
+    }
+    bucket
+        .reset_in_seconds
+        .filter(|&s| s > 0)
+        .map(|s| now_unix_secs.saturating_add(s))
+}
+
 fn build_quota_view(
     bucket: &QuotaBucket,
     label: &'static str,
     window_secs: u64,
     now_unix_secs: u64,
-) -> Option<QuotaView> {
+) -> Option<(QuotaView, Option<u64>)> {
     let frac = bucket.remaining_fraction.filter(|f| f.is_finite())?;
     let remaining_pct = (frac * 100.0).clamp(0.0, 100.0);
     let reset_secs = resolve_reset_secs(bucket, now_unix_secs);
+    let reset_at_secs = resolve_reset_at_secs(bucket, now_unix_secs);
     let reset_compact = reset_secs.map(format_duration_compact);
     let pace_behind = reset_secs.filter(|&s| s <= window_secs).is_some_and(|s| {
         let time_left_pct = (s as f64) * 100.0 / (window_secs as f64);
         (time_left_pct - remaining_pct) > PACE_BEHIND_DELTA_PCT
     });
-    Some(QuotaView {
-        label,
-        remaining_pct,
-        reset_compact,
-        pace_behind,
-    })
+    Some((
+        QuotaView {
+            label,
+            remaining_pct,
+            reset_compact,
+            pace_behind,
+            est_remaining_tokens: None,
+        },
+        reset_at_secs,
+    ))
 }
 
 fn try_priority_keys(
@@ -401,12 +422,12 @@ fn try_priority_keys(
     keys: &[(&str, &'static str)],
     window: QuotaWindow,
     now_unix_secs: u64,
-) -> Option<QuotaView> {
+) -> Option<(QuotaView, Option<u64>)> {
     let window_secs = window.secs();
     for &(key, label) in keys {
         if let Some(bucket) = quota.get(key) {
-            if let Some(view) = build_quota_view(bucket, label, window_secs, now_unix_secs) {
-                return Some(view);
+            if let Some(found) = build_quota_view(bucket, label, window_secs, now_unix_secs) {
+                return Some(found);
             }
         }
     }
@@ -419,24 +440,24 @@ fn select_tightest_matching(
     now_unix_secs: u64,
     predicate: impl Fn(&str) -> bool,
     label_override: Option<&'static str>,
-) -> Option<QuotaView> {
+) -> Option<(QuotaView, Option<u64>)> {
     let window_secs = window.secs();
-    let mut best: Option<QuotaView> = None;
+    let mut best: Option<(QuotaView, Option<u64>)> = None;
     for (key, bucket) in quota {
         let lower = key.to_ascii_lowercase();
         if !matches_window(&lower, window) || !predicate(&lower) {
             continue;
         }
         let label = label_override.unwrap_or_else(|| infer_label_for_key(&lower, window));
-        let Some(view) = build_quota_view(bucket, label, window_secs, now_unix_secs) else {
+        let Some(found) = build_quota_view(bucket, label, window_secs, now_unix_secs) else {
             continue;
         };
         let replace = match &best {
             None => true,
-            Some(cur) => view.remaining_pct < cur.remaining_pct,
+            Some((cur, _)) => found.0.remaining_pct < cur.remaining_pct,
         };
         if replace {
-            best = Some(view);
+            best = Some(found);
         }
     }
     best
@@ -515,16 +536,16 @@ fn resolve_quota_for_window(
     payload: &StatuslinePayload,
     window: QuotaWindow,
     now_unix_secs: u64,
-) -> Option<QuotaView> {
+) -> Option<(QuotaView, Option<u64>)> {
     let quota = payload.quota.as_ref()?;
     let family = classify_model(payload);
     let spec = family_spec(family, window);
 
     // 1. Exact priority keys for the active model family, then tightest family-compatible bucket.
-    if let Some(view) = try_priority_keys(quota, spec.keys, window, now_unix_secs)
+    if let Some(found) = try_priority_keys(quota, spec.keys, window, now_unix_secs)
         .or_else(|| select_tightest_matching(quota, window, now_unix_secs, spec.pred, spec.label))
     {
-        return Some(view);
+        return Some(found);
     }
 
     // 2. For Carbon / Argon, fall back cleanly to Gemini main buckets before cross-family 3p.
@@ -533,7 +554,7 @@ fn resolve_quota_for_window(
             QuotaWindow::FiveHour => &[("gemini-5h", "5h")],
             QuotaWindow::Weekly => &[("gemini-weekly", "7d")],
         };
-        if let Some(view) =
+        if let Some(found) =
             try_priority_keys(quota, gemini_keys, window, now_unix_secs).or_else(|| {
                 select_tightest_matching(
                     quota,
@@ -544,16 +565,16 @@ fn resolve_quota_for_window(
                 )
             })
         {
-            return Some(view);
+            return Some(found);
         }
     }
 
     // 3. Remaining non-3p Gemini buckets (e.g., GeminiMain falling back to argon/carbon when main is absent).
     if family != ModelFamily::ThirdParty {
-        if let Some(view) =
+        if let Some(found) =
             select_tightest_matching(quota, window, now_unix_secs, |k| !is_3p_bucket_key(k), None)
         {
-            return Some(view);
+            return Some(found);
         }
     }
 
@@ -572,9 +593,25 @@ fn resolve_quota_for_window(
         .or_else(|| select_tightest_matching(quota, window, now_unix_secs, |_| true, None))
 }
 
+/// Resolves the active 5-hour quota bucket and its reset epoch timestamp at `now_unix_secs`.
+pub fn resolve_quota_5h_with_reset_at(
+    payload: &StatuslinePayload,
+    now_unix_secs: u64,
+) -> Option<(QuotaView, Option<u64>)> {
+    resolve_quota_for_window(payload, QuotaWindow::FiveHour, now_unix_secs)
+}
+
+/// Resolves the active weekly quota bucket and its reset epoch timestamp at `now_unix_secs`.
+pub fn resolve_quota_weekly_with_reset_at(
+    payload: &StatuslinePayload,
+    now_unix_secs: u64,
+) -> Option<(QuotaView, Option<u64>)> {
+    resolve_quota_for_window(payload, QuotaWindow::Weekly, now_unix_secs)
+}
+
 /// Resolves the active 5-hour quota bucket at an explicit Unix epoch timestamp.
 pub fn resolve_quota_5h_at(payload: &StatuslinePayload, now_unix_secs: u64) -> Option<QuotaView> {
-    resolve_quota_for_window(payload, QuotaWindow::FiveHour, now_unix_secs)
+    resolve_quota_5h_with_reset_at(payload, now_unix_secs).map(|(v, _)| v)
 }
 
 /// Resolves the active weekly quota bucket at an explicit Unix epoch timestamp.
@@ -582,7 +619,7 @@ pub fn resolve_quota_weekly_at(
     payload: &StatuslinePayload,
     now_unix_secs: u64,
 ) -> Option<QuotaView> {
-    resolve_quota_for_window(payload, QuotaWindow::Weekly, now_unix_secs)
+    resolve_quota_weekly_with_reset_at(payload, now_unix_secs).map(|(v, _)| v)
 }
 
 /// Resolves the active 5-hour quota bucket (`gemini-5h`, `3p-5h`, `carbon`, or tightest match).
