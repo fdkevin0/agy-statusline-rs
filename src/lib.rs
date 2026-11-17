@@ -17,6 +17,7 @@ pub mod layout;
 pub mod metrics;
 pub mod protobuf;
 pub mod render;
+pub mod stats;
 pub mod statusline;
 pub mod theme;
 pub mod tui;

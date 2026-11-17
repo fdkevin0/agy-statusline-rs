@@ -36,6 +36,12 @@ agy-statusline apply --yes
 agy-statusline doctor
 ```
 
+4. Inspect local token usage, reference API cost, and per-model speed:
+
+```sh
+agy-statusline stats --days 30
+```
+
 > Press `s` inside `agy-statusline config` to save and apply in one step.
 
 ## Documentation

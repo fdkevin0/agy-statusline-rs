@@ -11,11 +11,12 @@ use agy_statusline::apply::{
     set_statusline_enabled,
 };
 use agy_statusline::calibration::default_calibration_cache_dir;
-use agy_statusline::db::SqliteSpeedReader;
+use agy_statusline::db::{resolve_home_dir, SqliteSpeedReader};
 use agy_statusline::git::SystemGitProbe;
 use agy_statusline::layout::{
     default_config_path, load_layout_config, save_layout_config, LayoutConfig,
 };
+use agy_statusline::stats::run_stats_command;
 use agy_statusline::statusline::process_statusline_with_calibration;
 use agy_statusline::tui::run_tui_config;
 
@@ -30,7 +31,8 @@ fn print_help() {
          agy-statusline config --show                 Print current XDG layout config\n  \
          agy-statusline config --reset                Remove XDG layout config (restore defaults)\n  \
          agy-statusline apply [--yes|-y] [--stack|--replace|--disable]\n                                               Register or disable statusLine in AGY settings.json\n  \
-         agy-statusline doctor                        Check configuration, AGY hook, and sample preview"
+         agy-statusline doctor                        Check configuration, AGY hook, and sample preview\n  \
+         agy-statusline stats [--days <N>] [--json] [--ascii]\n                                               Show local token usage, estimated API cost, and speed stats"
     );
 }
 
@@ -45,6 +47,22 @@ fn parse_preset(name: &str) -> io::Result<LayoutConfig> {
             format!("unknown preset '{other}' (expected full|powerline|minimal|addon)"),
         )),
     }
+}
+
+fn parse_days_value(val: &str) -> io::Result<u32> {
+    let parsed = val.parse::<u32>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid --days value '{val}' (expected positive integer)"),
+        )
+    })?;
+    if parsed == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--days must be >= 1",
+        ));
+    }
+    Ok(parsed)
 }
 
 fn main() -> io::Result<()> {
@@ -116,6 +134,58 @@ fn main() -> io::Result<()> {
                 let settings_path = default_settings_path()?;
                 let mut stdout = io::stdout().lock();
                 return run_doctor(&config_path, &settings_path, no_color, &mut stdout);
+            }
+            "stats" => {
+                let mut days: Option<u32> = None;
+                let mut json = false;
+                let mut ascii = false;
+                while let Some(arg) = args.next() {
+                    match arg.as_str() {
+                        "--json" => json = true,
+                        "--ascii" => ascii = true,
+                        "--days" => {
+                            let val = args.next().ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "missing value for --days",
+                                )
+                            })?;
+                            days = Some(parse_days_value(&val)?);
+                        }
+                        s if s.starts_with("--days=") => {
+                            days = Some(parse_days_value(&s["--days=".len()..])?);
+                        }
+                        "--help" | "-h" => {
+                            println!("Usage: agy-statusline stats [--days <N>] [--json] [--ascii]");
+                            return Ok(());
+                        }
+                        other => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("unknown option for stats: {other}"),
+                            ));
+                        }
+                    }
+                }
+                let home = resolve_home_dir().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "neither HOME nor USERPROFILE environment variable is set",
+                    )
+                })?;
+                let now_unix_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let mut stdout = io::stdout().lock();
+                return run_stats_command(
+                    &home,
+                    days,
+                    json,
+                    no_color,
+                    ascii,
+                    now_unix_secs,
+                    &mut stdout,
+                );
             }
             "config" => {
                 let config_path = default_config_path()?;
