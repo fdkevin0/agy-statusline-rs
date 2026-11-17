@@ -3,8 +3,9 @@
 use proptest::prelude::*;
 
 use agy_statusline::db::{is_valid_uuid, SpeedReader};
-use agy_statusline::format::{format_tokens, render_statusline, TokenUsage, MAX_TERMINAL_WIDTH};
+use agy_statusline::format::format_tokens;
 use agy_statusline::protobuf::{decode_varint, extract_metadata_speed, find_field};
+use agy_statusline::render::build_progress_bar;
 use agy_statusline::statusline::process_statusline;
 
 struct FixedSpeed(Option<f64>);
@@ -19,9 +20,7 @@ proptest! {
     fn prop_decode_varint_never_panics(data in prop::collection::vec(any::<u8>(), 0..64)) {
         let mut pos = 0;
         let res = decode_varint(&data, &mut pos);
-        if res.is_some() {
-            prop_assert!(pos >= 1 && pos <= data.len().min(10));
-        }
+        prop_assert!(res.is_none() || (pos >= 1 && pos <= data.len().min(10)));
     }
 
     #[test]
@@ -31,48 +30,29 @@ proptest! {
 
     #[test]
     fn prop_extract_metadata_speed_bounds(data in prop::collection::vec(any::<u8>(), 0..128)) {
-        if let Some(speed) = extract_metadata_speed(&data) {
-            prop_assert!(speed > 0.0 && speed < 1000.0);
-        }
+        let speed = extract_metadata_speed(&data);
+        prop_assert!(speed.is_none_or(|s| s > 0.0 && s < 1000.0));
     }
 
     #[test]
-    fn prop_format_tokens_matches_k_rule(value in 0u64..1_000_000_000) {
+    fn prop_format_tokens_small_no_suffix(value in 0u64..1000) {
         let mut buf = String::new();
         format_tokens(value, &mut buf);
-        if value >= 1000 {
-            prop_assert!(buf.ends_with('K'));
-        } else {
-            prop_assert!(!buf.ends_with('K'));
-        }
+        prop_assert!(!buf.ends_with('K'));
     }
 
     #[test]
-    fn prop_render_statusline_ansi_framing(
-        input in -10i64..1_000_000,
-        read in -10i64..1_000_000,
-        creation in -1i64..10,
-        speed in prop::option::of(0.1f64..999.9),
-        width in prop::option::of(0usize..1500),
-    ) {
-        let usage = TokenUsage {
-            input_tokens: Some(input),
-            cache_read_input_tokens: Some(read),
-            cache_creation_input_tokens: Some(creation),
-        };
-        let rendered = render_statusline(Some(usage), speed);
-        let mut out = Vec::new();
-        rendered.write_padded(&mut out, width).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        prop_assert!(text.ends_with("\x1b[0m\n"));
-        if let Some(w) = width {
-            let clamped = w.min(MAX_TERMINAL_WIDTH);
-            if clamped > rendered.payload.len() {
-                let spaces = clamped - rendered.payload.len();
-                let expected_tail = format!("{}\x1b[0m\n", " ".repeat(spaces));
-                prop_assert!(text.ends_with(&expected_tail));
-            }
-        }
+    fn prop_format_tokens_large_has_k_suffix(value in 1000u64..1_000_000_000) {
+        let mut buf = String::new();
+        format_tokens(value, &mut buf);
+        prop_assert!(buf.ends_with('K'));
+    }
+
+    #[test]
+    fn prop_progress_bar_clamps_and_matches_char_len(pct in -50.0f64..200.0, bar_len in 4usize..40) {
+        let (bar, clamped) = build_progress_bar(pct, bar_len);
+        prop_assert!((0.0..=100.0).contains(&clamped));
+        prop_assert_eq!(bar.chars().count(), bar_len);
     }
 }
 
@@ -82,9 +62,13 @@ fn integration_full_json_and_uuid_checks() {
     assert!(!is_valid_uuid("01234567-89ab-cdef-0123-456789abcde"));
 
     let json = r#"{
-        "terminal_width": 80,
+        "agent_state": "working",
+        "model": {"display_name": "Gemini 4", "effort": "high"},
+        "vcs": {"branch": "main", "dirty": true},
+        "terminal_width": 120,
         "conversation_id": "01234567-89ab-cdef-0123-456789abcdef",
         "context_window": {
+            "used_percentage": 35.0,
             "current_usage": {
                 "input_tokens": 500,
                 "cache_read_input_tokens": 1500,
@@ -95,6 +79,9 @@ fn integration_full_json_and_uuid_checks() {
     let mut out = Vec::new();
     process_statusline(json, &FixedSpeed(Some(120.4)), &mut out).unwrap();
     let s = String::from_utf8(out).unwrap();
-    assert!(s.starts_with("\x1b[44;97mCache hit: 75.0% | Cache read: 1K | Last avg speed: 120 token/s"));
-    assert!(s.ends_with("\x1b[0m\n"));
+    assert!(s.contains("WORKING"));
+    assert!(!s.contains("Gemini 4"));
+    assert!(s.contains("main*"));
+    assert!(s.contains("75.0%"));
+    assert!(s.contains("120 tok/s"));
 }

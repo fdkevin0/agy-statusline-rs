@@ -1,4 +1,4 @@
-//! Automatic AGY `settings.json` configuration for `agy-statusline`.
+//! Automatic AGY `settings.json` integration for `agy-statusline apply`.
 
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -27,11 +27,12 @@ pub fn settings_path_for_home(home: &Path) -> PathBuf {
 }
 
 /// Builds the `statusLine` JSON object pointing to `command_path`.
-pub fn build_statusline_entry(command_path: &Path) -> Value {
+pub fn build_statusline_entry(command_path: &Path, stack_with_default: bool) -> Value {
     json!({
         "type": "command",
         "command": command_path.to_string_lossy(),
-        "stack_with_default": true
+        "enabled": true,
+        "stack_with_default": stack_with_default
     })
 }
 
@@ -42,7 +43,11 @@ pub fn build_statusline_entry(command_path: &Path) -> Value {
 ///
 /// Returns an error if an existing `settings.json` cannot be read, is not a
 /// valid JSON object, or cannot be written back.
-pub fn apply_statusline_config(settings_path: &Path, command_path: &Path) -> io::Result<()> {
+pub fn apply_statusline_config(
+    settings_path: &Path,
+    command_path: &Path,
+    stack_with_default: bool,
+) -> io::Result<()> {
     let mut root: Map<String, Value> = match fs::read_to_string(settings_path) {
         Ok(content) if content.trim().is_empty() => Map::new(),
         Ok(content) => {
@@ -57,7 +62,10 @@ pub fn apply_statusline_config(settings_path: &Path, command_path: &Path) -> io:
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("{} must contain a top-level JSON object", settings_path.display()),
+                        format!(
+                            "{} must contain a top-level JSON object",
+                            settings_path.display()
+                        ),
                     ));
                 }
             }
@@ -68,7 +76,7 @@ pub fn apply_statusline_config(settings_path: &Path, command_path: &Path) -> io:
 
     root.insert(
         "statusLine".to_string(),
-        build_statusline_entry(command_path),
+        build_statusline_entry(command_path, stack_with_default),
     );
 
     if let Some(parent) = settings_path.parent() {
@@ -85,15 +93,16 @@ pub fn apply_statusline_config(settings_path: &Path, command_path: &Path) -> io:
     Ok(())
 }
 
-/// Runs the `config` CLI subcommand, prompting unless `assume_yes` is `true`.
-pub fn run_config_command<R: BufRead, W: Write>(
+/// Runs the `apply` CLI subcommand, prompting unless `assume_yes` is `true`.
+pub fn run_apply_command<R: BufRead, W: Write>(
     assume_yes: bool,
+    stack_with_default: bool,
     settings_path: &Path,
     command_path: &Path,
     stdin: &mut R,
     out: &mut W,
 ) -> io::Result<()> {
-    let entry = build_statusline_entry(command_path);
+    let entry = build_statusline_entry(command_path, stack_with_default);
     let preview = serde_json::to_string_pretty(&entry)
         .map_err(|e| io::Error::other(format!("failed to format preview: {e}")))?;
 
@@ -112,10 +121,10 @@ pub fn run_config_command<R: BufRead, W: Write>(
         }
     }
 
-    apply_statusline_config(settings_path, command_path)?;
+    apply_statusline_config(settings_path, command_path, stack_with_default)?;
     writeln!(
         out,
-        "Configured statusLine in {} -> {}",
+        "Configured statusLine (stack_with_default={stack_with_default}) in {} -> {}",
         settings_path.display(),
         command_path.display()
     )?;
@@ -129,7 +138,7 @@ mod tests {
 
     fn temp_home(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "agy_statusline_cfg_{}_{}",
+            "agy_statusline_apply_{}_{}",
             tag,
             std::process::id()
         ));
@@ -146,12 +155,16 @@ mod tests {
         let mut stdin = Cursor::new(b"");
         let mut out = Vec::new();
 
-        run_config_command(true, &settings, &cmd, &mut stdin, &mut out).unwrap();
+        run_apply_command(true, false, &settings, &cmd, &mut stdin, &mut out).unwrap();
 
         let written: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(written["statusLine"]["type"], "command");
-        assert_eq!(written["statusLine"]["command"], "/usr/local/bin/agy-statusline");
-        assert_eq!(written["statusLine"]["stack_with_default"], true);
+        assert_eq!(
+            written["statusLine"]["command"],
+            "/usr/local/bin/agy-statusline"
+        );
+        assert_eq!(written["statusLine"]["enabled"], true);
+        assert_eq!(written["statusLine"]["stack_with_default"], false);
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -164,15 +177,34 @@ mod tests {
 
         let cmd = PathBuf::from("/opt/agy-statusline");
         let mut out = Vec::new();
-        run_config_command(false, &settings, &cmd, &mut Cursor::new(b"n\n"), &mut out).unwrap();
-        let after_abort: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        run_apply_command(
+            false,
+            true,
+            &settings,
+            &cmd,
+            &mut Cursor::new(b"n\n"),
+            &mut out,
+        )
+        .unwrap();
+        let after_abort: Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
         assert!(after_abort.get("statusLine").is_none());
 
         out.clear();
-        run_config_command(false, &settings, &cmd, &mut Cursor::new(b"yes\n"), &mut out).unwrap();
-        let after_yes: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        run_apply_command(
+            false,
+            true,
+            &settings,
+            &cmd,
+            &mut Cursor::new(b"yes\n"),
+            &mut out,
+        )
+        .unwrap();
+        let after_yes: Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(after_yes["theme"], "dark");
         assert_eq!(after_yes["statusLine"]["command"], "/opt/agy-statusline");
+        assert_eq!(after_yes["statusLine"]["stack_with_default"], true);
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -183,7 +215,8 @@ mod tests {
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
         fs::write(&settings, "{not json").unwrap();
 
-        let err = apply_statusline_config(&settings, Path::new("/bin/agy-statusline")).unwrap_err();
+        let err =
+            apply_statusline_config(&settings, Path::new("/bin/agy-statusline"), false).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let _ = fs::remove_dir_all(&home);
     }
