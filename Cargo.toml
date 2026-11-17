@@ -10,6 +10,9 @@ keywords = ["cli", "statusline", "sqlite", "antigravity"]
 categories = ["command-line-utilities"]
 include = ["src/**/*", "tests/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
+[features]
+bundled = ["rusqlite/bundled"]
+
 [dependencies]
 crossterm = "0.29"
 ratatui = "0.30"
