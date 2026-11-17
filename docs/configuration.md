@@ -39,8 +39,8 @@
 | `ttft` | First token latency | Extracted from `gen_metadata` (`chat.11`) |
 | `cost` | Session cost | `~$usd` and `(sub $...)` when `subagent_usd >= 0.01` |
 | `mode` | Cycle mode | `PLAN` / `AUTO` / `EDIT` plus `>200K` indicator when exceeded |
-| `quota_5h` | 5h quota + pace | Model-aware `gemini-5h` / `3p-5h` remaining % + reset timer + pace warn |
-| `quota_weekly` | Weekly / Argon quota | Model-aware `gemini-weekly` / `3p-weekly` / `gemini-argon-wtu-weekly` |
+| `quota_5h` | 5h quota + pace | Model-aware 5h bucket (`gemini-5h` / `3p-5h` / `carbon` / dynamic tightest) + sub-1% precision (`<0.1%`, `0.1%`–`0.9%`) + `reset_time` RFC3339 fallback + pace warn |
+| `quota_weekly` | Weekly / Argon / Carbon quota | Model-aware weekly bucket (`gemini-weekly` / `gemini-argon-wtu-weekly` / `gemini-carbon-wtu-weekly` / `3p-weekly` / dynamic tightest) + `Carbon`/`m670`, `Argon`/`m668`/bare `Orchestrator`, expanded 3P routing |
 | `artifacts` | Artifact count | Hidden when `0` if `smart_hide` is enabled |
 | `subagents` | Subagent count | Hidden when `0` if `smart_hide` is enabled |
 | `tasks` | Task count | Hidden when `0` if `smart_hide` is enabled |
