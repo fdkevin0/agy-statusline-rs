@@ -4,6 +4,7 @@
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agy_statusline::apply::{
@@ -11,7 +12,7 @@ use agy_statusline::apply::{
     set_statusline_enabled,
 };
 use agy_statusline::calibration::default_calibration_cache_dir;
-use agy_statusline::db::{resolve_home_dir, SqliteSpeedReader};
+use agy_statusline::db::{resolve_agy_cli_dir, resolve_home_dir, SqliteSpeedReader};
 use agy_statusline::git::SystemGitProbe;
 use agy_statusline::layout::{
     default_config_path, load_layout_config, save_layout_config, LayoutConfig,
@@ -167,18 +168,19 @@ fn main() -> io::Result<()> {
                         }
                     }
                 }
-                let home = resolve_home_dir().ok_or_else(|| {
-                    io::Error::new(
+                let home = resolve_home_dir();
+                if home.is_none() && resolve_agy_cli_dir().is_none() {
+                    return Err(io::Error::new(
                         io::ErrorKind::NotFound,
-                        "neither HOME nor USERPROFILE environment variable is set",
-                    )
-                })?;
+                        "neither HOME, USERPROFILE, ANTIGRAVITY_CLI_HOME, nor AGY_HOME environment variable is set",
+                    ));
+                }
                 let now_unix_secs = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
                 let mut stdout = io::stdout().lock();
                 return run_stats_command(
-                    &home,
+                    home.as_deref().unwrap_or_else(|| Path::new("")),
                     days,
                     json,
                     no_color,
