@@ -87,5 +87,9 @@ fn cli_calibrates_quota_tokens_across_ticks_and_persists_in_xdg_cache() {
     let out3 = run_binary_with_stdin(&base, tick3);
     assert!(out3.contains("5h 75% (~1.5M)"));
 
+    let cal_raw = fs::read_to_string(base.join("cache/agy-statusline/quota_cal.json")).unwrap();
+    assert!(cal_raw.contains("\"gemini-5h\""));
+    assert!(!cal_raw.contains("\"5h:5h\""));
+
     let _ = fs::remove_dir_all(&base);
 }

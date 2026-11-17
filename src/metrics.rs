@@ -1,35 +1,29 @@
-//! Pure metric derivation for cache hit rate, context tokens, and quota pacing.
+//! Pure metric derivation for cache hit rate, context tokens, and dynamic quota pacing.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::statusline::{QuotaBucket, StatuslinePayload};
 
-const WINDOW_5H_SECS: u64 = 18_000;
-const WINDOW_WEEKLY_SECS: u64 = 604_800;
+const SECS_PER_HOUR: u64 = 3_600;
+const SECS_PER_DAY: u64 = 86_400;
+const SECS_PER_WEEK: u64 = 604_800;
 const PACE_BEHIND_DELTA_PCT: f64 = 15.0;
-
-const THIRD_PARTY_NEEDLES: &[&str] = &[
-    "claude",
-    "anthropic",
-    "sonnet",
-    "opus",
-    "haiku",
-    "gpt",
-    "openai",
-    "o1",
-    "o3",
-    "o4",
-    "codex",
-];
+const STRUCTURAL_NOISE_TOKENS: &[&str] = &["wtu", "quota", "pool", "limit"];
 
 /// Resolved rate-limit view for `quota_5h` or `quota_weekly` widgets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuotaView {
-    /// Short bucket label (`"5h"`, `"3p 5h"`, `"7d"`, `"3p 7d"`, `"argon"`, `"carbon"`).
-    pub label: &'static str,
+    /// Dynamic bucket label (e.g. `"5h"`, `"3p 5h"`, `"7d"`, `"3p 7d"`, `"24h"`).
+    pub label: String,
+    /// Raw bucket identifier key from `payload.quota`.
+    pub bucket_key: String,
+    /// Parsed rolling window duration in seconds.
+    pub window_secs: u64,
     /// Remaining quota percentage (`0.0..=100.0`).
     pub remaining_pct: f64,
+    /// Remaining credit units when `remaining_fraction` is absent and `remaining_amount >= 0`.
+    pub remaining_amount: Option<i64>,
     /// Compact countdown until reset (e.g. `"3h10m"`), if positive remaining time is known.
     pub reset_compact: Option<String>,
     /// True when remaining quota is lagging behind remaining time by `> 15%`.
@@ -39,40 +33,27 @@ pub struct QuotaView {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelFamily {
-    Carbon,
-    Argon,
-    ThirdParty,
-    GeminiMain,
+enum WindowTarget {
+    Short,
+    MultiDay,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuotaWindow {
-    FiveHour,
-    Weekly,
+impl WindowTarget {
+    fn matches(self, window_secs: u64) -> bool {
+        match self {
+            Self::Short => window_secs < SECS_PER_DAY,
+            Self::MultiDay => window_secs >= SECS_PER_DAY,
+        }
+    }
 }
 
-impl QuotaWindow {
-    fn secs(self) -> u64 {
-        match self {
-            Self::FiveHour => WINDOW_5H_SECS,
-            Self::Weekly => WINDOW_WEEKLY_SECS,
-        }
-    }
-
-    fn default_gemini_label(self) -> &'static str {
-        match self {
-            Self::FiveHour => "5h",
-            Self::Weekly => "7d",
-        }
-    }
-
-    fn default_3p_label(self) -> &'static str {
-        match self {
-            Self::FiveHour => "3p 5h",
-            Self::Weekly => "3p 7d",
-        }
-    }
+#[derive(Debug, Clone)]
+struct BucketDescriptor {
+    window_secs: u64,
+    win_short: String,
+    is_3p: bool,
+    provider: Option<String>,
+    qualifiers: Vec<String>,
 }
 
 /// Computes prompt cache hit percentage and cached token count from `current_usage`.
@@ -258,113 +239,103 @@ fn current_unix_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-fn model_name_contains(payload: &StatuslinePayload, needles: &[&str]) -> bool {
-    let Some(m) = payload.model.as_ref() else {
-        return false;
-    };
-    let check = |s: &str| {
-        let lower = s.to_ascii_lowercase();
-        needles.iter().any(|n| lower.contains(n))
-    };
-    m.id.as_deref().is_some_and(check) || m.display_name.as_deref().is_some_and(check)
+fn tokenize_alnum_lower(raw: &str) -> Vec<String> {
+    raw.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|tok| !tok.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
-fn is_orchestrator_argon_text(raw: &str) -> bool {
-    let lower = raw.to_ascii_lowercase();
-    let trimmed = lower.trim();
-    if trimmed.contains("argon")
-        || trimmed.contains("m668")
-        || trimmed == "orchestrator"
-        || trimmed == "gemini pro orchestrator"
-    {
-        return true;
+fn parse_window_token(token: &str) -> Option<(u64, String)> {
+    match token {
+        "hourly" | "hour" => return Some((SECS_PER_HOUR, "1h".to_string())),
+        "daily" | "day" => return Some((SECS_PER_DAY, "1d".to_string())),
+        "weekly" | "week" => return Some((SECS_PER_WEEK, "7d".to_string())),
+        _ => {}
     }
-    // Match bare `gemini-pro-orchestrator` or known Argon/G1 variants without swallowing unknown suffixes.
-    let prefix = "gemini-pro-orchestrator";
-    let mut search_from = 0;
-    while let Some(rel) = trimmed[search_from..].find(prefix) {
-        let start = search_from + rel;
-        let before_ok = start == 0 || !trimmed.as_bytes()[start - 1].is_ascii_alphanumeric();
-        let after = &trimmed[start + prefix.len()..];
-        let after_ok = if after.is_empty() {
-            true
-        } else if let Some(rest) = after
-            .strip_prefix("-argon")
-            .or_else(|| after.strip_prefix("-g1-pro"))
-            .or_else(|| after.strip_prefix("-g1"))
-        {
-            rest.is_empty()
-                || (!rest.as_bytes()[0].is_ascii_alphanumeric() && rest.as_bytes()[0] != b'-')
-        } else {
-            !after.as_bytes()[0].is_ascii_alphanumeric() && after.as_bytes()[0] != b'-'
-        };
-        if before_ok && after_ok {
-            return true;
-        }
-        search_from = start + prefix.len();
-    }
-    false
-}
-
-fn classify_model(payload: &StatuslinePayload) -> ModelFamily {
-    if model_name_contains(payload, &["carbon", "m670"]) {
-        return ModelFamily::Carbon;
-    }
-    let is_argon = payload.model.as_ref().is_some_and(|m| {
-        m.id.as_deref().is_some_and(is_orchestrator_argon_text)
-            || m.display_name
-                .as_deref()
-                .is_some_and(is_orchestrator_argon_text)
-    });
-    if is_argon {
-        return ModelFamily::Argon;
-    }
-    if model_name_contains(payload, THIRD_PARTY_NEEDLES) {
-        return ModelFamily::ThirdParty;
-    }
-    ModelFamily::GeminiMain
-}
-
-fn is_3p_bucket_key(lower_key: &str) -> bool {
-    lower_key.starts_with("3p")
-        || lower_key.contains("3p-")
-        || lower_key.contains("3p_")
-        || THIRD_PARTY_NEEDLES.iter().any(|n| lower_key.contains(n))
-}
-
-fn is_carbon_bucket_key(lower_key: &str) -> bool {
-    lower_key.contains("carbon") || lower_key.contains("m670")
-}
-
-fn is_argon_bucket_key(lower_key: &str) -> bool {
-    lower_key.contains("argon") || lower_key.contains("m668")
-}
-
-fn matches_window(lower_key: &str, window: QuotaWindow) -> bool {
-    match window {
-        QuotaWindow::FiveHour => lower_key.contains("5h") || lower_key.contains("hour"),
-        QuotaWindow::Weekly => {
-            lower_key.contains("weekly") || lower_key.contains("7d") || lower_key.contains("week")
+    if let Some(num) = token.strip_suffix('h') {
+        if let Some(n) = num.parse::<u64>().ok().filter(|&n| n > 0) {
+            return n.checked_mul(SECS_PER_HOUR).map(|s| (s, format!("{n}h")));
         }
     }
+    if let Some(num) = token.strip_suffix('d') {
+        if let Some(n) = num.parse::<u64>().ok().filter(|&n| n > 0) {
+            return n.checked_mul(SECS_PER_DAY).map(|s| (s, format!("{n}d")));
+        }
+    }
+    None
 }
 
-fn infer_label_for_key(lower_key: &str, window: QuotaWindow) -> &'static str {
-    if is_3p_bucket_key(lower_key) {
-        window.default_3p_label()
-    } else if is_carbon_bucket_key(lower_key) {
-        "carbon"
-    } else if is_argon_bucket_key(lower_key) {
-        "argon"
+fn parse_bucket_descriptor(key: &str) -> Option<BucketDescriptor> {
+    let mut window_info: Option<(u64, String)> = None;
+    let mut is_3p = false;
+    let mut non_3p_tokens = Vec::new();
+
+    for tok in tokenize_alnum_lower(key) {
+        if let Some(parsed) = parse_window_token(&tok) {
+            if window_info.is_none() {
+                window_info = Some(parsed);
+            }
+            continue;
+        }
+        if STRUCTURAL_NOISE_TOKENS.contains(&tok.as_str()) {
+            continue;
+        }
+        if tok == "3p" {
+            is_3p = true;
+            continue;
+        }
+        non_3p_tokens.push(tok);
+    }
+
+    let (window_secs, win_short) = window_info?;
+    let (provider, qualifiers) = if is_3p {
+        (None, non_3p_tokens)
     } else {
-        window.default_gemini_label()
+        let mut iter = non_3p_tokens.into_iter();
+        (iter.next(), iter.collect())
+    };
+    Some(BucketDescriptor {
+        window_secs,
+        win_short,
+        is_3p,
+        provider,
+        qualifiers,
+    })
+}
+
+fn synthesize_label(desc: &BucketDescriptor) -> String {
+    if desc.is_3p {
+        return format!("3p {}", desc.win_short);
     }
+    if !desc.qualifiers.is_empty() {
+        let joined = desc.qualifiers.join(" ");
+        if desc.window_secs >= SECS_PER_DAY {
+            return joined;
+        }
+        return format!("{joined} {}", desc.win_short);
+    }
+    desc.win_short.clone()
+}
+
+fn collect_model_tokens(payload: &StatuslinePayload) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    let Some(model) = payload.model.as_ref() else {
+        return tokens;
+    };
+    if let Some(id) = model.id.as_deref() {
+        tokens.extend(tokenize_alnum_lower(id));
+    }
+    if let Some(name) = model.display_name.as_deref() {
+        tokens.extend(tokenize_alnum_lower(name));
+    }
+    tokens
 }
 
 fn resolve_reset_secs(bucket: &QuotaBucket, now_unix_secs: u64) -> Option<u64> {
     match bucket.reset_in_seconds {
-        Some(0) => None,
-        Some(secs) => Some(secs),
+        Some(secs) if secs <= 0 => None,
+        Some(secs) => Some(secs as u64),
         None => {
             let reset_unix = bucket
                 .reset_time
@@ -387,234 +358,206 @@ fn resolve_reset_at_secs(bucket: &QuotaBucket, now_unix_secs: u64) -> Option<u64
     bucket
         .reset_in_seconds
         .filter(|&s| s > 0)
-        .map(|s| now_unix_secs.saturating_add(s))
+        .map(|s| now_unix_secs.saturating_add(s as u64))
 }
 
 fn build_quota_view(
+    key: &str,
+    desc: &BucketDescriptor,
     bucket: &QuotaBucket,
-    label: &'static str,
-    window_secs: u64,
     now_unix_secs: u64,
-) -> Option<(QuotaView, Option<u64>)> {
-    let frac = bucket.remaining_fraction.filter(|f| f.is_finite())?;
-    let remaining_pct = (frac * 100.0).clamp(0.0, 100.0);
+) -> Option<(QuotaView, Option<u64>, bool)> {
+    let has_frac = bucket.remaining_fraction.is_some_and(f64::is_finite);
+    let (remaining_pct, remaining_amount) =
+        if let Some(frac) = bucket.remaining_fraction.filter(|f| f.is_finite()) {
+            ((frac * 100.0).clamp(0.0, 100.0), None)
+        } else {
+            let amt = bucket.remaining_amount.filter(|&a| a >= 0)?;
+            (0.0, Some(amt))
+        };
     let reset_secs = resolve_reset_secs(bucket, now_unix_secs);
     let reset_at_secs = resolve_reset_at_secs(bucket, now_unix_secs);
     let reset_compact = reset_secs.map(format_duration_compact);
-    let pace_behind = reset_secs.filter(|&s| s <= window_secs).is_some_and(|s| {
-        let time_left_pct = (s as f64) * 100.0 / (window_secs as f64);
-        (time_left_pct - remaining_pct) > PACE_BEHIND_DELTA_PCT
-    });
+    let pace_behind = has_frac
+        && reset_secs
+            .filter(|&s| s <= desc.window_secs)
+            .is_some_and(|s| {
+                let time_left_pct = (s as f64) * 100.0 / (desc.window_secs as f64);
+                (time_left_pct - remaining_pct) > PACE_BEHIND_DELTA_PCT
+            });
     Some((
         QuotaView {
-            label,
+            label: synthesize_label(desc),
+            bucket_key: key.to_string(),
+            window_secs: desc.window_secs,
             remaining_pct,
+            remaining_amount,
             reset_compact,
             pace_behind,
             est_remaining_tokens: None,
         },
         reset_at_secs,
+        has_frac,
     ))
 }
 
-fn try_priority_keys(
-    quota: &BTreeMap<String, QuotaBucket>,
-    keys: &[(&str, &'static str)],
-    window: QuotaWindow,
-    now_unix_secs: u64,
-) -> Option<(QuotaView, Option<u64>)> {
-    let window_secs = window.secs();
-    for &(key, label) in keys {
-        if let Some(bucket) = quota.get(key) {
-            if let Some(found) = build_quota_view(bucket, label, window_secs, now_unix_secs) {
-                return Some(found);
-            }
+type AffinityScore = (u8, usize, isize);
+
+fn score_bucket(
+    desc: &BucketDescriptor,
+    model_tokens: &BTreeSet<String>,
+    effective_providers: &BTreeSet<String>,
+    has_model_identity: bool,
+) -> AffinityScore {
+    let provider_matched = desc
+        .provider
+        .as_ref()
+        .is_some_and(|p| effective_providers.contains(p));
+    let matched_q = desc
+        .qualifiers
+        .iter()
+        .filter(|q| model_tokens.contains(*q))
+        .count();
+    let unmatched_q = desc.qualifiers.len() - matched_q;
+    let is_3p_model = has_model_identity && effective_providers.is_empty();
+
+    let tier = if desc.is_3p {
+        if is_3p_model && unmatched_q == 0 && matched_q > 0 {
+            7
+        } else if is_3p_model && unmatched_q == 0 {
+            6
+        } else if is_3p_model {
+            5
+        } else if unmatched_q == 0 {
+            1
+        } else {
+            0
         }
+    } else if provider_matched && unmatched_q == 0 && matched_q > 0 {
+        7
+    } else if (provider_matched && unmatched_q == 0) || (matched_q > 0 && unmatched_q == 0) {
+        6
+    } else if provider_matched {
+        4
+    } else if !has_model_identity && unmatched_q == 0 {
+        5
+    } else if !has_model_identity {
+        3
+    } else {
+        2
+    };
+
+    (tier, matched_q, -(unmatched_q as isize))
+}
+
+struct Candidate {
+    score: AffinityScore,
+    has_frac: bool,
+    view: QuotaView,
+    reset_at: Option<u64>,
+}
+
+fn is_tighter_equal_score(cand: &Candidate, cur: &Candidate) -> bool {
+    if cand.has_frac != cur.has_frac {
+        return cand.has_frac;
     }
-    None
-}
-
-fn select_tightest_matching(
-    quota: &BTreeMap<String, QuotaBucket>,
-    window: QuotaWindow,
-    now_unix_secs: u64,
-    predicate: impl Fn(&str) -> bool,
-    label_override: Option<&'static str>,
-) -> Option<(QuotaView, Option<u64>)> {
-    let window_secs = window.secs();
-    let mut best: Option<(QuotaView, Option<u64>)> = None;
-    for (key, bucket) in quota {
-        let lower = key.to_ascii_lowercase();
-        if !matches_window(&lower, window) || !predicate(&lower) {
-            continue;
-        }
-        let label = label_override.unwrap_or_else(|| infer_label_for_key(&lower, window));
-        let Some(found) = build_quota_view(bucket, label, window_secs, now_unix_secs) else {
-            continue;
-        };
-        let replace = match &best {
-            None => true,
-            Some((cur, _)) => found.0.remaining_pct < cur.remaining_pct,
-        };
-        if replace {
-            best = Some(found);
-        }
-    }
-    best
-}
-
-struct FamilySpec {
-    keys: &'static [(&'static str, &'static str)],
-    pred: fn(&str) -> bool,
-    label: Option<&'static str>,
-}
-
-fn is_gemini_main_bucket_key(lower_key: &str) -> bool {
-    !is_3p_bucket_key(lower_key)
-        && !is_argon_bucket_key(lower_key)
-        && !is_carbon_bucket_key(lower_key)
-}
-
-fn family_spec(family: ModelFamily, window: QuotaWindow) -> FamilySpec {
-    match (family, window) {
-        (ModelFamily::Carbon, QuotaWindow::FiveHour) => FamilySpec {
-            keys: &[
-                ("gemini-carbon-5h", "carbon"),
-                ("gemini-carbon-wtu-5h", "carbon"),
-            ],
-            pred: is_carbon_bucket_key,
-            label: Some("carbon"),
-        },
-        (ModelFamily::Carbon, QuotaWindow::Weekly) => FamilySpec {
-            keys: &[
-                ("gemini-carbon-wtu-weekly", "carbon"),
-                ("gemini-carbon-weekly", "carbon"),
-            ],
-            pred: is_carbon_bucket_key,
-            label: Some("carbon"),
-        },
-        (ModelFamily::Argon, QuotaWindow::FiveHour) => FamilySpec {
-            keys: &[
-                ("gemini-argon-5h", "argon"),
-                ("gemini-argon-wtu-5h", "argon"),
-            ],
-            pred: is_argon_bucket_key,
-            label: Some("argon"),
-        },
-        (ModelFamily::Argon, QuotaWindow::Weekly) => FamilySpec {
-            keys: &[
-                ("gemini-argon-wtu-weekly", "argon"),
-                ("gemini-argon-weekly", "argon"),
-            ],
-            pred: is_argon_bucket_key,
-            label: Some("argon"),
-        },
-        (ModelFamily::ThirdParty, QuotaWindow::FiveHour) => FamilySpec {
-            keys: &[("3p-5h", "3p 5h")],
-            pred: is_3p_bucket_key,
-            label: Some(window.default_3p_label()),
-        },
-        (ModelFamily::ThirdParty, QuotaWindow::Weekly) => FamilySpec {
-            keys: &[("3p-weekly", "3p 7d")],
-            pred: is_3p_bucket_key,
-            label: Some(window.default_3p_label()),
-        },
-        (ModelFamily::GeminiMain, QuotaWindow::FiveHour) => FamilySpec {
-            keys: &[("gemini-5h", "5h")],
-            pred: is_gemini_main_bucket_key,
-            label: Some(window.default_gemini_label()),
-        },
-        (ModelFamily::GeminiMain, QuotaWindow::Weekly) => FamilySpec {
-            keys: &[("gemini-weekly", "7d")],
-            pred: is_gemini_main_bucket_key,
-            label: Some(window.default_gemini_label()),
-        },
+    if cand.has_frac {
+        cand.view.remaining_pct < cur.view.remaining_pct
+    } else {
+        cand.view.remaining_amount < cur.view.remaining_amount
     }
 }
 
 fn resolve_quota_for_window(
     payload: &StatuslinePayload,
-    window: QuotaWindow,
+    target: WindowTarget,
     now_unix_secs: u64,
 ) -> Option<(QuotaView, Option<u64>)> {
     let quota = payload.quota.as_ref()?;
-    let family = classify_model(payload);
-    let spec = family_spec(family, window);
+    let model_tokens = collect_model_tokens(payload);
+    let has_model_identity = !model_tokens.is_empty();
 
-    // 1. Exact priority keys for the active model family, then tightest family-compatible bucket.
-    if let Some(found) = try_priority_keys(quota, spec.keys, window, now_unix_secs)
-        .or_else(|| select_tightest_matching(quota, window, now_unix_secs, spec.pred, spec.label))
-    {
-        return Some(found);
-    }
-
-    // 2. For Carbon / Argon, fall back cleanly to Gemini main buckets before cross-family 3p.
-    if matches!(family, ModelFamily::Carbon | ModelFamily::Argon) {
-        let gemini_keys: &[(&str, &'static str)] = match window {
-            QuotaWindow::FiveHour => &[("gemini-5h", "5h")],
-            QuotaWindow::Weekly => &[("gemini-weekly", "7d")],
+    let mut active_descriptors: Vec<(&str, BucketDescriptor, &QuotaBucket)> = Vec::new();
+    let mut provider_tokens_in_map = BTreeSet::new();
+    for (key, bucket) in quota {
+        if bucket.disabled == Some(true) {
+            continue;
+        }
+        let Some(desc) = parse_bucket_descriptor(key) else {
+            continue;
         };
-        if let Some(found) =
-            try_priority_keys(quota, gemini_keys, window, now_unix_secs).or_else(|| {
-                select_tightest_matching(
-                    quota,
-                    window,
-                    now_unix_secs,
-                    is_gemini_main_bucket_key,
-                    Some(window.default_gemini_label()),
-                )
-            })
-        {
-            return Some(found);
+        if let Some(ref p) = desc.provider {
+            provider_tokens_in_map.insert(p.clone());
+        }
+        active_descriptors.push((key.as_str(), desc, bucket));
+    }
+
+    // Seed effective providers from model tokens directly matching any provider in the quota map,
+    // plus providers of buckets whose non-empty qualifiers all appear in the model tokens.
+    let mut effective_providers: BTreeSet<String> = provider_tokens_in_map
+        .into_iter()
+        .filter(|p| model_tokens.contains(p))
+        .collect();
+    for (_, desc, _) in &active_descriptors {
+        if let Some(ref p) = desc.provider {
+            if !desc.qualifiers.is_empty()
+                && desc.qualifiers.iter().all(|q| model_tokens.contains(q))
+            {
+                effective_providers.insert(p.clone());
+            }
         }
     }
 
-    // 3. Remaining non-3p Gemini buckets (e.g., GeminiMain falling back to argon/carbon when main is absent).
-    if family != ModelFamily::ThirdParty {
-        if let Some(found) =
-            select_tightest_matching(quota, window, now_unix_secs, |k| !is_3p_bucket_key(k), None)
-        {
-            return Some(found);
+    let mut best: Option<Candidate> = None;
+    for (key, desc, bucket) in active_descriptors {
+        if !target.matches(desc.window_secs) {
+            continue;
+        }
+        let Some((view, reset_at, has_frac)) = build_quota_view(key, &desc, bucket, now_unix_secs)
+        else {
+            continue;
+        };
+        let score = score_bucket(&desc, &model_tokens, &effective_providers, has_model_identity);
+        let cand = Candidate {
+            score,
+            has_frac,
+            view,
+            reset_at,
+        };
+        let replace = match &best {
+            None => true,
+            Some(cur) => cand.score > cur.score || (cand.score == cur.score && is_tighter_equal_score(&cand, cur)),
+        };
+        if replace {
+            best = Some(cand);
         }
     }
 
-    // 4. Last-resort cross-family fallback only when no family-matching bucket exists.
-    let cross_keys: &[(&str, &'static str)] = match (family, window) {
-        (ModelFamily::ThirdParty, QuotaWindow::FiveHour) => &[("gemini-5h", "5h")],
-        (ModelFamily::ThirdParty, QuotaWindow::Weekly) => &[
-            ("gemini-weekly", "7d"),
-            ("gemini-argon-wtu-weekly", "argon"),
-            ("gemini-carbon-wtu-weekly", "carbon"),
-        ],
-        (_, QuotaWindow::FiveHour) => &[("3p-5h", "3p 5h")],
-        (_, QuotaWindow::Weekly) => &[("3p-weekly", "3p 7d")],
-    };
-    try_priority_keys(quota, cross_keys, window, now_unix_secs)
-        .or_else(|| select_tightest_matching(quota, window, now_unix_secs, |_| true, None))
+    best.map(|c| (c.view, c.reset_at))
 }
 
-/// Resolves the active 5-hour quota bucket and its reset epoch timestamp at `now_unix_secs`.
+/// Resolves the active short-window (`< 24h`) quota bucket and its reset epoch timestamp at `now_unix_secs`.
 pub fn resolve_quota_5h_with_reset_at(
     payload: &StatuslinePayload,
     now_unix_secs: u64,
 ) -> Option<(QuotaView, Option<u64>)> {
-    resolve_quota_for_window(payload, QuotaWindow::FiveHour, now_unix_secs)
+    resolve_quota_for_window(payload, WindowTarget::Short, now_unix_secs)
 }
 
-/// Resolves the active weekly quota bucket and its reset epoch timestamp at `now_unix_secs`.
+/// Resolves the active multi-day (`>= 24h`) quota bucket and its reset epoch timestamp at `now_unix_secs`.
 pub fn resolve_quota_weekly_with_reset_at(
     payload: &StatuslinePayload,
     now_unix_secs: u64,
 ) -> Option<(QuotaView, Option<u64>)> {
-    resolve_quota_for_window(payload, QuotaWindow::Weekly, now_unix_secs)
+    resolve_quota_for_window(payload, WindowTarget::MultiDay, now_unix_secs)
 }
 
-/// Resolves the active 5-hour quota bucket at an explicit Unix epoch timestamp.
+/// Resolves the active short-window quota bucket at an explicit Unix epoch timestamp.
 pub fn resolve_quota_5h_at(payload: &StatuslinePayload, now_unix_secs: u64) -> Option<QuotaView> {
     resolve_quota_5h_with_reset_at(payload, now_unix_secs).map(|(v, _)| v)
 }
 
-/// Resolves the active weekly quota bucket at an explicit Unix epoch timestamp.
+/// Resolves the active multi-day quota bucket at an explicit Unix epoch timestamp.
 pub fn resolve_quota_weekly_at(
     payload: &StatuslinePayload,
     now_unix_secs: u64,
@@ -622,12 +565,12 @@ pub fn resolve_quota_weekly_at(
     resolve_quota_weekly_with_reset_at(payload, now_unix_secs).map(|(v, _)| v)
 }
 
-/// Resolves the active 5-hour quota bucket (`gemini-5h`, `3p-5h`, `carbon`, or tightest match).
+/// Resolves the active short-window quota bucket dynamically from `payload.quota`.
 pub fn resolve_quota_5h(payload: &StatuslinePayload) -> Option<QuotaView> {
     resolve_quota_5h_at(payload, current_unix_secs())
 }
 
-/// Resolves the active weekly quota bucket (`gemini-weekly`, `3p-weekly`, `argon`, `carbon`, or tightest match).
+/// Resolves the active multi-day quota bucket dynamically from `payload.quota`.
 pub fn resolve_quota_weekly(payload: &StatuslinePayload) -> Option<QuotaView> {
     resolve_quota_weekly_at(payload, current_unix_secs())
 }
@@ -635,6 +578,7 @@ pub fn resolve_quota_weekly(payload: &StatuslinePayload) -> Option<QuotaView> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use crate::statusline::{ContextWindow, JsonUsage, ModelInfo};
 
     #[test]
@@ -672,11 +616,11 @@ mod tests {
     fn quota_resolution_selects_model_bucket_and_pace_warning() {
         let mut quota = BTreeMap::new();
         quota.insert(
-            "gemini-5h".to_string(),
+            "acme-5h".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.40),
                 reset_in_seconds: Some(14_400), // 80% time left vs 40% quota -> behind pace
-                reset_time: None,
+                ..Default::default()
             },
         );
         quota.insert(
@@ -684,48 +628,52 @@ mod tests {
             QuotaBucket {
                 remaining_fraction: Some(0.90),
                 reset_in_seconds: Some(11_400),
-                reset_time: None,
+                ..Default::default()
             },
         );
         quota.insert(
-            "gemini-argon-wtu-weekly".to_string(),
+            "acme-tier1-wtu-weekly".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.9378),
                 reset_in_seconds: Some(560_580),
-                reset_time: None,
+                ..Default::default()
             },
         );
 
-        let gemini_payload = StatuslinePayload {
+        let acme_payload = StatuslinePayload {
             model: Some(ModelInfo {
-                id: Some("Gemini 4 Argon (Medium)".to_string()),
-                display_name: Some("Gemini 4 Argon (Medium)".to_string()),
+                id: Some("Acme 4 Tier1 (Medium)".to_string()),
+                display_name: Some("Acme 4 Tier1 (Medium)".to_string()),
                 effort: None,
             }),
             quota: Some(quota.clone()),
             ..Default::default()
         };
-        let q5 = resolve_quota_5h(&gemini_payload).unwrap();
+        let q5 = resolve_quota_5h(&acme_payload).unwrap();
         assert_eq!(q5.label, "5h");
+        assert_eq!(q5.bucket_key, "acme-5h");
+        assert_eq!(q5.window_secs, 18_000);
         assert!((q5.remaining_pct - 40.0).abs() < 1e-6);
         assert_eq!(q5.reset_compact.as_deref(), Some("4h"));
         assert!(q5.pace_behind);
 
-        let qw = resolve_quota_weekly(&gemini_payload).unwrap();
-        assert_eq!(qw.label, "argon");
+        let qw = resolve_quota_weekly(&acme_payload).unwrap();
+        assert_eq!(qw.label, "tier1");
+        assert_eq!(qw.bucket_key, "acme-tier1-wtu-weekly");
+        assert_eq!(qw.window_secs, 604_800);
         assert_eq!(qw.reset_compact.as_deref(), Some("6d11h"));
         assert!(!qw.pace_behind);
 
-        let claude_payload = StatuslinePayload {
+        let third_party_payload = StatuslinePayload {
             model: Some(ModelInfo {
-                id: Some("claude-sonnet-4".to_string()),
-                display_name: Some("Claude Sonnet 4".to_string()),
+                id: Some("vendorx-large-4".to_string()),
+                display_name: Some("VendorX Large 4".to_string()),
                 effort: None,
             }),
             quota: Some(quota),
             ..Default::default()
         };
-        let q3p = resolve_quota_5h(&claude_payload).unwrap();
+        let q3p = resolve_quota_5h(&third_party_payload).unwrap();
         assert_eq!(q3p.label, "3p 5h");
         assert_eq!(q3p.reset_compact.as_deref(), Some("3h10m"));
         assert!(!q3p.pace_behind);
@@ -795,25 +743,25 @@ mod tests {
         let now = 1_795_003_200 - 14_400;
         let mut quota = BTreeMap::new();
         quota.insert(
-            "gemini-5h".to_string(),
+            "acme-5h".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.40),
-                reset_in_seconds: None,
                 reset_time: Some("2026-11-18T12:00:00Z".to_string()),
+                ..Default::default()
             },
         );
         quota.insert(
-            "gemini-weekly".to_string(),
+            "acme-weekly".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.80),
-                reset_in_seconds: None,
                 reset_time: Some("2026-11-18T20:00:00+08:00".to_string()),
+                ..Default::default()
             },
         );
 
         let payload = StatuslinePayload {
             model: Some(ModelInfo {
-                id: Some("gemini-4-hydrogen".to_string()),
+                id: Some("acme-4-base".to_string()),
                 ..Default::default()
             }),
             quota: Some(quota),
@@ -830,23 +778,34 @@ mod tests {
     }
 
     #[test]
-    fn expired_reset_time_and_zero_reset_in_seconds_emit_no_timer() {
+    fn expired_negative_or_zero_reset_emits_no_timer_and_disabled_is_ignored() {
         let now = 1_795_003_200;
         let mut quota = BTreeMap::new();
         quota.insert(
-            "gemini-5h".to_string(),
+            "acme-5h".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.10),
-                reset_in_seconds: None,
-                reset_time: Some("2026-11-18T12:00:00Z".to_string()), // == now (expired)
+                reset_in_seconds: Some(-12),
+                reset_time: Some("2026-11-18T12:00:00Z".to_string()),
+                ..Default::default()
             },
         );
         quota.insert(
-            "gemini-weekly".to_string(),
+            "acme-weekly".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.10),
                 reset_in_seconds: Some(0),
                 reset_time: Some("2099-01-01T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        );
+        quota.insert(
+            "acme-disabled-5h".to_string(),
+            QuotaBucket {
+                remaining_fraction: Some(0.01),
+                reset_in_seconds: Some(600),
+                disabled: Some(true),
+                ..Default::default()
             },
         );
 
@@ -856,6 +815,7 @@ mod tests {
         };
 
         let q5 = resolve_quota_5h_at(&payload, now).unwrap();
+        assert_eq!(q5.bucket_key, "acme-5h");
         assert_eq!(q5.reset_compact, None);
         assert!(!q5.pace_behind);
 
@@ -865,30 +825,30 @@ mod tests {
     }
 
     #[test]
-    fn routes_orchestrator_carbon_and_gpt_oss_models() {
+    fn token_affinity_routes_qualifiers_3p_dynamic_windows_and_credits() {
         let mut base_quota = BTreeMap::new();
         base_quota.insert(
-            "gemini-5h".to_string(),
+            "acme-5h".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.80),
                 reset_in_seconds: Some(3_600),
-                reset_time: None,
+                ..Default::default()
             },
         );
         base_quota.insert(
-            "gemini-weekly".to_string(),
+            "acme-weekly".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.70),
                 reset_in_seconds: Some(86_400),
-                reset_time: None,
+                ..Default::default()
             },
         );
         base_quota.insert(
-            "gemini-argon-wtu-weekly".to_string(),
+            "acme-tier1-wtu-weekly".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.60),
                 reset_in_seconds: Some(86_400),
-                reset_time: None,
+                ..Default::default()
             },
         );
         base_quota.insert(
@@ -896,7 +856,7 @@ mod tests {
             QuotaBucket {
                 remaining_fraction: Some(0.004),
                 reset_in_seconds: Some(1_800),
-                reset_time: None,
+                ..Default::default()
             },
         );
         base_quota.insert(
@@ -904,159 +864,159 @@ mod tests {
             QuotaBucket {
                 remaining_fraction: Some(0.50),
                 reset_in_seconds: Some(172_800),
-                reset_time: None,
+                ..Default::default()
             },
         );
 
-        // Bare gemini-pro-orchestrator routes to argon when carbon is absent.
-        let orch = StatuslinePayload {
+        // Model without tier1 qualifier picks acme-weekly (7d), not tier1.
+        let base_model = StatuslinePayload {
             model: Some(ModelInfo {
-                id: Some("gemini-pro-orchestrator".to_string()),
-                display_name: Some("Orchestrator".to_string()),
+                id: Some("acme-4-base".to_string()),
+                display_name: Some("Acme 4 Base".to_string()),
                 effort: None,
             }),
             quota: Some(base_quota.clone()),
             ..Default::default()
         };
-        assert_eq!(resolve_quota_weekly_at(&orch, 0).unwrap().label, "argon");
-        assert_eq!(resolve_quota_5h_at(&orch, 0).unwrap().label, "5h");
+        assert_eq!(resolve_quota_weekly_at(&base_model, 0).unwrap().label, "7d");
+        assert_eq!(resolve_quota_5h_at(&base_model, 0).unwrap().label, "5h");
 
-        // Carbon without carbon-specific buckets falls back cleanly to 7d / 5h.
-        let carbon_fallback = StatuslinePayload {
+        // Model with qualifier token in display_name matches acme-tier1-wtu-weekly dynamically.
+        let qualified_display = StatuslinePayload {
             model: Some(ModelInfo {
-                id: Some("m670".to_string()),
-                display_name: Some("Gemini 4 Carbon".to_string()),
+                id: None,
+                display_name: Some("Orchestrator (Tier1)".to_string()),
                 effort: None,
             }),
             quota: Some(base_quota.clone()),
             ..Default::default()
         };
         assert_eq!(
-            resolve_quota_weekly_at(&carbon_fallback, 0).unwrap().label,
-            "7d"
+            resolve_quota_weekly_at(&qualified_display, 0).unwrap().label,
+            "tier1"
         );
-        assert_eq!(
-            resolve_quota_5h_at(&carbon_fallback, 0).unwrap().label,
-            "5h"
-        );
+        assert_eq!(resolve_quota_5h_at(&qualified_display, 0).unwrap().label, "5h");
 
-        // Carbon with carbon-specific bucket uses label "carbon".
-        let mut carbon_quota = base_quota.clone();
-        carbon_quota.insert(
-            "gemini-carbon-wtu-weekly".to_string(),
-            QuotaBucket {
-                remaining_fraction: Some(0.45),
-                reset_in_seconds: Some(86_400),
-                reset_time: None,
-            },
-        );
-        let carbon_specific = StatuslinePayload {
+        // Arbitrary unknown third-party model picks 3p buckets automatically.
+        let unknown_3p = StatuslinePayload {
             model: Some(ModelInfo {
-                id: Some("gemini-pro-orchestrator-carbon".to_string()),
-                display_name: None,
-                effort: None,
-            }),
-            quota: Some(carbon_quota),
-            ..Default::default()
-        };
-        let cw = resolve_quota_weekly_at(&carbon_specific, 0).unwrap();
-        assert_eq!(cw.label, "carbon");
-        assert!((cw.remaining_pct - 45.0).abs() < 1e-6);
-
-        // GPT-OSS and expanded 3P needles route to 3p buckets and preserve 0.4%.
-        let gpt_oss = StatuslinePayload {
-            model: Some(ModelInfo {
-                id: Some("gpt-oss-120b".to_string()),
-                display_name: Some("GPT-OSS 120B".to_string()),
-                effort: None,
-            }),
-            quota: Some(base_quota.clone()),
-            ..Default::default()
-        };
-        let g5 = resolve_quota_5h_at(&gpt_oss, 0).unwrap();
-        assert_eq!(g5.label, "3p 5h");
-        assert_eq!(format_quota_pct(g5.remaining_pct), "0.4%");
-        assert_eq!(resolve_quota_weekly_at(&gpt_oss, 0).unwrap().label, "3p 7d");
-
-        let codex = StatuslinePayload {
-            model: Some(ModelInfo {
-                id: Some("openai/o3-codex".to_string()),
-                display_name: None,
+                id: Some("deepseek-r1".to_string()),
+                display_name: Some("DeepSeek R1".to_string()),
                 effort: None,
             }),
             quota: Some(base_quota),
             ..Default::default()
         };
-        assert_eq!(resolve_quota_5h_at(&codex, 0).unwrap().label, "3p 5h");
+        let g5 = resolve_quota_5h_at(&unknown_3p, 0).unwrap();
+        assert_eq!(g5.label, "3p 5h");
+        assert_eq!(format_quota_pct(g5.remaining_pct), "0.4%");
+        assert_eq!(resolve_quota_weekly_at(&unknown_3p, 0).unwrap().label, "3p 7d");
+
+        // Custom 24h / 1h / credit-only buckets work dynamically.
+        let mut custom_quota = BTreeMap::new();
+        custom_quota.insert(
+            "acme-hourly".to_string(),
+            QuotaBucket {
+                remaining_fraction: None,
+                remaining_amount: Some(450),
+                reset_in_seconds: Some(1_200),
+                ..Default::default()
+            },
+        );
+        custom_quota.insert(
+            "acme-24h".to_string(),
+            QuotaBucket {
+                remaining_fraction: Some(0.62),
+                reset_in_seconds: Some(43_200),
+                ..Default::default()
+            },
+        );
+        let custom_payload = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: Some("acme-pro".to_string()),
+                ..Default::default()
+            }),
+            quota: Some(custom_quota),
+            ..Default::default()
+        };
+        let c_short = resolve_quota_5h_at(&custom_payload, 0).unwrap();
+        assert_eq!(c_short.label, "1h");
+        assert_eq!(c_short.window_secs, 3_600);
+        assert_eq!(c_short.remaining_amount, Some(450));
+        assert!(!c_short.pace_behind);
+
+        let c_day = resolve_quota_weekly_at(&custom_payload, 0).unwrap();
+        assert_eq!(c_day.label, "24h");
+        assert_eq!(c_day.window_secs, 86_400);
     }
 
     #[test]
-    fn dynamic_scan_picks_tightest_family_bucket_without_cross_binding() {
+    fn dynamic_scan_picks_tightest_matching_bucket_without_cross_binding() {
         let mut quota = BTreeMap::new();
         quota.insert(
-            "gemini-flash-5h".to_string(),
+            "acme-fast-5h".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.65),
                 reset_in_seconds: Some(7_200),
-                reset_time: None,
+                ..Default::default()
             },
         );
         quota.insert(
-            "gemini-pro-5h".to_string(),
+            "acme-pro-5h".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.12),
                 reset_in_seconds: Some(3_600),
-                reset_time: None,
+                ..Default::default()
             },
         );
         quota.insert(
-            "3p-claude-5h".to_string(),
+            "3p-vendor-5h".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.01),
                 reset_in_seconds: Some(900),
-                reset_time: None,
+                ..Default::default()
             },
         );
         quota.insert(
-            "3p-openai-weekly".to_string(),
+            "3p-alpha-weekly".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.22),
                 reset_in_seconds: Some(86_400),
-                reset_time: None,
+                ..Default::default()
             },
         );
         quota.insert(
-            "3p-anthropic-weekly".to_string(),
+            "3p-beta-weekly".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.55),
                 reset_in_seconds: Some(86_400),
-                reset_time: None,
+                ..Default::default()
             },
         );
         quota.insert(
-            "gemini-hydrogen-weekly".to_string(),
+            "acme-base-weekly".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.02),
                 reset_in_seconds: Some(86_400),
-                reset_time: None,
+                ..Default::default()
             },
         );
 
-        let gemini = StatuslinePayload {
+        let acme = StatuslinePayload {
             model: Some(ModelInfo {
-                id: Some("gemini-4-hydrogen".to_string()),
+                id: Some("acme-4-other".to_string()),
                 ..Default::default()
             }),
             quota: Some(quota.clone()),
             ..Default::default()
         };
-        let g5 = resolve_quota_5h_at(&gemini, 0).unwrap();
-        assert_eq!(g5.label, "5h");
+        let g5 = resolve_quota_5h_at(&acme, 0).unwrap();
+        assert_eq!(g5.label, "pro 5h");
         assert!((g5.remaining_pct - 12.0).abs() < 1e-6);
 
         let third_party = StatuslinePayload {
             model: Some(ModelInfo {
-                id: Some("anthropic/claude-opus-5-5".to_string()),
+                id: Some("beta/model-5-5".to_string()),
                 ..Default::default()
             }),
             quota: Some(quota),
@@ -1064,6 +1024,7 @@ mod tests {
         };
         let tw = resolve_quota_weekly_at(&third_party, 0).unwrap();
         assert_eq!(tw.label, "3p 7d");
-        assert!((tw.remaining_pct - 22.0).abs() < 1e-6);
+        assert_eq!(tw.bucket_key, "3p-beta-weekly");
+        assert!((tw.remaining_pct - 55.0).abs() < 1e-6);
     }
 }

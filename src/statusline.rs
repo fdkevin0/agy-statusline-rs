@@ -107,10 +107,14 @@ pub struct CostInfo {
 pub struct QuotaBucket {
     /// Fraction of quota remaining (`0.0..=1.0`).
     pub remaining_fraction: Option<f64>,
-    /// Countdown in seconds until the bucket resets.
-    pub reset_in_seconds: Option<u64>,
+    /// Remaining credit amount when the bucket reports discrete units instead of a fraction.
+    pub remaining_amount: Option<i64>,
+    /// Countdown in seconds until the bucket resets (may be negative right after reset).
+    pub reset_in_seconds: Option<i64>,
     /// ISO-8601 reset timestamp.
     pub reset_time: Option<String>,
+    /// Whether this bucket is disabled by the server.
+    pub disabled: Option<bool>,
 }
 
 /// Null-safe top-level AGY statusline JSON payload passed via `stdin`.
@@ -149,15 +153,26 @@ pub struct StatuslinePayload {
     pub context_window: Option<ContextWindow>,
     /// Session cost estimate.
     pub cost: Option<CostInfo>,
-    /// Quota buckets (`gemini-5h`, `gemini-weekly`, `gemini-argon-wtu-weekly`, `3p-5h`, `3p-weekly`).
+    /// Quota buckets keyed by server bucket ID.
     pub quota: Option<BTreeMap<String, QuotaBucket>>,
 }
 
 impl StatuslinePayload {
     /// Returns the number of active subagents when `subagents` is a JSON array.
+    ///
+    /// For objects containing a string `"status"` field, counts only entries where
+    /// `status != "completed"`; entries lacking `"status"` fall back to direct counting.
     pub fn subagent_count(&self) -> usize {
         match &self.subagents {
-            Some(Value::Array(items)) => items.len(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter(|item| {
+                    item.as_object()
+                        .and_then(|obj| obj.get("status"))
+                        .and_then(Value::as_str)
+                        .is_none_or(|status| !status.eq_ignore_ascii_case("completed"))
+                })
+                .count(),
             _ => 0,
         }
     }
@@ -380,5 +395,39 @@ mod tests {
         process_statusline_with_probes(json, &StubReader(None), &git, &cfg, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("feat/probe"));
+    }
+
+    #[test]
+    fn parses_negative_reset_credit_bucket_disabled_and_subagent_status() {
+        let json = r#"{
+            "subagents": [
+                {"name": "worker-1", "status": "running"},
+                {"name": "worker-2", "status": "completed"},
+                {"name": "legacy-worker"}
+            ],
+            "quota": {
+                "pool-5h": {
+                    "remaining_amount": 420,
+                    "reset_in_seconds": -15,
+                    "disabled": false
+                },
+                "pool-7d": {
+                    "remaining_fraction": 0.10,
+                    "disabled": true
+                }
+            }
+        }"#;
+        let payload: StatuslinePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.subagent_count(), 2);
+
+        let quota = payload.quota.unwrap();
+        assert_eq!(quota["pool-5h"].remaining_amount, Some(420));
+        assert_eq!(quota["pool-5h"].reset_in_seconds, Some(-15));
+        assert_eq!(quota["pool-5h"].disabled, Some(false));
+        assert_eq!(quota["pool-7d"].disabled, Some(true));
+
+        let legacy: StatuslinePayload =
+            serde_json::from_str(r#"{"subagents":[1,2,3]}"#).unwrap();
+        assert_eq!(legacy.subagent_count(), 3);
     }
 }

@@ -36,7 +36,7 @@ fn base_payload(width: usize) -> StatuslinePayload {
         QuotaBucket {
             remaining_fraction: Some(0.84),
             reset_in_seconds: Some(11_400),
-            reset_time: None,
+            ..Default::default()
         },
     );
     quota.insert(
@@ -44,7 +44,7 @@ fn base_payload(width: usize) -> StatuslinePayload {
         QuotaBucket {
             remaining_fraction: Some(0.92),
             reset_in_seconds: Some(432_000),
-            reset_time: None,
+            ..Default::default()
         },
     );
     StatuslinePayload {

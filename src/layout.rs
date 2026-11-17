@@ -50,7 +50,7 @@ pub enum WidgetId {
     Mode,
     /// Rolling 5-hour quota remaining % + reset timer + pace warning.
     Quota5h,
-    /// Weekly (or Argon) quota remaining % + reset timer + pace warning.
+    /// Weekly (or multi-day) quota remaining % + reset timer + pace warning.
     QuotaWeekly,
     /// Artifact count (`art 2`).
     Artifacts,
@@ -80,7 +80,7 @@ const WIDGET_META: [(WidgetId, &str, &str); 21] = [
     (WidgetId::Cost, "cost", "Session Cost ($)"),
     (WidgetId::Mode, "mode", "Cycle Mode (Plan/Auto)"),
     (WidgetId::Quota5h, "quota_5h", "5h Quota + Pace"),
-    (WidgetId::QuotaWeekly, "quota_weekly", "Weekly / Argon Quota"),
+    (WidgetId::QuotaWeekly, "quota_weekly", "Weekly Quota"),
     (WidgetId::Artifacts, "artifacts", "Artifact Count"),
     (WidgetId::Subagents, "subagents", "Active Subagents"),
     (WidgetId::Tasks, "tasks", "Background Tasks"),
@@ -515,7 +515,7 @@ impl LayoutConfig {
         cfg
     }
 
-    /// Preset 3: Codex-style single-line statusline.
+    /// Preset 3: Minimal single-line statusline.
     pub fn preset_minimal() -> Self {
         Self::base_with_rows(vec![vec![
             WidgetId::State,
