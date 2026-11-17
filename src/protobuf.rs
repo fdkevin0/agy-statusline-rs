@@ -121,6 +121,17 @@ pub fn find_number(data: &[u8], id: u64) -> u64 {
     }
 }
 
+const FIELD_CHAT: u64 = 1;
+const FIELD_CHAT_USAGE: u64 = 4;
+const FIELD_USAGE_OUTPUT_TOKENS: u64 = 3;
+const FIELD_CHAT_START: u64 = 9;
+const FIELD_START_CTX_WINDOW: u64 = 10;
+const FIELD_CTX_MAX_TOKENS: u64 = 4;
+const FIELD_CHAT_TTFT: u64 = 11;
+const FIELD_CHAT_DECODE_DURATION: u64 = 12;
+const FIELD_DURATION_SECS: u64 = 1;
+const FIELD_DURATION_NANOS: u64 = 2;
+
 /// Timing and output token metrics extracted from one `gen_metadata` turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TurnMetrics {
@@ -133,21 +144,26 @@ pub struct TurnMetrics {
 }
 
 fn decode_duration_secs(msg: &[u8]) -> Option<f64> {
-    let nanos = find_number(msg, 2);
+    let nanos = find_number(msg, FIELD_DURATION_NANOS);
     if nanos >= 1_000_000_000 {
         return None;
     }
-    Some((find_number(msg, 1) as f64) + (nanos as f64) / 1e9)
+    Some((find_number(msg, FIELD_DURATION_SECS) as f64) + (nanos as f64) / 1e9)
+}
+
+fn extract_raw_usage_and_decode(data: &[u8]) -> Option<(&[u8], u64, f64)> {
+    let chat = find_bytes(data, FIELD_CHAT)?;
+    let usage = find_bytes(chat, FIELD_CHAT_USAGE)?;
+    let duration = find_bytes(chat, FIELD_CHAT_DECODE_DURATION)?;
+    let decode_secs = decode_duration_secs(duration)?;
+    let output_tokens = find_number(usage, FIELD_USAGE_OUTPUT_TOKENS);
+    Some((chat, output_tokens, decode_secs))
 }
 
 /// Extracts [`TurnMetrics`] (output tokens, decode duration, and optional TTFT)
 /// from a `gen_metadata.data` Protobuf blob.
 pub fn extract_turn_metrics(data: &[u8]) -> Option<TurnMetrics> {
-    let chat = find_bytes(data, 1)?;
-    let usage = find_bytes(chat, 4)?;
-    let duration = find_bytes(chat, 12)?;
-    let decode_secs = decode_duration_secs(duration)?;
-    let output_tokens = find_number(usage, 3);
+    let (chat, output_tokens, decode_secs) = extract_raw_usage_and_decode(data)?;
     if decode_secs < 0.02 || output_tokens == 0 {
         return None;
     }
@@ -155,7 +171,7 @@ pub fn extract_turn_metrics(data: &[u8]) -> Option<TurnMetrics> {
     if !inst_speed.is_finite() || inst_speed <= 0.0 || inst_speed >= 2000.0 {
         return None;
     }
-    let ttft_secs = find_bytes(chat, 11)
+    let ttft_secs = find_bytes(chat, FIELD_CHAT_TTFT)
         .and_then(decode_duration_secs)
         .filter(|&t| t > 0.0 && t < 600.0);
     Some(TurnMetrics {
@@ -180,15 +196,7 @@ pub fn extract_turn_metrics(data: &[u8]) -> Option<TurnMetrics> {
 /// assert_eq!(extract_metadata_speed(&blob), Some(50.0));
 /// ```
 pub fn extract_metadata_speed(data: &[u8]) -> Option<f64> {
-    let chat = find_bytes(data, 1)?;
-    let usage = find_bytes(chat, 4)?;
-    let duration = find_bytes(chat, 12)?;
-    let nanos = find_number(duration, 2);
-    if nanos >= 1_000_000_000 {
-        return None;
-    }
-    let seconds = (find_number(duration, 1) as f64) + (nanos as f64) / 1e9;
-    let output = find_number(usage, 3);
+    let (_, output, seconds) = extract_raw_usage_and_decode(data)?;
     if seconds < 0.1 || output == 0 {
         return None;
     }
@@ -205,10 +213,10 @@ pub fn extract_metadata_speed(data: &[u8]) -> Option<f64> {
 ///
 /// Returns `None` if any nested field is missing, malformed, or `0`.
 pub fn extract_max_context_tokens(data: &[u8]) -> Option<u64> {
-    let chat = find_bytes(data, 1)?;
-    let chat_start = find_bytes(chat, 9)?;
-    let ctx_window = find_bytes(chat_start, 10)?;
-    match find_field(ctx_window, 4)? {
+    let chat = find_bytes(data, FIELD_CHAT)?;
+    let chat_start = find_bytes(chat, FIELD_CHAT_START)?;
+    let ctx_window = find_bytes(chat_start, FIELD_START_CTX_WINDOW)?;
+    match find_field(ctx_window, FIELD_CTX_MAX_TOKENS)? {
         FieldValue::Number(val) if val > 0 => Some(val),
         _ => None,
     }

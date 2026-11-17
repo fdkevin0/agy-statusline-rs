@@ -60,9 +60,25 @@ fn apply_sgr(style: &mut Style, params: &str) {
                 *style = style.fg(Color::Indexed(codes[i + 2].min(255) as u8));
                 i += 2;
             }
+            38 if i + 4 < codes.len() && codes[i + 1] == 2 => {
+                *style = style.fg(Color::Rgb(
+                    codes[i + 2].min(255) as u8,
+                    codes[i + 3].min(255) as u8,
+                    codes[i + 4].min(255) as u8,
+                ));
+                i += 4;
+            }
             48 if i + 2 < codes.len() && codes[i + 1] == 5 => {
                 *style = style.bg(Color::Indexed(codes[i + 2].min(255) as u8));
                 i += 2;
+            }
+            48 if i + 4 < codes.len() && codes[i + 1] == 2 => {
+                *style = style.bg(Color::Rgb(
+                    codes[i + 2].min(255) as u8,
+                    codes[i + 3].min(255) as u8,
+                    codes[i + 4].min(255) as u8,
+                ));
+                i += 4;
             }
             _ => {}
         }
@@ -133,5 +149,14 @@ mod tests {
         let raw = "ctx ███████▒······· 50.0%\n";
         let lines = ansi_to_ratatui_lines(raw);
         assert_eq!(lines[0].spans[0].content, "ctx ███████▒······· 50.0%");
+    }
+
+    #[test]
+    fn parses_truecolor_24bit_rgb_sgr() {
+        let raw = "\x1b[38;2;12;34;56m\x1b[48;2;200;150;100mHi\x1b[0m\n";
+        let lines = ansi_to_ratatui_lines(raw);
+        assert_eq!(lines[0].spans[0].content, "Hi");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Rgb(12, 34, 56)));
+        assert_eq!(lines[0].spans[0].style.bg, Some(Color::Rgb(200, 150, 100)));
     }
 }

@@ -2,82 +2,21 @@
 
 use std::io::{self, Write as IoWrite};
 
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::db::SessionMetadata;
 use crate::format::format_tokens;
 use crate::git::GitInfo;
-use crate::layout::{LayoutConfig, SpeedMode, ThemeStyle, VisualStyle, WidgetId};
+use crate::layout::{GlyphMode, LayoutConfig, SpeedMode, ThemeStyle, VisualStyle, WidgetId};
+use crate::metrics::{
+    current_context_tokens, resolve_quota_5h, resolve_quota_weekly, valid_cache_usage, QuotaView,
+};
 use crate::statusline::StatuslinePayload;
+use crate::theme::{GlyphSet, Palette};
 
-#[derive(Debug, Clone, Copy)]
-struct Palette {
-    ready: u8,
-    thinking: u8,
-    working: u8,
-    tool: u8,
-    model: u8,
-    dir: u8,
-    vcs_clean: u8,
-    vcs_dirty: u8,
-    ctx_ok: u8,
-    ctx_warn: u8,
-    ctx_crit: u8,
-    cache: u8,
-    speed_ok: u8,
-    speed_slow: u8,
-    cost: u8,
-    muted: u8,
-    sep: u8,
-    pill_bg: u8,
-    pl_bg_a: u8,
-    pl_bg_b: u8,
-    pl_accent_fg: u8,
-}
-
-const PALETTES: [Palette; 4] = [
-    // Default
-    Palette {
-        ready: 78, thinking: 220, working: 81, tool: 177, model: 183, dir: 117,
-        vcs_clean: 75, vcs_dirty: 203, ctx_ok: 78, ctx_warn: 220, ctx_crit: 203,
-        cache: 111, speed_ok: 80, speed_slow: 214, cost: 150, muted: 245, sep: 240,
-        pill_bg: 236, pl_bg_a: 237, pl_bg_b: 235, pl_accent_fg: 232,
-    },
-    // Nord
-    Palette {
-        ready: 108, thinking: 222, working: 110, tool: 139, model: 110, dir: 109,
-        vcs_clean: 74, vcs_dirty: 174, ctx_ok: 108, ctx_warn: 222, ctx_crit: 174,
-        cache: 110, speed_ok: 109, speed_slow: 215, cost: 151, muted: 244, sep: 239,
-        pill_bg: 236, pl_bg_a: 238, pl_bg_b: 235, pl_accent_fg: 233,
-    },
-    // Catppuccin
-    Palette {
-        ready: 114, thinking: 223, working: 117, tool: 183, model: 183, dir: 117,
-        vcs_clean: 111, vcs_dirty: 210, ctx_ok: 114, ctx_warn: 223, ctx_crit: 210,
-        cache: 147, speed_ok: 116, speed_slow: 216, cost: 151, muted: 245, sep: 240,
-        pill_bg: 237, pl_bg_a: 238, pl_bg_b: 236, pl_accent_fg: 232,
-    },
-    // Mono
-    Palette {
-        ready: 15, thinking: 15, working: 15, tool: 15, model: 15, dir: 15,
-        vcs_clean: 15, vcs_dirty: 15, ctx_ok: 15, ctx_warn: 15, ctx_crit: 15,
-        cache: 15, speed_ok: 15, speed_slow: 15, cost: 15, muted: 15, sep: 15,
-        pill_bg: 0, pl_bg_a: 0, pl_bg_b: 0, pl_accent_fg: 0,
-    },
-];
-
-impl Palette {
-    const fn for_theme(theme: ThemeStyle) -> Self {
-        match theme {
-            ThemeStyle::Default => PALETTES[0],
-            ThemeStyle::Nord => PALETTES[1],
-            ThemeStyle::Catppuccin => PALETTES[2],
-            ThemeStyle::Mono => PALETTES[3],
-        }
-    }
-}
-
+#[derive(Debug, Clone)]
 struct Segment {
+    widget: WidgetId,
     text: String,
     fg: u8,
     accent_bg: Option<u8>,
@@ -86,17 +25,98 @@ struct Segment {
 }
 
 impl Segment {
-    fn plain(text: String, fg: u8, bold: bool) -> Self {
-        Self { text, fg, accent_bg: None, bold, is_spacer: false }
+    fn plain(widget: WidgetId, text: String, fg: u8, bold: bool) -> Self {
+        Self {
+            widget,
+            text,
+            fg,
+            accent_bg: None,
+            bold,
+            is_spacer: false,
+        }
     }
 
     fn spacer() -> Self {
-        Self { text: String::new(), fg: 0, accent_bg: None, bold: false, is_spacer: true }
+        Self {
+            widget: WidgetId::Spacer,
+            text: String::new(),
+            fg: 0,
+            accent_bg: None,
+            bold: false,
+            is_spacer: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StyleGeometry {
+    pad_per_seg: usize,
+    sep_w: usize,
+    slice_trail_w: usize,
+    mono: bool,
+    sep_str: &'static str,
+}
+
+fn compute_geometry(cfg: &LayoutConfig, glyphs: &GlyphSet) -> StyleGeometry {
+    let mono = cfg.theme == ThemeStyle::Mono || cfg.no_color;
+    let sep_str = if cfg.glyph_mode == GlyphMode::Ascii {
+        cfg.separator.as_ascii_str()
+    } else {
+        cfg.separator.as_str()
+    };
+    if mono {
+        return StyleGeometry {
+            pad_per_seg: 0,
+            sep_w: sep_str.width(),
+            slice_trail_w: 0,
+            mono: true,
+            sep_str,
+        };
+    }
+    match cfg.style {
+        VisualStyle::Plain => StyleGeometry {
+            pad_per_seg: 0,
+            sep_w: sep_str.width(),
+            slice_trail_w: 0,
+            mono: false,
+            sep_str,
+        },
+        VisualStyle::Pill => {
+            let pad = match glyphs.pill_caps {
+                Some((l, r)) => l.width() + r.width(),
+                None => 2,
+            };
+            StyleGeometry {
+                pad_per_seg: pad,
+                sep_w: 1,
+                slice_trail_w: 0,
+                mono: false,
+                sep_str,
+            }
+        }
+        VisualStyle::Powerline => {
+            let arrow_w = glyphs.pl_right.width();
+            StyleGeometry {
+                pad_per_seg: 2,
+                sep_w: arrow_w,
+                slice_trail_w: arrow_w,
+                mono: false,
+                sep_str,
+            }
+        }
     }
 }
 
 /// Builds a `bar_len`-segment Unicode context progress bar (`█▓▒░·`).
 pub fn build_progress_bar(used_percentage: f64, bar_len: usize) -> (String, f64) {
+    build_progress_bar_with_chars(used_percentage, bar_len, ['█', '▓', '▒', '░', '·'])
+}
+
+fn build_progress_bar_with_chars(
+    used_percentage: f64,
+    bar_len: usize,
+    chars: [char; 5],
+) -> (String, f64) {
     let clamped = if used_percentage.is_finite() {
         used_percentage.clamp(0.0, 100.0)
     } else {
@@ -110,15 +130,15 @@ pub fn build_progress_bar(used_percentage: f64, bar_len: usize) -> (String, f64)
     let mut bar = String::with_capacity(len * 3);
     for i in 0..len {
         let ch = if i < filled {
-            '█'
+            chars[0]
         } else if i == filled && remainder >= 75 {
-            '▓'
+            chars[1]
         } else if i == filled && remainder >= 50 {
-            '▒'
+            chars[2]
         } else if i == filled && remainder >= 25 {
-            '░'
+            chars[3]
         } else {
-            '·'
+            chars[4]
         };
         bar.push(ch);
     }
@@ -135,36 +155,6 @@ fn ctx_color(pct: f64, pal: &Palette) -> u8 {
     }
 }
 
-fn valid_cache_usage(payload: &StatuslinePayload) -> Option<(f64, u64)> {
-    let u = payload.context_window.as_ref()?.current_usage?;
-    let (Some(input), Some(read), Some(0)) = (
-        u.input_tokens,
-        u.cache_read_input_tokens,
-        u.cache_creation_input_tokens,
-    ) else {
-        return None;
-    };
-    if input < 0 || read < 0 {
-        return None;
-    }
-    let total = (input as f64) + (read as f64);
-    (total > 0.0).then(|| (100.0 * (read as f64) / total, read as u64))
-}
-
-fn current_context_tokens(payload: &StatuslinePayload) -> Option<u64> {
-    let u = payload.context_window.as_ref()?.current_usage?;
-    if u.input_tokens.is_none()
-        && u.cache_read_input_tokens.is_none()
-        && u.cache_creation_input_tokens.is_none()
-    {
-        return None;
-    }
-    let inp = u.input_tokens.unwrap_or(0).max(0) as u64;
-    let read = u.cache_read_input_tokens.unwrap_or(0).max(0) as u64;
-    let create = u.cache_creation_input_tokens.unwrap_or(0).max(0) as u64;
-    Some(inp + read + create)
-}
-
 fn format_tok_str(tokens: u64) -> String {
     let mut buf = String::new();
     format_tokens(tokens, &mut buf);
@@ -178,7 +168,38 @@ struct RenderContext<'a> {
     eff_limit: Option<u64>,
     speed: Option<f64>,
     ttft_secs: Option<f64>,
+    quota_5h: Option<QuotaView>,
+    quota_weekly: Option<QuotaView>,
     git: &'a GitInfo,
+}
+
+fn render_quota(
+    widget: WidgetId,
+    view: &Option<QuotaView>,
+    fallback_label: &str,
+    cfg: &LayoutConfig,
+    pal: &Palette,
+    glyphs: &GlyphSet,
+) -> Option<Segment> {
+    let Some(q) = view else {
+        return (!cfg.smart_hide).then(|| {
+            Segment::plain(widget, format!("{fallback_label} --"), pal.muted, false)
+        });
+    };
+    let mut text = format!("{} {:.0}%", q.label, q.remaining_pct);
+    if let Some(reset) = &q.reset_compact {
+        text.push(' ');
+        text.push_str(glyphs.reset);
+        text.push_str(reset);
+    }
+    let (fg, bold) = if q.remaining_pct <= 10.0 {
+        (pal.ctx_crit, true)
+    } else if q.remaining_pct <= 30.0 || q.pace_behind {
+        (pal.ctx_warn, false)
+    } else {
+        (pal.ctx_ok, false)
+    };
+    Some(Segment::plain(widget, text, fg, bold))
 }
 
 fn render_widget(
@@ -187,6 +208,7 @@ fn render_widget(
     ctx: &RenderContext<'_>,
     cfg: &LayoutConfig,
     pal: &Palette,
+    glyphs: &GlyphSet,
 ) -> Option<Segment> {
     let cache = ctx.cache;
     let used_pct = ctx.used_pct;
@@ -199,13 +221,27 @@ fn render_widget(
         WidgetId::State => {
             let state = payload.agent_state.as_deref().unwrap_or("idle");
             let (text, fg) = match state {
-                "idle" => ("● READY".to_string(), pal.ready),
-                "thinking" => ("◆ THINKING".to_string(), pal.thinking),
-                "working" => ("⚙ WORKING".to_string(), pal.working),
-                "tool_use" => ("🔧 TOOL".to_string(), pal.tool),
-                other => (format!("⏳ {}", other.to_ascii_uppercase()), pal.muted),
+                "idle" => (format!("{} READY", glyphs.ready), pal.ready),
+                "thinking" => (format!("{} THINKING", glyphs.thinking), pal.thinking),
+                "working" => (format!("{} WORKING", glyphs.working), pal.working),
+                "tool_use" => (format!("{} TOOL", glyphs.tool), pal.tool),
+                "reviewing" => (format!("{} REVIEW", glyphs.review), pal.review),
+                "authenticating" => (format!("{} AUTH", glyphs.thinking), pal.thinking),
+                "initializing" => (format!("{} INIT", glyphs.thinking), pal.thinking),
+                "error" => (format!("{} ERROR", glyphs.error), pal.error),
+                other => (
+                    format!("{} {}", glyphs.other, other.to_ascii_uppercase()),
+                    pal.muted,
+                ),
             };
-            Some(Segment { text, fg, accent_bg: Some(fg), bold: true, is_spacer: false })
+            Some(Segment {
+                widget,
+                text,
+                fg,
+                accent_bg: Some(fg),
+                bold: true,
+                is_spacer: false,
+            })
         }
         WidgetId::Model => {
             let model = payload.model.as_ref()?;
@@ -213,43 +249,79 @@ fn render_widget(
             if name.is_empty() {
                 return None;
             }
-            let text = match model.effort.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+            let joiner = if cfg.glyph_mode == GlyphMode::Ascii {
+                " / "
+            } else {
+                " · "
+            };
+            let text = match model
+                .effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+            {
                 Some(effort)
                     if !name
                         .to_ascii_lowercase()
                         .contains(&effort.to_ascii_lowercase()) =>
                 {
-                    format!("{name} · {effort}")
+                    format!("{name}{joiner}{effort}")
                 }
                 _ => name.to_string(),
             };
-            Some(Segment::plain(text, pal.model, true))
+            Some(Segment::plain(widget, text, pal.model, true))
         }
         WidgetId::Directory => Some(Segment::plain(
-            format!("⌂ {}", payload.workspace_basename()?),
+            widget,
+            format!("{} {}", glyphs.dir, payload.workspace_basename()?),
             pal.dir,
             false,
         )),
         WidgetId::Vcs => {
-            let vcs = payload.vcs.as_ref()?;
-            let branch = vcs.branch.as_deref()?.trim();
-            if branch.is_empty() {
-                return None;
-            }
-            let dirty = vcs.dirty.unwrap_or(false);
-            let mut text = if dirty { format!("⎇ {branch}*") } else { format!("⎇ {branch}") };
+            let vcs = payload.vcs.as_ref();
+            let branch = vcs
+                .and_then(|v| v.branch.as_deref())
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .or_else(|| ctx.git.branch.as_deref().filter(|b| !b.is_empty()))?;
+            let dirty = vcs.and_then(|v| v.dirty).unwrap_or(false)
+                || ctx.git.added > 0
+                || ctx.git.deleted > 0;
+            let mut text = if dirty {
+                format!("{} {branch}*", glyphs.branch)
+            } else {
+                format!("{} {branch}", glyphs.branch)
+            };
             if cfg.show_git_diff && (ctx.git.added > 0 || ctx.git.deleted > 0) {
                 text.push_str(&format!(" +{} -{}", ctx.git.added, ctx.git.deleted));
             }
-            Some(Segment::plain(text, if dirty { pal.vcs_dirty } else { pal.vcs_clean }, dirty))
+            Some(Segment::plain(
+                widget,
+                text,
+                if dirty { pal.vcs_dirty } else { pal.vcs_clean },
+                dirty,
+            ))
         }
         WidgetId::Worktree => match &ctx.git.worktree {
-            Some(wt) => Some(Segment::plain(format!("⎇ wt:{wt}"), pal.dir, true)),
+            Some(wt) => {
+                let text = if cfg.glyph_mode == GlyphMode::Ascii {
+                    format!("wt:{wt}")
+                } else {
+                    format!("{} wt:{wt}", glyphs.branch)
+                };
+                Some(Segment::plain(widget, text, pal.dir, true))
+            }
             None if cfg.smart_hide => None,
-            None => Some(Segment::plain("wt:main".to_string(), pal.muted, false)),
+            None => Some(Segment::plain(
+                widget,
+                "wt:main".to_string(),
+                pal.muted,
+                false,
+            )),
         },
         WidgetId::CtxBar => {
-            let (bar, pct) = build_progress_bar(used_pct, cfg.bar_length);
+            let (bar, pct) =
+                build_progress_bar_with_chars(used_pct, cfg.bar_length, glyphs.bar_chars);
             let (tag, disp_pct) = if cfg.ctx_remaining {
                 ("rem", (100.0 - pct).max(0.0))
             } else {
@@ -259,10 +331,14 @@ fn render_widget(
                 Some(lim) => format!("{tag} {bar} {disp_pct:.1}% ({})", format_tok_str(lim)),
                 None => format!("{tag} {bar} {disp_pct:.1}%"),
             };
-            Some(Segment::plain(text, ctx_color(pct, pal), pct >= 85.0))
+            Some(Segment::plain(widget, text, ctx_color(pct, pal), pct >= 85.0))
         }
         WidgetId::CtxPct => {
-            let pct = if used_pct.is_finite() { used_pct.clamp(0.0, 100.0) } else { 0.0 };
+            let pct = if used_pct.is_finite() {
+                used_pct.clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
             let (tag, disp_pct) = if cfg.ctx_remaining {
                 ("rem", (100.0 - pct).max(0.0))
             } else {
@@ -272,11 +348,12 @@ fn render_widget(
                 Some(lim) => format!("{tag} {disp_pct:.1}% ({})", format_tok_str(lim)),
                 None => format!("{tag} {disp_pct:.1}%"),
             };
-            Some(Segment::plain(text, ctx_color(pct, pal), false))
+            Some(Segment::plain(widget, text, ctx_color(pct, pal), false))
         }
         WidgetId::CtxTokens => {
             if let (Some(cur), Some(lim)) = (cur_ctx, eff_limit) {
                 return Some(Segment::plain(
+                    widget,
                     format!("{}/{}", format_tok_str(cur), format_tok_str(lim)),
                     pal.muted,
                     false,
@@ -287,106 +364,304 @@ fn render_widget(
             if total == 0 {
                 return None;
             }
-            Some(Segment::plain(format!("{} tok", format_tok_str(total)), pal.muted, false))
+            Some(Segment::plain(
+                widget,
+                format!("{} tok", format_tok_str(total)),
+                pal.muted,
+                false,
+            ))
         }
-        WidgetId::CacheHit => Some(Segment::plain(
-            cache.map_or_else(|| "◈ cache --".to_string(), |(pct, _)| format!("◈ cache {pct:.1}%")),
-            if cache.is_some() { pal.cache } else { pal.muted },
-            false,
-        )),
+        WidgetId::CacheHit => {
+            let text = if glyphs.cache == "cache" {
+                cache.map_or_else(
+                    || "cache --".to_string(),
+                    |(pct, _)| format!("cache {pct:.1}%"),
+                )
+            } else {
+                cache.map_or_else(
+                    || format!("{} cache --", glyphs.cache),
+                    |(pct, _)| format!("{} cache {pct:.1}%", glyphs.cache),
+                )
+            };
+            Some(Segment::plain(
+                widget,
+                text,
+                if cache.is_some() { pal.cache } else { pal.muted },
+                false,
+            ))
+        }
         WidgetId::CacheRead => cache.map(|(_, read)| {
-            let mut buf = String::from("↻ ");
+            let mut buf = format!("{} ", glyphs.reset);
             format_tokens(read, &mut buf);
-            Segment::plain(buf, pal.cache, false)
+            Segment::plain(widget, buf, pal.cache, false)
         }),
         WidgetId::Speed => {
             let slow = speed.is_some_and(|s| s < cfg.speed_warn_threshold);
-            let text = speed.map_or_else(|| "⚡ --".to_string(), |s| format!("⚡ {s:.0} tok/s"));
+            let text = speed.map_or_else(
+                || format!("{} --", glyphs.speed),
+                |s| format!("{} {s:.0} tok/s", glyphs.speed),
+            );
             let fg = match speed {
                 Some(_) if slow => pal.speed_slow,
                 Some(_) => pal.speed_ok,
                 None => pal.muted,
             };
-            Some(Segment { text, fg, accent_bg: slow.then_some(pal.speed_slow), bold: slow, is_spacer: false })
+            Some(Segment {
+                widget,
+                text,
+                fg,
+                accent_bg: slow.then_some(pal.speed_slow),
+                bold: slow,
+                is_spacer: false,
+            })
         }
         WidgetId::Ttft => match ctx.ttft_secs {
-            Some(t) if t < 1.0 => Some(Segment::plain(format!("⏱ {:.0}ms", t * 1000.0), pal.muted, false)),
+            Some(t) if t < 1.0 => Some(Segment::plain(
+                widget,
+                format!("{} {:.0}ms", glyphs.ttft, t * 1000.0),
+                pal.muted,
+                false,
+            )),
             Some(t) => Some(Segment::plain(
-                format!("⏱ {t:.1}s"),
+                widget,
+                format!("{} {t:.1}s", glyphs.ttft),
                 if t >= 5.0 { pal.speed_slow } else { pal.muted },
                 false,
             )),
             None if cfg.smart_hide => None,
-            None => Some(Segment::plain("⏱ --".to_string(), pal.muted, false)),
+            None => Some(Segment::plain(
+                widget,
+                format!("{} --", glyphs.ttft),
+                pal.muted,
+                false,
+            )),
         },
         WidgetId::Cost => {
             let cost = payload.cost.as_ref()?;
             let usd = cost.total_usd?;
-            let prefix = if cost.estimated == Some(true) { "~$" } else { "$" };
-            Some(Segment::plain(format!("{prefix}{usd:.2}"), pal.cost, false))
+            let prefix = if cost.estimated == Some(true) {
+                "~$"
+            } else {
+                "$"
+            };
+            let mut text = format!("{prefix}{usd:.2}");
+            if let Some(sub) = cost.subagent_usd.filter(|&s| s >= 0.01) {
+                text.push_str(&format!(" (sub ${sub:.2})"));
+            }
+            Some(Segment::plain(widget, text, pal.cost, false))
         }
+        WidgetId::Mode => {
+            let mode = payload
+                .cycle_mode
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            let mut text = format!("{} {}", glyphs.mode, mode.to_ascii_uppercase());
+            if payload.exceeds_200k_tokens == Some(true) {
+                text.push_str(" >200K");
+            }
+            let fg = match mode.to_ascii_lowercase().as_str() {
+                "plan" => pal.thinking,
+                "auto" => pal.ready,
+                _ => pal.model,
+            };
+            Some(Segment::plain(widget, text, fg, true))
+        }
+        WidgetId::Quota5h => render_quota(widget, &ctx.quota_5h, "5h", cfg, pal, glyphs),
+        WidgetId::QuotaWeekly => render_quota(widget, &ctx.quota_weekly, "7d", cfg, pal, glyphs),
         WidgetId::Artifacts => {
             let n = payload.artifact_count.unwrap_or(0);
             if cfg.smart_hide && n == 0 {
                 return None;
             }
-            Some(Segment::plain(format!("art {n}"), pal.muted, false))
+            Some(Segment::plain(widget, format!("art {n}"), pal.muted, false))
         }
         WidgetId::Subagents => {
             let n = payload.subagent_count();
             if cfg.smart_hide && n == 0 {
                 return None;
             }
-            Some(Segment::plain(format!("sub {n}"), pal.muted, false))
+            Some(Segment::plain(widget, format!("sub {n}"), pal.muted, false))
         }
         WidgetId::Tasks => {
             let n = payload.task_count.unwrap_or(0);
             if cfg.smart_hide && n == 0 {
                 return None;
             }
-            Some(Segment::plain(format!("tasks {n}"), pal.muted, false))
+            Some(Segment::plain(
+                widget,
+                format!("tasks {n}"),
+                pal.muted,
+                false,
+            ))
         }
         WidgetId::Sandbox => {
-            let on = payload.sandbox.as_ref().and_then(|s| s.enabled).unwrap_or(false);
+            let on = payload
+                .sandbox
+                .as_ref()
+                .and_then(|s| s.enabled)
+                .unwrap_or(false);
             if cfg.smart_hide && !on {
                 return None;
             }
             let text = if on { "sandbox ON" } else { "sandbox off" }.to_string();
-            Some(Segment::plain(text, if on { pal.ready } else { pal.muted }, on))
+            Some(Segment::plain(
+                widget,
+                text,
+                if on { pal.ready } else { pal.muted },
+                on,
+            ))
         }
     }
 }
 
-fn fit_segments(segments: Vec<Segment>, max_width: Option<usize>, pad_per_seg: usize, sep_w: usize) -> Vec<Segment> {
-    let Some(limit) = max_width.filter(|&w| w > 0) else {
-        return segments;
-    };
-    let mut kept = Vec::with_capacity(segments.len());
-    let mut used = 0usize;
-    for (idx, seg) in segments.into_iter().enumerate() {
-        let seg_w = seg.text.width() + pad_per_seg + if idx > 0 { sep_w } else { 0 };
-        if idx > 0 && used + seg_w > limit {
-            break;
-        }
-        used += seg_w;
-        kept.push(seg);
+fn slice_visible_width(segments: &[Segment], geom: StyleGeometry) -> usize {
+    if segments.is_empty() {
+        return 0;
     }
-    kept
-}
-
-fn row_visible_width(segments: &[Segment], pad_per_seg: usize, sep_w: usize) -> usize {
-    segments
+    let body: usize = segments
         .iter()
         .enumerate()
-        .map(|(i, s)| s.text.width() + pad_per_seg + if i > 0 { sep_w } else { 0 })
-        .sum()
+        .map(|(i, s)| s.text.width() + geom.pad_per_seg + if i > 0 { geom.sep_w } else { 0 })
+        .sum();
+    body + geom.slice_trail_w
 }
 
-fn write_slice<W: IoWrite>(segments: &[Segment], cfg: &LayoutConfig, pal: &Palette, out: &mut W) -> io::Result<()> {
-    if cfg.theme == ThemeStyle::Mono {
-        let sep = cfg.separator.as_str();
+fn groups_visible_width(groups: &[Vec<Segment>], geom: StyleGeometry) -> usize {
+    if groups.is_empty() {
+        return 0;
+    }
+    let sum: usize = groups.iter().map(|g| slice_visible_width(g, geom)).sum();
+    sum + groups.len().saturating_sub(1)
+}
+
+fn truncate_to_width(s: &str, max_cols: usize, ellipsis: &str) -> String {
+    if s.width() <= max_cols {
+        return s.to_string();
+    }
+    let ell_w = ellipsis.width();
+    if max_cols == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    let budget = if max_cols > ell_w {
+        max_cols - ell_w
+    } else {
+        max_cols
+    };
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    if max_cols > ell_w {
+        out.push_str(ellipsis);
+    }
+    out
+}
+
+fn split_into_groups(segs: Vec<Segment>) -> Vec<Vec<Segment>> {
+    let mut groups: Vec<Vec<Segment>> = Vec::new();
+    let mut cur = Vec::new();
+    for seg in segs {
+        if seg.is_spacer {
+            if !cur.is_empty() {
+                groups.push(cur);
+                cur = Vec::new();
+            }
+        } else {
+            cur.push(seg);
+        }
+    }
+    if !cur.is_empty() {
+        groups.push(cur);
+    }
+    while groups.len() > 3 {
+        let tail = groups.remove(3);
+        groups[2].extend(tail);
+    }
+    groups
+}
+
+fn fit_row_groups(
+    mut groups: Vec<Vec<Segment>>,
+    max_width: Option<usize>,
+    geom: StyleGeometry,
+    ellipsis: &str,
+) -> Vec<Vec<Segment>> {
+    let Some(limit) = max_width.filter(|&w| w > 0) else {
+        return groups;
+    };
+    if groups_visible_width(&groups, geom) <= limit {
+        return groups;
+    }
+
+    for g in &mut groups {
+        for seg in g {
+            if seg.widget == WidgetId::Vcs && seg.text.width() > 24 {
+                seg.text = truncate_to_width(&seg.text, 24, ellipsis);
+            }
+        }
+    }
+
+    while groups_visible_width(&groups, geom) > limit {
+        let total_segs: usize = groups.iter().map(Vec::len).sum();
+        if total_segs <= 1 {
+            break;
+        }
+        let mut drop_pos: Option<(usize, usize, u8)> = None;
+        for (gi, g) in groups.iter().enumerate() {
+            for (si, seg) in g.iter().enumerate() {
+                let p = seg.widget.priority();
+                let replace = match drop_pos {
+                    None => true,
+                    Some((_, _, best_p)) => p <= best_p,
+                };
+                if replace {
+                    drop_pos = Some((gi, si, p));
+                }
+            }
+        }
+        if let Some((gi, si, _)) = drop_pos {
+            groups[gi].remove(si);
+            if groups[gi].is_empty() {
+                groups.remove(gi);
+            }
+        } else {
+            break;
+        }
+    }
+
+    if groups_visible_width(&groups, geom) > limit && groups.len() == 1 && groups[0].len() == 1 {
+        let overhead = geom.pad_per_seg + geom.slice_trail_w;
+        let text_budget = limit.saturating_sub(overhead);
+        if text_budget == 0 {
+            groups.clear();
+        } else {
+            groups[0][0].text = truncate_to_width(&groups[0][0].text, text_budget, ellipsis);
+        }
+    }
+
+    groups
+}
+
+fn write_slice<W: IoWrite>(
+    segments: &[Segment],
+    cfg: &LayoutConfig,
+    geom: StyleGeometry,
+    pal: &Palette,
+    glyphs: &GlyphSet,
+    out: &mut W,
+) -> io::Result<()> {
+    if geom.mono {
         for (i, seg) in segments.iter().enumerate() {
-            if i > 0 { write!(out, "{sep}")?; }
+            if i > 0 {
+                write!(out, "{}", geom.sep_str)?;
+            }
             write!(out, "{}", seg.text)?;
         }
         return Ok(());
@@ -394,9 +669,10 @@ fn write_slice<W: IoWrite>(segments: &[Segment], cfg: &LayoutConfig, pal: &Palet
 
     match cfg.style {
         VisualStyle::Plain => {
-            let sep = cfg.separator.as_str();
             for (i, seg) in segments.iter().enumerate() {
-                if i > 0 { write!(out, "\x1b[38;5;{}m{sep}\x1b[0m", pal.sep)?; }
+                if i > 0 {
+                    write!(out, "\x1b[38;5;{}m{}\x1b[0m", pal.sep, geom.sep_str)?;
+                }
                 let bold = if seg.bold { "\x1b[1m" } else { "" };
                 write!(out, "{bold}\x1b[38;5;{}m{}\x1b[0m", seg.fg, seg.text)?;
             }
@@ -404,12 +680,22 @@ fn write_slice<W: IoWrite>(segments: &[Segment], cfg: &LayoutConfig, pal: &Palet
         }
         VisualStyle::Pill => {
             for (i, seg) in segments.iter().enumerate() {
-                if i > 0 { write!(out, " ")?; }
+                if i > 0 {
+                    write!(out, " ")?;
+                }
                 let (bg, fg, bold) = match seg.accent_bg {
                     Some(abg) => (abg, pal.pl_accent_fg, "\x1b[1m"),
                     None => (pal.pill_bg, seg.fg, if seg.bold { "\x1b[1m" } else { "" }),
                 };
-                write!(out, "\x1b[48;5;{bg}m\x1b[38;5;{fg}m{bold} {} \x1b[0m", seg.text)?;
+                if let Some((cap_l, cap_r)) = glyphs.pill_caps {
+                    write!(
+                        out,
+                        "\x1b[38;5;{bg}m{cap_l}\x1b[48;5;{bg}m\x1b[38;5;{fg}m{bold}{}\x1b[0m\x1b[38;5;{bg}m{cap_r}\x1b[0m",
+                        seg.text
+                    )?;
+                } else {
+                    write!(out, "\x1b[48;5;{bg}m\x1b[38;5;{fg}m{bold} {} \x1b[0m", seg.text)?;
+                }
             }
             Ok(())
         }
@@ -418,10 +704,16 @@ fn write_slice<W: IoWrite>(segments: &[Segment], cfg: &LayoutConfig, pal: &Palet
             for (i, seg) in segments.iter().enumerate() {
                 let (bg, fg, bold) = match seg.accent_bg {
                     Some(accent) => (accent, pal.pl_accent_fg, true),
-                    None => (if i % 2 == 0 { pal.pl_bg_a } else { pal.pl_bg_b }, seg.fg, seg.bold),
+                    None => (
+                        if i % 2 == 0 { pal.pl_bg_a } else { pal.pl_bg_b },
+                        seg.fg,
+                        seg.bold,
+                    ),
                 };
                 match prev_bg {
-                    Some(p_bg) => write!(out, "\x1b[48;5;{bg}m\x1b[38;5;{p_bg}m\u{e0b0}")?,
+                    Some(p_bg) => {
+                        write!(out, "\x1b[48;5;{bg}m\x1b[38;5;{p_bg}m{}", glyphs.pl_right)?;
+                    }
                     None => write!(out, "\x1b[48;5;{bg}m")?,
                 }
                 let bold_s = if bold { "\x1b[1m" } else { "\x1b[22m" };
@@ -429,44 +721,56 @@ fn write_slice<W: IoWrite>(segments: &[Segment], cfg: &LayoutConfig, pal: &Palet
                 prev_bg = Some(bg);
             }
             if let Some(last_bg) = prev_bg {
-                write!(out, "\x1b[0m\x1b[38;5;{last_bg}m\u{e0b0}\x1b[0m")?;
+                write!(
+                    out,
+                    "\x1b[0m\x1b[38;5;{last_bg}m{}\x1b[0m",
+                    glyphs.pl_right
+                )?;
             }
             Ok(())
         }
     }
 }
 
-fn write_row<W: IoWrite>(
-    segments: &[Segment],
+fn write_row_groups<W: IoWrite>(
+    groups: &[Vec<Segment>],
     term_width: Option<usize>,
-    pad_per_seg: usize,
-    sep_w: usize,
+    geom: StyleGeometry,
     cfg: &LayoutConfig,
     pal: &Palette,
+    glyphs: &GlyphSet,
     out: &mut W,
 ) -> io::Result<()> {
-    if let Some(pos) = segments.iter().position(|s| s.is_spacer) {
-        let left = &segments[..pos];
-        let right: Vec<&Segment> = segments[pos + 1..].iter().filter(|s| !s.is_spacer).collect();
-        let right_owned: Vec<Segment> = right
-            .into_iter()
-            .map(|s| Segment { text: s.text.clone(), fg: s.fg, accent_bg: s.accent_bg, bold: s.bold, is_spacer: false })
-            .collect();
-        let left_w = row_visible_width(left, pad_per_seg, sep_w);
-        let right_w = row_visible_width(&right_owned, pad_per_seg, sep_w);
-        let gap = term_width
-            .unwrap_or(0)
-            .saturating_sub(left_w + right_w)
-            .max(1);
-        write_slice(left, cfg, pal, out)?;
-        if !right_owned.is_empty() {
-            write!(out, "{}", " ".repeat(gap))?;
-            write_slice(&right_owned, cfg, pal, out)?;
+    match groups {
+        [] => Ok(()),
+        [only] => {
+            write_slice(only, cfg, geom, pal, glyphs, out)?;
+            writeln!(out)
         }
-        return writeln!(out);
+        [left, right] => {
+            let w0 = slice_visible_width(left, geom);
+            let w1 = slice_visible_width(right, geom);
+            let gap = term_width.unwrap_or(0).saturating_sub(w0 + w1).max(1);
+            write_slice(left, cfg, geom, pal, glyphs, out)?;
+            write!(out, "{}", " ".repeat(gap))?;
+            write_slice(right, cfg, geom, pal, glyphs, out)?;
+            writeln!(out)
+        }
+        [left, center, right, ..] => {
+            let w0 = slice_visible_width(left, geom);
+            let w1 = slice_visible_width(center, geom);
+            let w2 = slice_visible_width(right, geom);
+            let rem = term_width.unwrap_or(0).saturating_sub(w0 + w1 + w2);
+            let gap1 = (rem / 2).max(1);
+            let gap2 = rem.saturating_sub(gap1).max(1);
+            write_slice(left, cfg, geom, pal, glyphs, out)?;
+            write!(out, "{}", " ".repeat(gap1))?;
+            write_slice(center, cfg, geom, pal, glyphs, out)?;
+            write!(out, "{}", " ".repeat(gap2))?;
+            write_slice(right, cfg, geom, pal, glyphs, out)?;
+            writeln!(out)
+        }
     }
-    write_slice(segments, cfg, pal, out)?;
-    writeln!(out)
 }
 
 /// Renders all non-empty configured rows in `cfg` for `payload`, `meta`, and `git`.
@@ -478,6 +782,8 @@ pub fn write_statusline<W: IoWrite>(
     out: &mut W,
 ) -> io::Result<()> {
     let pal = Palette::for_theme(cfg.theme);
+    let glyphs = GlyphSet::for_mode(cfg.glyph_mode);
+    let geom = compute_geometry(cfg, &glyphs);
     let cache = valid_cache_usage(payload);
     let cur_ctx = current_context_tokens(payload);
     let eff_limit = meta
@@ -504,10 +810,6 @@ pub fn write_statusline<W: IoWrite>(
         SpeedMode::E2e => meta.e2e_speed.or(meta.speed),
     };
     let max_width = cfg.responsive.then_some(payload.terminal_width).flatten();
-    let (pad_per_seg, sep_w) = match cfg.style {
-        VisualStyle::Plain => (0, cfg.separator.as_str().width()),
-        VisualStyle::Pill | VisualStyle::Powerline => (2, 1),
-    };
 
     let ctx = RenderContext {
         cache,
@@ -516,18 +818,27 @@ pub fn write_statusline<W: IoWrite>(
         eff_limit,
         speed,
         ttft_secs: meta.ttft_secs,
+        quota_5h: resolve_quota_5h(payload),
+        quota_weekly: resolve_quota_weekly(payload),
         git,
     };
 
     for row in &cfg.rows {
         let segs: Vec<Segment> = row
             .iter()
-            .filter_map(|&w| render_widget(w, payload, &ctx, cfg, &pal))
+            .filter_map(|&w| render_widget(w, payload, &ctx, cfg, &pal, &glyphs))
             .collect();
-        if !segs.is_empty() {
-            let fitted = fit_segments(segs, max_width, pad_per_seg, sep_w);
-            write_row(&fitted, payload.terminal_width, pad_per_seg, sep_w, cfg, &pal, out)?;
-        }
+        let groups = split_into_groups(segs);
+        let fitted = fit_row_groups(groups, max_width, geom, glyphs.ellipsis);
+        write_row_groups(
+            &fitted,
+            payload.terminal_width,
+            geom,
+            cfg,
+            &pal,
+            &glyphs,
+            out,
+        )?;
     }
     Ok(())
 }
@@ -535,7 +846,10 @@ pub fn write_statusline<W: IoWrite>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::statusline::{ContextWindow, CostInfo, JsonUsage, ModelInfo, VcsInfo, WorkspaceInfo};
+    use crate::statusline::{
+        ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, VcsInfo, WorkspaceInfo,
+    };
+    use std::collections::BTreeMap;
 
     #[test]
     fn renders_all_three_styles_and_drops_overflow_when_responsive() {
@@ -551,6 +865,7 @@ mod tests {
                 project_dir: None,
             }),
             vcs: Some(VcsInfo {
+                vcs_type: None,
                 branch: Some("main".to_string()),
                 dirty: Some(true),
             }),
@@ -583,6 +898,7 @@ mod tests {
             max_context_tokens: Some(512_000),
         };
         let git = GitInfo {
+            branch: None,
             worktree: Some("feat-wt".to_string()),
             added: 12,
             deleted: 3,
@@ -634,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn spacer_aligns_left_and_right_and_smart_hide_hides_zeros() {
+    fn spacer_aligns_left_center_right_and_smart_hide_hides_zeros() {
         let payload = StatuslinePayload {
             agent_state: Some("idle".to_string()),
             terminal_width: Some(40),
@@ -642,14 +958,52 @@ mod tests {
         };
         let mut cfg = LayoutConfig::preset_minimal();
         cfg.theme = ThemeStyle::Mono;
-        cfg.rows = vec![vec![WidgetId::State, WidgetId::Spacer, WidgetId::Tasks, WidgetId::Speed]];
+        cfg.rows = vec![vec![
+            WidgetId::State,
+            WidgetId::Spacer,
+            WidgetId::Tasks,
+            WidgetId::Speed,
+        ]];
         let mut out = Vec::new();
-        write_statusline(&payload, &SessionMetadata::default(), &GitInfo::default(), &cfg, &mut out).unwrap();
+        write_statusline(
+            &payload,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("tasks 0"));
         assert!(text.starts_with("● READY"));
         assert!(text.ends_with("⚡ --\n"));
         assert!(text.contains("        "));
+
+        // Three-group centering: Left, Center, Right.
+        let mut cfg3 = LayoutConfig::preset_minimal();
+        cfg3.theme = ThemeStyle::Mono;
+        cfg3.rows = vec![vec![
+            WidgetId::State,
+            WidgetId::Spacer,
+            WidgetId::Speed,
+            WidgetId::Spacer,
+            WidgetId::CacheHit,
+        ]];
+        let mut out3 = Vec::new();
+        write_statusline(
+            &payload,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg3,
+            &mut out3,
+        )
+        .unwrap();
+        let line3 = String::from_utf8(out3).unwrap();
+        let trimmed = line3.trim_end_matches('\n');
+        assert_eq!(trimmed.width(), 40);
+        assert!(trimmed.starts_with("● READY"));
+        assert!(trimmed.contains("⚡ --"));
+        assert!(trimmed.ends_with("◈ cache --"));
     }
 
     #[test]
@@ -666,7 +1020,66 @@ mod tests {
         cfg.theme = ThemeStyle::Mono;
         cfg.rows = vec![vec![WidgetId::Model]];
         let mut out = Vec::new();
-        write_statusline(&payload, &SessionMetadata::default(), &GitInfo::default(), &cfg, &mut out).unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), "Gemini 4 Hydrogen (Medium)\n");
+        write_statusline(
+            &payload,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Gemini 4 Hydrogen (Medium)\n"
+        );
+    }
+
+    #[test]
+    fn renders_mode_quota_subagent_cost_and_ascii_no_color() {
+        let mut quota = BTreeMap::new();
+        quota.insert(
+            "gemini-5h".to_string(),
+            QuotaBucket {
+                remaining_fraction: Some(0.84),
+                reset_in_seconds: Some(11_400),
+                reset_time: None,
+            },
+        );
+        let payload = StatuslinePayload {
+            agent_state: Some("reviewing".to_string()),
+            cycle_mode: Some("plan".to_string()),
+            exceeds_200k_tokens: Some(true),
+            cost: Some(CostInfo {
+                total_usd: Some(0.45),
+                subagent_usd: Some(0.12),
+                estimated: Some(false),
+            }),
+            quota: Some(quota),
+            ..Default::default()
+        };
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.glyph_mode = GlyphMode::Ascii;
+        cfg.no_color = true;
+        cfg.rows = vec![vec![
+            WidgetId::State,
+            WidgetId::Mode,
+            WidgetId::Cost,
+            WidgetId::Quota5h,
+        ]];
+        let mut out = Vec::new();
+        write_statusline(
+            &payload,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains('\x1b'));
+        assert_eq!(
+            text,
+            "@ REVIEW * mode: PLAN >200K * $0.45 (sub $0.12) * 5h 84% r:3h10m\n"
+        );
     }
 }

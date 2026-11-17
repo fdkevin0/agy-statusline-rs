@@ -1,12 +1,23 @@
 //! Property-based (`proptest`) and end-to-end integration tests for `agy-statusline`.
 
-use proptest::prelude::*;
+use std::collections::BTreeMap;
+use std::fs;
+use std::process::Command;
 
-use agy_statusline::db::{is_valid_uuid, SpeedReader};
+use proptest::prelude::*;
+use unicode_width::UnicodeWidthStr;
+
+use agy_statusline::ansi::ansi_to_ratatui_lines;
+use agy_statusline::db::{is_valid_uuid, SessionMetadata, SpeedReader};
 use agy_statusline::format::format_tokens;
+use agy_statusline::git::{GitInfo, SystemGitProbe};
+use agy_statusline::layout::{GlyphMode, LayoutConfig, ThemeStyle, VisualStyle, WidgetId};
 use agy_statusline::protobuf::{decode_varint, extract_metadata_speed, find_field};
-use agy_statusline::render::build_progress_bar;
-use agy_statusline::statusline::process_statusline;
+use agy_statusline::render::{build_progress_bar, write_statusline};
+use agy_statusline::statusline::{
+    process_statusline, process_statusline_with_probes, ContextWindow, CostInfo, JsonUsage,
+    ModelInfo, QuotaBucket, StatuslinePayload, WorkspaceInfo,
+};
 
 struct FixedSpeed(Option<f64>);
 impl SpeedReader for FixedSpeed {
@@ -42,10 +53,17 @@ proptest! {
     }
 
     #[test]
-    fn prop_format_tokens_large_has_k_suffix(value in 1000u64..1_000_000_000) {
+    fn prop_format_tokens_k_range_has_k_suffix(value in 1000u64..1_000_000) {
         let mut buf = String::new();
         format_tokens(value, &mut buf);
         prop_assert!(buf.ends_with('K'));
+    }
+
+    #[test]
+    fn prop_format_tokens_m_range_has_m_suffix(value in 1_000_000u64..1_000_000_000) {
+        let mut buf = String::new();
+        format_tokens(value, &mut buf);
+        prop_assert!(buf.ends_with('M'));
     }
 
     #[test]
@@ -53,6 +71,116 @@ proptest! {
         let (bar, clamped) = build_progress_bar(pct, bar_len);
         prop_assert!((0.0..=100.0).contains(&clamped));
         prop_assert_eq!(bar.chars().count(), bar_len);
+    }
+
+    #[test]
+    fn prop_responsive_row_never_exceeds_terminal_width(
+        style_idx in 0usize..3,
+        theme_idx in 0usize..7,
+        glyph_idx in 0usize..3,
+        term_width in 24usize..120,
+    ) {
+        let styles = [VisualStyle::Plain, VisualStyle::Pill, VisualStyle::Powerline];
+        let themes = [
+            ThemeStyle::Default,
+            ThemeStyle::Nord,
+            ThemeStyle::Catppuccin,
+            ThemeStyle::TokyoNight,
+            ThemeStyle::Gruvbox,
+            ThemeStyle::Light,
+            ThemeStyle::Mono,
+        ];
+        let glyphs = [GlyphMode::Unicode, GlyphMode::Nerd, GlyphMode::Ascii];
+
+        let mut cfg = LayoutConfig::preset_full();
+        cfg.rows[0].push(WidgetId::Spacer);
+        cfg.rows[0].push(WidgetId::QuotaWeekly);
+        cfg.style = styles[style_idx];
+        cfg.theme = themes[theme_idx];
+        cfg.glyph_mode = glyphs[glyph_idx];
+        cfg.responsive = true;
+
+        let mut quota = BTreeMap::new();
+        quota.insert(
+            "gemini-5h".to_string(),
+            QuotaBucket {
+                remaining_fraction: Some(0.75),
+                reset_in_seconds: Some(7200),
+                reset_time: None,
+            },
+        );
+        quota.insert(
+            "gemini-weekly".to_string(),
+            QuotaBucket {
+                remaining_fraction: Some(0.92),
+                reset_in_seconds: Some(300_000),
+                reset_time: None,
+            },
+        );
+
+        let payload = StatuslinePayload {
+            agent_state: Some("thinking".to_string()),
+            cycle_mode: Some("plan".to_string()),
+            model: Some(ModelInfo {
+                id: Some("gemini-4".to_string()),
+                display_name: Some("Gemini 4".to_string()),
+                effort: Some("high".to_string()),
+            }),
+            workspace: Some(WorkspaceInfo {
+                current_dir: Some("/work/very-long-workspace-name".to_string()),
+                project_dir: None,
+            }),
+            context_window: Some(ContextWindow {
+                used_percentage: Some(42.5),
+                current_usage: Some(JsonUsage {
+                    input_tokens: Some(50_000),
+                    output_tokens: Some(100),
+                    cache_read_input_tokens: Some(150_000),
+                    cache_creation_input_tokens: Some(1_000),
+                }),
+                ..Default::default()
+            }),
+            cost: Some(CostInfo {
+                total_usd: Some(1.23),
+                subagent_usd: Some(0.25),
+                estimated: Some(true),
+            }),
+            quota: Some(quota),
+            terminal_width: Some(term_width),
+            ..Default::default()
+        };
+        let meta = SessionMetadata {
+            speed: Some(85.0),
+            last_turn_speed: Some(90.0),
+            e2e_speed: Some(60.0),
+            ttft_secs: Some(1.2),
+            max_context_tokens: Some(512_000),
+        };
+        let git = GitInfo {
+            branch: Some("feat/extremely-long-branch-name-that-overflows".to_string()),
+            worktree: Some("wt-long".to_string()),
+            added: 120,
+            deleted: 45,
+        };
+
+        let mut out = Vec::new();
+        write_statusline(&payload, &meta, &git, &cfg, &mut out).unwrap();
+        let raw = String::from_utf8(out).unwrap();
+        let lines = ansi_to_ratatui_lines(&raw);
+        prop_assert_eq!(lines.len(), 1);
+        let visible_w: usize = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref().width())
+            .sum();
+        prop_assert!(
+            visible_w <= term_width,
+            "visible_w={visible_w} exceeded term_width={term_width} for {:?}/{:?}/{:?}: {:?}",
+            cfg.style,
+            cfg.theme,
+            cfg.glyph_mode,
+            raw
+        );
     }
 }
 
@@ -84,4 +212,82 @@ fn integration_full_json_and_uuid_checks() {
     assert!(s.contains("main*"));
     assert!(s.contains("75.0%"));
     assert!(s.contains("120 tok/s"));
+}
+
+#[test]
+fn live_git_cli_probe_extracts_branch_and_diff_stats() {
+    let dir = std::env::temp_dir().join(format!("agy_live_git_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let init_ok = Command::new("git")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["init"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(init_ok.status.success());
+
+    let branch_ok = Command::new("git")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["-C"])
+        .arg(&dir)
+        .args(["checkout", "-b", "feat-live"])
+        .output()
+        .unwrap();
+    assert!(branch_ok.status.success());
+
+    fs::write(dir.join("notes.txt"), "line1\nline2\n").unwrap();
+    let add_ok = Command::new("git")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["-C"])
+        .arg(&dir)
+        .args(["add", "notes.txt"])
+        .output()
+        .unwrap();
+    assert!(add_ok.status.success());
+
+    let commit_ok = Command::new("git")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["-C"])
+        .arg(&dir)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .output()
+        .unwrap();
+    assert!(commit_ok.status.success());
+
+    fs::write(dir.join("notes.txt"), "line1\nchanged\nadded_line\n").unwrap();
+
+    let payload = serde_json::json!({
+        "agent_state": "idle",
+        "cwd": dir,
+        "vcs": { "type": "git" }
+    })
+    .to_string();
+
+    let mut cfg = LayoutConfig::preset_minimal();
+    cfg.theme = ThemeStyle::Mono;
+    cfg.show_git_diff = true;
+    let probe = SystemGitProbe {
+        cache_dir: Some(dir.join(".tmp_cache")),
+    };
+
+    let mut out = Vec::new();
+    process_statusline_with_probes(&payload, &FixedSpeed(None), &probe, &cfg, &mut out).unwrap();
+    let rendered = String::from_utf8(out).unwrap();
+    assert!(rendered.contains("feat-live* +2 -1"));
+
+    let _ = fs::remove_dir_all(&dir);
 }

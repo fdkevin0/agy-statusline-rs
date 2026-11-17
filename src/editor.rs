@@ -9,7 +9,7 @@ use crate::layout::{LayoutConfig, WidgetId, MAX_ROWS};
 pub enum ActivePane {
     /// Left pane: 3-line layout canvas with pill reordering and Move Mode.
     Canvas,
-    /// Center pane: catalog of all 15 widgets toggled into the target line.
+    /// Center pane: catalog of all 21 widgets toggled into the target line.
     Catalog,
     /// Right pane: presets, visual style, theme, separator, thresholds, and AGY mode.
     Settings,
@@ -103,7 +103,7 @@ pub struct TuiEditorState {
     pub grabbed: bool,
     /// Selected index in `WidgetId::ALL` inside `Catalog`.
     pub catalog_idx: usize,
-    /// Selected index (`0..7`) inside `Settings`.
+    /// Selected index (`0..13`) inside `Settings`.
     pub settings_idx: usize,
     /// Active preset cursor (`0=Full`, `1=Powerline`, `2=Minimal`, `3=Addon`).
     pub preset_idx: usize,
@@ -113,11 +113,12 @@ pub struct TuiEditorState {
 
 impl TuiEditorState {
     /// Total rows in the Settings pane.
-    pub const SETTINGS_COUNT: usize = 10;
+    pub const SETTINGS_COUNT: usize = 13;
 
     /// Initializes editor state from `config`.
     pub fn new(mut config: LayoutConfig) -> Self {
         config.normalize_rows();
+        let preset_idx = config.matching_preset_index().unwrap_or(0);
         Self {
             config,
             active_pane: ActivePane::Canvas,
@@ -126,9 +127,14 @@ impl TuiEditorState {
             grabbed: false,
             catalog_idx: 0,
             settings_idx: 0,
-            preset_idx: 0,
+            preset_idx,
             preview_width: PreviewWidth::Auto,
         }
+    }
+
+    /// Returns true if `config` has been modified away from all built-in presets.
+    pub fn is_custom_preset(&self) -> bool {
+        self.config.matching_preset_index().is_none()
     }
 
     /// Applies one of the 4 built-in presets (`1..=4`).
@@ -245,6 +251,19 @@ impl TuiEditorState {
 
     fn toggle_catalog_widget(&mut self) {
         let widget = WidgetId::ALL[self.catalog_idx];
+        if widget == WidgetId::Spacer {
+            if let Some(c) = self.config.rows[self.canvas_row]
+                .iter()
+                .rposition(|&w| w == WidgetId::Spacer)
+            {
+                self.config.rows[self.canvas_row].remove(c);
+                self.clamp_canvas_col();
+            } else {
+                self.config.rows[self.canvas_row].push(WidgetId::Spacer);
+                self.canvas_col = self.config.rows[self.canvas_row].len() - 1;
+            }
+            return;
+        }
         if let Some((r, c)) = self.config.locate_widget(widget) {
             self.config.rows[r].remove(c);
             self.clamp_canvas_col();
@@ -269,6 +288,12 @@ impl TuiEditorState {
             7 => self.config.show_git_diff = !self.config.show_git_diff,
             8 => self.config.bar_length = (self.config.bar_length as isize + dir).clamp(4, 40) as usize,
             9 => self.config.stack_with_default = !self.config.stack_with_default,
+            10 => self.config.glyph_mode = self.config.glyph_mode.step(dir),
+            11 => self.config.responsive = !self.config.responsive,
+            12 => {
+                self.config.speed_warn_threshold =
+                    (self.config.speed_warn_threshold + (dir as f64) * 5.0).clamp(10.0, 200.0);
+            }
             _ => {}
         }
     }
@@ -337,6 +362,17 @@ impl TuiEditorState {
                 self.catalog_idx += 1;
             }
             KeyCode::Char(' ') | KeyCode::Enter => self.toggle_catalog_widget(),
+            KeyCode::Char('+')
+                if WidgetId::ALL[self.catalog_idx] == WidgetId::Spacer
+                    && self.config.rows[self.canvas_row]
+                        .iter()
+                        .filter(|&&w| w == WidgetId::Spacer)
+                        .count()
+                        < 2 =>
+            {
+                self.config.rows[self.canvas_row].push(WidgetId::Spacer);
+                self.canvas_col = self.config.rows[self.canvas_row].len() - 1;
+            }
             _ => {}
         }
     }
@@ -403,18 +439,16 @@ impl TuiEditorState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{ThemeStyle, VisualStyle};
+    use crate::layout::{GlyphMode, ThemeStyle, VisualStyle};
 
     #[test]
     fn move_mode_swaps_within_and_across_rows() {
         let mut ed = TuiEditorState::new(LayoutConfig::preset_full());
-        // Grab State (0, 0), shift right -> [Model, State, Directory, Vcs]
         assert_eq!(ed.handle_key(KeyCode::Enter, KeyModifiers::NONE), ExitOutcome::Continue);
         assert!(ed.grabbed);
         ed.handle_key(KeyCode::Right, KeyModifiers::NONE);
         assert_eq!(ed.config.rows[0][1], WidgetId::State);
 
-        // Move State down to Line 2 and drop
         ed.handle_key(KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(ed.canvas_row, 1);
         assert_eq!(ed.config.rows[1].last().copied(), Some(WidgetId::State));
@@ -425,20 +459,21 @@ mod tests {
     #[test]
     fn catalog_adds_to_selected_target_line_and_settings_cycle() {
         let mut ed = TuiEditorState::new(LayoutConfig::preset_minimal());
-        // Move to Line 3 (empty), press Enter -> focuses Catalog targeting Line 3
+        assert_eq!(ed.preset_idx, 2);
+        assert!(!ed.is_custom_preset());
+
         ed.handle_key(KeyCode::Down, KeyModifiers::NONE);
         ed.handle_key(KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(ed.canvas_row, 2);
         ed.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(ed.active_pane, ActivePane::Catalog);
 
-        // Toggle Directory (index 2) into Line 3
         ed.handle_key(KeyCode::Down, KeyModifiers::NONE);
         ed.handle_key(KeyCode::Down, KeyModifiers::NONE);
         ed.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
         assert_eq!(ed.config.rows[2], vec![WidgetId::Directory]);
+        assert!(ed.is_custom_preset());
 
-        // Tab to Settings, move to Style (idx 1) and Theme (idx 2)
         ed.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(ed.active_pane, ActivePane::Settings);
         ed.handle_key(KeyCode::Down, KeyModifiers::NONE);
@@ -448,13 +483,19 @@ mod tests {
         ed.handle_key(KeyCode::Right, KeyModifiers::NONE);
         assert_eq!(ed.config.theme, ThemeStyle::Nord);
 
+        ed.adjust_setting_at(10, 1);
+        assert_eq!(ed.config.glyph_mode, GlyphMode::Nerd);
+        ed.adjust_setting_at(11, 1);
+        assert!(!ed.config.responsive);
+        ed.adjust_setting_at(12, 1);
+        assert!((ed.config.speed_warn_threshold - 55.0).abs() < 1e-6);
+
         assert_eq!(ed.handle_key(KeyCode::Char('s'), KeyModifiers::NONE), ExitOutcome::SaveAndApply);
     }
 
     #[test]
     fn mouse_helpers_select_toggle_and_scroll() {
         let mut ed = TuiEditorState::new(LayoutConfig::preset_minimal());
-        // Click pill (0, 1) -> selects; click again -> grabs; right-click -> removes
         ed.click_canvas(0, Some(1));
         assert!(!ed.grabbed);
         ed.click_canvas(0, Some(1));
@@ -462,15 +503,30 @@ mod tests {
         ed.remove_canvas_pill(0, 1);
         assert!(!ed.grabbed);
 
-        // Click catalog item 2 (Directory) -> adds to Line 1
         ed.click_catalog(2);
         assert_eq!(ed.active_pane, ActivePane::Catalog);
         assert!(ed.config.rows[0].contains(&WidgetId::Directory));
 
-        // Scroll & click setting 1 (Style)
         ed.scroll_settings(1);
         assert_eq!(ed.settings_idx, 1);
         ed.adjust_setting_at(1, 1);
         assert_eq!(ed.config.style, VisualStyle::Pill);
+    }
+
+    #[test]
+    fn spacer_toggles_independently_across_rows() {
+        let mut ed = TuiEditorState::new(LayoutConfig::preset_minimal());
+        let spacer_idx = WidgetId::ALL.len() - 1;
+        ed.click_catalog(spacer_idx);
+        assert!(ed.config.rows[0].contains(&WidgetId::Spacer));
+
+        ed.click_canvas(1, None);
+        ed.click_catalog(spacer_idx);
+        assert!(ed.config.rows[0].contains(&WidgetId::Spacer));
+        assert!(ed.config.rows[1].contains(&WidgetId::Spacer));
+
+        ed.click_catalog(spacer_idx);
+        assert!(ed.config.rows[0].contains(&WidgetId::Spacer));
+        assert!(!ed.config.rows[1].contains(&WidgetId::Spacer));
     }
 }

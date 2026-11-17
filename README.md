@@ -1,25 +1,19 @@
 # agy-statusline
 
-A `#![forbid(unsafe_code)]` Rust statusline for Antigravity CLI (`agy`) with real compaction-threshold sniffing, `git worktree` awareness, and an interactive 3-pane TUI configurator.
+A `#![forbid(unsafe_code)]` Rust statusline for Antigravity CLI (`agy`) with quota pacing, real compaction-threshold sniffing, pure-Rust `.git/HEAD` + worktree awareness, and an interactive 3-pane TUI configurator.
 
 ## Install
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/fdkevin0/agy-statusline-rs/main/install.sh | sh
-```
-
-Or install via Cargo:
 
 ```sh
 cargo install agy-statusline
 ```
 
-Or build from source (requires Rust 2021 + `libsqlite3` dev headers):
+Or build from source (requires Rust 2021; `libsqlite3` is bundled by default, pass `--no-default-features` to link system `libsqlite3`):
 
 ```sh
 git clone https://github.com/fdkevin0/agy-statusline-rs.git
 cd agy-statusline-rs
-cargo install --path .
+cargo install --path . --locked
 ```
 
 ## Quick Start
@@ -34,6 +28,12 @@ agy-statusline config
 
 ```sh
 agy-statusline apply --yes
+```
+
+3. Verify your configuration, AGY hook, and sample output:
+
+```sh
+agy-statusline doctor
 ```
 
 > Press `s` inside `agy-statusline config` to save and apply in one step.

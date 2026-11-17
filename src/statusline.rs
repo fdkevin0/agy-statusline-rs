@@ -1,5 +1,6 @@
 //! Null-safe AGY statusline JSON schema and pipeline orchestration.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -27,6 +28,9 @@ pub struct ModelInfo {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct VcsInfo {
+    /// VCS type (`"git"`).
+    #[serde(rename = "type")]
+    pub vcs_type: Option<String>,
     /// Active branch name.
     pub branch: Option<String>,
     /// Whether the working tree has uncommitted changes.
@@ -95,14 +99,34 @@ pub struct CostInfo {
     pub estimated: Option<bool>,
 }
 
+/// Rolling rate-limit bucket from AGY `quota`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct QuotaBucket {
+    /// Fraction of quota remaining (`0.0..=1.0`).
+    pub remaining_fraction: Option<f64>,
+    /// Countdown in seconds until the bucket resets.
+    pub reset_in_seconds: Option<u64>,
+    /// ISO-8601 reset timestamp.
+    pub reset_time: Option<String>,
+}
+
 /// Null-safe top-level AGY statusline JSON payload passed via `stdin`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct StatuslinePayload {
-    /// Agent execution state (`idle`, `thinking`, `working`, `tool_use`).
+    /// Agent execution state (`idle`, `thinking`, `working`, `tool_use`, `reviewing`, etc.).
     pub agent_state: Option<String>,
     /// Active conversation UUID.
     pub conversation_id: Option<String>,
+    /// Top-level current working directory fallback.
+    pub cwd: Option<String>,
+    /// Active agent cycle mode (`plan`, `auto`, `edit`, etc.).
+    pub cycle_mode: Option<String>,
+    /// Active account plan tier (`Pro`, `Ultra`, etc.).
+    pub plan_tier: Option<String>,
+    /// Whether context exceeds 200K tokens.
+    pub exceeds_200k_tokens: Option<bool>,
     /// Terminal column width.
     pub terminal_width: Option<usize>,
     /// Number of generated artifacts.
@@ -123,6 +147,8 @@ pub struct StatuslinePayload {
     pub context_window: Option<ContextWindow>,
     /// Session cost estimate.
     pub cost: Option<CostInfo>,
+    /// Quota buckets (`gemini-5h`, `gemini-weekly`, `gemini-argon-wtu-weekly`, `3p-5h`, `3p-weekly`).
+    pub quota: Option<BTreeMap<String, QuotaBucket>>,
 }
 
 impl StatuslinePayload {
@@ -134,23 +160,33 @@ impl StatuslinePayload {
         }
     }
 
-    /// Returns the raw workspace directory path preferring `current_dir`, then `project_dir`.
+    /// Returns the raw workspace directory path preferring `workspace.current_dir`,
+    /// then `workspace.project_dir`, then top-level `cwd`.
     pub fn workspace_path(&self) -> Option<&str> {
-        let ws = self.workspace.as_ref()?;
-        ws.current_dir
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .or_else(|| ws.project_dir.as_deref().filter(|s| !s.is_empty()))
+        self.workspace
+            .as_ref()
+            .and_then(|ws| {
+                ws.current_dir
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| ws.project_dir.as_deref().filter(|s| !s.is_empty()))
+            })
+            .or_else(|| self.cwd.as_deref().filter(|s| !s.is_empty()))
     }
 
-    /// Returns the directory basename preferring `workspace.project_dir`, then `current_dir`.
+    /// Returns the directory basename preferring `workspace.project_dir`,
+    /// then `workspace.current_dir`, then top-level `cwd`.
     pub fn workspace_basename(&self) -> Option<&str> {
-        let ws = self.workspace.as_ref()?;
-        let raw = ws
-            .project_dir
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .or_else(|| ws.current_dir.as_deref().filter(|s| !s.is_empty()))?;
+        let raw = self
+            .workspace
+            .as_ref()
+            .and_then(|ws| {
+                ws.project_dir
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| ws.current_dir.as_deref().filter(|s| !s.is_empty()))
+            })
+            .or_else(|| self.cwd.as_deref().filter(|s| !s.is_empty()))?;
         Path::new(raw)
             .file_name()
             .and_then(|n| n.to_str())
@@ -195,7 +231,7 @@ pub fn process_statusline_with_config<W: Write>(
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
-    process_statusline_with_probes(input, reader, &SystemGitProbe, cfg, out)
+    process_statusline_with_probes(input, reader, &SystemGitProbe::default(), cfg, out)
 }
 
 /// Parses `input` JSON using explicit [`SpeedReader`] and [`GitProbe`] boundaries.
@@ -212,15 +248,23 @@ pub fn process_statusline_with_probes<W: Write>(
         .as_deref()
         .map(|id| reader.session_metadata(id))
         .unwrap_or_default();
-    let needs_git = cfg.rows.iter().flatten().any(|w| {
-        matches!(w, WidgetId::Worktree) || (cfg.show_git_diff && matches!(w, WidgetId::Vcs))
-    });
+    let has_vcs = cfg.rows.iter().flatten().any(|w| matches!(w, WidgetId::Vcs));
+    let has_wt = cfg
+        .rows
+        .iter()
+        .flatten()
+        .any(|w| matches!(w, WidgetId::Worktree));
+    let payload_has_branch = payload
+        .vcs
+        .as_ref()
+        .and_then(|v| v.branch.as_deref())
+        .is_some_and(|b| !b.trim().is_empty());
+    let needs_git = has_wt || (has_vcs && (cfg.show_git_diff || !payload_has_branch));
     let git_info = if needs_git {
         payload
             .workspace_path()
             .map(|dir| {
-                let want_diff = cfg.show_git_diff
-                    && cfg.rows.iter().flatten().any(|w| matches!(w, WidgetId::Vcs));
+                let want_diff = cfg.show_git_diff && has_vcs;
                 git_probe.probe(Path::new(dir), want_diff)
             })
             .unwrap_or_default()
@@ -238,6 +282,13 @@ mod tests {
     impl SpeedReader for StubReader {
         fn last_speed(&self, _id: &str) -> Option<f64> {
             self.0
+        }
+    }
+
+    struct StubGit(GitInfo);
+    impl GitProbe for StubGit {
+        fn probe(&self, _dir: &Path, _include_diff: bool) -> GitInfo {
+            self.0.clone()
         }
     }
 
@@ -269,17 +320,34 @@ mod tests {
 
         let mut out = Vec::new();
         process_statusline_with_config("", &StubReader(None), &cfg, &mut out).unwrap();
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "◈ cache -- ⚡ --\n"
-        );
+        assert_eq!(String::from_utf8(out).unwrap(), "◈ cache -- ⚡ --\n");
 
         let mut out2 = Vec::new();
         process_statusline_with_config("{bad json", &StubReader(Some(100.0)), &cfg, &mut out2)
             .unwrap();
-        assert_eq!(
-            String::from_utf8(out2).unwrap(),
-            "◈ cache -- ⚡ --\n"
-        );
+        assert_eq!(String::from_utf8(out2).unwrap(), "◈ cache -- ⚡ --\n");
+    }
+
+    #[test]
+    fn falls_back_to_cwd_and_git_probe_when_vcs_branch_absent() {
+        let json = r#"{
+            "agent_state": "idle",
+            "cwd": "/tmp/my-repo",
+            "vcs": {"type": "git"}
+        }"#;
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = crate::layout::ThemeStyle::Mono;
+        cfg.show_git_diff = false;
+        let git = StubGit(GitInfo {
+            branch: Some("feat/probe".to_string()),
+            worktree: None,
+            added: 0,
+            deleted: 0,
+        });
+
+        let mut out = Vec::new();
+        process_statusline_with_probes(json, &StubReader(None), &git, &cfg, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("feat/probe"));
     }
 }

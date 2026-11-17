@@ -1,6 +1,6 @@
 //! 3-pane `ratatui` + `crossterm` interactive TUI configurator with true-color live preview.
 
-use std::env;
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 
@@ -21,15 +21,15 @@ use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthStr;
 
 use crate::ansi::ansi_to_ratatui_lines;
-use crate::apply::{apply_statusline_config, default_settings_path};
+use crate::apply::{apply_statusline_config, resolve_invoked_binary_path, default_settings_path};
 use crate::db::SessionMetadata;
 use crate::editor::{ActivePane, ExitOutcome, TuiEditorState};
 use crate::git::GitInfo;
 use crate::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
 use crate::render::write_statusline;
 use crate::statusline::{
-    ContextWindow, CostInfo, JsonUsage, ModelInfo, SandboxInfo, StatuslinePayload, VcsInfo,
-    WorkspaceInfo,
+    ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, SandboxInfo, StatuslinePayload,
+    VcsInfo, WorkspaceInfo,
 };
 
 struct TerminalGuard;
@@ -41,6 +41,7 @@ impl Drop for TerminalGuard {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PillHit {
     row: usize,
     col: usize,
@@ -106,8 +107,7 @@ pub fn run_tui_config(config_path: &Path) -> io::Result<()> {
         ExitOutcome::SaveAndApply => {
             save_layout_config(config_path, &state.config)?;
             let settings_path = default_settings_path()?;
-            let exe = env::current_exe()?;
-            let cmd = exe.canonicalize().unwrap_or(exe);
+            let cmd = resolve_invoked_binary_path()?;
             apply_statusline_config(&settings_path, &cmd, state.config.stack_with_default)?;
             println!("Saved layout config to {}", config_path.display());
             println!(
@@ -123,9 +123,29 @@ pub fn run_tui_config(config_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn sample_payload(width: usize) -> StatuslinePayload {
+/// Builds a rich sample payload used for live preview and `doctor`.
+pub fn sample_preview_payload(width: usize) -> StatuslinePayload {
+    let mut quota = BTreeMap::new();
+    quota.insert(
+        "gemini-5h".to_string(),
+        QuotaBucket {
+            remaining_fraction: Some(0.84),
+            reset_in_seconds: Some(11_400),
+            reset_time: None,
+        },
+    );
+    quota.insert(
+        "gemini-weekly".to_string(),
+        QuotaBucket {
+            remaining_fraction: Some(0.92),
+            reset_in_seconds: Some(432_000),
+            reset_time: None,
+        },
+    );
     StatuslinePayload {
         agent_state: Some("thinking".to_string()),
+        cycle_mode: Some("plan".to_string()),
+        plan_tier: Some("Pro".to_string()),
         model: Some(ModelInfo {
             id: None,
             display_name: Some("Gemini 4".to_string()),
@@ -136,6 +156,7 @@ fn sample_payload(width: usize) -> StatuslinePayload {
             project_dir: Some("/work/agy-statusline".to_string()),
         }),
         vcs: Some(VcsInfo {
+            vcs_type: Some("git".to_string()),
             branch: Some("main".to_string()),
             dirty: Some(true),
         }),
@@ -160,14 +181,15 @@ fn sample_payload(width: usize) -> StatuslinePayload {
             subagent_usd: None,
             estimated: Some(true),
         }),
+        quota: Some(quota),
         terminal_width: Some(width),
-        conversation_id: None,
+        ..Default::default()
     }
 }
 
 fn build_preview_lines(state: &TuiEditorState, box_inner: u16) -> (Vec<Line<'static>>, usize) {
     let width = state.preview_width.resolve(box_inner);
-    let sample = sample_payload(width);
+    let sample = sample_preview_payload(width);
     let meta = SessionMetadata {
         speed: Some(64.0),
         last_turn_speed: Some(72.0),
@@ -176,6 +198,7 @@ fn build_preview_lines(state: &TuiEditorState, box_inner: u16) -> (Vec<Line<'sta
         max_context_tokens: Some(512_000),
     };
     let git = GitInfo {
+        branch: Some("main".to_string()),
         worktree: Some("feat-wt".to_string()),
         added: 42,
         deleted: 11,
@@ -307,11 +330,12 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiEditorState) -> UiHitMap {
         "Replace"
     };
     let preview_title = format!(
-        " Live Preview [{} ({}col) · {} · {} · AGY: {}] ",
+        " Live Preview [{} ({}col) · {} · {} · {} · AGY: {}] ",
         state.preview_width.label(),
         eff_w,
         state.config.style.name(),
         state.config.theme.name(),
+        state.config.glyph_mode.name(),
         agy_mode
     );
     let preview = Paragraph::new(preview_lines)
@@ -331,9 +355,9 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiEditorState) -> UiHitMap {
     let mid = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(48),
+            Constraint::Percentage(46),
             Constraint::Percentage(27),
-            Constraint::Percentage(25),
+            Constraint::Percentage(27),
         ])
         .split(chunks[1]);
 
@@ -367,20 +391,23 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiEditorState) -> UiHitMap {
     }
 }
 
-fn draw_canvas_pane(
-    frame: &mut Frame<'_>,
+fn layout_canvas_lines(
     area: Rect,
     state: &TuiEditorState,
-) -> ([u16; MAX_ROWS], Vec<PillHit>) {
+) -> (Vec<Line<'static>>, [u16; MAX_ROWS], Vec<PillHit>) {
     let active = state.active_pane == ActivePane::Canvas;
     let mut lines = Vec::new();
     let mut line_y = [0u16; MAX_ROWS];
     let mut pills = Vec::new();
     let inner_x = area.x + 1;
+    let max_x = area.x + area.width.saturating_sub(1);
+    let max_y = area.y + area.height.saturating_sub(1);
+    let mut cur_y = area.y + 1;
 
     for r in 0..MAX_ROWS {
-        let y = area.y + 1 + (r as u16) * 2;
-        line_y[r] = y;
+        if cur_y < max_y {
+            line_y[r] = cur_y;
+        }
         let row_focused = active && state.canvas_row == r;
         let label_style = if row_focused {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -401,7 +428,10 @@ fn draw_canvas_pane(
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
             ));
+            lines.push(Line::from(spans));
+            cur_y += 1;
         } else {
+            let mut line_has_pill = false;
             for (c, w) in items.iter().enumerate() {
                 let is_cur = row_focused && c == state.canvas_col;
                 let (text, style) = if is_cur && state.grabbed {
@@ -427,14 +457,31 @@ fn draw_canvas_pane(
                     )
                 };
                 let pw = text.width() as u16;
-                pills.push(PillHit { row: r, col: c, y, x0: cur_x, x1: cur_x + pw });
+                if line_has_pill && cur_x + pw > max_x {
+                    lines.push(Line::from(spans));
+                    cur_y += 1;
+                    spans = vec![Span::raw("        ")];
+                    cur_x = inner_x + 8;
+                }
+                if cur_y < max_y {
+                    pills.push(PillHit {
+                        row: r,
+                        col: c,
+                        y: cur_y,
+                        x0: cur_x,
+                        x1: cur_x + pw,
+                    });
+                }
                 cur_x += pw + 1;
                 spans.push(Span::styled(text, style));
                 spans.push(Span::raw(" "));
+                line_has_pill = true;
             }
+            lines.push(Line::from(spans));
+            cur_y += 1;
         }
-        lines.push(Line::from(spans));
         lines.push(Line::raw(""));
+        cur_y += 1;
     }
 
     let hint = if state.grabbed {
@@ -444,9 +491,18 @@ fn draw_canvas_pane(
     };
     lines.push(Line::styled(hint, Style::default().fg(Color::DarkGray)));
 
+    (lines, line_y, pills)
+}
+
+fn draw_canvas_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiEditorState,
+) -> ([u16; MAX_ROWS], Vec<PillHit>) {
+    let active = state.active_pane == ActivePane::Canvas;
+    let (lines, line_y, pills) = layout_canvas_lines(area, state);
     let panel = Paragraph::new(lines)
-        .block(pane_block(" 1. Layout Lines ".to_string(), active, state.grabbed))
-        .wrap(Wrap { trim: false });
+        .block(pane_block(" 1. Layout Lines ".to_string(), active, state.grabbed));
     frame.render_widget(panel, area);
     (line_y, pills)
 }
@@ -459,7 +515,15 @@ fn draw_catalog_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState) 
         .saturating_sub(inner_h.saturating_sub(1));
     let mut lines = Vec::new();
     for (idx, &w) in WidgetId::ALL.iter().enumerate().skip(offset).take(inner_h) {
-        let placed = state.config.locate_widget(w);
+        let placed = if w == WidgetId::Spacer {
+            if state.config.rows[state.canvas_row].contains(&WidgetId::Spacer) {
+                Some((state.canvas_row, 0))
+            } else {
+                state.config.locate_widget(w)
+            }
+        } else {
+            state.config.locate_widget(w)
+        };
         let badge = match placed {
             Some((r, _)) => format!("[✓ L{}]", r + 1),
             None => "[    ]".to_string(),
@@ -489,14 +553,19 @@ fn draw_catalog_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState) 
 fn draw_settings_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState) -> usize {
     let active = state.active_pane == ActivePane::Settings;
     let cfg = &state.config;
-    let preset_name = match state.preset_idx {
+    let base_preset = match state.preset_idx {
         0 => "Full Dashboard",
         1 => "Powerline Pro",
         2 => "Codex 1-Line",
         _ => "Metrics Addon",
     };
+    let preset_name = if state.is_custom_preset() {
+        format!("{base_preset}*")
+    } else {
+        base_preset.to_string()
+    };
     let rows = [
-        ("Preset", preset_name.to_string()),
+        ("Preset", preset_name),
         ("Style", cfg.style.name().to_string()),
         ("Theme", cfg.theme.name().to_string()),
         ("Separator", cfg.separator.name().to_string()),
@@ -517,6 +586,9 @@ fn draw_settings_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState)
             }
             .to_string(),
         ),
+        ("Glyphs", cfg.glyph_mode.name().to_string()),
+        ("Responsive", if cfg.responsive { "ON" } else { "OFF" }.to_string()),
+        ("Speed warn", format!("{:.0} tok/s", cfg.speed_warn_threshold)),
     ];
 
     let inner_h = usize::from(area.height.saturating_sub(2)).max(1);
@@ -547,4 +619,25 @@ fn draw_settings_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState)
     let panel = Paragraph::new(lines).block(pane_block(" 3. Style & AGY ".to_string(), active, false));
     frame.render_widget(panel, area);
     offset
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::LayoutConfig;
+
+    #[test]
+    fn canvas_wrapping_updates_line_y_and_pill_hit_coordinates() {
+        let mut cfg = LayoutConfig::preset_full();
+        cfg.rows[1] = vec![WidgetId::Model];
+        let state = TuiEditorState::new(cfg);
+        let area = Rect::new(0, 0, 48, 18);
+        let (_lines, line_y, pills) = layout_canvas_lines(area, &state);
+
+        let last_row0 = pills.iter().rfind(|p| p.row == 0).unwrap();
+        let row1_pill = pills.iter().find(|p| p.row == 1).unwrap();
+        assert!(last_row0.y > line_y[0]);
+        assert_eq!(line_y[1], last_row0.y + 2);
+        assert_eq!(row1_pill.y, line_y[1]);
+    }
 }
