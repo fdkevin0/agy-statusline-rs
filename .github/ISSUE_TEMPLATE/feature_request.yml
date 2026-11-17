@@ -1,0 +1,16 @@
+name: Feature request
+description: Propose a new widget, preset, or improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Suggested solution and alternatives
+    validations:
+      required: true

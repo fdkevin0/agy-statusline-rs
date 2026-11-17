@@ -1,0 +1,34 @@
+name: Bug report
+description: Report a bug or rendering issue in agy-statusline
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never paste credentials, tokens, `~/.gemini/antigravity-cli/conversations/*.db` files, or private workspace paths. Report security vulnerabilities via the **Security** tab instead of a public issue.
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, terminal emulator, agy-statusline version, and Rust version
+      placeholder: "Ubuntu 24.04, Kitty, agy-statusline 0.1.0, rustc 1.85"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: "echo '{...}' | agy-statusline"
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected vs actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized output or config.json (optional)
+      render: json

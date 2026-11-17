@@ -121,6 +121,50 @@ pub fn find_number(data: &[u8], id: u64) -> u64 {
     }
 }
 
+/// Timing and output token metrics extracted from one `gen_metadata` turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TurnMetrics {
+    /// Total output tokens generated in the turn (`usage.3`).
+    pub output_tokens: u64,
+    /// Streaming decode duration in seconds (`chat.12`).
+    pub decode_secs: f64,
+    /// Optional time-to-first-token in seconds (`chat.11`).
+    pub ttft_secs: Option<f64>,
+}
+
+fn decode_duration_secs(msg: &[u8]) -> Option<f64> {
+    let nanos = find_number(msg, 2);
+    if nanos >= 1_000_000_000 {
+        return None;
+    }
+    Some((find_number(msg, 1) as f64) + (nanos as f64) / 1e9)
+}
+
+/// Extracts [`TurnMetrics`] (output tokens, decode duration, and optional TTFT)
+/// from a `gen_metadata.data` Protobuf blob.
+pub fn extract_turn_metrics(data: &[u8]) -> Option<TurnMetrics> {
+    let chat = find_bytes(data, 1)?;
+    let usage = find_bytes(chat, 4)?;
+    let duration = find_bytes(chat, 12)?;
+    let decode_secs = decode_duration_secs(duration)?;
+    let output_tokens = find_number(usage, 3);
+    if decode_secs < 0.02 || output_tokens == 0 {
+        return None;
+    }
+    let inst_speed = (output_tokens as f64) / decode_secs;
+    if !inst_speed.is_finite() || inst_speed <= 0.0 || inst_speed >= 2000.0 {
+        return None;
+    }
+    let ttft_secs = find_bytes(chat, 11)
+        .and_then(decode_duration_secs)
+        .filter(|&t| t > 0.0 && t < 600.0);
+    Some(TurnMetrics {
+        output_tokens,
+        decode_secs,
+        ttft_secs,
+    })
+}
+
 /// Extracts output generation speed (tokens/second) from a `gen_metadata` Protobuf blob.
 ///
 /// Returns `None` if required nested fields are missing, `nanos >= 1_000_000_000`,
@@ -153,6 +197,20 @@ pub fn extract_metadata_speed(data: &[u8]) -> Option<f64> {
         Some(speed)
     } else {
         None
+    }
+}
+
+/// Extracts server-issued `max_context_tokens` from `gen_metadata.data`
+/// along wire path `1 (bytes) -> 9 (bytes) -> 10 (bytes) -> 4 (varint)`.
+///
+/// Returns `None` if any nested field is missing, malformed, or `0`.
+pub fn extract_max_context_tokens(data: &[u8]) -> Option<u64> {
+    let chat = find_bytes(data, 1)?;
+    let chat_start = find_bytes(chat, 9)?;
+    let ctx_window = find_bytes(chat_start, 10)?;
+    match find_field(ctx_window, 4)? {
+        FieldValue::Number(val) if val > 0 => Some(val),
+        _ => None,
     }
 }
 
@@ -200,5 +258,26 @@ mod tests {
         assert_eq!(find_field(&[0x0b, 0x01], 1), None);
         // field id 0 is invalid
         assert_eq!(find_field(&[0x00, 0x01], 0), None);
+    }
+
+    #[test]
+    fn max_context_tokens_valid_and_invalid() {
+        let valid = [0x0a, 0x08, 0x4a, 0x06, 0x52, 0x04, 0x20, 0x80, 0xa0, 0x1f];
+        assert_eq!(extract_max_context_tokens(&valid), Some(512_000));
+        let zero = [0x0a, 0x06, 0x4a, 0x04, 0x52, 0x02, 0x20, 0x00];
+        assert_eq!(extract_max_context_tokens(&zero), None);
+        assert_eq!(extract_max_context_tokens(&[]), None);
+    }
+
+    #[test]
+    fn turn_metrics_extracts_ttft_and_short_decode() {
+        // chat(1) -> { usage(4) -> { output(3)=100 }, ttft(11) -> { sec(1)=1 }, dur(12) -> { sec(1)=2 } }
+        let blob = [
+            0x0a, 0x0c, 0x22, 0x02, 0x18, 0x64, 0x5a, 0x02, 0x08, 0x01, 0x62, 0x02, 0x08, 0x02,
+        ];
+        let m = extract_turn_metrics(&blob).unwrap();
+        assert_eq!(m.output_tokens, 100);
+        assert!((m.decode_secs - 2.0).abs() < 1e-9);
+        assert!((m.ttft_secs.unwrap() - 1.0).abs() < 1e-9);
     }
 }

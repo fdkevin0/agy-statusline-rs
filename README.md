@@ -1,22 +1,14 @@
 # agy-statusline
 
-A `#![forbid(unsafe_code)]` Rust statusline for Antigravity CLI (`agy`).
+A `#![forbid(unsafe_code)]` Rust statusline for Antigravity CLI (`agy`) with real compaction-threshold sniffing, `git worktree` awareness, and an interactive 3-pane TUI configurator.
 
-Reads AGY's statusline JSON from `stdin` and displays:
-- **Cache hit rate** (`cache_read_input_tokens / (input_tokens + cache_read_input_tokens)`) and formatted cache read token count. Displays `--` when data is missing, input is zero, or `cache_creation_input_tokens` is non-zero.
-- **Last turn average output speed** (tokens/s, including thinking tokens) from a read-only query against `~/.gemini/antigravity-cli/conversations/<conversation_id>.db`. Color-codes the bar yellow when `< 50 token/s` and blue otherwise.
-
-## Installation
-
-### From crates.io
+## Install
 
 ```sh
 cargo install agy-statusline
 ```
 
-### From source
-
-Requires Rust (2021 edition) and `libsqlite3` development headers:
+Or build from source (requires Rust 2021 + `libsqlite3` dev headers):
 
 ```sh
 git clone https://github.com/fdkevin0/agy-statusline-rs.git
@@ -24,40 +16,27 @@ cd agy-statusline-rs
 cargo install --path .
 ```
 
-## Quick Setup
+## Quick Start
 
-Automatically configure `~/.gemini/antigravity-cli/settings.json`:
-
-```sh
-agy-statusline config --yes
-```
-
-Omit `--yes` to preview the configuration and confirm interactively. Existing keys in `settings.json` are preserved.
-
-### Manual Configuration
-
-Edit `~/.gemini/antigravity-cli/settings.json` (Windows: `%USERPROFILE%\.gemini\antigravity-cli\settings.json`):
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "/path/to/agy-statusline",
-    "stack_with_default": true
-  }
-}
-```
-
-To restore the default statusline, run `/statusline delete` in AGY or remove `statusLine` from `settings.json`.
-
-## Development
+1. Configure your layout interactively (keyboard + mouse):
 
 ```sh
-cargo test --all-targets
-cargo test --doc
-cargo clippy --all-targets -- -D warnings
+agy-statusline config
 ```
+
+2. Register with AGY (`~/.gemini/antigravity-cli/settings.json`):
+
+```sh
+agy-statusline apply --yes
+```
+
+> Press `s` inside `agy-statusline config` to save and apply in one step.
+
+## Documentation
+
+- [Configuration, Widgets & TUI Guide](docs/configuration.md)
+- [Contributing](CONTRIBUTING.md) · [Code of Conduct](CODE_OF_CONDUCT.md) · [Security Policy](SECURITY.md)
 
 ## License
 
-MIT
+[MIT](LICENSE)
