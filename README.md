@@ -5,6 +5,12 @@ A `#![forbid(unsafe_code)]` Rust statusline for Antigravity CLI (`agy`) with rea
 ## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/fdkevin0/agy-statusline-rs/main/install.sh | sh
+```
+
+Or install via Cargo:
+
+```sh
 cargo install agy-statusline
 ```
 
