@@ -3,14 +3,18 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 
-use agy_statusline::apply::{default_settings_path, run_apply_command};
+use agy_statusline::apply::{
+    default_settings_path, resolve_invoked_binary_path, run_apply_command, run_doctor,
+    set_statusline_enabled,
+};
 use agy_statusline::db::SqliteSpeedReader;
+use agy_statusline::git::SystemGitProbe;
 use agy_statusline::layout::{
     default_config_path, load_layout_config, save_layout_config, LayoutConfig,
 };
-use agy_statusline::statusline::process_statusline_with_config;
+use agy_statusline::statusline::process_statusline_with_probes;
 use agy_statusline::tui::run_tui_config;
 
 const MAX_STDIN_BYTES: u64 = 1024 * 1024;
@@ -18,12 +22,13 @@ const MAX_STDIN_BYTES: u64 = 1024 * 1024;
 fn print_help() {
     println!(
         "Usage:\n  \
-         agy-statusline [--full|--preset <name>]      Render statusline from stdin JSON\n  \
+         agy-statusline [--full|--preset <name>]      Render statusline from stdin JSON (respects NO_COLOR)\n  \
          agy-statusline config                        Launch 3-pane interactive TUI editor\n  \
          agy-statusline config --preset <name>        Apply preset (full|powerline|minimal|addon)\n  \
          agy-statusline config --show                 Print current XDG layout config\n  \
          agy-statusline config --reset                Remove XDG layout config (restore defaults)\n  \
-         agy-statusline apply [--yes|-y] [--stack|--replace]\n                                               Register statusLine in AGY settings.json"
+         agy-statusline apply [--yes|-y] [--stack|--replace|--disable]\n                                               Register or disable statusLine in AGY settings.json\n  \
+         agy-statusline doctor                        Check configuration, AGY hook, and sample preview"
     );
 }
 
@@ -45,19 +50,22 @@ fn main() -> io::Result<()> {
     let mut preset_override: Option<LayoutConfig> = env::var_os("AGY_STATUSLINE_FULL")
         .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .map(|_| LayoutConfig::preset_full());
+    let no_color = env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
 
     if let Some(first) = args.next() {
         match first.as_str() {
             "apply" => {
                 let mut assume_yes = false;
+                let mut disable = false;
                 let mut stack_override: Option<bool> = None;
                 for arg in args {
                     match arg.as_str() {
                         "--yes" | "-y" => assume_yes = true,
                         "--stack" => stack_override = Some(true),
                         "--replace" => stack_override = Some(false),
+                        "--disable" => disable = true,
                         "--help" | "-h" => {
-                            println!("Usage: agy-statusline apply [--yes|-y] [--stack|--replace]");
+                            println!("Usage: agy-statusline apply [--yes|-y] [--stack|--replace|--disable]");
                             return Ok(());
                         }
                         other => {
@@ -68,14 +76,18 @@ fn main() -> io::Result<()> {
                         }
                     }
                 }
+                let settings_path = default_settings_path()?;
+                if disable {
+                    set_statusline_enabled(&settings_path, false)?;
+                    println!("Disabled statusLine in {}", settings_path.display());
+                    return Ok(());
+                }
                 let stack_with_default = stack_override.unwrap_or_else(|| {
                     default_config_path()
                         .map(|p| load_layout_config(&p).stack_with_default)
                         .unwrap_or(false)
                 });
-                let settings_path = default_settings_path()?;
-                let exe_path = env::current_exe()?;
-                let command_path = exe_path.canonicalize().unwrap_or(exe_path);
+                let command_path = resolve_invoked_binary_path()?;
                 let mut stdin = io::stdin().lock();
                 let mut stdout = io::stdout().lock();
                 return run_apply_command(
@@ -86,6 +98,22 @@ fn main() -> io::Result<()> {
                     &mut stdin,
                     &mut stdout,
                 );
+            }
+            "doctor" => {
+                if let Some(flag) = args.next() {
+                    if matches!(flag.as_str(), "--help" | "-h") {
+                        println!("Usage: agy-statusline doctor");
+                        return Ok(());
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unknown option for doctor: {flag}"),
+                    ));
+                }
+                let config_path = default_config_path()?;
+                let settings_path = default_settings_path()?;
+                let mut stdout = io::stdout().lock();
+                return run_doctor(&config_path, &settings_path, no_color, &mut stdout);
             }
             "config" => {
                 let config_path = default_config_path()?;
@@ -158,18 +186,25 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let cfg = match preset_override {
+    if preset_override.is_none() && io::stdin().is_terminal() {
+        print_help();
+        return Ok(());
+    }
+
+    let mut cfg = match preset_override {
         Some(c) => c,
         None => default_config_path()
             .map(|p| load_layout_config(&p))
             .unwrap_or_default(),
     };
+    cfg.no_color = no_color;
 
     let mut input = String::new();
     let _ = io::stdin()
         .take(MAX_STDIN_BYTES)
         .read_to_string(&mut input);
     let reader = SqliteSpeedReader::default();
+    let git_probe = SystemGitProbe::with_default_cache();
     let mut stdout = io::stdout().lock();
-    process_statusline_with_config(&input, &reader, &cfg, &mut stdout)
+    process_statusline_with_probes(&input, &reader, &git_probe, &cfg, &mut stdout)
 }

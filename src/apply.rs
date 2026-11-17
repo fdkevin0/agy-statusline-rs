@@ -1,12 +1,17 @@
-//! Automatic AGY `settings.json` integration for `agy-statusline apply`.
+//! Automatic AGY `settings.json` integration and diagnostics (`apply` / `doctor`).
 
+use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use crate::db::resolve_home_dir;
+use crate::db::{resolve_home_dir, SessionMetadata};
+use crate::git::GitInfo;
+use crate::layout::load_layout_config;
+use crate::render::write_statusline;
+use crate::tui::sample_preview_payload;
 
 /// Returns the default AGY settings path (`<home>/.gemini/antigravity-cli/settings.json`).
 pub fn default_settings_path() -> io::Result<PathBuf> {
@@ -26,6 +31,25 @@ pub fn settings_path_for_home(home: &Path) -> PathBuf {
         .join("settings.json")
 }
 
+/// Resolves the preferred binary path to register in AGY `settings.json`.
+///
+/// Preserves absolute symlinked launcher paths (e.g. Cargo or Homebrew symlinks)
+/// instead of resolving into versioned store directories.
+pub fn resolve_invoked_binary_path() -> io::Result<PathBuf> {
+    if let Some(arg0) = env::args_os().next() {
+        let p = PathBuf::from(arg0);
+        if p.is_absolute() && p.exists() {
+            return Ok(p);
+        }
+    }
+    let exe = env::current_exe()?;
+    if exe.exists() {
+        Ok(exe)
+    } else {
+        Ok(exe.canonicalize().unwrap_or(exe))
+    }
+}
+
 /// Builds the `statusLine` JSON object pointing to `command_path`.
 pub fn build_statusline_entry(command_path: &Path, stack_with_default: bool) -> Value {
     json!({
@@ -36,8 +60,48 @@ pub fn build_statusline_entry(command_path: &Path, stack_with_default: bool) -> 
     })
 }
 
-/// Updates `settings_path` in-place (preserving existing top-level keys) to
-/// configure `statusLine` for `command_path`.
+fn read_settings_object(settings_path: &Path, allow_missing: bool) -> io::Result<Map<String, Value>> {
+    match fs::read_to_string(settings_path) {
+        Ok(content) if content.trim().is_empty() => Ok(Map::new()),
+        Ok(content) => {
+            let parsed: Value = serde_json::from_str(&content).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid JSON in {}: {e}", settings_path.display()),
+                )
+            })?;
+            match parsed {
+                Value::Object(map) => Ok(map),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} must contain a top-level JSON object",
+                        settings_path.display()
+                    ),
+                )),
+            }
+        }
+        Err(e) if allow_missing && e.kind() == io::ErrorKind::NotFound => Ok(Map::new()),
+        Err(e) => Err(e),
+    }
+}
+
+fn write_settings_object(settings_path: &Path, root: Map<String, Value>) -> io::Result<()> {
+    if let Some(parent) = settings_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut formatted = serde_json::to_string_pretty(&Value::Object(root))
+        .map_err(|e| io::Error::other(format!("failed to serialize settings: {e}")))?;
+    formatted.push('\n');
+
+    let tmp_path = settings_path.with_extension("json.tmp");
+    fs::write(&tmp_path, formatted.as_bytes())?;
+    fs::rename(&tmp_path, settings_path)?;
+    Ok(())
+}
+
+/// Updates `settings_path` in-place (preserving existing top-level keys and custom
+/// `statusLine` properties such as `padding`) to configure `statusLine` for `command_path`.
 ///
 /// # Errors
 ///
@@ -48,49 +112,38 @@ pub fn apply_statusline_config(
     command_path: &Path,
     stack_with_default: bool,
 ) -> io::Result<()> {
-    let mut root: Map<String, Value> = match fs::read_to_string(settings_path) {
-        Ok(content) if content.trim().is_empty() => Map::new(),
-        Ok(content) => {
-            let parsed: Value = serde_json::from_str(&content).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid JSON in {}: {e}", settings_path.display()),
-                )
-            })?;
-            match parsed {
-                Value::Object(map) => map,
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "{} must contain a top-level JSON object",
-                            settings_path.display()
-                        ),
-                    ));
-                }
-            }
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Map::new(),
-        Err(e) => return Err(e),
+    let mut root = read_settings_object(settings_path, true)?;
+    let mut sl_map = match root.get("statusLine") {
+        Some(Value::Object(existing)) => existing.clone(),
+        _ => Map::new(),
     };
-
-    root.insert(
-        "statusLine".to_string(),
-        build_statusline_entry(command_path, stack_with_default),
+    sl_map.insert("type".to_string(), Value::String("command".to_string()));
+    sl_map.insert(
+        "command".to_string(),
+        Value::String(command_path.to_string_lossy().into_owned()),
     );
+    sl_map.insert("enabled".to_string(), Value::Bool(true));
+    sl_map.insert(
+        "stack_with_default".to_string(),
+        Value::Bool(stack_with_default),
+    );
+    root.insert("statusLine".to_string(), Value::Object(sl_map));
 
-    if let Some(parent) = settings_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    write_settings_object(settings_path, root)
+}
 
-    let mut formatted = serde_json::to_string_pretty(&Value::Object(root))
-        .map_err(|e| io::Error::other(format!("failed to serialize settings: {e}")))?;
-    formatted.push('\n');
-
-    let tmp_path = settings_path.with_extension("json.tmp");
-    fs::write(&tmp_path, formatted.as_bytes())?;
-    fs::rename(&tmp_path, settings_path)?;
-    Ok(())
+/// Toggles `statusLine.enabled` inside `settings_path` while preserving all other fields.
+pub fn set_statusline_enabled(settings_path: &Path, enabled: bool) -> io::Result<()> {
+    let mut root = read_settings_object(settings_path, false)?;
+    let Some(Value::Object(mut sl_map)) = root.remove("statusLine") else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no statusLine block found in {}", settings_path.display()),
+        ));
+    };
+    sl_map.insert("enabled".to_string(), Value::Bool(enabled));
+    root.insert("statusLine".to_string(), Value::Object(sl_map));
+    write_settings_object(settings_path, root)
 }
 
 /// Runs the `apply` CLI subcommand, prompting unless `assume_yes` is `true`.
@@ -128,6 +181,92 @@ pub fn run_apply_command<R: BufRead, W: Write>(
         settings_path.display(),
         command_path.display()
     )?;
+    Ok(())
+}
+
+/// Inspects XDG config, AGY `settings.json` wiring, and prints a live sample preview.
+pub fn run_doctor<W: Write>(
+    config_path: &Path,
+    settings_path: &Path,
+    no_color: bool,
+    out: &mut W,
+) -> io::Result<()> {
+    writeln!(out, "agy-statusline v{}", env!("CARGO_PKG_VERSION"))?;
+
+    let mut cfg = load_layout_config(config_path);
+    cfg.no_color = no_color;
+    let cfg_state = if config_path.exists() {
+        "custom file"
+    } else {
+        "not found (using built-in defaults)"
+    };
+    writeln!(out, "Config:   {} [{cfg_state}]", config_path.display())?;
+    writeln!(
+        out,
+        "Active:   style={} · theme={} · glyphs={} · stack={}",
+        cfg.style.name(),
+        cfg.theme.name(),
+        cfg.glyph_mode.name(),
+        cfg.stack_with_default
+    )?;
+    writeln!(
+        out,
+        "NO_COLOR: {}",
+        if no_color { "active" } else { "unset" }
+    )?;
+
+    match read_settings_object(settings_path, false) {
+        Ok(root) => match root.get("statusLine").and_then(Value::as_object) {
+            Some(sl) => {
+                let cmd = sl
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>");
+                let enabled = sl
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let stack = sl
+                    .get("stack_with_default")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let cmd_exists = Path::new(cmd).exists();
+                writeln!(
+                    out,
+                    "AGY Hook: {} [enabled={enabled}, stack={stack}, bin_exists={cmd_exists}]",
+                    settings_path.display()
+                )?;
+                writeln!(out, "Command:  {cmd}")?;
+            }
+            None => {
+                writeln!(
+                    out,
+                    "AGY Hook: {} [missing statusLine entry — run `agy-statusline apply`]",
+                    settings_path.display()
+                )?;
+            }
+        },
+        Err(e) => {
+            writeln!(out, "AGY Hook: {} [error: {e}]", settings_path.display())?;
+        }
+    }
+
+    writeln!(out, "Preview:")?;
+    let sample = sample_preview_payload(100);
+    let meta = SessionMetadata {
+        speed: Some(64.0),
+        last_turn_speed: Some(72.0),
+        e2e_speed: Some(46.0),
+        ttft_secs: Some(1.4),
+        max_context_tokens: Some(512_000),
+    };
+    let git = GitInfo {
+        branch: Some("main".to_string()),
+        worktree: Some("feat-wt".to_string()),
+        added: 42,
+        deleted: 11,
+    };
+    write_statusline(&sample, &meta, &git, &cfg, out)?;
     Ok(())
 }
 
@@ -169,11 +308,15 @@ mod tests {
     }
 
     #[test]
-    fn preserves_existing_keys_and_aborts_on_no() {
+    fn preserves_existing_keys_padding_and_supports_disable() {
         let home = temp_home("preserve");
         let settings = settings_path_for_home(&home);
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
-        fs::write(&settings, r#"{"theme": "dark"}"#).unwrap();
+        fs::write(
+            &settings,
+            r#"{"theme": "dark", "statusLine": {"padding": 1, "custom": "keep"}}"#,
+        )
+        .unwrap();
 
         let cmd = PathBuf::from("/opt/agy-statusline");
         let mut out = Vec::new();
@@ -188,7 +331,8 @@ mod tests {
         .unwrap();
         let after_abort: Value =
             serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
-        assert!(after_abort.get("statusLine").is_none());
+        assert_eq!(after_abort["statusLine"]["padding"], 1);
+        assert!(after_abort["statusLine"].get("command").is_none());
 
         out.clear();
         run_apply_command(
@@ -203,8 +347,18 @@ mod tests {
         let after_yes: Value =
             serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(after_yes["theme"], "dark");
+        assert_eq!(after_yes["statusLine"]["padding"], 1);
+        assert_eq!(after_yes["statusLine"]["custom"], "keep");
         assert_eq!(after_yes["statusLine"]["command"], "/opt/agy-statusline");
+        assert_eq!(after_yes["statusLine"]["enabled"], true);
         assert_eq!(after_yes["statusLine"]["stack_with_default"], true);
+
+        set_statusline_enabled(&settings, false).unwrap();
+        let after_disable: Value =
+            serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(after_disable["statusLine"]["enabled"], false);
+        assert_eq!(after_disable["statusLine"]["padding"], 1);
+        assert_eq!(after_disable["statusLine"]["command"], "/opt/agy-statusline");
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -218,6 +372,24 @@ mod tests {
         let err =
             apply_statusline_config(&settings, Path::new("/bin/agy-statusline"), false).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn doctor_reports_config_settings_and_preview() {
+        let home = temp_home("doctor");
+        let cfg_path = home.join("config.json");
+        let settings = settings_path_for_home(&home);
+        apply_statusline_config(&settings, Path::new("/nonexistent/agy-statusline"), false).unwrap();
+
+        let mut out = Vec::new();
+        run_doctor(&cfg_path, &settings, true, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("NO_COLOR: active"));
+        assert!(text.contains("enabled=true"));
+        assert!(text.contains("bin_exists=false"));
+        assert!(text.contains("Preview:"));
+        assert!(!text.contains('\x1b'));
         let _ = fs::remove_dir_all(&home);
     }
 }

@@ -135,6 +135,7 @@ pub fn query_session_metadata_from_db(db_path: &Path) -> SessionMetadata {
     let Ok(conn) = Connection::open_with_flags(db_path, flags) else {
         return meta;
     };
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(25));
     let Ok(mut stmt) =
         conn.prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx DESC LIMIT 5")
     else {

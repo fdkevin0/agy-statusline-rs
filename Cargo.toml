@@ -2,7 +2,7 @@
 name = "agy-statusline"
 version = "0.1.0"
 edition = "2021"
-description = "Safe Rust statusline for Antigravity CLI (agy) with cache hit rate, generation speed, and customizable layout."
+description = "Safe Rust statusline for Antigravity CLI (agy) with quota pacing, compaction sniffing, git worktree awareness, and a 3-pane TUI configurator."
 license = "MIT"
 repository = "https://github.com/fdkevin0/agy-statusline-rs"
 readme = "README.md"
@@ -11,6 +11,7 @@ categories = ["command-line-utilities"]
 include = ["src/**/*", "tests/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
 [features]
+default = ["bundled"]
 bundled = ["rusqlite/bundled"]
 
 [dependencies]
@@ -29,3 +30,4 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+strip = "symbols"

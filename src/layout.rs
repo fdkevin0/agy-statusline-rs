@@ -16,7 +16,7 @@ use crate::db::resolve_home_dir;
 /// Maximum number of configurable statusline rows.
 pub const MAX_ROWS: usize = 3;
 
-/// All 18 statusline widgets available for placement on any row.
+/// All 21 statusline widgets available for placement on any row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WidgetId {
@@ -46,6 +46,12 @@ pub enum WidgetId {
     Ttft,
     /// Estimated session cost (`$0.14`).
     Cost,
+    /// Active cycle mode (`◇ PLAN`, `◇ AUTO`, etc.) and `>200K` indicator.
+    Mode,
+    /// Rolling 5-hour quota remaining % + reset timer + pace warning.
+    Quota5h,
+    /// Weekly (or Argon) quota remaining % + reset timer + pace warning.
+    QuotaWeekly,
     /// Artifact count (`art 2`).
     Artifacts,
     /// Active subagent count (`sub 2`).
@@ -54,11 +60,11 @@ pub enum WidgetId {
     Tasks,
     /// Sandbox status (`sandbox ON` / `sandbox off`).
     Sandbox,
-    /// Elastic left/right alignment spacer.
+    /// Elastic left/center/right alignment spacer.
     Spacer,
 }
 
-const WIDGET_META: [(WidgetId, &str, &str); 18] = [
+const WIDGET_META: [(WidgetId, &str, &str); 21] = [
     (WidgetId::State, "state", "Agent State"),
     (WidgetId::Model, "model", "Model + Effort"),
     (WidgetId::Directory, "directory", "Workspace Dir"),
@@ -72,6 +78,9 @@ const WIDGET_META: [(WidgetId, &str, &str); 18] = [
     (WidgetId::Speed, "speed", "Output Speed (tok/s)"),
     (WidgetId::Ttft, "ttft", "First Token (TTFT)"),
     (WidgetId::Cost, "cost", "Session Cost ($)"),
+    (WidgetId::Mode, "mode", "Cycle Mode (Plan/Auto)"),
+    (WidgetId::Quota5h, "quota_5h", "5h Quota + Pace"),
+    (WidgetId::QuotaWeekly, "quota_weekly", "Weekly / Argon Quota"),
     (WidgetId::Artifacts, "artifacts", "Artifact Count"),
     (WidgetId::Subagents, "subagents", "Active Subagents"),
     (WidgetId::Tasks, "tasks", "Background Tasks"),
@@ -80,8 +89,8 @@ const WIDGET_META: [(WidgetId, &str, &str); 18] = [
 ];
 
 impl WidgetId {
-    /// Canonical list of all 18 widgets in catalog display order.
-    pub const ALL: [WidgetId; 18] = [
+    /// Canonical list of all 21 widgets in catalog display order.
+    pub const ALL: [WidgetId; 21] = [
         Self::State,
         Self::Model,
         Self::Directory,
@@ -95,6 +104,9 @@ impl WidgetId {
         Self::Speed,
         Self::Ttft,
         Self::Cost,
+        Self::Mode,
+        Self::Quota5h,
+        Self::QuotaWeekly,
         Self::Artifacts,
         Self::Subagents,
         Self::Tasks,
@@ -110,6 +122,22 @@ impl WidgetId {
     /// Descriptive display name shown in the widget catalog.
     pub fn display_name(self) -> &'static str {
         WIDGET_META.iter().find(|m| m.0 == self).map_or("", |m| m.2)
+    }
+
+    /// Responsive fitting priority (`5` = anchor kept last, `1` = auxiliary dropped first).
+    pub const fn priority(self) -> u8 {
+        match self {
+            Self::State | Self::Spacer => 5,
+            Self::Model | Self::CtxBar | Self::CtxPct | Self::Quota5h => 4,
+            Self::Mode | Self::Vcs | Self::Speed | Self::Cost | Self::QuotaWeekly => 3,
+            Self::Directory | Self::CacheHit | Self::CtxTokens | Self::Worktree => 2,
+            Self::CacheRead
+            | Self::Ttft
+            | Self::Subagents
+            | Self::Tasks
+            | Self::Artifacts
+            | Self::Sandbox => 1,
+        }
     }
 }
 
@@ -129,7 +157,7 @@ pub enum VisualStyle {
 impl VisualStyle {
     const ALL: [Self; 3] = [Self::Plain, Self::Pill, Self::Powerline];
 
-    /// Cycles forward (`offset = 1`) or backward (`offset = -1`).
+    /// Cycles forward (`dir = 1`) or backward (`dir = -1`).
     pub const fn step(self, dir: isize) -> Self {
         let idx = match self {
             Self::Plain => 0isize,
@@ -140,9 +168,13 @@ impl VisualStyle {
     }
 
     /// Cycles forward to the next style.
-    pub const fn next(self) -> Self { self.step(1) }
+    pub const fn next(self) -> Self {
+        self.step(1)
+    }
     /// Cycles backward to the previous style.
-    pub const fn prev(self) -> Self { self.step(-1) }
+    pub const fn prev(self) -> Self {
+        self.step(-1)
+    }
 
     /// Human-readable style name.
     pub const fn name(self) -> &'static str {
@@ -184,9 +216,13 @@ impl SeparatorStyle {
     }
 
     /// Cycles forward to the next separator.
-    pub const fn next(self) -> Self { self.step(1) }
+    pub const fn next(self) -> Self {
+        self.step(1)
+    }
     /// Cycles backward to the previous separator.
-    pub const fn prev(self) -> Self { self.step(-1) }
+    pub const fn prev(self) -> Self {
+        self.step(-1)
+    }
 
     /// Plain text separator string.
     pub const fn as_str(self) -> &'static str {
@@ -194,6 +230,16 @@ impl SeparatorStyle {
             Self::Dot => " · ",
             Self::Pipe => " │ ",
             Self::Slash => " ╱ ",
+            Self::Space => " ",
+        }
+    }
+
+    /// ASCII-safe separator string.
+    pub const fn as_ascii_str(self) -> &'static str {
+        match self {
+            Self::Dot => " * ",
+            Self::Pipe => " | ",
+            Self::Slash => " / ",
             Self::Space => " ",
         }
     }
@@ -209,6 +255,52 @@ impl SeparatorStyle {
     }
 }
 
+/// Glyph rendering mode across widgets and separators.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GlyphMode {
+    /// Crisp cross-platform Unicode glyphs (default).
+    #[default]
+    Unicode,
+    /// Nerd Font icons and rounded Powerline capsule caps.
+    Nerd,
+    /// Pure 7-bit ASCII symbols for basic terminals.
+    Ascii,
+}
+
+impl GlyphMode {
+    const ALL: [Self; 3] = [Self::Unicode, Self::Nerd, Self::Ascii];
+
+    /// Cycles forward or backward.
+    pub const fn step(self, dir: isize) -> Self {
+        let idx = match self {
+            Self::Unicode => 0isize,
+            Self::Nerd => 1,
+            Self::Ascii => 2,
+        };
+        Self::ALL[(idx + dir).rem_euclid(3) as usize]
+    }
+
+    /// Cycles forward to the next glyph mode.
+    pub const fn next(self) -> Self {
+        self.step(1)
+    }
+
+    /// Cycles backward to the previous glyph mode.
+    pub const fn prev(self) -> Self {
+        self.step(-1)
+    }
+
+    /// Human-readable glyph mode label.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unicode => "Unicode",
+            Self::Nerd => "Nerd Font",
+            Self::Ascii => "ASCII",
+        }
+    }
+}
+
 /// Color palette applied across segments.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -220,12 +312,26 @@ pub enum ThemeStyle {
     Nord,
     /// Catppuccin Mocha pastel palette.
     Catppuccin,
+    /// Deep twilight Tokyo Night palette.
+    TokyoNight,
+    /// Warm retro Gruvbox palette.
+    Gruvbox,
+    /// High-contrast light-terminal palette.
+    Light,
     /// Plain text without ANSI escapes.
     Mono,
 }
 
 impl ThemeStyle {
-    const ALL: [Self; 4] = [Self::Default, Self::Nord, Self::Catppuccin, Self::Mono];
+    const ALL: [Self; 7] = [
+        Self::Default,
+        Self::Nord,
+        Self::Catppuccin,
+        Self::TokyoNight,
+        Self::Gruvbox,
+        Self::Light,
+        Self::Mono,
+    ];
 
     /// Cycles forward or backward.
     pub const fn step(self, dir: isize) -> Self {
@@ -233,15 +339,22 @@ impl ThemeStyle {
             Self::Default => 0isize,
             Self::Nord => 1,
             Self::Catppuccin => 2,
-            Self::Mono => 3,
+            Self::TokyoNight => 3,
+            Self::Gruvbox => 4,
+            Self::Light => 5,
+            Self::Mono => 6,
         };
-        Self::ALL[(idx + dir).rem_euclid(4) as usize]
+        Self::ALL[(idx + dir).rem_euclid(7) as usize]
     }
 
     /// Cycles forward to the next theme.
-    pub const fn next(self) -> Self { self.step(1) }
+    pub const fn next(self) -> Self {
+        self.step(1)
+    }
     /// Cycles backward to the previous theme.
-    pub const fn prev(self) -> Self { self.step(-1) }
+    pub const fn prev(self) -> Self {
+        self.step(-1)
+    }
 
     /// Human-readable theme name.
     pub const fn name(self) -> &'static str {
@@ -249,6 +362,9 @@ impl ThemeStyle {
             Self::Default => "Default",
             Self::Nord => "Nord",
             Self::Catppuccin => "Catppuccin",
+            Self::TokyoNight => "Tokyo Night",
+            Self::Gruvbox => "Gruvbox",
+            Self::Light => "Light",
             Self::Mono => "Mono",
         }
     }
@@ -298,11 +414,13 @@ pub struct LayoutConfig {
     pub rows: Vec<Vec<WidgetId>>,
     /// Visual segment style (`plain`, `pill`, `powerline`).
     pub style: VisualStyle,
-    /// Color theme (`default`, `nord`, `catppuccin`, `mono`).
+    /// Color theme (`default`, `nord`, `catppuccin`, `tokyo_night`, `gruvbox`, `light`, `mono`).
     pub theme: ThemeStyle,
     /// Separator between widgets in `Plain` style.
     pub separator: SeparatorStyle,
-    /// Trim overflowing trailing widgets when narrow terminal width is known.
+    /// Glyph set (`unicode`, `nerd`, `ascii`).
+    pub glyph_mode: GlyphMode,
+    /// Trim overflowing widgets when terminal width is known.
     pub responsive: bool,
     /// Character length of `ctx_bar` (`4..=40`).
     pub bar_length: usize,
@@ -318,6 +436,9 @@ pub struct LayoutConfig {
     pub smart_hide: bool,
     /// Show `+ins -del` working-tree diff stats alongside `vcs` branch.
     pub show_git_diff: bool,
+    /// Runtime `NO_COLOR` flag injected at the CLI boundary (not serialized).
+    #[serde(skip)]
+    pub no_color: bool,
 }
 
 impl Default for LayoutConfig {
@@ -333,6 +454,7 @@ impl LayoutConfig {
             style: VisualStyle::Plain,
             theme: ThemeStyle::Default,
             separator: SeparatorStyle::Dot,
+            glyph_mode: GlyphMode::Unicode,
             responsive: true,
             bar_length: 12,
             speed_warn_threshold: 50.0,
@@ -341,6 +463,7 @@ impl LayoutConfig {
             ctx_remaining: false,
             smart_hide: true,
             show_git_diff: true,
+            no_color: false,
         };
         cfg.normalize_rows();
         cfg
@@ -349,17 +472,39 @@ impl LayoutConfig {
     /// Preset 1: Single-line Full Dashboard (replaces default AGY bar).
     pub fn preset_full() -> Self {
         Self::base_with_rows(vec![vec![
-            WidgetId::State, WidgetId::Directory, WidgetId::Vcs, WidgetId::Worktree,
-            WidgetId::CtxBar, WidgetId::CacheHit, WidgetId::CacheRead,
-            WidgetId::Speed, WidgetId::Ttft, WidgetId::Cost, WidgetId::Sandbox,
+            WidgetId::State,
+            WidgetId::Mode,
+            WidgetId::Directory,
+            WidgetId::Vcs,
+            WidgetId::Worktree,
+            WidgetId::CtxBar,
+            WidgetId::CacheHit,
+            WidgetId::CacheRead,
+            WidgetId::Speed,
+            WidgetId::Ttft,
+            WidgetId::Cost,
+            WidgetId::Quota5h,
+            WidgetId::Sandbox,
         ]])
     }
 
     /// Preset 2: Powerline Pro with Catppuccin palette.
     pub fn preset_powerline() -> Self {
         let mut cfg = Self::base_with_rows(vec![
-            vec![WidgetId::State, WidgetId::Model, WidgetId::Directory, WidgetId::Vcs],
-            vec![WidgetId::CtxBar, WidgetId::CacheHit, WidgetId::Speed, WidgetId::Cost],
+            vec![
+                WidgetId::State,
+                WidgetId::Mode,
+                WidgetId::Model,
+                WidgetId::Directory,
+                WidgetId::Vcs,
+            ],
+            vec![
+                WidgetId::CtxBar,
+                WidgetId::CacheHit,
+                WidgetId::Speed,
+                WidgetId::Cost,
+                WidgetId::Quota5h,
+            ],
         ]);
         cfg.style = VisualStyle::Powerline;
         cfg.theme = ThemeStyle::Catppuccin;
@@ -369,15 +514,22 @@ impl LayoutConfig {
     /// Preset 3: Codex-style single-line statusline.
     pub fn preset_minimal() -> Self {
         Self::base_with_rows(vec![vec![
-            WidgetId::State, WidgetId::Model, WidgetId::Vcs,
-            WidgetId::CtxPct, WidgetId::CacheHit, WidgetId::Speed,
+            WidgetId::State,
+            WidgetId::Model,
+            WidgetId::Vcs,
+            WidgetId::CtxPct,
+            WidgetId::CacheHit,
+            WidgetId::Speed,
         ]])
     }
 
     /// Preset 4: Metrics Addon bar stacked under AGY's built-in statusline.
     pub fn preset_addon() -> Self {
         let mut cfg = Self::base_with_rows(vec![vec![
-            WidgetId::CacheHit, WidgetId::CacheRead, WidgetId::Speed, WidgetId::Cost,
+            WidgetId::CacheHit,
+            WidgetId::CacheRead,
+            WidgetId::Speed,
+            WidgetId::Cost,
         ]]);
         cfg.style = VisualStyle::Pill;
         cfg.separator = SeparatorStyle::Space;
@@ -402,6 +554,20 @@ impl LayoutConfig {
             }
         }
         None
+    }
+
+    /// Returns the matching built-in preset index (`0..=3`), ignoring runtime `no_color`.
+    pub fn matching_preset_index(&self) -> Option<usize> {
+        let mut norm = self.clone();
+        norm.normalize_rows();
+        norm.no_color = false;
+        let presets = [
+            Self::preset_full(),
+            Self::preset_powerline(),
+            Self::preset_minimal(),
+            Self::preset_addon(),
+        ];
+        presets.iter().position(|p| p == &norm)
     }
 }
 
@@ -460,8 +626,12 @@ mod tests {
         let mut cfg: LayoutConfig = serde_json::from_str(old_json).unwrap();
         cfg.normalize_rows();
         assert_eq!(cfg.style, VisualStyle::Plain);
+        assert_eq!(cfg.glyph_mode, GlyphMode::Unicode);
         assert!(!cfg.stack_with_default);
-        assert_eq!(cfg.rows[0], vec![WidgetId::State, WidgetId::Model, WidgetId::Vcs]);
+        assert_eq!(
+            cfg.rows[0],
+            vec![WidgetId::State, WidgetId::Model, WidgetId::Vcs]
+        );
     }
 
     #[test]
@@ -473,6 +643,7 @@ mod tests {
         save_layout_config(&path, &cfg).unwrap();
         let loaded = load_layout_config(&path);
         assert_eq!(loaded, cfg);
+        assert_eq!(loaded.matching_preset_index(), Some(1));
         let _ = fs::remove_dir_all(&dir);
     }
 }

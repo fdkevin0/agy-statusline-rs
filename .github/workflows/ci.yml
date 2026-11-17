@@ -22,7 +22,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev pkg-config
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Unit and integration tests
+      - name: Unit and integration tests (default bundled)
         run: cargo test --locked --all-targets
+      - name: Unit and integration tests (system SQLite)
+        run: cargo test --locked --no-default-features --all-targets
       - name: Doc tests
         run: cargo test --locked --doc
