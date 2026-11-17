@@ -1,0 +1,25 @@
+[package]
+name = "agy-statusline"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust port of agy-statusline: cache hit rate and last-turn generation speed statusline."
+license = "MIT"
+repository = "https://github.com/fdkevin0/agy-statusline-rs"
+readme = "README.md"
+keywords = ["cli", "statusline", "sqlite", "antigravity"]
+categories = ["command-line-utilities"]
+include = ["src/**/*", "tests/**/*", "Cargo.toml", "README.md"]
+
+[dependencies]
+rusqlite = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
