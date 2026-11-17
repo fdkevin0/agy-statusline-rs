@@ -12,6 +12,7 @@
 - `agy-statusline apply [--yes|-y] [--stack|--replace]` — Write `statusLine` into `~/.gemini/antigravity-cli/settings.json` while preserving existing custom keys such as `padding`.
 - `agy-statusline apply --disable` — Set `statusLine.enabled = false` in `settings.json` without deleting your hook configuration.
 - `agy-statusline doctor` — Inspect config, AGY `settings.json` wiring, `NO_COLOR`, and render a live sample preview.
+- `agy-statusline stats [--days <N>] [--json] [--ascii]` — Summarize local AGY token usage (Today / 7d / 30d / All-Time), 28-day activity heatmap, reference API cost, per-model speed/TTFT, and SQLite `gen_metadata` turn metrics (`NO_COLOR` disables ANSI escapes).
 
 ## Interactive TUI Controls
 
