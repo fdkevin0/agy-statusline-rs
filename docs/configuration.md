@@ -26,13 +26,13 @@
 | ID | Description | Notes |
 | :--- | :--- | :--- |
 | `state` | Agent state | `READY`, `THINKING`, `WORKING`, `TOOL`, `REVIEW`, `AUTH`, `INIT`, `ERROR` |
-| `model` | Model + effort | Appends effort only if not already in `display_name` |
+| `model` | Model + effort | Appends effort only if not already matched canonically (`Low`/`Medium`/`High`/`XHigh`/`Extra High`/`Extra`/`Minimal`/`Max`) |
 | `directory` | Workspace dir | Basename of `project_dir`, `current_dir`, or `cwd` |
 | `vcs` | Git branch + diff | Pure-Rust `.git/HEAD` fallback + bounded/cached `+ins -del` diff stats |
 | `worktree` | Git worktree | `wt:<name>` inside linked worktrees including relative `gitdir:` paths |
-| `ctx_bar` | Context progress bar | Uses sniffed `max_context_tokens` when available |
-| `ctx_pct` | Context % only | Supports `ctx_remaining` (`rem` vs `ctx`) |
-| `ctx_tokens` | Context tokens | `current/limit` or cumulative session tokens |
+| `ctx_bar` | Context progress bar | Uses sniffed `max_context_tokens` when available; visual bar clamps `0..=100%` while numeric `%` displays `>100%` overflow |
+| `ctx_pct` | Context % only | Supports `ctx_remaining` (`rem` vs `ctx`) and `>100%` overflow |
+| `ctx_tokens` | Context tokens | `current/limit` or cumulative session tokens (`1K..10K` tenth-K, `10K..999K` rounded `K`) |
 | `cache_hit` | Cache hit % | `cache_read / (input + cache_read + cache_creation)` |
 | `cache_read` | Cache read tokens | Formatted with `K` / `M` grouping |
 | `speed` | Output speed | `Weighted 5t`, `Median`, `Instant`, or `E2E (+TTFT)` |

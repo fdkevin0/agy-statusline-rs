@@ -1,5 +1,23 @@
 //! Stack-allocated token count formatting utilities.
 
+fn push_tenths_with_suffix(tenths: u64, suffix: char, out: &mut String) {
+    if tenths == 100 {
+        out.reserve(3);
+        out.push_str("10");
+        out.push(suffix);
+        return;
+    }
+    let whole = (tenths / 10) as u8;
+    let frac = (tenths % 10) as u8;
+    out.reserve(4);
+    out.push((b'0' + whole) as char);
+    if frac != 0 {
+        out.push('.');
+        out.push((b'0' + frac) as char);
+    }
+    out.push(suffix);
+}
+
 /// Formats a non-negative token count into `out` with comma grouping and `K` (`>= 1,000`)
 /// or `M` (`>= 1,000,000`) suffix.
 ///
@@ -19,6 +37,10 @@
 /// assert_eq!(buf, "1M");
 ///
 /// buf.clear();
+/// format_tokens(1_500, &mut buf);
+/// assert_eq!(buf, "1.5K");
+///
+/// buf.clear();
 /// format_tokens(512_000, &mut buf);
 /// assert_eq!(buf, "512K");
 ///
@@ -28,27 +50,18 @@
 /// ```
 pub fn format_tokens(value: u64, out: &mut String) {
     if (1_000_000..10_000_000).contains(&value) {
-        let tenths = (value + 50_000) / 100_000;
-        if tenths == 100 {
-            out.push_str("10M");
-            return;
-        }
-        let whole = (tenths / 10) as u8;
-        let frac = (tenths % 10) as u8;
-        out.reserve(4);
-        out.push((b'0' + whole) as char);
-        if frac != 0 {
-            out.push('.');
-            out.push((b'0' + frac) as char);
-        }
-        out.push('M');
+        push_tenths_with_suffix((value + 50_000) / 100_000, 'M', out);
+        return;
+    }
+    if (1_000..10_000).contains(&value) {
+        push_tenths_with_suffix((value + 50) / 100, 'K', out);
         return;
     }
 
     let (n, suffix) = if value >= 10_000_000 {
         (value.saturating_add(500_000) / 1_000_000, Some('M'))
-    } else if value >= 1_000 {
-        (value / 1_000, Some('K'))
+    } else if value >= 10_000 {
+        (((value + 500) / 1_000).min(999), Some('K'))
     } else {
         (value, None)
     };
@@ -97,8 +110,36 @@ mod tests {
         assert_eq!(s, "999");
 
         s.clear();
+        format_tokens(1_000, &mut s);
+        assert_eq!(s, "1K");
+
+        s.clear();
+        format_tokens(1_500, &mut s);
+        assert_eq!(s, "1.5K");
+
+        s.clear();
+        format_tokens(1_950, &mut s);
+        assert_eq!(s, "2K");
+
+        s.clear();
+        format_tokens(9_950, &mut s);
+        assert_eq!(s, "10K");
+
+        s.clear();
+        format_tokens(10_499, &mut s);
+        assert_eq!(s, "10K");
+
+        s.clear();
+        format_tokens(10_500, &mut s);
+        assert_eq!(s, "11K");
+
+        s.clear();
         format_tokens(512_000, &mut s);
         assert_eq!(s, "512K");
+
+        s.clear();
+        format_tokens(999_999, &mut s);
+        assert_eq!(s, "999K");
 
         s.clear();
         format_tokens(1_000_000, &mut s);
