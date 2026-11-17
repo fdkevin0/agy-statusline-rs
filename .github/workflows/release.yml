@@ -61,7 +61,7 @@ jobs:
           CC_aarch64_unknown_linux_gnu: ${{ matrix.linker }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: |
-          cargo build --release --locked --target "${{ matrix.target }}"
+          cargo build --release --locked --features bundled --target "${{ matrix.target }}"
           mkdir -p dist
           if [ "${{ matrix.ext }}" = "zip" ]; then
             cp "target/${{ matrix.target }}/release/agy-statusline.exe" dist/

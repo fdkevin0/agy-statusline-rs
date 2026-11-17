@@ -66,7 +66,8 @@ main() {
   fi
 
   tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "${tmp_dir}"' EXIT INT TERM
+  trap 'rm -rf "${tmp_dir}"' EXIT
+  trap 'rm -rf "${tmp_dir}"; exit 130' INT TERM
 
   printf 'Downloading %s...\n' "${artifact}"
   curl -fsSL "${base_url}/${artifact}" -o "${tmp_dir}/${artifact}"
