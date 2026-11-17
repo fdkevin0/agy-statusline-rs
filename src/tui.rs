@@ -192,10 +192,12 @@ fn build_preview_lines(state: &TuiEditorState, box_inner: u16) -> (Vec<Line<'sta
     let sample = sample_preview_payload(width);
     let meta = SessionMetadata {
         speed: Some(64.0),
+        median_speed: Some(68.0),
         last_turn_speed: Some(72.0),
         e2e_speed: Some(46.0),
         ttft_secs: Some(1.4),
         max_context_tokens: Some(512_000),
+        ..Default::default()
     };
     let git = GitInfo {
         branch: Some("main".to_string()),
@@ -639,5 +641,35 @@ mod tests {
         assert!(last_row0.y > line_y[0]);
         assert_eq!(line_y[1], last_row0.y + 2);
         assert_eq!(row1_pill.y, line_y[1]);
+    }
+
+    #[test]
+    fn settings_pane_and_preview_reflect_median_speed_mode() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.speed_mode = crate::layout::SpeedMode::Median;
+        let state = TuiEditorState::new(cfg);
+
+        let (preview_lines, _) = build_preview_lines(&state, 80);
+        let preview_text: String = preview_lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(preview_text.contains("68 tok/s"));
+
+        let backend = ratatui::backend::TestBackend::new(110, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_settings_pane(frame, frame.area(), &state);
+            })
+            .unwrap();
+        let buffer_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(buffer_text.contains("Median"));
     }
 }

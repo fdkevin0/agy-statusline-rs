@@ -439,7 +439,7 @@ impl TuiEditorState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{GlyphMode, ThemeStyle, VisualStyle};
+    use crate::layout::{GlyphMode, SpeedMode, ThemeStyle, VisualStyle};
 
     #[test]
     fn move_mode_swaps_within_and_across_rows() {
@@ -482,6 +482,15 @@ mod tests {
         ed.handle_key(KeyCode::Down, KeyModifiers::NONE);
         ed.handle_key(KeyCode::Right, KeyModifiers::NONE);
         assert_eq!(ed.config.theme, ThemeStyle::Nord);
+
+        ed.adjust_setting_at(4, 1);
+        assert_eq!(ed.config.speed_mode, SpeedMode::Median);
+        ed.adjust_setting_at(4, 1);
+        assert_eq!(ed.config.speed_mode, SpeedMode::Instant);
+        ed.adjust_setting_at(4, 1);
+        assert_eq!(ed.config.speed_mode, SpeedMode::E2e);
+        ed.adjust_setting_at(4, 1);
+        assert_eq!(ed.config.speed_mode, SpeedMode::Weighted);
 
         ed.adjust_setting_at(10, 1);
         assert_eq!(ed.config.glyph_mode, GlyphMode::Nerd);

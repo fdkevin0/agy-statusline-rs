@@ -377,6 +377,8 @@ pub enum SpeedMode {
     /// 5-turn token-weighted decode average (`sum(output) / sum(decode_secs)`).
     #[default]
     Weighted,
+    /// Median single-turn decode speed across up to 9 valid completed turns.
+    Median,
     /// Latest single completed turn decode speed (`output / decode_secs`).
     Instant,
     /// Latest turn end-to-end throughput including TTFT (`output / (ttft + decode_secs)`).
@@ -384,22 +386,24 @@ pub enum SpeedMode {
 }
 
 impl SpeedMode {
-    const ALL: [Self; 3] = [Self::Weighted, Self::Instant, Self::E2e];
+    const ALL: [Self; 4] = [Self::Weighted, Self::Median, Self::Instant, Self::E2e];
 
     /// Cycles forward or backward.
     pub const fn step(self, dir: isize) -> Self {
         let idx = match self {
             Self::Weighted => 0isize,
-            Self::Instant => 1,
-            Self::E2e => 2,
+            Self::Median => 1,
+            Self::Instant => 2,
+            Self::E2e => 3,
         };
-        Self::ALL[(idx + dir).rem_euclid(3) as usize]
+        Self::ALL[(idx + dir).rem_euclid(4) as usize]
     }
 
     /// Human-readable name.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Weighted => "Weighted 5t",
+            Self::Median => "Median",
             Self::Instant => "Instant",
             Self::E2e => "E2E (+TTFT)",
         }
@@ -428,7 +432,7 @@ pub struct LayoutConfig {
     pub speed_warn_threshold: f64,
     /// Whether AGY `settings.json` stacks this bar under its built-in bar or replaces it.
     pub stack_with_default: bool,
-    /// Speed calculation method (`weighted`, `instant`, `e2e`).
+    /// Speed calculation method (`weighted`, `median`, `instant`, `e2e`).
     pub speed_mode: SpeedMode,
     /// Display remaining context % (`rem 57.5%`) instead of used % (`ctx 42.5%`).
     pub ctx_remaining: bool,
@@ -645,5 +649,26 @@ mod tests {
         assert_eq!(loaded, cfg);
         assert_eq!(loaded.matching_preset_index(), Some(1));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn speed_mode_cycles_with_median_and_serializes() {
+        let s0 = SpeedMode::Weighted;
+        let s1 = s0.step(1);
+        let s2 = s1.step(1);
+        let s3 = s2.step(1);
+        let s4 = s3.step(1);
+        assert_eq!(s1, SpeedMode::Median);
+        assert_eq!(s1.name(), "Median");
+        assert_eq!(s2, SpeedMode::Instant);
+        assert_eq!(s3, SpeedMode::E2e);
+        assert_eq!(s4, SpeedMode::Weighted);
+        assert_eq!(SpeedMode::Weighted.step(-1), SpeedMode::E2e);
+        assert_eq!(SpeedMode::Instant.step(-1), SpeedMode::Median);
+
+        let json = serde_json::to_string(&SpeedMode::Median).unwrap();
+        assert_eq!(json, "\"median\"");
+        let parsed: SpeedMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, SpeedMode::Median);
     }
 }
