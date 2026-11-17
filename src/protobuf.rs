@@ -1,7 +1,22 @@
 //! Zero-copy Protobuf wire-format decoder for AGY generation metadata.
 //!
-//! Extracts the last turn's output token count and generation duration from
-//! the serialized `gen_metadata` blob without schema codegen or heap allocation.
+//! Extracts turn timing, token counts, and context window metadata from
+//! `CortexStepGeneratorMetadata` (`gen_metadata.data`) without schema codegen
+//! or heap allocation.
+//!
+//! Verified wire paths (from embedded `.proto` descriptors in `agy`):
+//! - `chat_model` (`ChatModelMetadata`): field `1` (bytes)
+//!   - `usage` (`ModelUsageStats`): field `4` (bytes)
+//!     - `input_tokens`: field `2` (varint `uint64`)
+//!     - `output_tokens`: field `3` (varint `uint64`)
+//!     - `cache_read_tokens`: field `5` (varint `uint64`)
+//!     - `thinking_output_tokens`: field `9` (varint `uint64`)
+//!   - `chat_start_metadata` (`ChatStartMetadata`): field `9` (bytes)
+//!     - `context_window_metadata` (`ContextWindowMetadata`): field `10` (bytes)
+//!       - `estimated_tokens_used`: field `1` (varint `int32`)
+//!       - `max_context_tokens`: field `4` (varint `int32`)
+//!   - `time_to_first_token` (`google.protobuf.Duration`): field `11` (bytes; `seconds=1`, `nanos=2`)
+//!   - `streaming_duration` (`google.protobuf.Duration`): field `12` (bytes; `seconds=1`, `nanos=2`)
 
 /// A decoded Protobuf wire field value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,23 +139,38 @@ pub fn find_number(data: &[u8], id: u64) -> u64 {
 const FIELD_CHAT: u64 = 1;
 const FIELD_CHAT_USAGE: u64 = 4;
 const FIELD_USAGE_OUTPUT_TOKENS: u64 = 3;
+const FIELD_USAGE_THINKING_OUTPUT_TOKENS: u64 = 9;
 const FIELD_CHAT_START: u64 = 9;
 const FIELD_START_CTX_WINDOW: u64 = 10;
+const FIELD_CTX_ESTIMATED_TOKENS: u64 = 1;
 const FIELD_CTX_MAX_TOKENS: u64 = 4;
 const FIELD_CHAT_TTFT: u64 = 11;
 const FIELD_CHAT_DECODE_DURATION: u64 = 12;
 const FIELD_DURATION_SECS: u64 = 1;
 const FIELD_DURATION_NANOS: u64 = 2;
 
+const MIN_DECODE_SECS: f64 = 0.1;
+const MAX_SPEED_TPS: f64 = 1000.0;
+const MAX_TTFT_SECS: f64 = 600.0;
+
 /// Timing and output token metrics extracted from one `gen_metadata` turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TurnMetrics {
-    /// Total output tokens generated in the turn (`usage.3`).
+    /// Total output tokens generated in the turn (`chat(1).usage(4).output_tokens(3)`).
     pub output_tokens: u64,
-    /// Streaming decode duration in seconds (`chat.12`).
+    /// Optional thinking output tokens (`chat(1).usage(4).thinking_output_tokens(9)`).
+    pub thinking_tokens: Option<u64>,
+    /// Streaming decode duration in seconds (`chat(1).streaming_duration(12)`).
     pub decode_secs: f64,
-    /// Optional time-to-first-token in seconds (`chat.11`).
+    /// Optional time-to-first-token in seconds (`chat(1).time_to_first_token(11)`).
     pub ttft_secs: Option<f64>,
+}
+
+fn find_nonzero_number(data: &[u8], id: u64) -> Option<u64> {
+    match find_field(data, id)? {
+        FieldValue::Number(val) if val > 0 => Some(val),
+        _ => None,
+    }
 }
 
 fn decode_duration_secs(msg: &[u8]) -> Option<f64> {
@@ -151,31 +181,35 @@ fn decode_duration_secs(msg: &[u8]) -> Option<f64> {
     Some((find_number(msg, FIELD_DURATION_SECS) as f64) + (nanos as f64) / 1e9)
 }
 
-fn extract_raw_usage_and_decode(data: &[u8]) -> Option<(&[u8], u64, f64)> {
+fn is_sane_decode_speed(output_tokens: u64, decode_secs: f64) -> bool {
+    if decode_secs < MIN_DECODE_SECS || output_tokens == 0 {
+        return false;
+    }
+    let speed = (output_tokens as f64) / decode_secs;
+    speed.is_finite() && speed > 0.0 && speed < MAX_SPEED_TPS
+}
+
+/// Extracts [`TurnMetrics`] (output tokens, optional thinking tokens, decode duration,
+/// and optional TTFT) from a `gen_metadata.data` Protobuf blob.
+///
+/// Enforces unified sanity bounds: `decode_secs >= 0.1`, `output_tokens > 0`,
+/// and `0.0 < output_tokens / decode_secs < 1000.0`.
+pub fn extract_turn_metrics(data: &[u8]) -> Option<TurnMetrics> {
     let chat = find_bytes(data, FIELD_CHAT)?;
     let usage = find_bytes(chat, FIELD_CHAT_USAGE)?;
     let duration = find_bytes(chat, FIELD_CHAT_DECODE_DURATION)?;
     let decode_secs = decode_duration_secs(duration)?;
     let output_tokens = find_number(usage, FIELD_USAGE_OUTPUT_TOKENS);
-    Some((chat, output_tokens, decode_secs))
-}
-
-/// Extracts [`TurnMetrics`] (output tokens, decode duration, and optional TTFT)
-/// from a `gen_metadata.data` Protobuf blob.
-pub fn extract_turn_metrics(data: &[u8]) -> Option<TurnMetrics> {
-    let (chat, output_tokens, decode_secs) = extract_raw_usage_and_decode(data)?;
-    if decode_secs < 0.02 || output_tokens == 0 {
+    if !is_sane_decode_speed(output_tokens, decode_secs) {
         return None;
     }
-    let inst_speed = (output_tokens as f64) / decode_secs;
-    if !inst_speed.is_finite() || inst_speed <= 0.0 || inst_speed >= 2000.0 {
-        return None;
-    }
+    let thinking_tokens = find_nonzero_number(usage, FIELD_USAGE_THINKING_OUTPUT_TOKENS);
     let ttft_secs = find_bytes(chat, FIELD_CHAT_TTFT)
         .and_then(decode_duration_secs)
-        .filter(|&t| t > 0.0 && t < 600.0);
+        .filter(|&t| t > 0.0 && t < MAX_TTFT_SECS);
     Some(TurnMetrics {
         output_tokens,
+        thinking_tokens,
         decode_secs,
         ttft_secs,
     })
@@ -196,30 +230,31 @@ pub fn extract_turn_metrics(data: &[u8]) -> Option<TurnMetrics> {
 /// assert_eq!(extract_metadata_speed(&blob), Some(50.0));
 /// ```
 pub fn extract_metadata_speed(data: &[u8]) -> Option<f64> {
-    let (_, output, seconds) = extract_raw_usage_and_decode(data)?;
-    if seconds < 0.1 || output == 0 {
-        return None;
-    }
-    let speed = (output as f64) / seconds;
-    if speed > 0.0 && speed < 1000.0 {
-        Some(speed)
-    } else {
-        None
-    }
+    let metrics = extract_turn_metrics(data)?;
+    Some((metrics.output_tokens as f64) / metrics.decode_secs)
 }
 
-/// Extracts server-issued `max_context_tokens` from `gen_metadata.data`
-/// along wire path `1 (bytes) -> 9 (bytes) -> 10 (bytes) -> 4 (varint)`.
-///
-/// Returns `None` if any nested field is missing, malformed, or `0`.
-pub fn extract_max_context_tokens(data: &[u8]) -> Option<u64> {
+fn extract_ctx_window_field(data: &[u8], field_id: u64) -> Option<u64> {
     let chat = find_bytes(data, FIELD_CHAT)?;
     let chat_start = find_bytes(chat, FIELD_CHAT_START)?;
     let ctx_window = find_bytes(chat_start, FIELD_START_CTX_WINDOW)?;
-    match find_field(ctx_window, FIELD_CTX_MAX_TOKENS)? {
-        FieldValue::Number(val) if val > 0 => Some(val),
-        _ => None,
-    }
+    find_nonzero_number(ctx_window, field_id)
+}
+
+/// Extracts server-issued `max_context_tokens` from `gen_metadata.data`
+/// along verified wire path `chat(1) -> chat_start_metadata(9) -> context_window_metadata(10) -> max_context_tokens(4)`.
+///
+/// Returns `None` if any nested field is missing, malformed, or `0`.
+pub fn extract_max_context_tokens(data: &[u8]) -> Option<u64> {
+    extract_ctx_window_field(data, FIELD_CTX_MAX_TOKENS)
+}
+
+/// Extracts server-estimated `estimated_tokens_used` from `gen_metadata.data`
+/// along verified wire path `chat(1) -> chat_start_metadata(9) -> context_window_metadata(10) -> estimated_tokens_used(1)`.
+///
+/// Returns `None` if any nested field is missing, malformed, or `0`.
+pub fn extract_estimated_context_tokens(data: &[u8]) -> Option<u64> {
+    extract_ctx_window_field(data, FIELD_CTX_ESTIMATED_TOKENS)
 }
 
 #[cfg(test)]
@@ -285,7 +320,52 @@ mod tests {
         ];
         let m = extract_turn_metrics(&blob).unwrap();
         assert_eq!(m.output_tokens, 100);
+        assert_eq!(m.thinking_tokens, None);
         assert!((m.decode_secs - 2.0).abs() < 1e-9);
         assert!((m.ttft_secs.unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn turn_metrics_extracts_thinking_tokens() {
+        // chat(1) -> { usage(4) -> { output(3)=100, thinking(9)=250 }, dur(12) -> { sec(1)=2 } }
+        let blob = [
+            0x0a, 0x0b, 0x22, 0x05, 0x18, 0x64, 0x48, 0xfa, 0x01, 0x62, 0x02, 0x08, 0x02,
+        ];
+        let m = extract_turn_metrics(&blob).unwrap();
+        assert_eq!(m.output_tokens, 100);
+        assert_eq!(m.thinking_tokens, Some(250));
+        assert!((m.decode_secs - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimated_context_tokens_valid_and_invalid() {
+        // chat(1) -> chat_start(9) -> ctx_window(10) -> { estimated(1)=64000, max(4)=512000 }
+        let valid = [
+            0x0a, 0x0c, 0x4a, 0x0a, 0x52, 0x08, 0x08, 0x80, 0xf4, 0x03, 0x20, 0x80, 0xa0, 0x1f,
+        ];
+        assert_eq!(extract_estimated_context_tokens(&valid), Some(64_000));
+        assert_eq!(extract_max_context_tokens(&valid), Some(512_000));
+
+        // estimated(1)=0 -> None
+        let zero = [0x0a, 0x06, 0x4a, 0x04, 0x52, 0x02, 0x08, 0x00];
+        assert_eq!(extract_estimated_context_tokens(&zero), None);
+        assert_eq!(extract_estimated_context_tokens(&[]), None);
+    }
+
+    #[test]
+    fn unified_speed_sanity_bounds() {
+        // decode_secs = 0.05s (50_000_000 nanos = 0x02faf080 -> varint 0x80,0xe1,0xeb,0x17) -> rejected (< 0.1s)
+        let too_short = [
+            0x0a, 0x0b, 0x22, 0x02, 0x18, 0x0a, 0x62, 0x05, 0x10, 0x80, 0xe1, 0xeb, 0x17,
+        ];
+        assert_eq!(extract_turn_metrics(&too_short), None);
+        assert_eq!(extract_metadata_speed(&too_short), None);
+
+        // output = 1000, decode_secs = 1s -> 1000.0 tok/s -> rejected (>= 1000.0)
+        let too_fast = [
+            0x0a, 0x09, 0x22, 0x03, 0x18, 0xe8, 0x07, 0x62, 0x02, 0x08, 0x01,
+        ];
+        assert_eq!(extract_turn_metrics(&too_fast), None);
+        assert_eq!(extract_metadata_speed(&too_fast), None);
     }
 }

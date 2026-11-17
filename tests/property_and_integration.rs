@@ -155,6 +155,7 @@ proptest! {
             e2e_speed: Some(60.0),
             ttft_secs: Some(1.2),
             max_context_tokens: Some(512_000),
+            ..Default::default()
         };
         let git = GitInfo {
             branch: Some("feat/extremely-long-branch-name-that-overflows".to_string()),

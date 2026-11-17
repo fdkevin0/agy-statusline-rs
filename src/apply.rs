@@ -255,10 +255,12 @@ pub fn run_doctor<W: Write>(
     let sample = sample_preview_payload(100);
     let meta = SessionMetadata {
         speed: Some(64.0),
+        median_speed: Some(66.0),
         last_turn_speed: Some(72.0),
         e2e_speed: Some(46.0),
         ttft_secs: Some(1.4),
         max_context_tokens: Some(512_000),
+        ..Default::default()
     };
     let git = GitInfo {
         branch: Some("main".to_string()),

@@ -789,7 +789,8 @@ pub fn write_statusline<W: IoWrite>(
     let glyphs = GlyphSet::for_mode(cfg.glyph_mode);
     let geom = compute_geometry(cfg, &glyphs);
     let cache = valid_cache_usage(payload);
-    let cur_ctx = current_context_tokens(payload);
+    let cur_ctx = current_context_tokens(payload)
+        .or_else(|| meta.estimated_context_tokens.filter(|&v| v > 0));
     let eff_limit = meta
         .max_context_tokens
         .filter(|&v| v > 0)
@@ -810,6 +811,7 @@ pub fn write_statusline<W: IoWrite>(
     };
     let speed = match cfg.speed_mode {
         SpeedMode::Weighted => meta.speed,
+        SpeedMode::Median => meta.median_speed.or(meta.speed),
         SpeedMode::Instant => meta.last_turn_speed.or(meta.speed),
         SpeedMode::E2e => meta.e2e_speed.or(meta.speed),
     };
@@ -900,6 +902,7 @@ mod tests {
             e2e_speed: Some(45.0),
             ttft_secs: Some(1.4),
             max_context_tokens: Some(512_000),
+            ..Default::default()
         };
         let git = GitInfo {
             branch: None,

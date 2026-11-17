@@ -35,7 +35,7 @@
 | `ctx_tokens` | Context tokens | `current/limit` or cumulative session tokens |
 | `cache_hit` | Cache hit % | `cache_read / (input + cache_read + cache_creation)` |
 | `cache_read` | Cache read tokens | Formatted with `K` / `M` grouping |
-| `speed` | Output speed | `Weighted 5t`, `Instant`, or `E2E (+TTFT)` |
+| `speed` | Output speed | `Weighted 5t`, `Median`, `Instant`, or `E2E (+TTFT)` |
 | `ttft` | First token latency | Extracted from `gen_metadata` (`chat.11`) |
 | `cost` | Session cost | `~$usd` and `(sub $...)` when `subagent_usd >= 0.01` |
 | `mode` | Cycle mode | `PLAN` / `AUTO` / `EDIT` plus `>200K` indicator when exceeded |
@@ -52,4 +52,4 @@
 - **Styles**: `Plain`, `Pill` (256-color capsules, rounded in `Nerd` mode), `Powerline` (`` / `>` segments).
 - **Themes**: `Default`, `Nord`, `Catppuccin`, `Tokyo Night`, `Gruvbox`, `Light`, `Mono`.
 - **Glyph Modes**: `Unicode` (default), `Nerd Font`, `ASCII` (pure 7-bit ASCII).
-- **SQLite Sniffing**: Queries `~/.gemini/antigravity-cli/conversations/<conversation_id>.db` (`gen_metadata` `ORDER BY idx DESC LIMIT 5`) in read-only mode with a 25ms `busy_timeout` to extract `max_context_tokens` (`1 -> 9 -> 10 -> 4`), output token decode speed, and TTFT.
+- **SQLite Sniffing**: Queries `~/.gemini/antigravity-cli/conversations/<conversation_id>.db` (`gen_metadata` `ORDER BY idx DESC LIMIT 9`) in read-only mode with a 25ms `busy_timeout` to extract `max_context_tokens` (`1 -> 9 -> 10 -> 4`), `estimated_tokens_used` (`1 -> 9 -> 10 -> 1`), output token decode speed (5-turn weighted average and up to 9-turn median), thinking output tokens (`1 -> 4 -> 9`), and TTFT (`1 -> 11`).
