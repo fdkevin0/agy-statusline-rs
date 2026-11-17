@@ -186,7 +186,11 @@ fn render_quota(
             Segment::plain(widget, format!("{fallback_label} --"), pal.muted, false)
         });
     };
-    let mut text = format!("{} {:.0}%", q.label, q.remaining_pct);
+    let mut text = format!(
+        "{} {}",
+        q.label,
+        crate::metrics::format_quota_pct(q.remaining_pct)
+    );
     if let Some(reset) = &q.reset_compact {
         text.push(' ');
         text.push_str(glyphs.reset);
