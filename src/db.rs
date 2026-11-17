@@ -67,13 +67,19 @@ impl SpeedReader for SqliteSpeedReader {
     }
 
     fn session_metadata(&self, conversation_id: &str) -> SessionMetadata {
-        let Some(home) = (match &self.home_override {
-            Some(p) => Some(p.clone()),
-            None => resolve_home_dir(),
-        }) else {
+        if let Some(home) = &self.home_override {
+            return query_session_metadata(home, conversation_id);
+        }
+        if !is_valid_uuid(conversation_id) {
+            return SessionMetadata::default();
+        }
+        let Some(cli_dir) = resolve_agy_cli_dir() else {
             return SessionMetadata::default();
         };
-        query_session_metadata(&home, conversation_id)
+        let db_path = cli_dir
+            .join("conversations")
+            .join(format!("{conversation_id}.db"));
+        query_session_metadata_from_db(&db_path)
     }
 }
 
@@ -112,6 +118,16 @@ pub fn resolve_home_dir() -> Option<PathBuf> {
         .filter(|v| !v.is_empty())
         .or_else(|| env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
         .map(PathBuf::from)
+}
+
+/// Resolves the AGY CLI data directory (`ANTIGRAVITY_CLI_HOME`, `AGY_HOME`,
+/// or `<home>/.gemini/antigravity-cli`).
+pub fn resolve_agy_cli_dir() -> Option<PathBuf> {
+    env::var_os("ANTIGRAVITY_CLI_HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| env::var_os("AGY_HOME").filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+        .or_else(|| resolve_home_dir().map(|h| h.join(".gemini").join("antigravity-cli")))
 }
 
 /// Queries `<home>/.gemini/antigravity-cli/conversations/<conversation_id>.db`

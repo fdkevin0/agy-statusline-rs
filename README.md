@@ -36,7 +36,7 @@ agy-statusline apply --yes
 agy-statusline doctor
 ```
 
-4. Inspect local token usage, reference API cost, and per-model speed:
+4. Inspect local token usage, per-model speed, TTFT, and optional cost:
 
 ```sh
 agy-statusline stats --days 30

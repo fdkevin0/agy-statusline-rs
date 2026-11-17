@@ -12,7 +12,7 @@
 - `agy-statusline apply [--yes|-y] [--stack|--replace]` — Write `statusLine` into `~/.gemini/antigravity-cli/settings.json` while preserving existing custom keys such as `padding`.
 - `agy-statusline apply --disable` — Set `statusLine.enabled = false` in `settings.json` without deleting your hook configuration.
 - `agy-statusline doctor` — Inspect config, AGY `settings.json` wiring, `NO_COLOR`, and render a live sample preview.
-- `agy-statusline stats [--days <N>] [--json] [--ascii]` — Summarize local AGY token usage (Today / 7d / 30d / All-Time), 28-day activity heatmap, reference API cost, per-model speed/TTFT, and SQLite `gen_metadata` turn metrics (`NO_COLOR` disables ANSI escapes).
+- `agy-statusline stats [--days <N>] [--json] [--ascii]` — Summarize local AGY token usage in the host local timezone (Today / 7d / 30d / All-Time), 28-day activity heatmap, per-model thinking tokens / median speed / median TTFT from SQLite `conversations/<uuid>.db` (`gen_metadata` + `steps.metadata`, with deduplicated `transcript.jsonl` fallback for non-DB sessions), and optional user-configured cost from `$XDG_CONFIG_HOME/agy-statusline/pricing.json` (`NO_COLOR` disables ANSI escapes).
 
 ## Interactive TUI Controls
 
@@ -54,5 +54,5 @@
 - **Themes**: `Default`, `Nord`, `Catppuccin`, `Tokyo Night`, `Gruvbox`, `Light`, `Mono`.
 - **Glyph Modes**: `Unicode` (default), `Nerd Font`, `ASCII` (pure 7-bit ASCII).
 - **Responsive Compaction**: When `responsive` is enabled and a row overflows terminal width, segments compact progressively (`vcs` diff strip / 20-col cap -> `quota_*` timer strip -> `ctx_*` limit strip & `ctx_bar` collapse -> `model` abbreviation / 20-col cap) before dropping lower-priority widgets.
-- **SQLite Sniffing**: Queries `~/.gemini/antigravity-cli/conversations/<conversation_id>.db` (`gen_metadata` `ORDER BY idx DESC LIMIT 9`) in read-only mode with a 25ms `busy_timeout` to extract `max_context_tokens` (`1 -> 9 -> 10 -> 4`), `estimated_tokens_used` (`1 -> 9 -> 10 -> 1`), output token decode speed (5-turn weighted average and up to 9-turn median), thinking output tokens (`1 -> 4 -> 9`), and TTFT (`1 -> 11`).
+- **SQLite Sniffing**: Queries `$ANTIGRAVITY_CLI_HOME/conversations/<conversation_id>.db` (or `$AGY_HOME`, defaulting to `~/.gemini/antigravity-cli/conversations/<conversation_id>.db`) in read-only mode with a 25ms `busy_timeout` (`gen_metadata` `ORDER BY idx DESC LIMIT 9`) to extract `max_context_tokens` (`1 -> 9 -> 10 -> 4`), `estimated_tokens_used` (`1 -> 9 -> 10 -> 1`), output token decode speed (5-turn weighted average and up to 9-turn median, `>= 0.01s` and `< 10,000 tok/s`), thinking output tokens (`1 -> 4 -> 9`), and TTFT (`1 -> 11`). `agy-statusline stats` additionally decodes `step_indices` (`2`), `model` (`1 -> 3`), `model_cost` (`1 -> 5`), `response_model` (`1 -> 19`), `model_display_name` (`1 -> 21`), and `steps.metadata.created_at` (`1 -> 1`).
 - **Quota Token Calibration**: Learns rolling quota token budgets per raw bucket ID (`$XDG_CACHE_HOME/agy-statusline/quota_cal.json`, dynamic TTL `max(3 * window_secs, 7d)`) and renders `(~<tokens>)` next to the quota percentage once calibrated.

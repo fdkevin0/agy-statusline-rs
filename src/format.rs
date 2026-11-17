@@ -18,8 +18,8 @@ fn push_tenths_with_suffix(tenths: u64, suffix: char, out: &mut String) {
     out.push(suffix);
 }
 
-/// Formats a non-negative token count into `out` with comma grouping and `K` (`>= 1,000`)
-/// or `M` (`>= 1,000,000`) suffix.
+/// Formats a non-negative token count into `out` with comma grouping and `K` (`>= 1,000`),
+/// `M` (`>= 1,000,000`), or `B` (`>= 1,000,000,000`) suffix.
 ///
 /// Uses a stack buffer to avoid intermediate heap allocations.
 ///
@@ -29,6 +29,10 @@ fn push_tenths_with_suffix(tenths: u64, suffix: char, out: &mut String) {
 /// use agy_statusline::format::format_tokens;
 ///
 /// let mut buf = String::new();
+/// format_tokens(1_338_000_000, &mut buf);
+/// assert_eq!(buf, "1.3B");
+///
+/// buf.clear();
 /// format_tokens(1_234_567, &mut buf);
 /// assert_eq!(buf, "1.2M");
 ///
@@ -49,6 +53,10 @@ fn push_tenths_with_suffix(tenths: u64, suffix: char, out: &mut String) {
 /// assert_eq!(buf, "800");
 /// ```
 pub fn format_tokens(value: u64, out: &mut String) {
+    if (1_000_000_000..10_000_000_000).contains(&value) {
+        push_tenths_with_suffix((value + 50_000_000) / 100_000_000, 'B', out);
+        return;
+    }
     if (1_000_000..10_000_000).contains(&value) {
         push_tenths_with_suffix((value + 50_000) / 100_000, 'M', out);
         return;
@@ -58,7 +66,9 @@ pub fn format_tokens(value: u64, out: &mut String) {
         return;
     }
 
-    let (n, suffix) = if value >= 10_000_000 {
+    let (n, suffix) = if value >= 10_000_000_000 {
+        (value.saturating_add(500_000_000) / 1_000_000_000, Some('B'))
+    } else if value >= 10_000_000 {
         (value.saturating_add(500_000) / 1_000_000, Some('M'))
     } else if value >= 10_000 {
         (((value + 500) / 1_000).min(999), Some('K'))
@@ -164,5 +174,33 @@ mod tests {
         s.clear();
         format_tokens(12_345_678, &mut s);
         assert_eq!(s, "12M");
+
+        s.clear();
+        format_tokens(999_999_999, &mut s);
+        assert_eq!(s, "1,000M");
+
+        s.clear();
+        format_tokens(1_000_000_000, &mut s);
+        assert_eq!(s, "1B");
+
+        s.clear();
+        format_tokens(1_338_000_000, &mut s);
+        assert_eq!(s, "1.3B");
+
+        s.clear();
+        format_tokens(2_550_000_000, &mut s);
+        assert_eq!(s, "2.6B");
+
+        s.clear();
+        format_tokens(9_950_000_000, &mut s);
+        assert_eq!(s, "10B");
+
+        s.clear();
+        format_tokens(10_000_000_000, &mut s);
+        assert_eq!(s, "10B");
+
+        s.clear();
+        format_tokens(1_234_500_000_000, &mut s);
+        assert_eq!(s, "1,235B");
     }
 }

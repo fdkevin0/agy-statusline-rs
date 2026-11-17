@@ -12,7 +12,9 @@ use agy_statusline::db::{is_valid_uuid, SessionMetadata, SpeedReader};
 use agy_statusline::format::format_tokens;
 use agy_statusline::git::{GitInfo, SystemGitProbe};
 use agy_statusline::layout::{GlyphMode, LayoutConfig, ThemeStyle, VisualStyle, WidgetId};
-use agy_statusline::protobuf::{decode_varint, extract_metadata_speed, find_field};
+use agy_statusline::protobuf::{
+    decode_varint, extract_metadata_speed, find_field, MAX_TURN_SPEED_TPS,
+};
 use agy_statusline::render::{build_progress_bar, write_statusline};
 use agy_statusline::statusline::{
     process_statusline, process_statusline_with_probes, ContextWindow, CostInfo, JsonUsage,
@@ -42,7 +44,7 @@ proptest! {
     #[test]
     fn prop_extract_metadata_speed_bounds(data in prop::collection::vec(any::<u8>(), 0..128)) {
         let speed = extract_metadata_speed(&data);
-        prop_assert!(speed.is_none_or(|s| s > 0.0 && s < 1000.0));
+        prop_assert!(speed.is_none_or(|s| s > 0.0 && s < MAX_TURN_SPEED_TPS));
     }
 
     #[test]
@@ -64,6 +66,13 @@ proptest! {
         let mut buf = String::new();
         format_tokens(value, &mut buf);
         prop_assert!(buf.ends_with('M'));
+    }
+
+    #[test]
+    fn prop_format_tokens_b_range_has_b_suffix(value in 1_000_000_000u64..100_000_000_000) {
+        let mut buf = String::new();
+        format_tokens(value, &mut buf);
+        prop_assert!(buf.ends_with('B'));
     }
 
     #[test]
