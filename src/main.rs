@@ -4,17 +4,19 @@
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agy_statusline::apply::{
     default_settings_path, resolve_invoked_binary_path, run_apply_command, run_doctor,
     set_statusline_enabled,
 };
+use agy_statusline::calibration::default_calibration_cache_dir;
 use agy_statusline::db::SqliteSpeedReader;
 use agy_statusline::git::SystemGitProbe;
 use agy_statusline::layout::{
     default_config_path, load_layout_config, save_layout_config, LayoutConfig,
 };
-use agy_statusline::statusline::process_statusline_with_probes;
+use agy_statusline::statusline::process_statusline_with_calibration;
 use agy_statusline::tui::run_tui_config;
 
 const MAX_STDIN_BYTES: u64 = 1024 * 1024;
@@ -205,6 +207,18 @@ fn main() -> io::Result<()> {
         .read_to_string(&mut input);
     let reader = SqliteSpeedReader::default();
     let git_probe = SystemGitProbe::with_default_cache();
+    let calibration_dir = default_calibration_cache_dir();
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     let mut stdout = io::stdout().lock();
-    process_statusline_with_probes(&input, &reader, &git_probe, &cfg, &mut stdout)
+    process_statusline_with_calibration(
+        &input,
+        &reader,
+        &git_probe,
+        calibration_dir.as_deref(),
+        now_unix_secs,
+        &cfg,
+        &mut stdout,
+    )
 }

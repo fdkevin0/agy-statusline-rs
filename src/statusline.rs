@@ -7,10 +7,12 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::calibration::calibrate_quota_views_at;
 use crate::db::SpeedReader;
 use crate::git::{GitInfo, GitProbe, SystemGitProbe};
 use crate::layout::{LayoutConfig, WidgetId};
-use crate::render::write_statusline;
+use crate::metrics::{resolve_quota_5h, resolve_quota_weekly, QuotaView};
+use crate::render::write_statusline_with_quotas;
 
 /// Active AI model metadata (`"model": null` before a model is selected).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -234,15 +236,12 @@ pub fn process_statusline_with_config<W: Write>(
     process_statusline_with_probes(input, reader, &SystemGitProbe::default(), cfg, out)
 }
 
-/// Parses `input` JSON using explicit [`SpeedReader`] and [`GitProbe`] boundaries.
-pub fn process_statusline_with_probes<W: Write>(
-    input: &str,
+fn probe_session_and_git(
+    payload: &StatuslinePayload,
     reader: &dyn SpeedReader,
     git_probe: &dyn GitProbe,
     cfg: &LayoutConfig,
-    out: &mut W,
-) -> io::Result<()> {
-    let payload: StatuslinePayload = serde_json::from_str(input).unwrap_or_default();
+) -> (crate::db::SessionMetadata, GitInfo) {
     let meta = payload
         .conversation_id
         .as_deref()
@@ -271,7 +270,39 @@ pub fn process_statusline_with_probes<W: Write>(
     } else {
         GitInfo::default()
     };
-    write_statusline(&payload, &meta, &git_info, cfg, out)
+    (meta, git_info)
+}
+
+/// Parses `input` JSON using explicit [`SpeedReader`] and [`GitProbe`] boundaries.
+pub fn process_statusline_with_probes<W: Write>(
+    input: &str,
+    reader: &dyn SpeedReader,
+    git_probe: &dyn GitProbe,
+    cfg: &LayoutConfig,
+    out: &mut W,
+) -> io::Result<()> {
+    let payload: StatuslinePayload = serde_json::from_str(input).unwrap_or_default();
+    let (meta, git_info) = probe_session_and_git(&payload, reader, git_probe, cfg);
+    let quota_5h = resolve_quota_5h(&payload);
+    let quota_weekly = resolve_quota_weekly(&payload);
+    write_statusline_with_quotas(&payload, &meta, &git_info, quota_5h, quota_weekly, cfg, out)
+}
+
+/// Parses `input` JSON using explicit [`SpeedReader`], [`GitProbe`], and quota token calibration cache directory.
+pub fn process_statusline_with_calibration<W: Write>(
+    input: &str,
+    reader: &dyn SpeedReader,
+    git_probe: &dyn GitProbe,
+    calibration_dir: Option<&Path>,
+    now_unix_secs: u64,
+    cfg: &LayoutConfig,
+    out: &mut W,
+) -> io::Result<()> {
+    let payload: StatuslinePayload = serde_json::from_str(input).unwrap_or_default();
+    let (meta, git_info) = probe_session_and_git(&payload, reader, git_probe, cfg);
+    let (quota_5h, quota_weekly): (Option<QuotaView>, Option<QuotaView>) =
+        calibrate_quota_views_at(&payload, calibration_dir, now_unix_secs);
+    write_statusline_with_quotas(&payload, &meta, &git_info, quota_5h, quota_weekly, cfg, out)
 }
 
 #[cfg(test)]

@@ -39,8 +39,8 @@
 | `ttft` | First token latency | Extracted from `gen_metadata` (`chat.11`) |
 | `cost` | Session cost | `~$usd` and `(sub $...)` when `subagent_usd >= 0.01` |
 | `mode` | Cycle mode | `PLAN` / `AUTO` / `EDIT` plus `>200K` indicator when exceeded |
-| `quota_5h` | 5h quota + pace | Model-aware 5h bucket (`gemini-5h` / `3p-5h` / `carbon` / dynamic tightest) + sub-1% precision (`<0.1%`, `0.1%`–`0.9%`) + `reset_time` RFC3339 fallback + pace warn |
-| `quota_weekly` | Weekly / Argon / Carbon quota | Model-aware weekly bucket (`gemini-weekly` / `gemini-argon-wtu-weekly` / `gemini-carbon-wtu-weekly` / `3p-weekly` / dynamic tightest) + `Carbon`/`m670`, `Argon`/`m668`/bare `Orchestrator`, expanded 3P routing |
+| `quota_5h` | 5h quota + pace | Model-aware 5h bucket (`gemini-5h` / `3p-5h` / `carbon` / dynamic tightest) + sub-1% precision (`<0.1%`, `0.1%`–`0.9%`) + `reset_time` RFC3339 fallback + calibrated `(~tokens)` estimate + pace warn |
+| `quota_weekly` | Weekly / Argon / Carbon quota | Model-aware weekly bucket (`gemini-weekly` / `gemini-argon-wtu-weekly` / `gemini-carbon-wtu-weekly` / `3p-weekly` / dynamic tightest) + `Carbon`/`m670`, `Argon`/`m668`/bare `Orchestrator`, expanded 3P routing + calibrated `(~tokens)` estimate |
 | `artifacts` | Artifact count | Hidden when `0` if `smart_hide` is enabled |
 | `subagents` | Subagent count | Hidden when `0` if `smart_hide` is enabled |
 | `tasks` | Task count | Hidden when `0` if `smart_hide` is enabled |
@@ -54,3 +54,4 @@
 - **Glyph Modes**: `Unicode` (default), `Nerd Font`, `ASCII` (pure 7-bit ASCII).
 - **Responsive Compaction**: When `responsive` is enabled and a row overflows terminal width, segments compact progressively (`vcs` diff strip / 20-col cap -> `quota_*` timer strip -> `ctx_*` limit strip & `ctx_bar` collapse -> `model` abbreviation / 20-col cap) before dropping lower-priority widgets.
 - **SQLite Sniffing**: Queries `~/.gemini/antigravity-cli/conversations/<conversation_id>.db` (`gen_metadata` `ORDER BY idx DESC LIMIT 9`) in read-only mode with a 25ms `busy_timeout` to extract `max_context_tokens` (`1 -> 9 -> 10 -> 4`), `estimated_tokens_used` (`1 -> 9 -> 10 -> 1`), output token decode speed (5-turn weighted average and up to 9-turn median), thinking output tokens (`1 -> 4 -> 9`), and TTFT (`1 -> 11`).
+- **Quota Token Calibration**: Learns rolling 5h/weekly token budgets from per-conversation token deltas (`$XDG_CACHE_HOME/agy-statusline/quota_cal.json`, 7d TTL for 5h / 21d TTL for weekly) and renders `(~<tokens>)` next to the quota percentage once calibrated.
