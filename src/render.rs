@@ -206,6 +206,97 @@ fn render_quota(
     Some(Segment::plain(widget, text, fg, bold))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffortLevel {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Extra,
+    Minimal,
+    Max,
+}
+
+fn canonical_effort(raw: &str) -> Option<EffortLevel> {
+    let mut norm = String::with_capacity(raw.len());
+    let mut prev_space = true;
+    for ch in raw.trim().chars() {
+        if ch == '_' || ch == '-' || ch.is_whitespace() {
+            if !prev_space {
+                norm.push(' ');
+                prev_space = true;
+            }
+        } else {
+            norm.push(ch.to_ascii_lowercase());
+            prev_space = false;
+        }
+    }
+    match norm.trim_end() {
+        "low" => Some(EffortLevel::Low),
+        "medium" => Some(EffortLevel::Medium),
+        "high" => Some(EffortLevel::High),
+        "xhigh" | "x high" | "extra high" => Some(EffortLevel::XHigh),
+        "extra" => Some(EffortLevel::Extra),
+        "minimal" => Some(EffortLevel::Minimal),
+        "max" => Some(EffortLevel::Max),
+        _ => None,
+    }
+}
+
+fn trailing_display_effort(display_name: &str) -> Option<EffortLevel> {
+    let trimmed = display_name.trim();
+    if let Some(inner_start) = trimmed.rfind(['(', '（']) {
+        let after = &trimmed[inner_start..];
+        let mut chars = after.chars();
+        let open = chars.next()?;
+        let close = if open == '(' { ')' } else { '）' };
+        if let Some(inner) = chars.as_str().strip_suffix(close) {
+            if let Some(level) = canonical_effort(inner) {
+                return Some(level);
+            }
+        }
+    }
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.len() >= 3 {
+        let two_word = format!("{} {}", tokens[tokens.len() - 2], tokens[tokens.len() - 1]);
+        if let Some(level) = canonical_effort(&two_word) {
+            return Some(level);
+        }
+    }
+    if tokens.len() >= 2 {
+        let last = tokens[tokens.len() - 1].trim_start_matches(['-', ':', '·', '/']);
+        if let Some(level) = canonical_effort(last) {
+            return Some(level);
+        }
+    }
+    None
+}
+
+fn display_includes_effort(display_name: &str, effort: &str) -> bool {
+    match canonical_effort(effort) {
+        Some(target) => trailing_display_effort(display_name) == Some(target),
+        None => {
+            let trimmed = display_name.trim().to_ascii_lowercase();
+            let lower_eff = effort.trim().to_ascii_lowercase();
+            trimmed.ends_with(&format!("({lower_eff})"))
+                || trimmed.ends_with(&format!(" {lower_eff}"))
+        }
+    }
+}
+
+fn ctx_display_metrics(used_pct: f64, ctx_remaining: bool) -> (&'static str, f64, f64) {
+    let raw_pct = if used_pct.is_finite() {
+        used_pct.max(0.0)
+    } else {
+        0.0
+    };
+    if ctx_remaining {
+        ("rem", (100.0 - raw_pct).max(0.0), raw_pct)
+    } else {
+        ("ctx", raw_pct, raw_pct)
+    }
+}
+
 fn render_widget(
     widget: WidgetId,
     payload: &StatuslinePayload,
@@ -264,11 +355,7 @@ fn render_widget(
                 .map(str::trim)
                 .filter(|e| !e.is_empty())
             {
-                Some(effort)
-                    if !name
-                        .to_ascii_lowercase()
-                        .contains(&effort.to_ascii_lowercase()) =>
-                {
+                Some(effort) if !display_includes_effort(name, effort) => {
                     format!("{name}{joiner}{effort}")
                 }
                 _ => name.to_string(),
@@ -324,35 +411,27 @@ fn render_widget(
             )),
         },
         WidgetId::CtxBar => {
-            let (bar, pct) =
+            let (bar, _) =
                 build_progress_bar_with_chars(used_pct, cfg.bar_length, glyphs.bar_chars);
-            let (tag, disp_pct) = if cfg.ctx_remaining {
-                ("rem", (100.0 - pct).max(0.0))
-            } else {
-                ("ctx", pct)
-            };
+            let (tag, disp_pct, raw_pct) = ctx_display_metrics(used_pct, cfg.ctx_remaining);
             let text = match eff_limit {
                 Some(lim) => format!("{tag} {bar} {disp_pct:.1}% ({})", format_tok_str(lim)),
                 None => format!("{tag} {bar} {disp_pct:.1}%"),
             };
-            Some(Segment::plain(widget, text, ctx_color(pct, pal), pct >= 85.0))
+            Some(Segment::plain(
+                widget,
+                text,
+                ctx_color(raw_pct, pal),
+                raw_pct >= 85.0,
+            ))
         }
         WidgetId::CtxPct => {
-            let pct = if used_pct.is_finite() {
-                used_pct.clamp(0.0, 100.0)
-            } else {
-                0.0
-            };
-            let (tag, disp_pct) = if cfg.ctx_remaining {
-                ("rem", (100.0 - pct).max(0.0))
-            } else {
-                ("ctx", pct)
-            };
+            let (tag, disp_pct, raw_pct) = ctx_display_metrics(used_pct, cfg.ctx_remaining);
             let text = match eff_limit {
                 Some(lim) => format!("{tag} {disp_pct:.1}% ({})", format_tok_str(lim)),
                 None => format!("{tag} {disp_pct:.1}%"),
             };
-            Some(Segment::plain(widget, text, ctx_color(pct, pal), false))
+            Some(Segment::plain(widget, text, ctx_color(raw_pct, pal), false))
         }
         WidgetId::CtxTokens => {
             if let (Some(cur), Some(lim)) = (cur_ctx, eff_limit) {
@@ -802,7 +881,7 @@ pub fn write_statusline<W: IoWrite>(
                 .filter(|&v| v > 0)
         });
     let used_pct = match (cur_ctx, eff_limit) {
-        (Some(cur), Some(lim)) if lim > 0 => ((cur as f64) * 100.0 / (lim as f64)).clamp(0.0, 100.0),
+        (Some(cur), Some(lim)) if lim > 0 => ((cur as f64) * 100.0 / (lim as f64)).max(0.0),
         _ => payload
             .context_window
             .as_ref()
@@ -1088,5 +1167,140 @@ mod tests {
             text,
             "@ REVIEW * mode: PLAN >200K * $0.45 (sub $0.12) * 5h 84% r:3h10m\n"
         );
+    }
+
+    #[test]
+    fn model_canonical_effort_matching_avoids_false_positives_and_duplicates() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.rows = vec![vec![WidgetId::Model]];
+
+        let gpt_xhigh = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: None,
+                display_name: Some("GPT-OSS 120B (Extra High)".to_string()),
+                effort: Some("xhigh".to_string()),
+            }),
+            ..Default::default()
+        };
+        let mut out1 = Vec::new();
+        write_statusline(
+            &gpt_xhigh,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out1,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out1).unwrap(),
+            "GPT-OSS 120B (Extra High)\n"
+        );
+
+        let minimax = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: None,
+                display_name: Some("MiniMax M2".to_string()),
+                effort: Some("max".to_string()),
+            }),
+            ..Default::default()
+        };
+        let mut out2 = Vec::new();
+        write_statusline(
+            &minimax,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out2,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out2).unwrap(), "MiniMax M2 · max\n");
+
+        let gpt_high_vs_xhigh = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: None,
+                display_name: Some("GPT-OSS 120B (Extra High)".to_string()),
+                effort: Some("high".to_string()),
+            }),
+            ..Default::default()
+        };
+        let mut out3 = Vec::new();
+        write_statusline(
+            &gpt_high_vs_xhigh,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out3,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out3).unwrap(),
+            "GPT-OSS 120B (Extra High) · high\n"
+        );
+
+        let claude_min = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: None,
+                display_name: Some("Claude Sonnet Minimal".to_string()),
+                effort: Some("minimal".to_string()),
+            }),
+            ..Default::default()
+        };
+        let mut out4 = Vec::new();
+        write_statusline(
+            &claude_min,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out4,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out4).unwrap(), "Claude Sonnet Minimal\n");
+    }
+
+    #[test]
+    fn context_overflow_above_100_pct_renders_true_pct_and_crit_remaining_zero() {
+        let payload = StatuslinePayload {
+            context_window: Some(ContextWindow {
+                context_window_size: Some(2_000_000),
+                used_percentage: Some(26.8),
+                current_usage: Some(JsonUsage {
+                    input_tokens: Some(36_000),
+                    output_tokens: None,
+                    cache_read_input_tokens: Some(500_000),
+                    cache_creation_input_tokens: Some(0),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let meta = SessionMetadata {
+            max_context_tokens: Some(512_000),
+            ..Default::default()
+        };
+
+        let mut cfg_used = LayoutConfig::preset_minimal();
+        cfg_used.theme = ThemeStyle::Mono;
+        cfg_used.bar_length = 8;
+        cfg_used.rows = vec![vec![WidgetId::CtxBar, WidgetId::CtxPct]];
+        let mut out_used = Vec::new();
+        write_statusline(&payload, &meta, &GitInfo::default(), &cfg_used, &mut out_used).unwrap();
+        assert_eq!(
+            String::from_utf8(out_used).unwrap(),
+            "ctx ████████ 104.7% (512K) · ctx 104.7% (512K)\n"
+        );
+
+        let mut cfg_rem = LayoutConfig::preset_minimal();
+        cfg_rem.theme = ThemeStyle::Default;
+        cfg_rem.ctx_remaining = true;
+        cfg_rem.bar_length = 8;
+        cfg_rem.rows = vec![vec![WidgetId::CtxBar, WidgetId::CtxPct]];
+        let mut out_rem = Vec::new();
+        write_statusline(&payload, &meta, &GitInfo::default(), &cfg_rem, &mut out_rem).unwrap();
+        let rem_text = String::from_utf8(out_rem).unwrap();
+        let crit_code = format!("\x1b[38;5;{}m", Palette::for_theme(ThemeStyle::Default).ctx_crit);
+        assert!(rem_text.contains(&crit_code));
+        assert!(rem_text.contains("rem ████████ 0.0% (512K)"));
+        assert!(rem_text.contains("rem 0.0% (512K)"));
     }
 }
