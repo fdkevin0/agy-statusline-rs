@@ -670,6 +670,58 @@ fn split_into_groups(segs: Vec<Segment>) -> Vec<Vec<Segment>> {
     groups
 }
 
+fn compact_matching_segments(
+    groups: &mut [Vec<Segment>],
+    matches: fn(WidgetId) -> bool,
+    mut transform: impl FnMut(&mut Segment),
+) {
+    for g in groups {
+        for seg in g {
+            if matches(seg.widget) {
+                transform(seg);
+            }
+        }
+    }
+}
+
+fn strip_vcs_diff_stats(text: &str) -> String {
+    if let Some((head, tail)) = text.rsplit_once(" +") {
+        if let Some((ins, del)) = tail.split_once(" -") {
+            if !ins.is_empty()
+                && !del.is_empty()
+                && ins.bytes().all(|b| b.is_ascii_digit())
+                && del.bytes().all(|b| b.is_ascii_digit())
+            {
+                return head.to_string();
+            }
+        }
+    }
+    text.to_string()
+}
+
+fn strip_after_percent(text: &str) -> String {
+    match text.find('%') {
+        Some(idx) => text[..=idx].to_string(),
+        None => text.to_string(),
+    }
+}
+
+fn strip_trailing_paren_suffix(text: &str) -> String {
+    if let Some((head, _)) = text.strip_suffix(')').and_then(|s| s.rsplit_once(" (")) {
+        return head.to_string();
+    }
+    text.to_string()
+}
+
+fn collapse_ctx_bar(text: &str) -> String {
+    if let (Some((tag, rest)), Some((_, pct))) = (text.split_once(' '), text.rsplit_once(' ')) {
+        if rest.contains(' ') && pct.ends_with('%') {
+            return format!("{tag} {pct}");
+        }
+    }
+    text.to_string()
+}
+
 fn fit_row_groups(
     mut groups: Vec<Vec<Segment>>,
     max_width: Option<usize>,
@@ -683,14 +735,65 @@ fn fit_row_groups(
         return groups;
     }
 
-    for g in &mut groups {
-        for seg in g {
-            if seg.widget == WidgetId::Vcs && seg.text.width() > 24 {
-                seg.text = truncate_to_width(&seg.text, 24, ellipsis);
-            }
+    // Stage 1: Vcs — strip diff stats, then truncate to 20 cols.
+    compact_matching_segments(&mut groups, |w| w == WidgetId::Vcs, |seg| {
+        seg.text = strip_vcs_diff_stats(&seg.text);
+    });
+    if groups_visible_width(&groups, geom) <= limit {
+        return groups;
+    }
+    compact_matching_segments(&mut groups, |w| w == WidgetId::Vcs, |seg| {
+        if seg.text.width() > 20 {
+            seg.text = truncate_to_width(&seg.text, 20, ellipsis);
         }
+    });
+    if groups_visible_width(&groups, geom) <= limit {
+        return groups;
     }
 
+    // Stage 2: Quota5h / QuotaWeekly — strip reset timer and parenthetical estimate after '%'.
+    compact_matching_segments(
+        &mut groups,
+        |w| matches!(w, WidgetId::Quota5h | WidgetId::QuotaWeekly),
+        |seg| seg.text = strip_after_percent(&seg.text),
+    );
+    if groups_visible_width(&groups, geom) <= limit {
+        return groups;
+    }
+
+    // Stage 3: CtxBar / CtxPct — strip '(<limit>)', then collapse CtxBar to percentage.
+    compact_matching_segments(
+        &mut groups,
+        |w| matches!(w, WidgetId::CtxBar | WidgetId::CtxPct),
+        |seg| seg.text = strip_trailing_paren_suffix(&seg.text),
+    );
+    if groups_visible_width(&groups, geom) <= limit {
+        return groups;
+    }
+    compact_matching_segments(&mut groups, |w| w == WidgetId::CtxBar, |seg| {
+        seg.text = collapse_ctx_bar(&seg.text);
+    });
+    if groups_visible_width(&groups, geom) <= limit {
+        return groups;
+    }
+
+    // Stage 4: Model — abbreviate common family names, then truncate to 20 cols.
+    compact_matching_segments(&mut groups, |w| w == WidgetId::Model, |seg| {
+        seg.text = seg.text.replace("Gemini ", "G").replace("Claude ", "C");
+    });
+    if groups_visible_width(&groups, geom) <= limit {
+        return groups;
+    }
+    compact_matching_segments(&mut groups, |w| w == WidgetId::Model, |seg| {
+        if seg.text.width() > 20 {
+            seg.text = truncate_to_width(&seg.text, 20, ellipsis);
+        }
+    });
+    if groups_visible_width(&groups, geom) <= limit {
+        return groups;
+    }
+
+    // Stage 5: Priority-based widget drop and final single-segment truncation.
     while groups_visible_width(&groups, geom) > limit {
         let total_segs: usize = groups.iter().map(Vec::len).sum();
         if total_segs <= 1 {
