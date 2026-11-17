@@ -1,9 +1,9 @@
 //! Per-bucket quota token capacity calibration and atomic XDG cache persistence.
 //!
-//! Learns total token capacity per rolling quota bucket (`5h`, `weekly`, `3p`, `argon`, `carbon`)
-//! from incremental per-conversation token deltas (`total_input_tokens + total_output_tokens`)
-//! paired with quota fraction drops, while guarding against conversation switches, external
-//! multi-client consumption, reset cycles, and stale calibrations.
+//! Learns total token capacity per rolling quota bucket from incremental per-conversation
+//! token deltas (`total_input_tokens + total_output_tokens`) paired with quota fraction drops,
+//! while guarding against conversation switches, external multi-client consumption, reset
+//! cycles, and stale calibrations.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -22,8 +22,7 @@ use crate::statusline::StatuslinePayload;
 const SCHEMA_VERSION: u32 = 2;
 const CACHE_FILENAME: &str = "quota_cal.json";
 
-const TTL_5H_SECS: u64 = 7 * 86_400;
-const TTL_WEEKLY_SECS: u64 = 21 * 86_400;
+const MIN_TTL_SECS: u64 = 7 * 86_400;
 
 const NEW_CYCLE_FRAC_JUMP: f64 = 0.04;
 const NEW_CYCLE_RESET_SHIFT_SECS: u64 = 600;
@@ -74,7 +73,7 @@ pub struct BucketCalibration {
 pub struct CalibrationStore {
     /// Store schema version (`2`).
     pub schema_version: u32,
-    /// Per-bucket calibration map keyed by `<window>:<label>` (e.g. `"5h:5h"`, `"weekly:argon"`).
+    /// Per-bucket calibration map keyed by raw quota bucket ID.
     pub buckets: BTreeMap<String, BucketCalibration>,
 }
 
@@ -149,17 +148,12 @@ fn calibrate_bucket(
     entry: &mut BucketCalibration,
     mut view: QuotaView,
     reset_at_secs: Option<u64>,
-    is_weekly: bool,
     conv_id: Option<&str>,
     session_tokens: Option<u64>,
     now_unix_secs: u64,
 ) -> QuotaView {
     let frac = (view.remaining_pct / 100.0).clamp(0.0, 1.0);
-    let ttl_secs = if is_weekly {
-        TTL_WEEKLY_SECS
-    } else {
-        TTL_5H_SECS
-    };
+    let ttl_secs = view.window_secs.saturating_mul(3).max(MIN_TTL_SECS);
 
     // Expire invalid or TTL-aged prior calibration before evaluating the current sample.
     let prior_valid = entry
@@ -278,13 +272,14 @@ pub fn calibrate_store_at(
     let session_tokens = extract_session_tokens(payload);
 
     let q5 = resolve_quota_5h_with_reset_at(payload, now_unix_secs).map(|(view, reset_at)| {
-        let key = format!("5h:{}", view.label);
-        let entry = store.buckets.entry(key).or_default();
+        if view.remaining_amount.is_some() {
+            return view;
+        }
+        let entry = store.buckets.entry(view.bucket_key.clone()).or_default();
         calibrate_bucket(
             entry,
             view,
             reset_at,
-            false,
             conv_id,
             session_tokens,
             now_unix_secs,
@@ -292,13 +287,14 @@ pub fn calibrate_store_at(
     });
 
     let qw = resolve_quota_weekly_with_reset_at(payload, now_unix_secs).map(|(view, reset_at)| {
-        let key = format!("weekly:{}", view.label);
-        let entry = store.buckets.entry(key).or_default();
+        if view.remaining_amount.is_some() {
+            return view;
+        }
+        let entry = store.buckets.entry(view.bucket_key.clone()).or_default();
         calibrate_bucket(
             entry,
             view,
             reset_at,
-            true,
             conv_id,
             session_tokens,
             now_unix_secs,
@@ -357,25 +353,25 @@ mod tests {
     ) -> StatuslinePayload {
         let mut quota = BTreeMap::new();
         quota.insert(
-            "gemini-5h".to_string(),
+            "acme-5h".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(frac_5h),
-                reset_in_seconds: Some(reset_5h),
-                reset_time: None,
+                reset_in_seconds: Some(reset_5h as i64),
+                ..Default::default()
             },
         );
         quota.insert(
-            "gemini-weekly".to_string(),
+            "acme-weekly".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(frac_weekly),
-                reset_in_seconds: Some(reset_weekly),
-                reset_time: None,
+                reset_in_seconds: Some(reset_weekly as i64),
+                ..Default::default()
             },
         );
         StatuslinePayload {
             conversation_id: Some(conv_id.to_string()),
             model: Some(ModelInfo {
-                id: Some("gemini-4-hydrogen".to_string()),
+                id: Some("acme-4-base".to_string()),
                 ..Default::default()
             }),
             context_window: Some(ContextWindow {
@@ -402,21 +398,21 @@ mod tests {
         let p2 = make_payload("conv-a", 200_000, 10_000, 0.80, 13_900, 0.94, 499_900);
         let (q5_2, _) = calibrate_store_at(&mut store, &p2, t0 + 100);
         assert_eq!(q5_2.unwrap().est_remaining_tokens, Some(1_600_000));
-        assert_eq!(store.buckets["5h:5h"].sample_count, 1);
+        assert_eq!(store.buckets["acme-5h"].sample_count, 1);
 
         // Tick 3: +300K tokens for -0.10 quota => sample_total = 3.0M.
         // Second sample blends 0.4 * 2.0M + 0.6 * 3.0M = 2.6M; remaining at 0.70 = 1.82M.
         let p3 = make_payload("conv-a", 490_000, 20_000, 0.70, 13_800, 0.93, 499_800);
         let (q5_3, _) = calibrate_store_at(&mut store, &p3, t0 + 200);
         assert_eq!(q5_3.unwrap().est_remaining_tokens, Some(1_820_000));
-        assert_eq!(store.buckets["5h:5h"].sample_count, 2);
+        assert_eq!(store.buckets["acme-5h"].sample_count, 2);
 
         // Tick 4: +100K tokens for -0.05 quota => sample_total = 2.0M.
         // Third+ sample blends 0.6 * 2.6M + 0.4 * 2.0M = 2.36M; remaining at 0.65 = 1.534M.
         let p4 = make_payload("conv-a", 580_000, 30_000, 0.65, 13_700, 0.92, 499_700);
         let (q5_4, _) = calibrate_store_at(&mut store, &p4, t0 + 300);
         assert_eq!(q5_4.unwrap().est_remaining_tokens, Some(1_534_000));
-        assert_eq!(store.buckets["5h:5h"].sample_count, 3);
+        assert_eq!(store.buckets["acme-5h"].sample_count, 3);
     }
 
     #[test]
@@ -428,16 +424,16 @@ mod tests {
         calibrate_store_at(&mut store, &p1, t0);
         let p2 = make_payload("conv-1", 210_000, 0, 0.80, 13_900, 0.97, 499_900);
         calibrate_store_at(&mut store, &p2, t0 + 100);
-        assert!((store.buckets["5h:5h"].calibrated_total_tokens.unwrap() - 2_000_000.0).abs() < 1e-3);
+        assert!((store.buckets["acme-5h"].calibrated_total_tokens.unwrap() - 2_000_000.0).abs() < 1e-3);
 
         // Switch to conv-2 (smaller per-conversation total 5K, quota moved to 0.70):
         // Must preserve 2.0M calibration -> est 1.4M, and re-anchor to (0.70, 5K).
         let p3 = make_payload("conv-2", 5_000, 0, 0.70, 13_800, 0.96, 499_800);
         let (q5_3, _) = calibrate_store_at(&mut store, &p3, t0 + 200);
         assert_eq!(q5_3.unwrap().est_remaining_tokens, Some(1_400_000));
-        assert_eq!(store.buckets["5h:5h"].anchor_session_tokens, Some(5_000));
-        assert!(!store.buckets["5h:5h"].external_divergence_in_cycle);
-        assert_eq!(store.buckets["5h:5h"].sample_count, 1);
+        assert_eq!(store.buckets["acme-5h"].anchor_session_tokens, Some(5_000));
+        assert!(!store.buckets["acme-5h"].external_divergence_in_cycle);
+        assert_eq!(store.buckets["acme-5h"].sample_count, 1);
     }
 
     #[test]
@@ -451,7 +447,7 @@ mod tests {
         let p2 = make_payload("conv-div", 1_100, 0, 0.85, 9_900, 0.90, 499_900);
         let (q5_2, _) = calibrate_store_at(&mut store, &p2, t0 + 100);
         assert_eq!(q5_2.unwrap().est_remaining_tokens, None);
-        assert!(store.buckets["5h:5h"].external_divergence_in_cycle);
+        assert!(store.buckets["acme-5h"].external_divergence_in_cycle);
 
         // Subsequent large local delta in the SAME cycle remains blocked until reset.
         let p3 = make_payload("conv-div", 500_000, 0, 0.60, 9_800, 0.90, 499_800);
@@ -461,7 +457,7 @@ mod tests {
         // New cycle (frac jumps >= 0.04 & reset_at shifts > 600s) clears external divergence.
         let p4 = make_payload("conv-div", 500_000, 0, 1.00, 18_000, 0.90, 499_700);
         calibrate_store_at(&mut store, &p4, t0 + 300);
-        assert!(!store.buckets["5h:5h"].external_divergence_in_cycle);
+        assert!(!store.buckets["acme-5h"].external_divergence_in_cycle);
 
         // Calibrate 10M pool in new cycle, then hit frac = 0.0 -> Some(0).
         let p5 = make_payload("conv-div", 1_500_000, 0, 0.90, 17_900, 0.90, 499_600);
@@ -470,7 +466,7 @@ mod tests {
         let (q5_zero, _) = calibrate_store_at(&mut store, &p_zero, t0 + 500);
         assert_eq!(q5_zero.unwrap().est_remaining_tokens, Some(0));
 
-        // Advance past 7d TTL (7 * 86_400 + 1) -> 5h calibration expires while weekly (21d TTL) would not.
+        // Advance past 7d TTL (MIN_TTL_SECS + 1) -> 5h calibration expires while weekly (21d TTL) would not.
         let p_expired = make_payload(
             "conv-div",
             1_500_000,
@@ -480,9 +476,9 @@ mod tests {
             0.85,
             400_000,
         );
-        let (q5_exp, _) = calibrate_store_at(&mut store, &p_expired, t0 + 400 + TTL_5H_SECS + 1);
+        let (q5_exp, _) = calibrate_store_at(&mut store, &p_expired, t0 + 400 + MIN_TTL_SECS + 1);
         assert_eq!(q5_exp.unwrap().est_remaining_tokens, None);
-        assert_eq!(store.buckets["5h:5h"].calibrated_total_tokens, None);
+        assert_eq!(store.buckets["acme-5h"].calibrated_total_tokens, None);
     }
 
     #[test]
@@ -500,7 +496,7 @@ mod tests {
         assert_eq!(q2.unwrap().est_remaining_tokens, Some(1_600_000));
 
         let reloaded = load_calibration_store(&dir);
-        assert_eq!(reloaded.buckets["5h:5h"].sample_count, 1);
+        assert_eq!(reloaded.buckets["acme-5h"].sample_count, 1);
 
         let _ = fs::remove_dir_all(&dir);
     }

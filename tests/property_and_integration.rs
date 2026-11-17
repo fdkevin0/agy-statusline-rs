@@ -106,7 +106,7 @@ proptest! {
             QuotaBucket {
                 remaining_fraction: Some(0.75),
                 reset_in_seconds: Some(7200),
-                reset_time: None,
+                ..Default::default()
             },
         );
         quota.insert(
@@ -114,7 +114,7 @@ proptest! {
             QuotaBucket {
                 remaining_fraction: Some(0.92),
                 reset_in_seconds: Some(300_000),
-                reset_time: None,
+                ..Default::default()
             },
         );
 

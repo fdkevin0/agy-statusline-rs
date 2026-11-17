@@ -131,7 +131,7 @@ pub fn sample_preview_payload(width: usize) -> StatuslinePayload {
         QuotaBucket {
             remaining_fraction: Some(0.84),
             reset_in_seconds: Some(11_400),
-            reset_time: None,
+            ..Default::default()
         },
     );
     quota.insert(
@@ -139,7 +139,7 @@ pub fn sample_preview_payload(width: usize) -> StatuslinePayload {
         QuotaBucket {
             remaining_fraction: Some(0.92),
             reset_in_seconds: Some(432_000),
-            reset_time: None,
+            ..Default::default()
         },
     );
     StatuslinePayload {
@@ -558,7 +558,7 @@ fn draw_settings_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState)
     let base_preset = match state.preset_idx {
         0 => "Full Dashboard",
         1 => "Powerline Pro",
-        2 => "Codex 1-Line",
+        2 => "Minimal 1-Line",
         _ => "Metrics Addon",
     };
     let preset_name = if state.is_custom_preset() {

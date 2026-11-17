@@ -186,107 +186,93 @@ fn render_quota(
             Segment::plain(widget, format!("{fallback_label} --"), pal.muted, false)
         });
     };
-    let mut text = format!(
-        "{} {}",
-        q.label,
-        crate::metrics::format_quota_pct(q.remaining_pct)
-    );
-    if let Some(tok) = q.est_remaining_tokens {
-        text.push_str(" (~");
-        format_tokens(tok, &mut text);
-        text.push(')');
-    }
+    let (mut text, fg, bold) = if let Some(amt) = q.remaining_amount {
+        let (fg, bold) = if amt <= 0 {
+            (pal.ctx_crit, true)
+        } else if q.pace_behind {
+            (pal.ctx_warn, false)
+        } else {
+            (pal.ctx_ok, false)
+        };
+        (format!("{} {amt}", q.label), fg, bold)
+    } else {
+        let mut text = format!(
+            "{} {}",
+            q.label,
+            crate::metrics::format_quota_pct(q.remaining_pct)
+        );
+        if let Some(tok) = q.est_remaining_tokens {
+            text.push_str(" (~");
+            format_tokens(tok, &mut text);
+            text.push(')');
+        }
+        let (fg, bold) = if q.remaining_pct <= 10.0 {
+            (pal.ctx_crit, true)
+        } else if q.remaining_pct <= 30.0 || q.pace_behind {
+            (pal.ctx_warn, false)
+        } else {
+            (pal.ctx_ok, false)
+        };
+        (text, fg, bold)
+    };
     if let Some(reset) = &q.reset_compact {
         text.push(' ');
         text.push_str(glyphs.reset);
         text.push_str(reset);
     }
-    let (fg, bold) = if q.remaining_pct <= 10.0 {
-        (pal.ctx_crit, true)
-    } else if q.remaining_pct <= 30.0 || q.pace_behind {
-        (pal.ctx_warn, false)
-    } else {
-        (pal.ctx_ok, false)
-    };
     Some(Segment::plain(widget, text, fg, bold))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EffortLevel {
-    Low,
-    Medium,
-    High,
-    XHigh,
-    Extra,
-    Minimal,
-    Max,
-}
-
-fn canonical_effort(raw: &str) -> Option<EffortLevel> {
-    let mut norm = String::with_capacity(raw.len());
-    let mut prev_space = true;
-    for ch in raw.trim().chars() {
-        if ch == '_' || ch == '-' || ch.is_whitespace() {
-            if !prev_space {
-                norm.push(' ');
-                prev_space = true;
+fn normalize_effort_words(raw: &str) -> Vec<String> {
+    let tokens: Vec<String> = raw
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mut out = Vec::with_capacity(tokens.len());
+    for (i, tok) in tokens.iter().enumerate() {
+        if tok == "x" && i + 1 < tokens.len() {
+            out.push("extra".to_string());
+        } else if let Some(rest) = tok.strip_prefix('x') {
+            if rest.len() >= 3 && rest.bytes().all(|b| b.is_ascii_alphabetic()) {
+                out.push("extra".to_string());
+                out.push(rest.to_string());
+            } else {
+                out.push(tok.clone());
             }
         } else {
-            norm.push(ch.to_ascii_lowercase());
-            prev_space = false;
+            out.push(tok.clone());
         }
     }
-    match norm.trim_end() {
-        "low" => Some(EffortLevel::Low),
-        "medium" => Some(EffortLevel::Medium),
-        "high" => Some(EffortLevel::High),
-        "xhigh" | "x high" | "extra high" => Some(EffortLevel::XHigh),
-        "extra" => Some(EffortLevel::Extra),
-        "minimal" => Some(EffortLevel::Minimal),
-        "max" => Some(EffortLevel::Max),
-        _ => None,
-    }
+    out
 }
 
-fn trailing_display_effort(display_name: &str) -> Option<EffortLevel> {
+fn display_includes_effort(display_name: &str, effort: &str) -> bool {
+    let eff_words = normalize_effort_words(effort);
+    if eff_words.is_empty() {
+        return false;
+    }
     let trimmed = display_name.trim();
     if let Some(inner_start) = trimmed.rfind(['(', '（']) {
         let after = &trimmed[inner_start..];
         let mut chars = after.chars();
-        let open = chars.next()?;
-        let close = if open == '(' { ')' } else { '）' };
-        if let Some(inner) = chars.as_str().strip_suffix(close) {
-            if let Some(level) = canonical_effort(inner) {
-                return Some(level);
+        if let Some(open) = chars.next() {
+            let close = if open == '(' { ')' } else { '）' };
+            if let Some(inner) = chars.as_str().strip_suffix(close) {
+                let group_words = normalize_effort_words(inner);
+                return !group_words.is_empty() && group_words == eff_words;
             }
         }
     }
-    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-    if tokens.len() >= 3 {
-        let two_word = format!("{} {}", tokens[tokens.len() - 2], tokens[tokens.len() - 1]);
-        if let Some(level) = canonical_effort(&two_word) {
-            return Some(level);
-        }
+    let disp_words = normalize_effort_words(trimmed);
+    if disp_words.len() <= eff_words.len() {
+        return false;
     }
-    if tokens.len() >= 2 {
-        let last = tokens[tokens.len() - 1].trim_start_matches(['-', ':', '·', '/']);
-        if let Some(level) = canonical_effort(last) {
-            return Some(level);
-        }
+    let split_idx = disp_words.len() - eff_words.len();
+    if disp_words[split_idx..] != eff_words[..] {
+        return false;
     }
-    None
-}
-
-fn display_includes_effort(display_name: &str, effort: &str) -> bool {
-    match canonical_effort(effort) {
-        Some(target) => trailing_display_effort(display_name) == Some(target),
-        None => {
-            let trimmed = display_name.trim().to_ascii_lowercase();
-            let lower_eff = effort.trim().to_ascii_lowercase();
-            trimmed.ends_with(&format!("({lower_eff})"))
-                || trimmed.ends_with(&format!(" {lower_eff}"))
-        }
-    }
+    !(eff_words.len() == 1 && disp_words[split_idx - 1] == "extra")
 }
 
 fn ctx_display_metrics(used_pct: f64, ctx_remaining: bool) -> (&'static str, f64, f64) {
@@ -328,6 +314,7 @@ fn render_widget(
                 "reviewing" => (format!("{} REVIEW", glyphs.review), pal.review),
                 "authenticating" => (format!("{} AUTH", glyphs.thinking), pal.thinking),
                 "initializing" => (format!("{} INIT", glyphs.thinking), pal.thinking),
+                "completed" => (format!("{} DONE", glyphs.ready), pal.ready),
                 "error" => (format!("{} ERROR", glyphs.error), pal.error),
                 other => (
                     format!("{} {}", glyphs.other, other.to_ascii_uppercase()),
@@ -704,11 +691,30 @@ fn strip_vcs_diff_stats(text: &str) -> String {
     text.to_string()
 }
 
-fn strip_after_percent(text: &str) -> String {
-    match text.find('%') {
-        Some(idx) => text[..=idx].to_string(),
-        None => text.to_string(),
+fn strip_quota_trailers(text: &str) -> String {
+    if let Some(idx) = text.find('%') {
+        return text[..=idx].to_string();
     }
+    for marker in [" (~", " \u{21bb}", " r:"] {
+        if let Some(idx) = text.find(marker) {
+            return text[..idx].to_string();
+        }
+    }
+    text.to_string()
+}
+
+fn abbreviate_leading_word(text: &str) -> String {
+    if let Some((first, rest)) = text.split_once(' ') {
+        if first.len() >= 4
+            && first.bytes().all(|b| b.is_ascii_alphabetic())
+            && rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        {
+            if let Some(ch) = first.chars().next() {
+                return format!("{}{rest}", ch.to_ascii_uppercase());
+            }
+        }
+    }
+    text.to_string()
 }
 
 fn strip_trailing_paren_suffix(text: &str) -> String {
@@ -756,11 +762,11 @@ fn fit_row_groups(
         return groups;
     }
 
-    // Stage 2: Quota5h / QuotaWeekly — strip reset timer and parenthetical estimate after '%'.
+    // Stage 2: Quota5h / QuotaWeekly — strip reset timer and parenthetical estimate.
     compact_matching_segments(
         &mut groups,
         |w| matches!(w, WidgetId::Quota5h | WidgetId::QuotaWeekly),
-        |seg| seg.text = strip_after_percent(&seg.text),
+        |seg| seg.text = strip_quota_trailers(&seg.text),
     );
     if groups_visible_width(&groups, geom) <= limit {
         return groups;
@@ -782,9 +788,9 @@ fn fit_row_groups(
         return groups;
     }
 
-    // Stage 4: Model — abbreviate common family names, then truncate to 20 cols.
+    // Stage 4: Model — abbreviate leading vendor word, then truncate to 20 cols.
     compact_matching_segments(&mut groups, |w| w == WidgetId::Model, |seg| {
-        seg.text = seg.text.replace("Gemini ", "G").replace("Claude ", "C");
+        seg.text = abbreviate_leading_word(&seg.text);
     });
     if groups_visible_width(&groups, geom) <= limit {
         return groups;
@@ -1226,7 +1232,7 @@ mod tests {
         let payload = StatuslinePayload {
             model: Some(ModelInfo {
                 id: None,
-                display_name: Some("Gemini 4 Hydrogen (Medium)".to_string()),
+                display_name: Some("Acme 4 Base (Medium)".to_string()),
                 effort: Some("medium".to_string()),
             }),
             ..Default::default()
@@ -1243,21 +1249,27 @@ mod tests {
             &mut out,
         )
         .unwrap();
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "Gemini 4 Hydrogen (Medium)\n"
-        );
+        assert_eq!(String::from_utf8(out).unwrap(), "Acme 4 Base (Medium)\n");
     }
 
     #[test]
-    fn renders_mode_quota_subagent_cost_and_ascii_no_color() {
+    fn renders_mode_quota_subagent_cost_completed_state_and_credit_bucket() {
         let mut quota = BTreeMap::new();
         quota.insert(
-            "gemini-5h".to_string(),
+            "acme-5h".to_string(),
             QuotaBucket {
                 remaining_fraction: Some(0.84),
                 reset_in_seconds: Some(11_400),
-                reset_time: None,
+                ..Default::default()
+            },
+        );
+        quota.insert(
+            "acme-weekly".to_string(),
+            QuotaBucket {
+                remaining_fraction: None,
+                remaining_amount: Some(450),
+                reset_in_seconds: Some(172_800),
+                ..Default::default()
             },
         );
         let payload = StatuslinePayload {
@@ -1280,6 +1292,7 @@ mod tests {
             WidgetId::Mode,
             WidgetId::Cost,
             WidgetId::Quota5h,
+            WidgetId::QuotaWeekly,
         ]];
         let mut out = Vec::new();
         write_statusline(
@@ -1294,27 +1307,43 @@ mod tests {
         assert!(!text.contains('\x1b'));
         assert_eq!(
             text,
-            "@ REVIEW * mode: PLAN >200K * $0.45 (sub $0.12) * 5h 84% r:3h10m\n"
+            "@ REVIEW * mode: PLAN >200K * $0.45 (sub $0.12) * 5h 84% r:3h10m * 7d 450 r:2d\n"
         );
+
+        let completed = StatuslinePayload {
+            agent_state: Some("completed".to_string()),
+            ..Default::default()
+        };
+        cfg.rows = vec![vec![WidgetId::State]];
+        let mut out_done = Vec::new();
+        write_statusline(
+            &completed,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out_done,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out_done).unwrap(), "* DONE\n");
     }
 
     #[test]
-    fn model_canonical_effort_matching_avoids_false_positives_and_duplicates() {
+    fn model_structural_effort_matching_works_for_arbitrary_tiers() {
         let mut cfg = LayoutConfig::preset_minimal();
         cfg.theme = ThemeStyle::Mono;
         cfg.rows = vec![vec![WidgetId::Model]];
 
-        let gpt_xhigh = StatuslinePayload {
+        let model_xhigh = StatuslinePayload {
             model: Some(ModelInfo {
                 id: None,
-                display_name: Some("GPT-OSS 120B (Extra High)".to_string()),
+                display_name: Some("Model-X 120B (Extra High)".to_string()),
                 effort: Some("xhigh".to_string()),
             }),
             ..Default::default()
         };
         let mut out1 = Vec::new();
         write_statusline(
-            &gpt_xhigh,
+            &model_xhigh,
             &SessionMetadata::default(),
             &GitInfo::default(),
             &cfg,
@@ -1323,39 +1352,39 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(out1).unwrap(),
-            "GPT-OSS 120B (Extra High)\n"
+            "Model-X 120B (Extra High)\n"
         );
 
-        let minimax = StatuslinePayload {
+        let model_m2 = StatuslinePayload {
             model: Some(ModelInfo {
                 id: None,
-                display_name: Some("MiniMax M2".to_string()),
+                display_name: Some("VendorM M2".to_string()),
                 effort: Some("max".to_string()),
             }),
             ..Default::default()
         };
         let mut out2 = Vec::new();
         write_statusline(
-            &minimax,
+            &model_m2,
             &SessionMetadata::default(),
             &GitInfo::default(),
             &cfg,
             &mut out2,
         )
         .unwrap();
-        assert_eq!(String::from_utf8(out2).unwrap(), "MiniMax M2 · max\n");
+        assert_eq!(String::from_utf8(out2).unwrap(), "VendorM M2 · max\n");
 
-        let gpt_high_vs_xhigh = StatuslinePayload {
+        let model_high_vs_xhigh = StatuslinePayload {
             model: Some(ModelInfo {
                 id: None,
-                display_name: Some("GPT-OSS 120B (Extra High)".to_string()),
+                display_name: Some("Model-X 120B (Extra High)".to_string()),
                 effort: Some("high".to_string()),
             }),
             ..Default::default()
         };
         let mut out3 = Vec::new();
         write_statusline(
-            &gpt_high_vs_xhigh,
+            &model_high_vs_xhigh,
             &SessionMetadata::default(),
             &GitInfo::default(),
             &cfg,
@@ -1364,27 +1393,82 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(out3).unwrap(),
-            "GPT-OSS 120B (Extra High) · high\n"
+            "Model-X 120B (Extra High) · high\n"
         );
 
-        let claude_min = StatuslinePayload {
+        let model_min = StatuslinePayload {
             model: Some(ModelInfo {
                 id: None,
-                display_name: Some("Claude Sonnet Minimal".to_string()),
+                display_name: Some("Acme Model Minimal".to_string()),
                 effort: Some("minimal".to_string()),
             }),
             ..Default::default()
         };
         let mut out4 = Vec::new();
         write_statusline(
-            &claude_min,
+            &model_min,
             &SessionMetadata::default(),
             &GitInfo::default(),
             &cfg,
             &mut out4,
         )
         .unwrap();
-        assert_eq!(String::from_utf8(out4).unwrap(), "Claude Sonnet Minimal\n");
+        assert_eq!(String::from_utf8(out4).unwrap(), "Acme Model Minimal\n");
+
+        let model_turbo = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: None,
+                display_name: Some("DeepSeek R2 (Turbo)".to_string()),
+                effort: Some("turbo".to_string()),
+            }),
+            ..Default::default()
+        };
+        let mut out5 = Vec::new();
+        write_statusline(
+            &model_turbo,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out5,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out5).unwrap(), "DeepSeek R2 (Turbo)\n");
+
+        let model_ultra = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: None,
+                display_name: Some("Model-Z - Ultra".to_string()),
+                effort: Some("ultra".to_string()),
+            }),
+            ..Default::default()
+        };
+        let mut out6 = Vec::new();
+        write_statusline(
+            &model_ultra,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out6,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out6).unwrap(), "Model-Z - Ultra\n");
+    }
+
+    #[test]
+    fn abbreviate_leading_word_is_vendor_agnostic() {
+        assert_eq!(
+            abbreviate_leading_word("AlphaModel M2 · max"),
+            "AM2 · max"
+        );
+        assert_eq!(
+            abbreviate_leading_word("VendorName 3.1 Pro"),
+            "V3.1 Pro"
+        );
+        assert_eq!(abbreviate_leading_word("M2 · max"), "M2 · max");
+        assert_eq!(
+            abbreviate_leading_word("Model-X 120B"),
+            "Model-X 120B"
+        );
     }
 
     #[test]
