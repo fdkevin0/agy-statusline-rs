@@ -34,7 +34,7 @@ use crate::timeutil::{
 const SECS_PER_DAY: i64 = 86_400;
 const DAYS_PER_WEEK: i64 = 7;
 const MAX_TRANSCRIPT_SCAN_DEPTH: usize = 4;
-const ACTIVITY_WEEKS: usize = 4;
+const ACTIVITY_WEEKS: usize = 20;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 25;
 
 const SKIP_DIRS: &[&str] = &[
@@ -49,8 +49,11 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const UNICODE_HEATMAP: [&str; 5] = ["···", "░░░", "▒▒▒", "▓▓▓", "███"];
-const ASCII_HEATMAP: [&str; 5] = ["...", "===", "---", "###", "***"];
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const UNICODE_HEATMAP: [&str; 5] = ["··", "░░", "▒▒", "▓▓", "██"];
+const ASCII_HEATMAP: [&str; 5] = ["..", "==", "--", "##", "**"];
 const HEATMAP_ANSI_CODES: [&str; 5] = ["2", "38;5;29", "38;5;36", "38;5;42", "1;38;5;78"];
 
 /// Aggregated token and optional cost totals for a time window.
@@ -118,7 +121,7 @@ pub struct DailyUsage {
     pub unpriced_requests: u64,
 }
 
-/// Monday-anchored local calendar week aggregate for the 4-week activity view.
+/// Monday-anchored local calendar week aggregate for the 20-week activity tile grid.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WeeklyUsage {
     /// Monday start date in `YYYY-MM-DD` format.
@@ -205,10 +208,10 @@ pub struct StatsReport {
     pub totals: PeriodSummary,
     /// Daily usage entries sorted chronologically (filtered by `filter_days` when set).
     pub daily: Vec<DailyUsage>,
-    /// Unfiltered 4-week Monday-anchored calendar activity (oldest week first, ending with current week).
+    /// Unfiltered 20-week Monday-anchored calendar activity (oldest week first, ending with current week).
     #[serde(default)]
     pub weekly: Vec<WeeklyUsage>,
-    /// Unfiltered per-local-day token totals (`YYYY-MM-DD -> total_tokens`) for the 4-week activity view.
+    /// Unfiltered per-local-day token totals (`YYYY-MM-DD -> total_tokens`) for the 20-week activity grid.
     #[serde(skip)]
     pub unfiltered_daily_tokens: BTreeMap<String, u64>,
     /// Per-model breakdown sorted by `total_tokens` descending.
@@ -1990,13 +1993,40 @@ fn resolve_weekly_usage(report: &StatsReport) -> Vec<WeeklyUsage> {
     build_weekly_usage(today_idx, &daily_by_date)
 }
 
-fn short_month_day(civil_date: &str) -> String {
-    if let Some(day_idx) = parse_civil_date_day(civil_date) {
-        let (_, m, d) = civil_from_days(day_idx);
-        format!("{m:02}-{d:02}")
-    } else {
-        civil_date.to_string()
+fn build_month_header(weeks: &[WeeklyUsage]) -> String {
+    let week_months: Vec<Option<usize>> = weeks
+        .iter()
+        .map(|w| {
+            let day_idx = parse_civil_date_day(&w.week_start)?;
+            let (_, m, _) = civil_from_days(day_idx);
+            (1..=12).contains(&m).then_some((m - 1) as usize)
+        })
+        .collect();
+
+    let mut out = String::new();
+
+    for (w, maybe_m) in week_months.iter().copied().enumerate() {
+        let Some(m) = maybe_m else {
+            continue;
+        };
+        let show = if w == 0 {
+            week_months
+                .get(1)
+                .copied()
+                .flatten()
+                .is_none_or(|m1| m1 == m)
+        } else {
+            week_months[w - 1] != Some(m)
+        };
+        let col_pos = w * 3;
+        let min_col = if out.is_empty() { 0 } else { out.len() + 1 };
+        if show && col_pos >= min_col {
+            out.push_str(&" ".repeat(col_pos - out.len()));
+            out.push_str(MONTH_NAMES[m]);
+        }
     }
+
+    out
 }
 
 fn write_weekly_activity<W: Write>(
@@ -2023,58 +2053,68 @@ fn write_weekly_activity<W: Write>(
         }
     }
 
-    let peak_tokens = peak.as_ref().map_or(0, |(_, _, p)| *p);
-    let peak_note = match peak {
-        Some((date, wd, tok)) => format!("peak {} on {date} ({wd})", fmt_tok(tok)),
-        None => "no activity".to_string(),
-    };
-    writeln!(
-        out,
-        "\n{} {peak_note}",
-        style_wrap(no_color, "38;5;117", "Activity (4w):"),
-    )?;
-    if weeks.is_empty() {
-        return Ok(());
-    }
-
-    writeln!(
-        out,
-        "{}",
-        style_wrap(
-            no_color,
-            "2",
-            "  Week            Mon Tue Wed Thu Fri Sat Sun    Tokens"
-        )
-    )?;
-
     let glyphs = if ascii {
         &ASCII_HEATMAP
     } else {
         &UNICODE_HEATMAP
     };
+    let peak_tokens = peak.as_ref().map_or(0, |(_, _, p)| *p);
+    let peak_note = match peak {
+        Some((date, wd, tok)) => format!("peak {} on {date} ({wd})", fmt_tok(tok)),
+        None => "no activity".to_string(),
+    };
+    let sep = if ascii { "|" } else { "·" };
+    let legend_tiles: String = (0..5)
+        .map(|lvl| style_wrap(no_color, HEATMAP_ANSI_CODES[lvl], glyphs[lvl]))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let legend = format!(
+        "{} {} {}",
+        style_wrap(no_color, "2", "Less"),
+        legend_tiles,
+        style_wrap(no_color, "2", "More"),
+    );
+    let span_weeks = if weeks.is_empty() {
+        ACTIVITY_WEEKS
+    } else {
+        weeks.len()
+    };
 
-    for week in &weeks {
-        let range = format!(
-            "{} .. {}",
-            short_month_day(&week.week_start),
-            short_month_day(&week.week_end)
-        );
-        let mut cells = Vec::with_capacity(7);
-        for maybe_tok in &week.daily_tokens {
-            match maybe_tok {
-                Some(tok) => {
-                    let lvl = heatmap_level(*tok, peak_tokens);
-                    cells.push(style_wrap(no_color, HEATMAP_ANSI_CODES[lvl], glyphs[lvl]));
+    writeln!(
+        out,
+        "\n{} {peak_note} {sep} {legend}",
+        style_wrap(no_color, "38;5;117", &format!("Activity ({span_weeks}w):")),
+    )?;
+    if weeks.is_empty() {
+        return Ok(());
+    }
+
+    let month_hdr = build_month_header(&weeks);
+    if !month_hdr.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            style_wrap(no_color, "2", &format!("       {month_hdr}"))
+        )?;
+    }
+
+    for (wd_idx, wd_name) in WEEKDAY_NAMES.iter().enumerate() {
+        let wd_label = style_wrap(no_color, "2", wd_name);
+        if let Some(last_w) = weeks.iter().rposition(|w| w.daily_tokens[wd_idx].is_some()) {
+            let mut row_cells = Vec::with_capacity(last_w + 1);
+            for week in &weeks[..=last_w] {
+                match week.daily_tokens[wd_idx] {
+                    Some(tok) => {
+                        let lvl = heatmap_level(tok, peak_tokens);
+                        row_cells.push(style_wrap(no_color, HEATMAP_ANSI_CODES[lvl], glyphs[lvl]));
+                    }
+                    None => row_cells.push("  ".to_string()),
                 }
-                None => cells.push("   ".to_string()),
             }
-        }
-        let tok_str = if week.total_tokens == 0 {
-            "-".to_string()
+            writeln!(out, "  {wd_label}  {}", row_cells.join(" "))?;
         } else {
-            fmt_tok(week.total_tokens)
-        };
-        writeln!(out, "  {:<14}  {}  {:>8}", range, cells.join(" "), tok_str)?;
+            writeln!(out, "  {wd_label}")?;
+        }
     }
 
     Ok(())
@@ -2779,10 +2819,18 @@ mod tests {
         render_stats_report(&empty, true, true, &mut empty_out).unwrap();
         let empty_text = String::from_utf8(empty_out).unwrap();
         assert!(!empty_text.contains('\x1b'));
-        assert!(empty_text.contains("Activity (4w): no activity"));
-        assert!(empty_text.contains("  Week            Mon Tue Wed Thu Fri Sat Sun    Tokens"));
-        assert!(empty_text.contains("  10-26 .. 11-01  ... ... ... ... ... ... ...         -"));
-        assert!(empty_text.contains("  11-16 .. 11-22  ... ... ...                         -"));
+        assert!(
+            empty_text.contains("Activity (20w): no activity | Less .. == -- ## ** More"),
+            "unexpected text:\n{empty_text}"
+        );
+        assert!(
+            empty_text.contains("       Jul         Aug            Sep         Oct         Nov")
+        );
+        assert!(empty_text
+            .contains("  Mon  .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .."));
+        assert!(
+            empty_text.contains("  Sun  .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..")
+        );
         assert!(empty_text.contains("Models: none recorded"));
 
         // Minimal gen_metadata-only DB without steps table falls back to DB mtime.
@@ -2819,7 +2867,7 @@ mod tests {
     }
 
     #[test]
-    fn days_filter_preserves_4w_weekly_activity() {
+    fn days_filter_preserves_20w_weekly_activity() {
         let home = temp_home("days_heatmap");
         let uuid = "44444444-4444-4444-8444-444444444444";
         let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
@@ -2851,30 +2899,30 @@ mod tests {
         assert_eq!(report.filter_days, Some(7));
         assert!(report.daily.is_empty());
         assert!(report.models.is_empty());
-        assert_eq!(report.weekly.len(), 4);
-        assert_eq!(report.weekly[1].week_start, "2026-11-02");
-        assert_eq!(report.weekly[1].week_end, "2026-11-08");
-        assert_eq!(report.weekly[1].daily_tokens[1], Some(3_000));
-        assert_eq!(report.weekly[1].total_tokens, 3_000);
+        assert_eq!(report.weekly.len(), 20);
+        assert_eq!(report.weekly[17].week_start, "2026-11-02");
+        assert_eq!(report.weekly[17].week_end, "2026-11-08");
+        assert_eq!(report.weekly[17].daily_tokens[1], Some(3_000));
+        assert_eq!(report.weekly[17].total_tokens, 3_000);
 
         let mut out = Vec::new();
         render_stats_report(&report, true, true, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("no activity"), "unexpected text:\n{text}");
         assert!(
-            text.contains("Activity (4w): peak 3K on 2026-11-03 (Tue)"),
+            text.contains("Activity (20w): peak 3K on 2026-11-03 (Tue) | Less .. == -- ## ** More"),
             "missing 15d-old activity peak in:\n{text}"
         );
         assert!(
-            text.contains("  11-02 .. 11-08  ... *** ... ... ... ... ...        3K"),
-            "missing week 2 row in:\n{text}"
+            text.contains("  Tue  .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ** .. .."),
+            "missing Tue tile row in:\n{text}"
         );
 
         let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn weekly_activity_renders_monday_anchored_4w_table_and_blanks_future_days() {
+    fn github_tile_activity_renders_20w_grid_months_and_blanks_future_days() {
         let mut unfiltered_daily_tokens = BTreeMap::new();
         unfiltered_daily_tokens.insert("2026-11-03".to_string(), 250_000);
         unfiltered_daily_tokens.insert("2026-11-15".to_string(), 1_000_000);
@@ -2894,25 +2942,47 @@ mod tests {
         let mut unicode_out = Vec::new();
         render_stats_report(&report, true, false, &mut unicode_out).unwrap();
         let unicode_text = String::from_utf8(unicode_out).unwrap();
-        assert!(unicode_text.contains("Activity (4w): peak 1M on 2026-11-15 (Sun)"));
-        assert!(unicode_text.contains("  Week            Mon Tue Wed Thu Fri Sat Sun    Tokens"));
-        assert!(unicode_text.contains("  10-26 .. 11-01  ··· ··· ··· ··· ··· ··· ···         -"));
-        assert!(unicode_text.contains("  11-02 .. 11-08  ··· ░░░ ··· ··· ··· ··· ···      250K"));
-        assert!(unicode_text.contains("  11-09 .. 11-15  ··· ··· ··· ··· ··· ··· ███        1M"));
-        assert!(unicode_text.contains("  11-16 .. 11-22  ▒▒▒ ▓▓▓ ···                      1.3M"));
+        assert!(unicode_text
+            .contains("Activity (20w): peak 1M on 2026-11-15 (Sun) · Less ·· ░░ ▒▒ ▓▓ ██ More"));
+        assert!(
+            unicode_text.contains("       Jul         Aug            Sep         Oct         Nov")
+        );
+        assert!(unicode_text
+            .contains("  Mon  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ▒▒"));
+        assert!(unicode_text
+            .contains("  Tue  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ░░ ·· ▓▓"));
+        assert!(unicode_text
+            .contains("  Wed  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ··"));
+        assert!(unicode_text
+            .contains("  Thu  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ··\n"));
+        assert!(unicode_text
+            .contains("  Sun  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ██\n"));
 
-        // Year-rollover week (2026-12-30 is Wednesday -> current week 2026-12-28 .. 2027-01-03).
-        let rollover = StatsReport {
-            today_local: "2026-12-30".to_string(),
+        // Trailing-month week 0 (2026-11-11 -> w=0 is 2026-06-29 Jun, w=1 is 2026-07-06 Jul) omits Jun collision,
+        // and year-rollover (2027-01-06 -> w=19 is 2027-01-04 Jan) renders Jan cleanly.
+        let trailing = StatsReport {
+            today_local: "2026-11-11".to_string(),
             timezone: "UTC".to_string(),
-            today_utc: "2026-12-30".to_string(),
+            today_utc: "2026-11-11".to_string(),
+            ..Default::default()
+        };
+        let mut trailing_out = Vec::new();
+        render_stats_report(&trailing, true, true, &mut trailing_out).unwrap();
+        let trailing_text = String::from_utf8(trailing_out).unwrap();
+        assert!(!trailing_text.contains("JunJul"));
+        assert!(trailing_text.contains("          Jul         Aug"));
+
+        let rollover = StatsReport {
+            today_local: "2027-01-06".to_string(),
+            timezone: "UTC".to_string(),
+            today_utc: "2027-01-06".to_string(),
             ..Default::default()
         };
         let mut rollover_out = Vec::new();
         render_stats_report(&rollover, false, true, &mut rollover_out).unwrap();
         let rollover_text = String::from_utf8(rollover_out).unwrap();
         assert!(rollover_text.contains("\x1b["));
-        assert!(rollover_text.contains("12-28 .. 01-03"));
+        assert!(rollover_text.contains("Dec         Jan"));
     }
 
     #[test]
