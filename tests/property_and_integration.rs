@@ -301,3 +301,68 @@ fn live_git_cli_probe_extracts_branch_and_diff_stats() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn tier2_apply_and_doctor_honor_antigravity_cli_home_and_agy_home() {
+    let base = std::env::temp_dir().join(format!("agy_apply_env_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let cli_home = base.join("custom_cli_home");
+    let agy_home = base.join("custom_agy_home");
+    fs::create_dir_all(&base).unwrap();
+
+    // ANTIGRAVITY_CLI_HOME takes precedence over AGY_HOME and HOME.
+    let apply_cli = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
+        .env("HOME", &base)
+        .env("USERPROFILE", &base)
+        .env("XDG_CONFIG_HOME", base.join("cfg"))
+        .env("XDG_CACHE_HOME", base.join("cache"))
+        .env("ANTIGRAVITY_CLI_HOME", &cli_home)
+        .env("AGY_HOME", &agy_home)
+        .env_remove("AGY_STATUSLINE_FULL")
+        .env("NO_COLOR", "1")
+        .args(["apply", "--yes"])
+        .output()
+        .unwrap();
+    assert!(apply_cli.status.success());
+    assert!(cli_home.join("settings.json").is_file());
+    assert!(!agy_home.join("settings.json").exists());
+    assert!(!base.join(".gemini/antigravity-cli/settings.json").exists());
+
+    // AGY_HOME is used when ANTIGRAVITY_CLI_HOME is unset.
+    let apply_agy = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
+        .env("HOME", &base)
+        .env("USERPROFILE", &base)
+        .env("XDG_CONFIG_HOME", base.join("cfg"))
+        .env("XDG_CACHE_HOME", base.join("cache"))
+        .env_remove("ANTIGRAVITY_CLI_HOME")
+        .env("AGY_HOME", &agy_home)
+        .env_remove("AGY_STATUSLINE_FULL")
+        .env("NO_COLOR", "1")
+        .args(["apply", "--yes"])
+        .output()
+        .unwrap();
+    assert!(apply_agy.status.success());
+    assert!(agy_home.join("settings.json").is_file());
+
+    let doctor_out = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
+        .env("HOME", &base)
+        .env("USERPROFILE", &base)
+        .env("XDG_CONFIG_HOME", base.join("cfg"))
+        .env("XDG_CACHE_HOME", base.join("cache"))
+        .env_remove("ANTIGRAVITY_CLI_HOME")
+        .env("AGY_HOME", &agy_home)
+        .env_remove("AGY_STATUSLINE_FULL")
+        .env("NO_COLOR", "1")
+        .args(["doctor"])
+        .output()
+        .unwrap();
+    assert!(doctor_out.status.success());
+    let doctor_text = String::from_utf8(doctor_out.stdout).unwrap();
+    assert!(
+        doctor_text.contains(&agy_home.join("settings.json").display().to_string()),
+        "doctor stdout: {doctor_text}"
+    );
+    assert!(doctor_text.contains("enabled=true"));
+
+    let _ = fs::remove_dir_all(&base);
+}

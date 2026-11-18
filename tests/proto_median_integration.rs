@@ -169,7 +169,12 @@ fn tier2_binary_reads_temp_sqlite_db_median_and_estimated_context() {
     );
     let mut child = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
         .env("HOME", &dir)
+        .env("USERPROFILE", &dir)
         .env("XDG_CONFIG_HOME", &xdg_cfg)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env_remove("ANTIGRAVITY_CLI_HOME")
+        .env_remove("AGY_HOME")
+        .env_remove("AGY_STATUSLINE_FULL")
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

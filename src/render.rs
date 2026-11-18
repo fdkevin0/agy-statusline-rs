@@ -435,7 +435,10 @@ fn render_widget(
                 ));
             }
             let cw = payload.context_window.as_ref()?;
-            let total = cw.total_input_tokens.unwrap_or(0) + cw.total_output_tokens.unwrap_or(0);
+            let total = cw
+                .total_input_tokens
+                .unwrap_or(0)
+                .saturating_add(cw.total_output_tokens.unwrap_or(0));
             if total == 0 {
                 return None;
             }
@@ -610,7 +613,7 @@ fn groups_visible_width(groups: &[Vec<Segment>], geom: StyleGeometry) -> usize {
     sum + groups.len().saturating_sub(1)
 }
 
-fn truncate_to_width(s: &str, max_cols: usize, ellipsis: &str) -> String {
+pub(crate) fn truncate_to_width(s: &str, max_cols: usize, ellipsis: &str) -> String {
     if s.width() <= max_cols {
         return s.to_string();
     }
@@ -691,16 +694,20 @@ fn strip_vcs_diff_stats(text: &str) -> String {
     text.to_string()
 }
 
-fn strip_quota_trailers(text: &str) -> String {
+fn strip_quota_trailers(text: &str, reset_glyph: &str) -> String {
     if let Some(idx) = text.find('%') {
         return text[..=idx].to_string();
     }
-    for marker in [" (~", " \u{21bb}", " r:"] {
-        if let Some(idx) = text.find(marker) {
-            return text[..idx].to_string();
-        }
+    let reset_marker = (!reset_glyph.is_empty()).then(|| format!(" {reset_glyph}"));
+    let cut = [" (~", " \u{21bb}", " r:"]
+        .into_iter()
+        .chain(reset_marker.as_deref())
+        .filter_map(|marker| text.find(marker))
+        .min();
+    match cut {
+        Some(idx) => text[..idx].to_string(),
+        None => text.to_string(),
     }
-    text.to_string()
 }
 
 fn abbreviate_leading_word(text: &str) -> String {
@@ -738,6 +745,7 @@ fn fit_row_groups(
     max_width: Option<usize>,
     geom: StyleGeometry,
     ellipsis: &str,
+    reset_glyph: &str,
 ) -> Vec<Vec<Segment>> {
     let Some(limit) = max_width.filter(|&w| w > 0) else {
         return groups;
@@ -766,7 +774,7 @@ fn fit_row_groups(
     compact_matching_segments(
         &mut groups,
         |w| matches!(w, WidgetId::Quota5h | WidgetId::QuotaWeekly),
-        |seg| seg.text = strip_quota_trailers(&seg.text),
+        |seg| seg.text = strip_quota_trailers(&seg.text, reset_glyph),
     );
     if groups_visible_width(&groups, geom) <= limit {
         return groups;
@@ -1049,7 +1057,7 @@ pub fn write_statusline_with_quotas<W: IoWrite>(
             .filter_map(|&w| render_widget(w, payload, &ctx, cfg, &pal, &glyphs))
             .collect();
         let groups = split_into_groups(segs);
-        let fitted = fit_row_groups(groups, max_width, geom, glyphs.ellipsis);
+        let fitted = fit_row_groups(groups, max_width, geom, glyphs.ellipsis, glyphs.reset);
         write_row_groups(
             &fitted,
             payload.terminal_width,
@@ -1515,5 +1523,69 @@ mod tests {
         assert!(rem_text.contains(&crit_code));
         assert!(rem_text.contains("rem ████████ 0.0% (512K)"));
         assert!(rem_text.contains("rem 0.0% (512K)"));
+    }
+
+    #[test]
+    fn nerd_font_credit_bucket_strips_reset_timer_in_stage2_compaction() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.glyph_mode = GlyphMode::Nerd;
+        cfg.responsive = true;
+        cfg.rows = vec![vec![WidgetId::Vcs, WidgetId::Quota5h]];
+
+        let mut quota = BTreeMap::new();
+        quota.insert(
+            "acme-1h".to_string(),
+            QuotaBucket {
+                remaining_amount: Some(450),
+                reset_in_seconds: Some(1_200),
+                ..Default::default()
+            },
+        );
+        // Full row: "<nf_branch> main · 1h 450 <nf_reset>20m" (19 cols).
+        // After Stage 2: "<nf_branch> main · 1h 450" (15 cols).
+        let payload = StatuslinePayload {
+            quota: Some(quota),
+            terminal_width: Some(16),
+            ..Default::default()
+        };
+        let git = GitInfo {
+            branch: Some("main".to_string()),
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        write_statusline(&payload, &SessionMetadata::default(), &git, &cfg, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("1h 450"), "text was: {text:?}");
+        assert!(!text.contains('\u{f021}'), "reset glyph remained: {text:?}");
+        assert!(!text.contains("20m"), "reset timer remained: {text:?}");
+    }
+
+    #[test]
+    fn ctx_tokens_total_saturates_on_u64_max() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.rows = vec![vec![WidgetId::CtxTokens]];
+
+        let payload = StatuslinePayload {
+            context_window: Some(ContextWindow {
+                total_input_tokens: Some(u64::MAX),
+                total_output_tokens: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        write_statusline(
+            &payload,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, format!("{} tok\n", format_tok_str(u64::MAX)));
     }
 }
