@@ -409,11 +409,22 @@ pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord<'_>>
     })
 }
 
+/// Minimum valid `google.protobuf.Timestamp.seconds` (`0001-01-01T00:00:00Z`).
+const MIN_TIMESTAMP_SECS: i64 = -62_135_596_800;
+/// Maximum valid `google.protobuf.Timestamp.seconds` (`9999-12-31T23:59:59Z`).
+const MAX_TIMESTAMP_SECS: i64 = 253_402_300_799;
+
 /// Extracts `CortexStepMetadata.created_at` (`field 1 -> google.protobuf.Timestamp.seconds = 1`)
 /// from a `steps.metadata` Protobuf blob.
+///
+/// Rejects timestamps outside proleptic UTC years `0001..=9999`
+/// (`-62_135_596_800..=253_402_300_799`).
 pub fn extract_step_created_at_secs(data: &[u8]) -> Option<i64> {
     let ts = find_bytes(data, FIELD_STEP_CREATED_AT)?;
-    find_nonzero_number(ts, FIELD_TIMESTAMP_SECS).map(|s| s as i64)
+    let secs = find_nonzero_number(ts, FIELD_TIMESTAMP_SECS)? as i64;
+    (MIN_TIMESTAMP_SECS..=MAX_TIMESTAMP_SECS)
+        .contains(&secs)
+        .then_some(secs)
 }
 
 /// Extracts output generation speed (tokens/second) from a `gen_metadata` Protobuf blob.
@@ -683,5 +694,38 @@ mod tests {
         push_field_bytes(&mut step_meta, 1, &ts);
         assert_eq!(extract_step_created_at_secs(&step_meta), Some(1_763_400_000));
         assert_eq!(extract_step_created_at_secs(&[]), None);
+    }
+
+    #[test]
+    fn step_created_at_secs_rejects_out_of_range_years() {
+        let mut ts_min = Vec::new();
+        push_field_varint(&mut ts_min, 1, (-62_135_596_800_i64) as u64);
+        let mut meta_min = Vec::new();
+        push_field_bytes(&mut meta_min, 1, &ts_min);
+        assert_eq!(
+            extract_step_created_at_secs(&meta_min),
+            Some(-62_135_596_800)
+        );
+
+        let mut ts_max = Vec::new();
+        push_field_varint(&mut ts_max, 1, 253_402_300_799);
+        let mut meta_max = Vec::new();
+        push_field_bytes(&mut meta_max, 1, &ts_max);
+        assert_eq!(
+            extract_step_created_at_secs(&meta_max),
+            Some(253_402_300_799)
+        );
+
+        let mut ts_too_low = Vec::new();
+        push_field_varint(&mut ts_too_low, 1, (-62_135_596_801_i64) as u64);
+        let mut meta_too_low = Vec::new();
+        push_field_bytes(&mut meta_too_low, 1, &ts_too_low);
+        assert_eq!(extract_step_created_at_secs(&meta_too_low), None);
+
+        let mut ts_too_high = Vec::new();
+        push_field_varint(&mut ts_too_high, 1, 253_402_300_800);
+        let mut meta_too_high = Vec::new();
+        push_field_bytes(&mut meta_too_high, 1, &ts_too_high);
+        assert_eq!(extract_step_created_at_secs(&meta_too_high), None);
     }
 }
