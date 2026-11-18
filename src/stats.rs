@@ -22,18 +22,19 @@ use unicode_width::UnicodeWidthStr;
 use crate::db::{is_valid_uuid, resolve_agy_cli_dir, resolve_home_dir};
 use crate::format::format_tokens;
 use crate::protobuf::{
-    extract_gen_metadata_record, extract_step_created_at_secs, MAX_TTFT_SECS,
-    MAX_TURN_SPEED_TPS, MIN_TURN_DECODE_SECS,
+    extract_gen_metadata_record, extract_step_created_at_secs, MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
+    MIN_TURN_DECODE_SECS,
 };
 use crate::render::truncate_to_width;
+pub use crate::timeutil::parse_rfc3339_unix_secs;
 use crate::timeutil::{
     civil_from_days, days_from_civil, days_in_month, is_leap_year, parse_ascii_digits,
 };
-pub use crate::timeutil::parse_rfc3339_unix_secs;
 
 const SECS_PER_DAY: i64 = 86_400;
+const DAYS_PER_WEEK: i64 = 7;
 const MAX_TRANSCRIPT_SCAN_DEPTH: usize = 4;
-const HEATMAP_DAYS: i64 = 28;
+const ACTIVITY_WEEKS: usize = 4;
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 25;
 
 const SKIP_DIRS: &[&str] = &[
@@ -47,8 +48,10 @@ const SKIP_DIRS: &[&str] = &[
     "__pycache__",
 ];
 
-const UNICODE_HEATMAP: [char; 5] = ['·', '░', '▒', '▓', '█'];
-const ASCII_HEATMAP: [char; 5] = ['.', '=', '-', '#', '*'];
+const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const UNICODE_HEATMAP: [&str; 5] = ["···", "░░░", "▒▒▒", "▓▓▓", "███"];
+const ASCII_HEATMAP: [&str; 5] = ["...", "===", "---", "###", "***"];
+const HEATMAP_ANSI_CODES: [&str; 5] = ["2", "38;5;29", "38;5;36", "38;5;42", "1;38;5;78"];
 
 /// Aggregated token and optional cost totals for a time window.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -113,6 +116,19 @@ pub struct DailyUsage {
     pub priced_usd: f64,
     /// Count of unpriced turns on this date.
     pub unpriced_requests: u64,
+}
+
+/// Monday-anchored local calendar week aggregate for the 4-week activity view.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WeeklyUsage {
+    /// Monday start date in `YYYY-MM-DD` format.
+    pub week_start: String,
+    /// Sunday end date in `YYYY-MM-DD` format.
+    pub week_end: String,
+    /// Per-day token totals from Monday (`0`) through Sunday (`6`), `None` for future days after `today_local`.
+    pub daily_tokens: [Option<u64>; 7],
+    /// Total tokens across non-future days in this week.
+    pub total_tokens: u64,
 }
 
 /// Per-model usage, optional cost, and speed/TTFT leaderboard entry.
@@ -189,7 +205,10 @@ pub struct StatsReport {
     pub totals: PeriodSummary,
     /// Daily usage entries sorted chronologically (filtered by `filter_days` when set).
     pub daily: Vec<DailyUsage>,
-    /// Unfiltered per-local-day token totals (`YYYY-MM-DD -> total_tokens`) for the 28d heatmap.
+    /// Unfiltered 4-week Monday-anchored calendar activity (oldest week first, ending with current week).
+    #[serde(default)]
+    pub weekly: Vec<WeeklyUsage>,
+    /// Unfiltered per-local-day token totals (`YYYY-MM-DD -> total_tokens`) for the 4-week activity view.
     #[serde(skip)]
     pub unfiltered_daily_tokens: BTreeMap<String, u64>,
     /// Per-model breakdown sorted by `total_tokens` descending.
@@ -811,9 +830,7 @@ impl PosixTzRule {
 
     fn transition_unix_secs(&self, year: i64, boundary: DstBoundary, prev_offset: i32) -> i64 {
         let day_idx = match boundary.date {
-            DstRuleDate::JulianZeroBased(n) => {
-                days_from_civil(year, 1, 1) + i64::from(n)
-            }
+            DstRuleDate::JulianZeroBased(n) => days_from_civil(year, 1, 1) + i64::from(n),
             DstRuleDate::JulianOneBased(j) => {
                 let jan1 = days_from_civil(year, 1, 1);
                 let extra = if is_leap_year(year) && j >= 60 { 1 } else { 0 };
@@ -985,15 +1002,14 @@ fn parse_duration_secs(v: Option<&Value>) -> Option<f64> {
             if s.is_empty() {
                 return None;
             }
-            let (num_str, scale) = if let Some(prefix) =
-                s.strip_suffix("ms").or_else(|| s.strip_suffix("MS"))
-            {
-                (prefix.trim(), 0.001)
-            } else if let Some(prefix) = s.strip_suffix('s').or_else(|| s.strip_suffix('S')) {
-                (prefix.trim(), 1.0)
-            } else {
-                (s, 1.0)
-            };
+            let (num_str, scale) =
+                if let Some(prefix) = s.strip_suffix("ms").or_else(|| s.strip_suffix("MS")) {
+                    (prefix.trim(), 0.001)
+                } else if let Some(prefix) = s.strip_suffix('s').or_else(|| s.strip_suffix('S')) {
+                    (prefix.trim(), 1.0)
+                } else {
+                    (s, 1.0)
+                };
             let parsed = num_str.parse::<f64>().ok()?;
             let secs = parsed * scale;
             (secs.is_finite() && secs >= 0.0).then_some(secs)
@@ -1214,10 +1230,15 @@ fn parse_transcript_line(
     let (local_day, local_date) = tz.local_day_and_date(unix_secs);
 
     let cm_obj = obj.get("chatModel").and_then(Value::as_object);
-    let usage_obj = cm_obj.and_then(|cm| cm.get("usage")).and_then(Value::as_object);
+    let usage_obj = cm_obj
+        .and_then(|cm| cm.get("usage"))
+        .and_then(Value::as_object);
 
     let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens) =
-        if has_non_null_field(&obj, &["input_tokens", "output_tokens", "cache_read_tokens"]) {
+        if has_non_null_field(
+            &obj,
+            &["input_tokens", "output_tokens", "cache_read_tokens"],
+        ) {
             (
                 value_as_u64(obj.get("input_tokens")),
                 value_as_u64(obj.get("output_tokens")),
@@ -1406,7 +1427,11 @@ fn scan_sqlite_conversations(
     roots: &[(&'static str, PathBuf)],
     tz: &TimeZoneSpec,
     pricing: &PricingCatalog,
-) -> (SqliteStats, Vec<UsageEvent>, HashSet<(&'static str, String)>) {
+) -> (
+    SqliteStats,
+    Vec<UsageEvent>,
+    HashSet<(&'static str, String)>,
+) {
     let mut seen_dbs = HashSet::new();
     let mut targets = Vec::new();
     let mut covered = HashSet::new();
@@ -1827,6 +1852,12 @@ pub fn collect_stats_for_roots(
             .then_with(|| a.model.cmp(&b.model))
     });
 
+    let unfiltered_lookup: HashMap<&str, u64> = unfiltered_daily_tokens
+        .iter()
+        .map(|(date, tokens)| (date.as_str(), *tokens))
+        .collect();
+    let weekly = build_weekly_usage(today_day_idx, &unfiltered_lookup);
+
     StatsReport {
         today_local,
         timezone,
@@ -1836,6 +1867,7 @@ pub fn collect_stats_for_roots(
         windows,
         totals,
         daily,
+        weekly,
         unfiltered_daily_tokens,
         models,
         sqlite,
@@ -1892,14 +1924,55 @@ fn heatmap_level(tokens: u64, peak: u64) -> usize {
     }
 }
 
-fn build_28d_heatmap(report: &StatsReport, ascii: bool) -> (String, Option<(String, u64)>) {
+/// Monday-based weekday index (`0 = Mon .. 6 = Sun`) for days since `1970-01-01` (Thursday).
+fn weekday_mon0(day_idx: i64) -> usize {
+    (day_idx + 3).rem_euclid(DAYS_PER_WEEK) as usize
+}
+
+fn build_weekly_usage(today_idx: i64, daily_by_date: &HashMap<&str, u64>) -> Vec<WeeklyUsage> {
+    let today_wd = weekday_mon0(today_idx) as i64;
+    let curr_monday = today_idx - today_wd;
+    let first_monday = curr_monday - ((ACTIVITY_WEEKS as i64 - 1) * DAYS_PER_WEEK);
+    let mut weeks = Vec::with_capacity(ACTIVITY_WEEKS);
+
+    for w in 0..ACTIVITY_WEEKS {
+        let week_mon = first_monday + (w as i64) * DAYS_PER_WEEK;
+        let week_sun = week_mon + (DAYS_PER_WEEK - 1);
+        let mut daily_tokens = [None; 7];
+        let mut total_tokens = 0u64;
+
+        for (d, slot) in daily_tokens.iter_mut().enumerate() {
+            let day_idx = week_mon + (d as i64);
+            if day_idx <= today_idx {
+                let date = format_day(day_idx);
+                let tok = daily_by_date.get(date.as_str()).copied().unwrap_or(0);
+                *slot = Some(tok);
+                total_tokens = total_tokens.saturating_add(tok);
+            }
+        }
+
+        weeks.push(WeeklyUsage {
+            week_start: format_day(week_mon),
+            week_end: format_day(week_sun),
+            daily_tokens,
+            total_tokens,
+        });
+    }
+
+    weeks
+}
+
+fn resolve_weekly_usage(report: &StatsReport) -> Vec<WeeklyUsage> {
+    if !report.weekly.is_empty() {
+        return report.weekly.clone();
+    }
     let ref_date = if report.today_local.is_empty() {
         &report.today_utc
     } else {
         &report.today_local
     };
     let Some(today_idx) = parse_civil_date_day(ref_date) else {
-        return (String::new(), None);
+        return Vec::new();
     };
     let daily_by_date: HashMap<&str, u64> = if !report.unfiltered_daily_tokens.is_empty() {
         report
@@ -1914,31 +1987,97 @@ fn build_28d_heatmap(report: &StatsReport, ascii: bool) -> (String, Option<(Stri
             .map(|d| (d.date.as_str(), d.total_tokens))
             .collect()
     };
+    build_weekly_usage(today_idx, &daily_by_date)
+}
 
-    let start_idx = today_idx - (HEATMAP_DAYS - 1);
-    let mut counts = Vec::with_capacity(HEATMAP_DAYS as usize);
-    let mut peak: Option<(String, u64)> = None;
+fn short_month_day(civil_date: &str) -> String {
+    if let Some(day_idx) = parse_civil_date_day(civil_date) {
+        let (_, m, d) = civil_from_days(day_idx);
+        format!("{m:02}-{d:02}")
+    } else {
+        civil_date.to_string()
+    }
+}
 
-    for offset in 0..HEATMAP_DAYS {
-        let date = format_day(start_idx + offset);
-        let tokens = daily_by_date.get(date.as_str()).copied().unwrap_or(0);
-        if tokens > 0 && peak.as_ref().is_none_or(|(_, p)| tokens > *p) {
-            peak = Some((date.clone(), tokens));
+fn write_weekly_activity<W: Write>(
+    out: &mut W,
+    report: &StatsReport,
+    no_color: bool,
+    ascii: bool,
+) -> io::Result<()> {
+    let weeks = resolve_weekly_usage(report);
+    let mut peak: Option<(String, &'static str, u64)> = None;
+
+    for week in &weeks {
+        let mon_idx = parse_civil_date_day(&week.week_start);
+        for (wd_idx, maybe_tok) in week.daily_tokens.iter().enumerate() {
+            if let Some(tok) = *maybe_tok {
+                if tok > 0 && peak.as_ref().is_none_or(|(_, _, p)| tok > *p) {
+                    let date = mon_idx.map_or_else(
+                        || week.week_start.clone(),
+                        |m| format_day(m + wd_idx as i64),
+                    );
+                    peak = Some((date, WEEKDAY_NAMES[wd_idx], tok));
+                }
+            }
         }
-        counts.push(tokens);
     }
 
-    let peak_tokens = peak.as_ref().map_or(0, |(_, p)| *p);
+    let peak_tokens = peak.as_ref().map_or(0, |(_, _, p)| *p);
+    let peak_note = match peak {
+        Some((date, wd, tok)) => format!("peak {} on {date} ({wd})", fmt_tok(tok)),
+        None => "no activity".to_string(),
+    };
+    writeln!(
+        out,
+        "\n{} {peak_note}",
+        style_wrap(no_color, "38;5;117", "Activity (4w):"),
+    )?;
+    if weeks.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(
+        out,
+        "{}",
+        style_wrap(
+            no_color,
+            "2",
+            "  Week            Mon Tue Wed Thu Fri Sat Sun    Tokens"
+        )
+    )?;
+
     let glyphs = if ascii {
         &ASCII_HEATMAP
     } else {
         &UNICODE_HEATMAP
     };
-    let bar: String = counts
-        .into_iter()
-        .map(|t| glyphs[heatmap_level(t, peak_tokens)])
-        .collect();
-    (bar, peak)
+
+    for week in &weeks {
+        let range = format!(
+            "{} .. {}",
+            short_month_day(&week.week_start),
+            short_month_day(&week.week_end)
+        );
+        let mut cells = Vec::with_capacity(7);
+        for maybe_tok in &week.daily_tokens {
+            match maybe_tok {
+                Some(tok) => {
+                    let lvl = heatmap_level(*tok, peak_tokens);
+                    cells.push(style_wrap(no_color, HEATMAP_ANSI_CODES[lvl], glyphs[lvl]));
+                }
+                None => cells.push("   ".to_string()),
+            }
+        }
+        let tok_str = if week.total_tokens == 0 {
+            "-".to_string()
+        } else {
+            fmt_tok(week.total_tokens)
+        };
+        writeln!(out, "  {:<14}  {}  {:>8}", range, cells.join(" "), tok_str)?;
+    }
+
+    Ok(())
 }
 
 fn style_wrap(no_color: bool, code: &str, text: &str) -> String {
@@ -2038,17 +2177,7 @@ pub fn render_stats_report<W: Write>(
     write_window_row(out, "30d", &report.windows.last_30d, show_cost)?;
     write_window_row(out, "All-Time", &report.windows.all_time, show_cost)?;
 
-    let (heatmap, peak) = build_28d_heatmap(report, ascii);
-    let peak_note = match peak {
-        Some((date, tok)) => format!("peak {} on {date}", fmt_tok(tok)),
-        None => "no activity".to_string(),
-    };
-    writeln!(
-        out,
-        "\n{} [{}] ({peak_note})",
-        style_wrap(no_color, "38;5;117", "Activity (28d):"),
-        heatmap
-    )?;
+    write_weekly_activity(out, report, no_color, ascii)?;
 
     if report.models.is_empty() {
         writeln!(out, "\nModels: none recorded")?;
@@ -2392,11 +2521,7 @@ mod tests {
             "Model Alpha"
         );
         assert_eq!(
-            derive_model_name(
-                Some("Orchestrator (TierA)"),
-                Some("pro-orchestrator"),
-                1667
-            ),
+            derive_model_name(Some("Orchestrator (TierA)"), Some("pro-orchestrator"), 1667),
             "Orchestrator (TierA)"
         );
         assert_eq!(
@@ -2654,7 +2779,10 @@ mod tests {
         render_stats_report(&empty, true, true, &mut empty_out).unwrap();
         let empty_text = String::from_utf8(empty_out).unwrap();
         assert!(!empty_text.contains('\x1b'));
-        assert!(empty_text.contains("Activity (28d): [............................] (no activity)"));
+        assert!(empty_text.contains("Activity (4w): no activity"));
+        assert!(empty_text.contains("  Week            Mon Tue Wed Thu Fri Sat Sun    Tokens"));
+        assert!(empty_text.contains("  10-26 .. 11-01  ... ... ... ... ... ... ...         -"));
+        assert!(empty_text.contains("  11-16 .. 11-22  ... ... ...                         -"));
         assert!(empty_text.contains("Models: none recorded"));
 
         // Minimal gen_metadata-only DB without steps table falls back to DB mtime.
@@ -2667,21 +2795,12 @@ mod tests {
             [],
         )
         .unwrap();
-        let blob_50 = build_gen_blob(
-            None,
-            10,
-            "tiny-model",
-            "",
-            100,
-            200,
-            100,
-            40,
-            2,
-            1000,
-            None,
-        );
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [blob_50])
-            .unwrap();
+        let blob_50 = build_gen_blob(None, 10, "tiny-model", "", 100, 200, 100, 40, 2, 1000, None);
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [blob_50],
+        )
+        .unwrap();
         drop(conn);
         fs::write(
             conv_dir.join("8d0371e1-5a05-423b-a8bc-ed75995f9a8b.db-wal"),
@@ -2700,7 +2819,7 @@ mod tests {
     }
 
     #[test]
-    fn days_filter_preserves_28d_activity_heatmap() {
+    fn days_filter_preserves_4w_weekly_activity() {
         let home = temp_home("days_heatmap");
         let uuid = "44444444-4444-4444-8444-444444444444";
         let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
@@ -2732,17 +2851,68 @@ mod tests {
         assert_eq!(report.filter_days, Some(7));
         assert!(report.daily.is_empty());
         assert!(report.models.is_empty());
+        assert_eq!(report.weekly.len(), 4);
+        assert_eq!(report.weekly[1].week_start, "2026-11-02");
+        assert_eq!(report.weekly[1].week_end, "2026-11-08");
+        assert_eq!(report.weekly[1].daily_tokens[1], Some(3_000));
+        assert_eq!(report.weekly[1].total_tokens, 3_000);
 
         let mut out = Vec::new();
         render_stats_report(&report, true, true, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(!text.contains("(no activity)"), "unexpected text:\n{text}");
+        assert!(!text.contains("no activity"), "unexpected text:\n{text}");
         assert!(
-            text.contains("peak 3K on 2026-11-03"),
+            text.contains("Activity (4w): peak 3K on 2026-11-03 (Tue)"),
             "missing 15d-old activity peak in:\n{text}"
+        );
+        assert!(
+            text.contains("  11-02 .. 11-08  ... *** ... ... ... ... ...        3K"),
+            "missing week 2 row in:\n{text}"
         );
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn weekly_activity_renders_monday_anchored_4w_table_and_blanks_future_days() {
+        let mut unfiltered_daily_tokens = BTreeMap::new();
+        unfiltered_daily_tokens.insert("2026-11-03".to_string(), 250_000);
+        unfiltered_daily_tokens.insert("2026-11-15".to_string(), 1_000_000);
+        unfiltered_daily_tokens.insert("2026-11-16".to_string(), 500_000);
+        unfiltered_daily_tokens.insert("2026-11-17".to_string(), 750_000);
+        // Clock-skewed future date after today_local ("2026-11-18" Wed) must stay blank and uncounted.
+        unfiltered_daily_tokens.insert("2026-11-20".to_string(), 9_999_999);
+
+        let report = StatsReport {
+            today_local: "2026-11-18".to_string(),
+            timezone: "UTC+08:00".to_string(),
+            today_utc: "2026-11-18".to_string(),
+            unfiltered_daily_tokens,
+            ..Default::default()
+        };
+
+        let mut unicode_out = Vec::new();
+        render_stats_report(&report, true, false, &mut unicode_out).unwrap();
+        let unicode_text = String::from_utf8(unicode_out).unwrap();
+        assert!(unicode_text.contains("Activity (4w): peak 1M on 2026-11-15 (Sun)"));
+        assert!(unicode_text.contains("  Week            Mon Tue Wed Thu Fri Sat Sun    Tokens"));
+        assert!(unicode_text.contains("  10-26 .. 11-01  ··· ··· ··· ··· ··· ··· ···         -"));
+        assert!(unicode_text.contains("  11-02 .. 11-08  ··· ░░░ ··· ··· ··· ··· ···      250K"));
+        assert!(unicode_text.contains("  11-09 .. 11-15  ··· ··· ··· ··· ··· ··· ███        1M"));
+        assert!(unicode_text.contains("  11-16 .. 11-22  ▒▒▒ ▓▓▓ ···                      1.3M"));
+
+        // Year-rollover week (2026-12-30 is Wednesday -> current week 2026-12-28 .. 2027-01-03).
+        let rollover = StatsReport {
+            today_local: "2026-12-30".to_string(),
+            timezone: "UTC".to_string(),
+            today_utc: "2026-12-30".to_string(),
+            ..Default::default()
+        };
+        let mut rollover_out = Vec::new();
+        render_stats_report(&rollover, false, true, &mut rollover_out).unwrap();
+        let rollover_text = String::from_utf8(rollover_out).unwrap();
+        assert!(rollover_text.contains("\x1b["));
+        assert!(rollover_text.contains("12-28 .. 01-03"));
     }
 
     #[test]

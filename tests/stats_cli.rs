@@ -202,7 +202,8 @@ fn cli_stats_renders_text_no_color_and_json_in_isolated_home() {
     assert!(!text.contains("Est. Cost"));
     assert!(!text.contains("unpriced"));
     assert!(text.contains("SQLite Turns: 2 turns across 1 DBs"));
-    assert!(text.contains("Activity (28d): ["));
+    assert!(text.contains("Activity (4w): peak"));
+    assert!(text.contains("  Week            Mon Tue Wed Thu Fri Sat Sun    Tokens"));
 
     let json_out = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
         .env("HOME", &home)
@@ -222,6 +223,7 @@ fn cli_stats_renders_text_no_color_and_json_in_isolated_home() {
     assert_eq!(report.totals.requests, 1);
     assert_eq!(report.totals.thinking_tokens, 120);
     assert_eq!(report.windows.all_time.requests, 2);
+    assert_eq!(report.weekly.len(), 4);
     assert_eq!(report.models.len(), 1);
     assert_eq!(report.models[0].model, "Model Alpha");
     assert_eq!(report.sqlite.completed_turns, 2);
