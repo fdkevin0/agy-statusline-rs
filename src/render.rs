@@ -5,7 +5,7 @@ use std::io::{self, Write as IoWrite};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::db::SessionMetadata;
-use crate::format::format_tokens;
+use crate::format::{format_tokens, format_tokens_string as format_tok_str};
 use crate::git::GitInfo;
 use crate::layout::{GlyphMode, LayoutConfig, SpeedMode, ThemeStyle, VisualStyle, WidgetId};
 use crate::metrics::{
@@ -153,12 +153,6 @@ fn ctx_color(pct: f64, pal: &Palette) -> u8 {
     } else {
         pal.ctx_ok
     }
-}
-
-fn format_tok_str(tokens: u64) -> String {
-    let mut buf = String::new();
-    format_tokens(tokens, &mut buf);
-    buf
 }
 
 struct RenderContext<'a> {
