@@ -12,7 +12,7 @@
 - `agy-statusline apply [--yes|-y] [--stack|--replace]` — Write `statusLine` into `~/.gemini/antigravity-cli/settings.json` while preserving existing custom keys such as `padding`.
 - `agy-statusline apply --disable` — Set `statusLine.enabled = false` in `settings.json` without deleting your hook configuration.
 - `agy-statusline doctor` — Inspect config, AGY `settings.json` wiring, `NO_COLOR`, and render a live sample preview.
-- `agy-statusline stats [--days <N>] [--json] [--ascii]` — Summarize local AGY token usage in the host local timezone (Today / 7d / 30d / All-Time), 28-day activity heatmap, per-model thinking tokens / median speed / median TTFT from SQLite `conversations/<uuid>.db` (`gen_metadata` + `steps.metadata`, with deduplicated `transcript.jsonl` fallback for non-DB sessions), and optional user-configured cost from `$XDG_CONFIG_HOME/agy-statusline/pricing.json` (`NO_COLOR` disables ANSI escapes).
+- `agy-statusline stats [--days <N>] [--json] [--ascii]` — Summarize local AGY token usage in the host local timezone (Today / 7d / 30d / All-Time), 4-week Monday-anchored activity calendar, per-model thinking tokens / median speed / median TTFT from SQLite `conversations/<uuid>.db` (`gen_metadata` + `steps.metadata`, with deduplicated `transcript.jsonl` fallback for non-DB sessions), and optional user-configured cost from `$XDG_CONFIG_HOME/agy-statusline/pricing.json` (`NO_COLOR` disables ANSI escapes).
 
 ## Interactive TUI Controls
 
