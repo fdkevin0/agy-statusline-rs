@@ -22,7 +22,7 @@
 - **Live Preview**: Click the preview panel or press `w` to cycle `Auto` / `120col` / `72col`.
 - **Presets & Exit**: `1`–`4` apply presets; `s` saves `config.json` and updates AGY `settings.json`; `S` saves `config.json` only; `q` / `Esc` quits without saving.
 
-## Widgets (21)
+## Widgets (22)
 
 | ID | Description | Notes |
 | :--- | :--- | :--- |
@@ -38,6 +38,7 @@
 | `cache_read` | Cache read tokens | Formatted with `K` / `M` grouping |
 | `speed` | Output speed | `Weighted 5t`, `Median`, `Instant`, or `E2E (+TTFT)` |
 | `ttft` | First token latency | Extracted from `gen_metadata` (`chat.11`) |
+| `thinking` | Thinking tokens | Extracted from `gen_metadata` (`chat.4.9`); hidden when absent/zero if `smart_hide` is enabled |
 | `cost` | Session cost | `~$usd` and `(sub $...)` when `subagent_usd >= 0.01` |
 | `mode` | Cycle mode | `PLAN` / `AUTO` / `EDIT` plus `>200K` indicator when exceeded |
 | `quota_5h` | 5h quota + pace | Dynamic short-window (`<24h`) bucket via token-affinity scoring, `disabled` filtering, discrete credit amounts, sub-1% precision (`<0.1%`, `0.1%`–`0.9%`), `reset_time` RFC3339 fallback, calibrated `(~tokens)` estimate, and pace warn |

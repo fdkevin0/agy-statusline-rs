@@ -168,6 +168,7 @@ struct RenderContext<'a> {
     eff_limit: Option<u64>,
     speed: Option<f64>,
     ttft_secs: Option<f64>,
+    thinking_tokens: Option<u64>,
     quota_5h: Option<QuotaView>,
     quota_weekly: Option<QuotaView>,
     git: &'a GitInfo,
@@ -510,6 +511,21 @@ fn render_widget(
             None => Some(Segment::plain(
                 widget,
                 format!("{} --", glyphs.ttft),
+                pal.muted,
+                false,
+            )),
+        },
+        WidgetId::Thinking => match ctx.thinking_tokens.filter(|&t| t > 0) {
+            Some(tok) => Some(Segment::plain(
+                widget,
+                format!("{} think {}", glyphs.thinking, format_tok_str(tok)),
+                pal.thinking,
+                false,
+            )),
+            None if cfg.smart_hide => None,
+            None => Some(Segment::plain(
+                widget,
+                format!("{} think --", glyphs.thinking),
                 pal.muted,
                 false,
             )),
@@ -1046,6 +1062,7 @@ pub fn write_statusline_with_quotas<W: IoWrite>(
         eff_limit,
         speed,
         ttft_secs: meta.ttft_secs,
+        thinking_tokens: meta.thinking_tokens,
         quota_5h,
         quota_weekly,
         git,
