@@ -847,7 +847,9 @@ impl PosixTzRule {
         let Some((dst_offset_secs, start, end)) = self.dst else {
             return self.std_offset_secs;
         };
-        let approx_day = (unix_secs + i64::from(self.std_offset_secs)).div_euclid(SECS_PER_DAY);
+        let approx_day = unix_secs
+            .saturating_add(i64::from(self.std_offset_secs))
+            .div_euclid(SECS_PER_DAY);
         let (year, _, _) = civil_from_days(approx_day);
         let start_ts = self.transition_unix_secs(year, start, self.std_offset_secs);
         let end_ts = self.transition_unix_secs(year, end, dst_offset_secs);
