@@ -614,12 +614,15 @@ pub fn default_config_path() -> io::Result<PathBuf> {
 
 /// Loads [`LayoutConfig`] from `path`, falling back to [`LayoutConfig::default`] if absent or invalid.
 pub fn load_layout_config(path: &Path) -> LayoutConfig {
-    let Ok(content) = fs::read_to_string(path) else {
-        return LayoutConfig::default();
-    };
-    let mut cfg: LayoutConfig = serde_json::from_str(&content).unwrap_or_default();
+    try_load_layout_config(path).unwrap_or_default()
+}
+
+pub(crate) fn try_load_layout_config(path: &Path) -> io::Result<LayoutConfig> {
+    let content = fs::read_to_string(path)?;
+    let mut cfg: LayoutConfig = serde_json::from_str(&content)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     cfg.normalize_rows();
-    cfg
+    Ok(cfg)
 }
 
 /// Atomically writes `config` to `path` as pretty-printed JSON.

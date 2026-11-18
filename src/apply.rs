@@ -3,13 +3,13 @@
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::{self, Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
 use crate::db::{resolve_agy_cli_dir, SessionMetadata};
 use crate::git::GitInfo;
-use crate::layout::load_layout_config;
+use crate::layout::try_load_layout_config;
 use crate::render::write_statusline;
 use crate::tui::sample_preview_payload;
 
@@ -39,21 +39,29 @@ pub fn settings_path_for_home(home: &Path) -> PathBuf {
 
 /// Resolves the preferred binary path to register in AGY `settings.json`.
 ///
-/// Preserves absolute symlinked launcher paths (e.g. Cargo or Homebrew symlinks)
-/// instead of resolving into versioned store directories.
+/// Preserves the launcher path for explicit invocations and bare names on `PATH`.
 pub fn resolve_invoked_binary_path() -> io::Result<PathBuf> {
-    if let Some(arg0) = env::args_os().next() {
-        let p = PathBuf::from(arg0);
-        if p.is_absolute() && p.exists() {
-            return Ok(p);
-        }
-    }
     let exe = env::current_exe()?;
-    if exe.exists() {
-        Ok(exe)
+    let (Some(arg0), Ok(target)) = (env::args_os().next(), exe.canonicalize()) else {
+        return Ok(exe);
+    };
+    let arg0 = Path::new(&arg0);
+    let launcher = |candidate: PathBuf| {
+        let with_exe = (cfg!(windows) && candidate.extension().is_none())
+            .then(|| candidate.with_extension("exe"));
+        std::iter::once(candidate)
+            .chain(with_exe)
+            .filter_map(|candidate| path::absolute(candidate).ok())
+            .find(|candidate| candidate.canonicalize().is_ok_and(|p| p == target))
+    };
+
+    let resolved = if arg0.components().count() > 1 {
+        launcher(arg0.to_owned())
     } else {
-        Ok(exe.canonicalize().unwrap_or(exe))
-    }
+        env::var_os("PATH")
+            .and_then(|path| env::split_paths(&path).find_map(|dir| launcher(dir.join(arg0))))
+    };
+    Ok(resolved.unwrap_or(exe))
 }
 
 /// Builds the `statusLine` JSON object pointing to `command_path`.
@@ -93,16 +101,24 @@ fn read_settings_object(settings_path: &Path, allow_missing: bool) -> io::Result
 }
 
 fn write_settings_object(settings_path: &Path, root: Map<String, Value>) -> io::Result<()> {
-    if let Some(parent) = settings_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = settings_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
     let mut formatted = serde_json::to_string_pretty(&Value::Object(root))
         .map_err(|e| io::Error::other(format!("failed to serialize settings: {e}")))?;
     formatted.push('\n');
 
-    let tmp_path = settings_path.with_extension("json.tmp");
-    fs::write(&tmp_path, formatted.as_bytes())?;
-    fs::rename(&tmp_path, settings_path)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(formatted.as_bytes())?;
+    match fs::metadata(settings_path) {
+        Ok(metadata) => tmp.as_file().set_permissions(metadata.permissions())?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    tmp.as_file().sync_all()?;
+    tmp.persist(settings_path).map_err(|e| e.error)?;
     Ok(())
 }
 
@@ -199,13 +215,20 @@ pub fn run_doctor<W: Write>(
 ) -> io::Result<()> {
     writeln!(out, "agy-statusline v{}", env!("CARGO_PKG_VERSION"))?;
 
-    let mut cfg = load_layout_config(config_path);
-    cfg.no_color = no_color;
-    let cfg_state = if config_path.exists() {
-        "custom file"
-    } else {
-        "not found (using built-in defaults)"
+    let (mut cfg, cfg_state) = match try_load_layout_config(config_path) {
+        Ok(cfg) => (cfg, "custom file".into()),
+        Err(e) => {
+            let state = match e.kind() {
+                io::ErrorKind::NotFound => "not found (using built-in defaults)".into(),
+                io::ErrorKind::InvalidData => {
+                    format!("invalid config: {e} (using built-in defaults)")
+                }
+                _ => format!("unreadable config: {e} (using built-in defaults)"),
+            };
+            (Default::default(), state)
+        }
     };
+    cfg.no_color = no_color;
     writeln!(out, "Config:   {} [{cfg_state}]", config_path.display())?;
     writeln!(
         out,
