@@ -306,6 +306,16 @@ fn render_widget(
     match widget {
         WidgetId::Spacer => Some(Segment::spacer()),
         WidgetId::State => {
+            if payload.tool_confirmation_pending == Some(true) {
+                return Some(Segment {
+                    widget,
+                    text: format!("{} CONFIRM", glyphs.review),
+                    fg: pal.ctx_warn,
+                    accent_bg: Some(pal.ctx_warn),
+                    bold: true,
+                    is_spacer: false,
+                });
+            }
             let state = payload.agent_state.as_deref().unwrap_or("idle");
             let (text, fg) = match state {
                 "idle" => (format!("{} READY", glyphs.ready), pal.ready),
@@ -589,16 +599,90 @@ fn render_widget(
                 false,
             ))
         }
-        WidgetId::Sandbox => {
-            let on = payload
-                .sandbox
+        WidgetId::Queue => {
+            let n = payload.pending_input_count.unwrap_or(0);
+            if n > 0 {
+                Some(Segment::plain(
+                    widget,
+                    format!("queue {n}"),
+                    pal.thinking,
+                    true,
+                ))
+            } else if cfg.smart_hide {
+                None
+            } else {
+                Some(Segment::plain(
+                    widget,
+                    "queue 0".to_string(),
+                    pal.muted,
+                    false,
+                ))
+            }
+        }
+        WidgetId::Vim => {
+            let mode = payload
+                .vim
                 .as_ref()
-                .and_then(|s| s.enabled)
-                .unwrap_or(false);
+                .and_then(|v| v.mode.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match mode {
+                Some(m) => {
+                    let upper = m.to_ascii_uppercase();
+                    let fg = match upper.as_str() {
+                        "INSERT" => pal.ready,
+                        "VISUAL" | "V-LINE" | "V-BLOCK" => pal.model,
+                        "COMMAND" | "REPLACE" => pal.ctx_warn,
+                        _ => pal.dir,
+                    };
+                    Some(Segment::plain(widget, format!("vim {upper}"), fg, true))
+                }
+                None if cfg.smart_hide => None,
+                None => Some(Segment::plain(
+                    widget,
+                    "vim off".to_string(),
+                    pal.muted,
+                    false,
+                )),
+            }
+        }
+        WidgetId::Battle => {
+            let battle = payload.battle.as_ref();
+            let status = battle
+                .and_then(|b| b.status.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match status {
+                Some(st) => {
+                    let upper = st.to_ascii_uppercase();
+                    let text = match battle.and_then(|b| b.focused_arm) {
+                        Some(arm) => format!("battle {upper} #{arm}"),
+                        None => format!("battle {upper}"),
+                    };
+                    Some(Segment::plain(widget, text, pal.review, true))
+                }
+                None if cfg.smart_hide => None,
+                None => Some(Segment::plain(
+                    widget,
+                    "battle off".to_string(),
+                    pal.muted,
+                    false,
+                )),
+            }
+        }
+        WidgetId::Sandbox => {
+            let sb = payload.sandbox.as_ref();
+            let on = sb.and_then(|s| s.enabled).unwrap_or(false);
             if cfg.smart_hide && !on {
                 return None;
             }
-            let text = if on { "sandbox ON" } else { "sandbox off" }.to_string();
+            let net = sb.and_then(|s| s.allow_network).unwrap_or(false);
+            let text = match (on, net) {
+                (true, true) => "sandbox ON+net",
+                (true, false) => "sandbox ON",
+                (false, _) => "sandbox off",
+            }
+            .to_string();
             Some(Segment::plain(
                 widget,
                 text,

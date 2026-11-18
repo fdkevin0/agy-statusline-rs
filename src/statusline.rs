@@ -45,6 +45,26 @@ pub struct VcsInfo {
 pub struct SandboxInfo {
     /// Whether terminal sandbox is enabled.
     pub enabled: Option<bool>,
+    /// Whether network access is permitted inside the sandbox.
+    pub allow_network: Option<bool>,
+}
+
+/// Vim editing mode status (`normal`, `insert`, `visual`, etc.).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct VimInfo {
+    /// Active Vim mode name.
+    pub mode: Option<String>,
+}
+
+/// Battle / multi-arm comparison mode status.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct BattleInfo {
+    /// Battle mode status string.
+    pub status: Option<String>,
+    /// Currently focused arm index.
+    pub focused_arm: Option<u64>,
 }
 
 /// Active workspace directory paths.
@@ -139,6 +159,10 @@ pub struct StatuslinePayload {
     pub artifact_count: Option<u64>,
     /// Background task count.
     pub task_count: Option<u64>,
+    /// Whether a tool execution is awaiting user confirmation.
+    pub tool_confirmation_pending: Option<bool>,
+    /// Number of queued user inputs waiting to be processed.
+    pub pending_input_count: Option<u64>,
     /// Subagent array or null.
     pub subagents: Option<Value>,
     /// Active model info (`null` when unset).
@@ -147,6 +171,10 @@ pub struct StatuslinePayload {
     pub vcs: Option<VcsInfo>,
     /// Sandbox status.
     pub sandbox: Option<SandboxInfo>,
+    /// Vim editing mode state.
+    pub vim: Option<VimInfo>,
+    /// Battle mode state.
+    pub battle: Option<BattleInfo>,
     /// Workspace directory paths.
     pub workspace: Option<WorkspaceInfo>,
     /// Context window metrics.

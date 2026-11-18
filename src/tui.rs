@@ -29,7 +29,7 @@ use crate::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
 use crate::render::write_statusline;
 use crate::statusline::{
     ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, SandboxInfo, StatuslinePayload,
-    VcsInfo, WorkspaceInfo,
+    VcsInfo, VimInfo, WorkspaceInfo,
 };
 
 struct TerminalGuard;
@@ -160,7 +160,14 @@ pub fn sample_preview_payload(width: usize) -> StatuslinePayload {
             branch: Some("main".to_string()),
             dirty: Some(true),
         }),
-        sandbox: Some(SandboxInfo { enabled: Some(true) }),
+        sandbox: Some(SandboxInfo {
+            enabled: Some(true),
+            allow_network: None,
+        }),
+        vim: Some(VimInfo {
+            mode: Some("NORMAL".to_string()),
+        }),
+        pending_input_count: Some(1),
         artifact_count: Some(2),
         subagents: Some(serde_json::json!([1, 2])),
         task_count: Some(3),

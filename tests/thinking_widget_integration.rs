@@ -46,7 +46,7 @@ fn render_thinking(
 
 #[test]
 fn thinking_widget_catalog_metadata_and_presets_unchanged() {
-    assert_eq!(WidgetId::ALL.len(), 22);
+    assert_eq!(WidgetId::ALL.len(), 25);
     assert_eq!(WidgetId::Thinking.label(), "thinking");
     assert_eq!(WidgetId::Thinking.display_name(), "Thinking Tokens");
     assert_eq!(WidgetId::Thinking.priority(), 1);
