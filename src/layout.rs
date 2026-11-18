@@ -16,7 +16,7 @@ use crate::db::resolve_home_dir;
 /// Maximum number of configurable statusline rows.
 pub const MAX_ROWS: usize = 3;
 
-/// All 22 statusline widgets available for placement on any row.
+/// All 25 statusline widgets available for placement on any row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WidgetId {
@@ -60,13 +60,19 @@ pub enum WidgetId {
     Subagents,
     /// Background task count (`tasks 3`).
     Tasks,
-    /// Sandbox status (`sandbox ON` / `sandbox off`).
+    /// Queued user inputs (`queue 1`).
+    Queue,
+    /// Vim mode (`vim NORMAL`).
+    Vim,
+    /// Battle mode (`battle ACTIVE #1`).
+    Battle,
+    /// Sandbox status (`sandbox ON` / `sandbox ON+net` / `sandbox off`).
     Sandbox,
     /// Elastic left/center/right alignment spacer.
     Spacer,
 }
 
-const WIDGET_META: [(WidgetId, &str, &str); 22] = [
+const WIDGET_META: [(WidgetId, &str, &str); 25] = [
     (WidgetId::State, "state", "Agent State"),
     (WidgetId::Model, "model", "Model + Effort"),
     (WidgetId::Directory, "directory", "Workspace Dir"),
@@ -87,13 +93,16 @@ const WIDGET_META: [(WidgetId, &str, &str); 22] = [
     (WidgetId::Artifacts, "artifacts", "Artifact Count"),
     (WidgetId::Subagents, "subagents", "Active Subagents"),
     (WidgetId::Tasks, "tasks", "Background Tasks"),
+    (WidgetId::Queue, "queue", "Queued Inputs"),
+    (WidgetId::Vim, "vim", "Vim Mode"),
+    (WidgetId::Battle, "battle", "Battle Mode"),
     (WidgetId::Sandbox, "sandbox", "Sandbox Status"),
     (WidgetId::Spacer, "spacer", "Flex Spacer (L|R)"),
 ];
 
 impl WidgetId {
-    /// Canonical list of all 22 widgets in catalog display order.
-    pub const ALL: [WidgetId; 22] = [
+    /// Canonical list of all 25 widgets in catalog display order.
+    pub const ALL: [WidgetId; 25] = [
         Self::State,
         Self::Model,
         Self::Directory,
@@ -114,6 +123,9 @@ impl WidgetId {
         Self::Artifacts,
         Self::Subagents,
         Self::Tasks,
+        Self::Queue,
+        Self::Vim,
+        Self::Battle,
         Self::Sandbox,
         Self::Spacer,
     ];
@@ -134,13 +146,19 @@ impl WidgetId {
             Self::State | Self::Spacer => 5,
             Self::Model | Self::CtxBar | Self::CtxPct | Self::Quota5h => 4,
             Self::Mode | Self::Vcs | Self::Speed | Self::Cost | Self::QuotaWeekly => 3,
-            Self::Directory | Self::CacheHit | Self::CtxTokens | Self::Worktree => 2,
+            Self::Directory
+            | Self::CacheHit
+            | Self::CtxTokens
+            | Self::Worktree
+            | Self::Vim
+            | Self::Queue => 2,
             Self::CacheRead
             | Self::Ttft
             | Self::Thinking
             | Self::Subagents
             | Self::Tasks
             | Self::Artifacts
+            | Self::Battle
             | Self::Sandbox => 1,
         }
     }

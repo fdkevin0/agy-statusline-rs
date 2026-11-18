@@ -9,7 +9,7 @@ use crate::layout::{LayoutConfig, WidgetId, MAX_ROWS};
 pub enum ActivePane {
     /// Left pane: 3-line layout canvas with pill reordering and Move Mode.
     Canvas,
-    /// Center pane: catalog of all 22 widgets toggled into the target line.
+    /// Center pane: catalog of all 25 widgets toggled into the target line.
     Catalog,
     /// Right pane: presets, visual style, theme, separator, thresholds, and AGY mode.
     Settings,

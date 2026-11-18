@@ -22,11 +22,11 @@
 - **Live Preview**: Click the preview panel or press `w` to cycle `Auto` / `120col` / `72col`.
 - **Presets & Exit**: `1`–`4` apply presets; `s` saves `config.json` and updates AGY `settings.json`; `S` saves `config.json` only; `q` / `Esc` quits without saving.
 
-## Widgets (22)
+## Widgets (25)
 
 | ID | Description | Notes |
 | :--- | :--- | :--- |
-| `state` | Agent state | `READY`, `THINKING`, `WORKING`, `TOOL`, `REVIEW`, `AUTH`, `INIT`, `DONE`, `ERROR` |
+| `state` | Agent state | `READY`, `THINKING`, `WORKING`, `TOOL`, `REVIEW`, `AUTH`, `INIT`, `DONE`, `ERROR`, or `CONFIRM` when `tool_confirmation_pending` is true |
 | `model` | Model + effort | Appends effort only when not already matched structurally in a trailing group or suffix (including `x`/`extra` equivalence) |
 | `directory` | Workspace dir | Basename of `project_dir`, `current_dir`, or `cwd` |
 | `vcs` | Git branch + diff | Pure-Rust `.git/HEAD` fallback + bounded/cached `+ins -del` diff stats |
@@ -46,7 +46,10 @@
 | `artifacts` | Artifact count | Hidden when `0` if `smart_hide` is enabled |
 | `subagents` | Subagent count | Hidden when `0` if `smart_hide` is enabled |
 | `tasks` | Task count | Hidden when `0` if `smart_hide` is enabled |
-| `sandbox` | Sandbox badge | Hidden when `off` if `smart_hide` is enabled |
+| `queue` | Queued inputs | `queue <n>` from `pending_input_count`; hidden when `0` if `smart_hide` is enabled |
+| `vim` | Vim mode | `vim <MODE>` (`NORMAL`, `INSERT`, `VISUAL`, `COMMAND`, etc.); hidden when absent if `smart_hide` is enabled |
+| `battle` | Battle mode | `battle <STATUS>` (with optional `#<focused_arm>`); hidden when absent if `smart_hide` is enabled |
+| `sandbox` | Sandbox badge | `sandbox ON+net` when `allow_network` is true, `sandbox ON` otherwise; hidden when `off` if `smart_hide` is enabled |
 | `spacer` | Flex spacer | Splits row into `Left | Right` or `Left | Center | Right` groups |
 
 ## Styles, Themes, Glyphs & Data Sources
