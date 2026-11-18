@@ -328,10 +328,10 @@ fn spawn_background_pricing_sync() {
         .spawn();
 }
 
-/// Fetches `url` using `curl` with a bounded 8-second timeout.
+/// Fetches `url` using `curl` with a bounded 15-second timeout.
 pub fn fetch_models_dev_via_curl(url: &str) -> io::Result<String> {
     let output = Command::new("curl")
-        .args(["-fsSL", "--max-time", "8", url])
+        .args(["-fsSL", "--max-time", "15", url])
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .output()?;
