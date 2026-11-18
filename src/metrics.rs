@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::statusline::{QuotaBucket, StatuslinePayload};
+pub use crate::timeutil::parse_rfc3339_unix_secs;
 
 const SECS_PER_HOUR: u64 = 3_600;
 const SECS_PER_DAY: u64 = 86_400;
@@ -84,7 +85,7 @@ pub fn current_context_tokens(payload: &StatuslinePayload) -> Option<u64> {
     let inp = u.input_tokens.unwrap_or(0).max(0) as u64;
     let read = u.cache_read_input_tokens.unwrap_or(0).max(0) as u64;
     let create = u.cache_creation_input_tokens.unwrap_or(0).max(0) as u64;
-    Some(inp + read + create)
+    Some(inp.saturating_add(read).saturating_add(create))
 }
 
 /// Formats a duration in seconds into a compact human-readable string (`45s`, `12m`, `3h10m`, `5d12h`).
@@ -130,107 +131,6 @@ pub fn format_quota_pct(remaining_pct: f64) -> String {
     } else {
         format!("{:.0}%", pct.round())
     }
-}
-
-fn parse_ascii_digits(bytes: &[u8]) -> Option<i64> {
-    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let mut val: i64 = 0;
-    for &b in bytes {
-        val = val * 10 + i64::from(b - b'0');
-    }
-    Some(val)
-}
-
-fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-}
-
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-/// Converts a proleptic Gregorian calendar date to days since 1970-01-01 (Howard Hinnant's algorithm).
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = year - i64::from(month <= 2);
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let m = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * m + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// Parses an RFC3339 / ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SS[.fff](Z|+HH:MM|-HH:MM)`)
-/// into Unix epoch seconds without external date crates.
-pub fn parse_rfc3339_unix_secs(s: &str) -> Option<i64> {
-    let b = s.trim().as_bytes();
-    if b.len() < 20
-        || b[4] != b'-'
-        || b[7] != b'-'
-        || !matches!(b[10], b'T' | b't' | b' ')
-        || b[13] != b':'
-        || b[16] != b':'
-    {
-        return None;
-    }
-    let year = parse_ascii_digits(&b[0..4])?;
-    let month = parse_ascii_digits(&b[5..7])?;
-    let day = parse_ascii_digits(&b[8..10])?;
-    let hour = parse_ascii_digits(&b[11..13])?;
-    let minute = parse_ascii_digits(&b[14..16])?;
-    let second = parse_ascii_digits(&b[17..19])?;
-
-    if !(1..=12).contains(&month)
-        || !(1..=days_in_month(year, month)).contains(&day)
-        || !(0..=23).contains(&hour)
-        || !(0..=59).contains(&minute)
-        || !(0..=59).contains(&second)
-    {
-        return None;
-    }
-
-    let mut idx = 19;
-    if idx < b.len() && b[idx] == b'.' {
-        idx += 1;
-        let frac_start = idx;
-        while idx < b.len() && b[idx].is_ascii_digit() {
-            idx += 1;
-        }
-        if idx == frac_start {
-            return None;
-        }
-    }
-
-    let tz = b.get(idx..)?;
-    let offset_secs = match tz {
-        [b'Z' | b'z'] => 0,
-        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2] | [sign @ (b'+' | b'-'), h1, h2, m1, m2] => {
-            let tz_h = parse_ascii_digits(&[*h1, *h2])?;
-            let tz_m = parse_ascii_digits(&[*m1, *m2])?;
-            if tz_h > 23 || tz_m > 59 {
-                return None;
-            }
-            let mag = tz_h * 3600 + tz_m * 60;
-            if *sign == b'-' {
-                -mag
-            } else {
-                mag
-            }
-        }
-        _ => return None,
-    };
-
-    let days = days_from_civil(year, month, day);
-    let local_secs = days.checked_mul(86_400)? + hour * 3600 + minute * 60 + second;
-    local_secs.checked_sub(offset_secs)
 }
 
 fn current_unix_secs() -> u64 {
@@ -1026,5 +926,22 @@ mod tests {
         assert_eq!(tw.label, "3p 7d");
         assert_eq!(tw.bucket_key, "3p-beta-weekly");
         assert!((tw.remaining_pct - 55.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn current_context_tokens_saturates_on_i64_max() {
+        let payload = StatuslinePayload {
+            context_window: Some(ContextWindow {
+                current_usage: Some(JsonUsage {
+                    input_tokens: Some(i64::MAX),
+                    output_tokens: None,
+                    cache_read_input_tokens: Some(i64::MAX),
+                    cache_creation_input_tokens: Some(i64::MAX),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(current_context_tokens(&payload), Some(u64::MAX));
     }
 }

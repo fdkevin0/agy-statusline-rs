@@ -17,6 +17,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
 use crate::db::{is_valid_uuid, resolve_agy_cli_dir, resolve_home_dir};
 use crate::format::format_tokens;
@@ -24,6 +25,11 @@ use crate::protobuf::{
     extract_gen_metadata_record, extract_step_created_at_secs, MAX_TTFT_SECS,
     MAX_TURN_SPEED_TPS, MIN_TURN_DECODE_SECS,
 };
+use crate::render::truncate_to_width;
+use crate::timeutil::{
+    civil_from_days, days_from_civil, days_in_month, is_leap_year, parse_ascii_digits,
+};
+pub use crate::timeutil::parse_rfc3339_unix_secs;
 
 const SECS_PER_DAY: i64 = 86_400;
 const MAX_TRANSCRIPT_SCAN_DEPTH: usize = 4;
@@ -183,6 +189,9 @@ pub struct StatsReport {
     pub totals: PeriodSummary,
     /// Daily usage entries sorted chronologically (filtered by `filter_days` when set).
     pub daily: Vec<DailyUsage>,
+    /// Unfiltered per-local-day token totals (`YYYY-MM-DD -> total_tokens`) for the 28d heatmap.
+    #[serde(skip)]
+    pub unfiltered_daily_tokens: BTreeMap<String, u64>,
     /// Per-model breakdown sorted by `total_tokens` descending.
     pub models: Vec<ModelStats>,
     /// Aggregate statistics from SQLite `conversations/*.db` (`gen_metadata`).
@@ -211,7 +220,7 @@ pub struct ModelPricingRate {
 pub struct PricingCatalog {
     /// Map of case-insensitive model name or substring pattern to per-million-token rates.
     #[serde(default)]
-    pub models: HashMap<String, ModelPricingRate>,
+    pub models: BTreeMap<String, ModelPricingRate>,
 }
 
 impl PricingCatalog {
@@ -244,31 +253,41 @@ impl PricingCatalog {
             return None;
         }
 
-        let mut exact_match: Option<(&str, &ModelPricingRate)> = None;
-        let mut substr_match: Option<(usize, &str, &ModelPricingRate)> = None;
+        let valid_entries: Vec<(&str, String, &ModelPricingRate)> = self
+            .models
+            .iter()
+            .filter(|(_, rate)| is_valid_rate(rate))
+            .filter_map(|(pattern, rate)| {
+                let pat_lower = pattern.trim().to_ascii_lowercase();
+                (!pat_lower.is_empty()).then_some((pattern.as_str(), pat_lower, rate))
+            })
+            .collect();
 
-        for (pattern, rate) in &self.models {
-            if !is_valid_rate(rate) {
-                continue;
-            }
-            let pat_lower = pattern.trim().to_ascii_lowercase();
-            if pat_lower.is_empty() {
-                continue;
-            }
-            if lowered_candidates.iter().any(|c| c == &pat_lower) {
-                exact_match = Some((pattern.as_str(), rate));
+        // Exact matches take precedence in candidate specificity order (`response_model`,
+        // then `model_display_name`, then `model_group`), breaking ties via `BTreeMap` key order.
+        let mut exact_match: Option<(&str, &ModelPricingRate)> = None;
+        for cand in &lowered_candidates {
+            if let Some((key, _, rate)) = valid_entries.iter().find(|(_, pat, _)| pat == cand) {
+                exact_match = Some((*key, *rate));
                 break;
             }
-            if lowered_candidates.iter().any(|c| c.contains(&pat_lower)) {
-                let replace = match substr_match {
-                    None => true,
-                    Some((best_len, best_key, _)) => {
-                        pat_lower.len() > best_len
-                            || (pat_lower.len() == best_len && pattern.as_str() < best_key)
+        }
+
+        // Substring fallback prefers the longest pattern match, breaking ties via `BTreeMap` key order.
+        let mut substr_match: Option<(usize, &str, &ModelPricingRate)> = None;
+        if exact_match.is_none() {
+            for (pattern, pat_lower, rate) in &valid_entries {
+                if lowered_candidates.iter().any(|c| c.contains(pat_lower)) {
+                    let replace = match substr_match {
+                        None => true,
+                        Some((best_len, best_key, _)) => {
+                            pat_lower.len() > best_len
+                                || (pat_lower.len() == best_len && *pattern < best_key)
+                        }
+                    };
+                    if replace {
+                        substr_match = Some((pat_lower.len(), *pattern, *rate));
                     }
-                };
-                if replace {
-                    substr_match = Some((pat_lower.len(), pattern.as_str(), rate));
                 }
             }
         }
@@ -313,47 +332,6 @@ fn round_usd_6(v: f64) -> f64 {
     } else {
         0.0
     }
-}
-
-fn is_leap_year(year: i64) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
-}
-
-fn days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-/// Converts a civil Gregorian date to days since `1970-01-01` (Howard Hinnant algorithm).
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let m = i64::from(month);
-    let d = i64::from(day);
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// Converts days since `1970-01-01` back into `(year, month, day)`.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + i64::from(m <= 2);
-    (year, m as u32, d as u32)
 }
 
 fn format_day(day_idx: i64) -> String {
@@ -886,87 +864,6 @@ impl PosixTzRule {
     }
 }
 
-fn parse_ascii_digits<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
-    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    std::str::from_utf8(bytes).ok()?.parse::<T>().ok()
-}
-
-/// Parses an RFC3339 timestamp into Unix epoch seconds.
-pub fn parse_rfc3339_unix_secs(raw: &str) -> Option<i64> {
-    let s = raw.trim();
-    let b = s.as_bytes();
-    if b.len() < 20 {
-        return None;
-    }
-    if b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') {
-        return None;
-    }
-    if b[13] != b':' || b[16] != b':' {
-        return None;
-    }
-
-    let year: i64 = parse_ascii_digits(&b[0..4])?;
-    let month: u32 = parse_ascii_digits(&b[5..7])?;
-    let day: u32 = parse_ascii_digits(&b[8..10])?;
-    let hour: i64 = parse_ascii_digits(&b[11..13])?;
-    let minute: i64 = parse_ascii_digits(&b[14..16])?;
-    let second: i64 = parse_ascii_digits(&b[17..19])?;
-
-    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
-        return None;
-    }
-    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
-        return None;
-    }
-
-    let mut idx = 19;
-    if b.get(idx) == Some(&b'.') {
-        idx += 1;
-        let frac_start = idx;
-        while idx < b.len() && b[idx].is_ascii_digit() {
-            idx += 1;
-        }
-        if idx == frac_start {
-            return None;
-        }
-    }
-
-    let tz_offset_secs = match b.get(idx).copied() {
-        Some(b'Z' | b'z') if idx + 1 == b.len() => 0i64,
-        Some(sign @ (b'+' | b'-')) => {
-            let rest = &b[idx + 1..];
-            let (tz_h, tz_m) = match rest.len() {
-                5 if rest[2] == b':' => (
-                    parse_ascii_digits::<i64>(&rest[0..2])?,
-                    parse_ascii_digits::<i64>(&rest[3..5])?,
-                ),
-                4 => (
-                    parse_ascii_digits::<i64>(&rest[0..2])?,
-                    parse_ascii_digits::<i64>(&rest[2..4])?,
-                ),
-                _ => return None,
-            };
-            if !(0..=23).contains(&tz_h) || !(0..=59).contains(&tz_m) {
-                return None;
-            }
-            let mag = tz_h * 3_600 + tz_m * 60;
-            if sign == b'+' {
-                mag
-            } else {
-                -mag
-            }
-        }
-        _ => return None,
-    };
-
-    let days = days_from_civil(year, month, day);
-    let clamped_sec = second.min(59);
-    let local_secs = days * SECS_PER_DAY + hour * 3_600 + minute * 60 + clamped_sec;
-    Some(local_secs - tz_offset_secs)
-}
-
 /// Parses an RFC3339 timestamp into `(utc_day_index, "YYYY-MM-DD")`.
 pub fn parse_rfc3339_utc_day(raw: &str) -> Option<(i64, String)> {
     let utc_secs = parse_rfc3339_unix_secs(raw)?;
@@ -1378,13 +1275,13 @@ fn parse_transcript_line(
         (Some("native".to_string()), Some(round_usd_6(usd)))
     } else {
         let mut candidates = Vec::with_capacity(3);
-        candidates.push(model_group.as_str());
         if let Some(r) = resp {
             candidates.push(r);
         }
         if let Some(d) = disp {
             candidates.push(d);
         }
+        candidates.push(model_group.as_str());
         match pricing.estimate_cost(
             &candidates,
             input_tokens,
@@ -1542,7 +1439,6 @@ fn scan_sqlite_conversations(
                 continue;
             }
             let uuid_lower = stem.to_ascii_lowercase();
-            covered.insert((*source, uuid_lower.clone()));
             let real = canonical_or_self(&path);
             if seen_dbs.insert(real) {
                 targets.push(DbTarget {
@@ -1554,17 +1450,13 @@ fn scan_sqlite_conversations(
         }
     }
 
-    let mut stats = SqliteStats {
-        db_files: targets.len() as u64,
-        ..Default::default()
-    };
+    let mut stats = SqliteStats::default();
     let mut speed_samples = Vec::new();
     let mut ttft_samples = Vec::new();
     let mut events = Vec::new();
 
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     for target in &targets {
-        let _ = (&target.source, &target.uuid);
         let db_mtime_secs = fs::metadata(&target.path)
             .and_then(|m| m.modified())
             .ok()
@@ -1603,6 +1495,9 @@ fn scan_sqlite_conversations(
         let Ok(mut rows) = stmt.query([]) else {
             continue;
         };
+
+        covered.insert((target.source, target.uuid.clone()));
+        stats.db_files += 1;
 
         while let Ok(Some(row)) = rows.next() {
             let Ok(blob) = row.get::<_, Vec<u8>>(0) else {
@@ -1651,13 +1546,13 @@ fn scan_sqlite_conversations(
                 (Some("native".to_string()), Some(round_usd_6(usd)))
             } else {
                 let mut candidates = Vec::with_capacity(3);
-                candidates.push(model_group.as_str());
                 if let Some(r) = rec.response_model {
                     candidates.push(r);
                 }
                 if let Some(d) = rec.model_display_name {
                     candidates.push(d);
                 }
+                candidates.push(model_group.as_str());
                 match pricing.estimate_cost(
                     &candidates,
                     rec.input_tokens,
@@ -1798,6 +1693,7 @@ pub fn collect_stats_for_roots(
     let mut windows = WindowSummaries::default();
     let mut totals = PeriodSummary::default();
     let mut daily_map: BTreeMap<i64, DailyUsage> = BTreeMap::new();
+    let mut unfiltered_daily_tokens: BTreeMap<String, u64> = BTreeMap::new();
     let mut model_map: HashMap<String, ModelAccumulator> = HashMap::new();
     let mut first_day: Option<i64> = None;
 
@@ -1806,6 +1702,11 @@ pub fn collect_stats_for_roots(
             Some(prev) => prev.min(ev.local_day),
             None => ev.local_day,
         });
+
+        let day_tok = unfiltered_daily_tokens
+            .entry(ev.local_date.clone())
+            .or_insert(0);
+        *day_tok = day_tok.saturating_add(ev.total_tokens);
 
         accumulate_period(&mut windows.all_time, ev);
         if ev.local_day == today_day_idx {
@@ -1933,6 +1834,7 @@ pub fn collect_stats_for_roots(
         windows,
         totals,
         daily,
+        unfiltered_daily_tokens,
         models,
         sqlite,
     }
@@ -1997,11 +1899,19 @@ fn build_28d_heatmap(report: &StatsReport, ascii: bool) -> (String, Option<(Stri
     let Some(today_idx) = parse_civil_date_day(ref_date) else {
         return (String::new(), None);
     };
-    let daily_by_date: HashMap<&str, u64> = report
-        .daily
-        .iter()
-        .map(|d| (d.date.as_str(), d.total_tokens))
-        .collect();
+    let daily_by_date: HashMap<&str, u64> = if !report.unfiltered_daily_tokens.is_empty() {
+        report
+            .unfiltered_daily_tokens
+            .iter()
+            .map(|(date, tokens)| (date.as_str(), *tokens))
+            .collect()
+    } else {
+        report
+            .daily
+            .iter()
+            .map(|d| (d.date.as_str(), d.total_tokens))
+            .collect()
+    };
 
     let start_idx = today_idx - (HEATMAP_DAYS - 1);
     let mut counts = Vec::with_capacity(HEATMAP_DAYS as usize);
@@ -2075,6 +1985,13 @@ fn write_window_row<W: Write>(
     }
 }
 
+fn pad_model_cell(name: &str, width: usize, ascii: bool) -> String {
+    let ellipsis = if ascii { "..." } else { "…" };
+    let truncated = truncate_to_width(name, width, ellipsis);
+    let pad = width.saturating_sub(truncated.width());
+    format!("{truncated}{}", " ".repeat(pad))
+}
+
 /// Renders a concise terminal summary of [`StatsReport`], respecting `no_color` and `ascii`.
 pub fn render_stats_report<W: Write>(
     report: &StatsReport,
@@ -2137,7 +2054,7 @@ pub fn render_stats_report<W: Write>(
         let model_w = report
             .models
             .iter()
-            .map(|m| m.model.len())
+            .map(|m| m.model.width())
             .max()
             .unwrap_or(24)
             .clamp(24, 38);
@@ -2155,6 +2072,7 @@ pub fn render_stats_report<W: Write>(
         writeln!(out, "\n{}", style_wrap(no_color, "2", &model_hdr))?;
 
         for m in &report.models {
+            let model_cell = pad_model_cell(&m.model, model_w, ascii);
             let speed_str = m
                 .median_tok_per_sec
                 .map_or_else(|| "-".to_string(), |s| format!("{s:.1}"));
@@ -2166,8 +2084,8 @@ pub fn render_stats_report<W: Write>(
                 let cost_str = fmt_usd(m.priced_usd, priced_reqs, m.unpriced_requests);
                 writeln!(
                     out,
-                    "  {:<model_w$} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}  {}",
-                    m.model,
+                    "  {} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}  {}",
+                    model_cell,
                     m.requests,
                     fmt_tok(m.total_tokens),
                     fmt_tok(m.output_tokens),
@@ -2179,8 +2097,8 @@ pub fn render_stats_report<W: Write>(
             } else {
                 writeln!(
                     out,
-                    "  {:<model_w$} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}",
-                    m.model,
+                    "  {} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}",
+                    model_cell,
                     m.requests,
                     fmt_tok(m.total_tokens),
                     fmt_tok(m.output_tokens),
@@ -2777,5 +2695,208 @@ mod tests {
         assert_eq!(populated.models[0].model, "tiny-model");
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn days_filter_preserves_28d_activity_heatmap() {
+        let home = temp_home("days_heatmap");
+        let uuid = "44444444-4444-4444-8444-444444444444";
+        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
+        let old_secs = parse_rfc3339_unix_secs("2026-11-03T12:00:00Z").unwrap() as u64;
+
+        let db_path = home
+            .join(".gemini/antigravity-cli/conversations")
+            .join(format!("{uuid}.db"));
+        let steps = vec![(1, build_step_meta_blob(old_secs))];
+        let gens = vec![(
+            1,
+            build_gen_blob(
+                Some(1),
+                1526,
+                "model-alpha",
+                "Model Alpha",
+                2_500,
+                0,
+                500,
+                0,
+                2,
+                300,
+                None,
+            ),
+        )];
+        create_full_conv_db(&db_path, &steps, &gens);
+
+        let report = collect_stats_with_tz(&home, Some(7), now_secs, &TimeZoneSpec::utc());
+        assert_eq!(report.filter_days, Some(7));
+        assert!(report.daily.is_empty());
+        assert!(report.models.is_empty());
+
+        let mut out = Vec::new();
+        render_stats_report(&report, true, true, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("(no activity)"), "unexpected text:\n{text}");
+        assert!(
+            text.contains("peak 3K on 2026-11-03"),
+            "missing 15d-old activity peak in:\n{text}"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn pricing_catalog_prefers_exact_specificity_then_longest_deterministic_substring() {
+        let mut models = BTreeMap::new();
+        models.insert(
+            "claude-sonnet".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 1.0,
+                output_per_mtok: 2.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "claude-sonnet-4-6-thinking".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 10.0,
+                output_per_mtok: 20.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "alpha-a".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 3.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "alpha-b".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 9.0,
+                ..Default::default()
+            },
+        );
+        let catalog = PricingCatalog { models };
+
+        // Exact specificity: response_model ("claude-sonnet-4-6-thinking") beats model_group ("claude-sonnet")
+        // even though "claude-sonnet" < "claude-sonnet-4-6-thinking" in BTreeMap order.
+        let (matched_key, cost) = catalog
+            .estimate_cost(
+                &[
+                    "claude-sonnet-4-6-thinking",
+                    "Claude Sonnet 4.6 (Thinking)",
+                    "claude-sonnet",
+                ],
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(matched_key, "claude-sonnet-4-6-thinking");
+        assert!((cost - 10.0).abs() < 1e-6);
+
+        // Substring fallback: longest match wins, and equal-length tie breaks by BTreeMap key order ("alpha-a" < "alpha-b").
+        let (tie_key, tie_cost) = catalog
+            .estimate_cost(&["alpha-b-and-alpha-a-model"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(tie_key, "alpha-a");
+        assert!((tie_cost - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn empty_or_schemaless_db_falls_back_to_transcript_jsonl() {
+        let home = temp_home("empty_db_fallback");
+        let uuid_empty = "55555555-5555-4555-8555-555555555555";
+        let uuid_schemaless = "66666666-6666-4666-8666-666666666666";
+        let conv_dir = home.join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+
+        // 0-byte .db file.
+        fs::write(conv_dir.join(format!("{uuid_empty}.db")), b"").unwrap();
+        let t1 = home.join(format!(
+            ".gemini/antigravity-cli/brain/{uuid_empty}/.system_generated/logs/transcript.jsonl"
+        ));
+        fs::create_dir_all(t1.parent().unwrap()).unwrap();
+        fs::write(
+            &t1,
+            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"step_index\":1,\"model\":\"fallback-a\",\"input_tokens\":500,\"output_tokens\":50}\n",
+        )
+        .unwrap();
+
+        // Schema-less SQLite .db missing gen_metadata.
+        let conn = Connection::open(conv_dir.join(format!("{uuid_schemaless}.db"))).unwrap();
+        conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+        drop(conn);
+        let t2 = home.join(format!(
+            ".gemini/antigravity-cli/brain/{uuid_schemaless}/.system_generated/logs/transcript.jsonl"
+        ));
+        fs::create_dir_all(t2.parent().unwrap()).unwrap();
+        fs::write(
+            &t2,
+            "{\"created_at\":\"2026-11-18T11:00:00Z\",\"step_index\":1,\"model\":\"fallback-b\",\"input_tokens\":700,\"output_tokens\":100}\n",
+        )
+        .unwrap();
+
+        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
+        let report = collect_stats_with_tz(&home, None, now_secs, &TimeZoneSpec::utc());
+        assert_eq!(report.sqlite.db_files, 0);
+        assert_eq!(report.totals.requests, 2);
+        assert_eq!(report.totals.total_tokens, 1350);
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn render_stats_report_aligns_long_and_unicode_model_names() {
+        let report = StatsReport {
+            today_local: "2026-11-18".to_string(),
+            timezone: "UTC".to_string(),
+            today_utc: "2026-11-18".to_string(),
+            models: vec![
+                ModelStats {
+                    model: "extremely-long-model-display-name-45-chars-xy".to_string(),
+                    requests: 3,
+                    total_tokens: 1_500,
+                    output_tokens: 200,
+                    thinking_tokens: 50,
+                    median_tok_per_sec: Some(64.0),
+                    median_ttft_secs: Some(0.5),
+                    ..Default::default()
+                },
+                ModelStats {
+                    model: "模型-α-wide".to_string(),
+                    requests: 1,
+                    total_tokens: 500,
+                    output_tokens: 100,
+                    thinking_tokens: 0,
+                    median_tok_per_sec: Some(32.0),
+                    median_ttft_secs: Some(0.8),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        render_stats_report(&report, true, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let hdr_idx = lines
+            .iter()
+            .position(|l| l.contains("Model") && l.contains("Turns"))
+            .unwrap();
+        let hdr_col = lines[hdr_idx].find(" Turns").unwrap();
+        let row1_col = lines[hdr_idx + 1].find("     3").unwrap();
+        let row2_col = lines[hdr_idx + 2].find("     1").unwrap();
+        assert_eq!(
+            lines[hdr_idx][..hdr_col].width(),
+            lines[hdr_idx + 1][..row1_col].width()
+        );
+        assert_eq!(
+            lines[hdr_idx][..hdr_col].width(),
+            lines[hdr_idx + 2][..row2_col].width()
+        );
     }
 }

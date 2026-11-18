@@ -7,21 +7,27 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use crate::db::{resolve_home_dir, SessionMetadata};
+use crate::db::{resolve_agy_cli_dir, SessionMetadata};
 use crate::git::GitInfo;
 use crate::layout::load_layout_config;
 use crate::render::write_statusline;
 use crate::tui::sample_preview_payload;
 
-/// Returns the default AGY settings path (`<home>/.gemini/antigravity-cli/settings.json`).
-pub fn default_settings_path() -> io::Result<PathBuf> {
-    let home = resolve_home_dir().ok_or_else(|| {
+fn settings_path_from_cli_dir(cli_dir: Option<PathBuf>) -> io::Result<PathBuf> {
+    let dir = cli_dir.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            "neither HOME nor USERPROFILE environment variable is set",
+            "neither ANTIGRAVITY_CLI_HOME, AGY_HOME, HOME, nor USERPROFILE environment variable is set",
         )
     })?;
-    Ok(settings_path_for_home(&home))
+    Ok(dir.join("settings.json"))
+}
+
+/// Returns the default AGY settings path (`<agy_cli_dir>/settings.json`).
+///
+/// Honors `ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, or `<home>/.gemini/antigravity-cli`.
+pub fn default_settings_path() -> io::Result<PathBuf> {
+    settings_path_from_cli_dir(resolve_agy_cli_dir())
 }
 
 /// Returns `<home>/.gemini/antigravity-cli/settings.json` for a given home directory.
@@ -393,5 +399,16 @@ mod tests {
         assert!(text.contains("Preview:"));
         assert!(!text.contains('\x1b'));
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn settings_path_from_cli_dir_resolves_or_errors_not_found() {
+        let dir = PathBuf::from("/tmp/custom-agy-cli");
+        assert_eq!(
+            settings_path_from_cli_dir(Some(dir.clone())).unwrap(),
+            dir.join("settings.json")
+        );
+        let err = settings_path_from_cli_dir(None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }

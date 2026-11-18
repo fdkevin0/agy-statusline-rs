@@ -20,4 +20,5 @@ pub mod render;
 pub mod stats;
 pub mod statusline;
 pub mod theme;
+pub mod timeutil;
 pub mod tui;
