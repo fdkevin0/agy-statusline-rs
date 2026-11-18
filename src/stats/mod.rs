@@ -1331,7 +1331,8 @@ mod tests {
           "google": {
             "models": {
               "gemini-4-hydrogen": { "cost": { "input": 1.5, "output": 7.5, "cache_read": 0.075 } },
-              "gemini-4-carbon": { "cost": { "input": 2.0, "output": 10.0, "cache_read": 0.1 } }
+              "gemini-4-carbon": { "cost": { "input": 2.0, "output": 10.0, "cache_read": 0.1 } },
+              "gemini-4-argon": { "cost": { "input": 2.0, "output": 10.0, "cache_read": 0.1 } }
             }
           },
           "anthropic": {
@@ -1367,6 +1368,31 @@ mod tests {
             .estimate_cost(&["Gemini 4 Carbon (High)"], 1_000_000, 0, 0, 0)
             .unwrap();
         assert!((carbon_usd - 2.0).abs() < 1e-6);
+
+        // Orchestrator aliases map to their underlying Carbon/Argon models when no explicit rate exists.
+        let (orch_c_key, orch_c_usd) = cat1
+            .estimate_cost(
+                &["gemini-pro-orchestrator", "Orchestrator (Carbon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(orch_c_key, "gemini-4-carbon");
+        assert!((orch_c_usd - 2.0).abs() < 1e-6);
+
+        let (orch_a_key, orch_a_usd) = cat1
+            .estimate_cost(
+                &["gemini-pro-orchestrator-argon", "Orchestrator (Argon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(orch_a_key, "gemini-4-argon");
+        assert!((orch_a_usd - 2.0).abs() < 1e-6);
 
         // Within TTL: fetcher must NOT be called.
         let _cat2 = PricingCatalog::load_effective_with(
