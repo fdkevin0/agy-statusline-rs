@@ -246,7 +246,15 @@ impl PricingCatalog {
             }
         }
 
-        let (matched_key, rate) = exact_match.or_else(|| substr_match.map(|(_, k, r)| (k, r)))?;
+        let alias_match = if exact_match.is_none() && substr_match.is_none() {
+            resolve_orchestrator_alias(&lowered_candidates, &valid_entries)
+        } else {
+            None
+        };
+
+        let (matched_key, rate) = exact_match
+            .or_else(|| substr_match.map(|(_, k, r)| (k, r)))
+            .or(alias_match)?;
         let cost = ((input_tokens as f64) * rate.input_per_mtok
             + (cache_read_tokens as f64) * rate.cache_read_per_mtok
             + (cache_write_tokens as f64) * rate.cache_write_per_mtok
@@ -257,6 +265,34 @@ impl PricingCatalog {
         }
         Some((matched_key.to_string(), round_usd_6(cost)))
     }
+}
+
+fn resolve_orchestrator_alias<'a>(
+    candidates: &[(String, String)],
+    valid_entries: &[(&'a str, String, String, &'a ModelPricingRate)],
+) -> Option<(&'a str, &'a ModelPricingRate)> {
+    let target = candidates.iter().find_map(|(_, norm)| {
+        let has_orch = norm.split_whitespace().any(|w| w == "orchestrator");
+        if !has_orch {
+            return None;
+        }
+        if norm.split_whitespace().any(|w| w == "argon")
+            || norm == "gemini pro orchestrator g1 pro"
+        {
+            Some("gemini-4-argon")
+        } else if norm.split_whitespace().any(|w| w == "carbon")
+            || norm == "gemini pro orchestrator"
+        {
+            Some("gemini-4-carbon")
+        } else {
+            None
+        }
+    })?;
+
+    valid_entries
+        .iter()
+        .find(|(_, pat_raw, _, _)| pat_raw == target)
+        .map(|(key, _, _, rate)| (*key, *rate))
 }
 
 fn normalize_model_key(raw: &str) -> String {
