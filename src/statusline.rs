@@ -8,11 +8,12 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::calibration::calibrate_quota_views_at;
-use crate::db::SpeedReader;
+use crate::db::{resolve_agy_cli_dir, SpeedReader};
 use crate::git::{GitInfo, GitProbe, SystemGitProbe};
 use crate::layout::{LayoutConfig, WidgetId};
 use crate::metrics::{resolve_quota_5h, resolve_quota_weekly, QuotaView};
 use crate::render::write_statusline_with_quotas;
+use crate::stats::{estimate_conversation_cost_usd, PricingCatalog, SyncMode};
 
 /// Active AI model metadata (`"model": null` before a model is selected).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -331,6 +332,51 @@ pub fn process_statusline_with_probes<W: Write>(
     write_statusline_with_quotas(&payload, &meta, &git_info, quota_5h, quota_weekly, cfg, out)
 }
 
+fn estimate_payload_cost_usd(
+    payload: &StatuslinePayload,
+    pricing: &PricingCatalog,
+) -> Option<f64> {
+    let model = payload.model.as_ref()?;
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(id) = model.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        candidates.push(id);
+    }
+    if let Some(disp) = model
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        candidates.push(disp);
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let cw = payload.context_window.as_ref()?;
+    if cw.total_input_tokens.is_some() || cw.total_output_tokens.is_some() {
+        let inp = cw.total_input_tokens.unwrap_or(0);
+        let out = cw.total_output_tokens.unwrap_or(0);
+        if inp > 0 || out > 0 {
+            return pricing
+                .estimate_cost(&candidates, inp, 0, 0, out)
+                .map(|(_, usd)| usd);
+        }
+    }
+
+    let usage = cw.current_usage.as_ref()?;
+    let inp = usage.input_tokens.unwrap_or(0).max(0) as u64;
+    let cache_read = usage.cache_read_input_tokens.unwrap_or(0).max(0) as u64;
+    let cache_write = usage.cache_creation_input_tokens.unwrap_or(0).max(0) as u64;
+    let out = usage.output_tokens.unwrap_or(0).max(0) as u64;
+    if inp == 0 && cache_read == 0 && cache_write == 0 && out == 0 {
+        return None;
+    }
+    pricing
+        .estimate_cost(&candidates, inp, cache_read, cache_write, out)
+        .map(|(_, usd)| usd)
+}
+
 /// Parses `input` JSON using explicit [`SpeedReader`], [`GitProbe`], and quota token calibration cache directory.
 pub fn process_statusline_with_calibration<W: Write>(
     input: &str,
@@ -342,7 +388,20 @@ pub fn process_statusline_with_calibration<W: Write>(
     out: &mut W,
 ) -> io::Result<()> {
     let payload: StatuslinePayload = serde_json::from_str(input).unwrap_or_default();
-    let (meta, git_info) = probe_session_and_git(&payload, reader, git_probe, cfg);
+    let (mut meta, git_info) = probe_session_and_git(&payload, reader, git_probe, cfg);
+    let needs_cost = cfg.rows.iter().flatten().any(|w| matches!(w, WidgetId::Cost))
+        && payload.cost.as_ref().and_then(|c| c.total_usd).is_none();
+    if needs_cost {
+        let pricing = PricingCatalog::load_effective(SyncMode::SpawnIfStale, now_unix_secs);
+        meta.estimated_cost_usd = payload
+            .conversation_id
+            .as_deref()
+            .and_then(|cid| {
+                resolve_agy_cli_dir()
+                    .and_then(|cli_dir| estimate_conversation_cost_usd(&cli_dir, cid, &pricing))
+            })
+            .or_else(|| estimate_payload_cost_usd(&payload, &pricing));
+    }
     let (quota_5h, quota_weekly): (Option<QuotaView>, Option<QuotaView>) =
         calibrate_quota_views_at(&payload, calibration_dir, now_unix_secs);
     write_statusline_with_quotas(&payload, &meta, &git_info, quota_5h, quota_weekly, cfg, out)

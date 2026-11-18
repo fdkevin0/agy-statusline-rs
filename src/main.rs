@@ -17,7 +17,7 @@ use agy_statusline::git::SystemGitProbe;
 use agy_statusline::layout::{
     default_config_path, load_layout_config, save_layout_config, LayoutConfig,
 };
-use agy_statusline::stats::run_stats_command;
+use agy_statusline::stats::{run_pricing_command, run_stats_command};
 use agy_statusline::statusline::process_statusline_with_calibration;
 use agy_statusline::tui::run_tui_config;
 
@@ -33,8 +33,14 @@ fn print_help() {
          agy-statusline config --reset                Remove XDG layout config (restore defaults)\n  \
          agy-statusline apply [--yes|-y] [--stack|--replace|--disable]\n                                               Register or disable statusLine in AGY settings.json\n  \
          agy-statusline doctor                        Check configuration, AGY hook, and sample preview\n  \
-         agy-statusline stats [--days <N>] [--json] [--ascii]\n                                               Show local token usage, estimated API cost, and speed stats"
+         agy-statusline stats [--days <N>] [--json] [--ascii]\n                                               Show local token usage, estimated API cost, and speed stats\n  \
+         agy-statusline pricing [status|sync]         Show or force-refresh cached models.dev pricing (24h TTL)\n  \
+         agy-statusline version | --version | -V      Print version information"
     );
+}
+
+fn print_version() {
+    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 }
 
 fn parse_preset(name: &str) -> io::Result<LayoutConfig> {
@@ -246,6 +252,49 @@ fn main() -> io::Result<()> {
                     )
                 })?;
                 preset_override = Some(parse_preset(&name)?);
+            }
+            "pricing" => {
+                let mut sync = false;
+                let mut if_stale = false;
+                for arg in args {
+                    match arg.as_str() {
+                        "sync" => sync = true,
+                        "status" => {}
+                        "--if-stale" => if_stale = true,
+                        "--help" | "-h" => {
+                            println!("Usage: agy-statusline pricing [status|sync [--if-stale]]");
+                            return Ok(());
+                        }
+                        other => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("unknown option for pricing: {other}"),
+                            ));
+                        }
+                    }
+                }
+                if if_stale && !sync {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--if-stale requires 'pricing sync'",
+                    ));
+                }
+                let mut stdout = io::stdout().lock();
+                return run_pricing_command(sync, if_stale, &mut stdout);
+            }
+            "version" | "--version" | "-V" => {
+                if let Some(flag) = args.next() {
+                    if matches!(flag.as_str(), "--help" | "-h") {
+                        println!("Usage: agy-statusline version");
+                        return Ok(());
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unknown option for version: {flag}"),
+                    ));
+                }
+                print_version();
+                return Ok(());
             }
             "--help" | "-h" => {
                 print_help();

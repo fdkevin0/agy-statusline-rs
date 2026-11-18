@@ -366,3 +366,29 @@ fn tier2_apply_and_doctor_honor_antigravity_cli_home_and_agy_home() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn cli_version_command_and_flags() {
+    let expected = format!("{} {}\n", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+
+    let out_cmd = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
+        .arg("version")
+        .output()
+        .unwrap();
+    assert!(out_cmd.status.success());
+    assert_eq!(String::from_utf8(out_cmd.stdout).unwrap(), expected);
+
+    let out_long = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(out_long.status.success());
+    assert_eq!(String::from_utf8(out_long.stdout).unwrap(), expected);
+
+    let out_short = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
+        .arg("-V")
+        .output()
+        .unwrap();
+    assert!(out_short.status.success());
+    assert_eq!(String::from_utf8(out_short.stdout).unwrap(), expected);
+}

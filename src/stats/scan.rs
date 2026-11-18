@@ -806,3 +806,63 @@ pub(super) fn scan_sqlite_conversations(
     stats.median_ttft_secs = compute_median(&mut ttft_samples);
     (stats, events, covered)
 }
+
+/// Estimates total USD cost for a single conversation from its SQLite `gen_metadata` table.
+pub fn estimate_conversation_cost_usd(
+    cli_dir: &Path,
+    conversation_id: &str,
+    pricing: &PricingCatalog,
+) -> Option<f64> {
+    if !is_valid_uuid(conversation_id) {
+        return None;
+    }
+    let db_path = cli_dir
+        .join("conversations")
+        .join(format!("{}.db", conversation_id.to_ascii_lowercase()));
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(&db_path, flags).ok()?;
+    let _ = conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS));
+    let mut stmt = conn
+        .prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL")
+        .ok()?;
+    let mut rows = stmt.query([]).ok()?;
+
+    let mut total_usd = 0.0_f64;
+    let mut priced_turns = 0_u64;
+    while let Ok(Some(row)) = rows.next() {
+        let Ok(blob) = row.get::<_, Vec<u8>>(0) else {
+            continue;
+        };
+        let Some(rec) = extract_gen_metadata_record(&blob) else {
+            continue;
+        };
+        let turn_usd = if let Some(usd) = rec.model_cost_usd {
+            Some(round_usd_6(usd))
+        } else {
+            let model_group =
+                derive_model_name(rec.model_display_name, rec.response_model, rec.model_enum);
+            let mut candidates = Vec::with_capacity(3);
+            if let Some(r) = rec.response_model {
+                candidates.push(r);
+            }
+            if let Some(d) = rec.model_display_name {
+                candidates.push(d);
+            }
+            candidates.push(model_group.as_str());
+            pricing
+                .estimate_cost(
+                    &candidates,
+                    rec.input_tokens,
+                    rec.cache_read_tokens,
+                    rec.cache_write_tokens,
+                    rec.output_tokens,
+                )
+                .map(|(_, usd)| usd)
+        };
+        if let Some(usd) = turn_usd {
+            total_usd += usd;
+            priced_turns += 1;
+        }
+    }
+    (priced_turns > 0 && total_usd.is_finite()).then(|| round_usd_6(total_usd))
+}

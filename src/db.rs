@@ -31,6 +31,8 @@ pub struct SessionMetadata {
     pub estimated_context_tokens: Option<u64>,
     /// Thinking output tokens (`thinking_output_tokens`) from the latest completed turn.
     pub thinking_tokens: Option<u64>,
+    /// Locally estimated session cost in USD (used when AGY payload omits `cost.total_usd`).
+    pub estimated_cost_usd: Option<f64>,
 }
 
 /// Trait abstracting last-turn speed and context limit lookup for testability.
@@ -45,11 +47,7 @@ pub trait SpeedReader {
             speed,
             median_speed: speed,
             last_turn_speed: speed,
-            e2e_speed: None,
-            ttft_secs: None,
-            max_context_tokens: None,
-            estimated_context_tokens: None,
-            thinking_tokens: None,
+            ..Default::default()
         }
     }
 }
