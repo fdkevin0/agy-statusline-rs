@@ -18,9 +18,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use pricing::{default_pricing_path, ModelPricingRate, PricingCatalog};
+pub use pricing::{
+    default_pricing_cache_dir, default_pricing_path, fetch_models_dev_via_curl,
+    parse_models_dev_json, pricing_cache_status, run_pricing_command,
+    sync_models_dev_pricing_with, ModelPricingRate, PricingCacheStatus, PricingCatalog, SyncMode,
+    DEFAULT_PRICING_TTL_SECS,
+};
 pub use render::render_stats_report;
-pub use scan::derive_model_name;
+pub use scan::{derive_model_name, estimate_conversation_cost_usd};
 pub use tz::{
     parse_rfc3339_unix_secs, parse_rfc3339_utc_day, unix_secs_to_utc_date, TimeZoneSpec,
 };
@@ -475,6 +480,9 @@ pub fn run_stats_command<W: Write>(
         roots.push(("desktop", home.join(".gemini").join("antigravity")));
     }
 
+    let cache_dir = default_pricing_cache_dir().or_else(|| {
+        (!home.as_os_str().is_empty()).then(|| home.join(".cache").join("agy-statusline"))
+    });
     let pricing_path = default_pricing_path().or_else(|| {
         (!home.as_os_str().is_empty()).then(|| {
             home.join(".config")
@@ -482,9 +490,14 @@ pub fn run_stats_command<W: Write>(
                 .join("pricing.json")
         })
     });
-    let pricing = pricing_path
-        .map(|p| PricingCatalog::load_from_file(&p))
-        .unwrap_or_default();
+    let pricing = PricingCatalog::load_effective_with(
+        cache_dir.as_deref(),
+        pricing_path.as_deref(),
+        SyncMode::BlockingIfStale,
+        now_unix_secs,
+        DEFAULT_PRICING_TTL_SECS,
+        fetch_models_dev_via_curl,
+    );
     let tz = TimeZoneSpec::local();
     let report = collect_stats_for_roots(&roots, days, now_unix_secs, &tz, &pricing);
 
@@ -1300,5 +1313,87 @@ mod tests {
             lines[hdr_idx][..hdr_col].width(),
             lines[hdr_idx + 2][..row2_col].width()
         );
+    }
+
+    #[test]
+    fn models_dev_sync_respects_ttl_overrides_and_normalizes_model_names() {
+        let home = temp_home("models_dev_ttl");
+        let cache_dir = home.join("cache");
+        let override_path = home.join("pricing.json");
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        let sample_api = r#"{
+          "reseller": {
+            "models": {
+              "gemini-4-hydrogen": { "cost": { "input": 99.0, "output": 99.0 } }
+            }
+          },
+          "google": {
+            "models": {
+              "gemini-4-hydrogen": { "cost": { "input": 1.5, "output": 7.5, "cache_read": 0.075 } },
+              "gemini-4-carbon": { "cost": { "input": 2.0, "output": 10.0, "cache_read": 0.1 } }
+            }
+          },
+          "anthropic": {
+            "models": {
+              "claude-opus-5-5": { "cost": { "input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0 } }
+            }
+          }
+        }"#;
+
+        let t0 = 1_700_000_000;
+        let mut fetch_calls = 0usize;
+        let cat1 = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            Some(&override_path),
+            SyncMode::BlockingIfStale,
+            t0,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| {
+                fetch_calls += 1;
+                Ok(sample_api.to_string())
+            },
+        );
+        assert_eq!(fetch_calls, 1);
+        // Canonical provider (`google`) takes precedence over `reseller`.
+        assert_eq!(cat1.models["gemini-4-hydrogen"].input_per_mtok, 1.5);
+
+        // Separator-normalized matching (`Claude Opus 5.5` -> `claude-opus-5-5`, `Gemini 4 Carbon (High)` -> `gemini-4-carbon`).
+        let (_, opus_usd) = cat1
+            .estimate_cost(&["Claude Opus 5.5"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert!((opus_usd - 4.0).abs() < 1e-6);
+        let (_, carbon_usd) = cat1
+            .estimate_cost(&["Gemini 4 Carbon (High)"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert!((carbon_usd - 2.0).abs() < 1e-6);
+
+        // Within TTL: fetcher must NOT be called.
+        let _cat2 = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            Some(&override_path),
+            SyncMode::BlockingIfStale,
+            t0 + 100,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| -> io::Result<String> { panic!("unexpected fetch while cache is fresh") },
+        );
+
+        // User override `pricing.json` overrides cached rate.
+        fs::write(
+            &override_path,
+            r#"{"models":{"gemini-4-hydrogen":{"input_per_mtok":9.0,"output_per_mtok":9.0}}}"#,
+        )
+        .unwrap();
+        let cat3 = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            Some(&override_path),
+            SyncMode::Offline,
+            t0 + 100,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| unreachable!(),
+        );
+        assert_eq!(cat3.models["gemini-4-hydrogen"].input_per_mtok, 9.0);
+
+        let _ = fs::remove_dir_all(&home);
     }
 }

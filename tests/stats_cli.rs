@@ -19,6 +19,18 @@ fn isolated_temp_home(tag: &str) -> PathBuf {
     ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
+    // Pre-seed a fresh empty models.dev cache so offline CLI tests stay deterministic and fast.
+    let cache_dir = dir.join(".cache/agy-statusline");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    fs::write(
+        cache_dir.join("models_dev_pricing.json"),
+        format!("{{\"fetched_at\":{now_secs},\"models\":{{}}}}"),
+    )
+    .unwrap();
     dir
 }
 

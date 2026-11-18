@@ -163,6 +163,7 @@ struct RenderContext<'a> {
     speed: Option<f64>,
     ttft_secs: Option<f64>,
     thinking_tokens: Option<u64>,
+    estimated_cost_usd: Option<f64>,
     quota_5h: Option<QuotaView>,
     quota_weekly: Option<QuotaView>,
     git: &'a GitInfo,
@@ -535,18 +536,22 @@ fn render_widget(
             )),
         },
         WidgetId::Cost => {
-            let cost = payload.cost.as_ref()?;
-            let usd = cost.total_usd?;
-            let prefix = if cost.estimated == Some(true) {
-                "~$"
-            } else {
-                "$"
-            };
-            let mut text = format!("{prefix}{usd:.2}");
-            if let Some(sub) = cost.subagent_usd.filter(|&s| s >= 0.01) {
-                text.push_str(&format!(" (sub ${sub:.2})"));
+            if let Some(cost) = payload.cost.as_ref() {
+                if let Some(usd) = cost.total_usd {
+                    let prefix = if cost.estimated == Some(true) {
+                        "~$"
+                    } else {
+                        "$"
+                    };
+                    let mut text = format!("{prefix}{usd:.2}");
+                    if let Some(sub) = cost.subagent_usd.filter(|&s| s >= 0.01) {
+                        text.push_str(&format!(" (sub ${sub:.2})"));
+                    }
+                    return Some(Segment::plain(widget, text, pal.cost, false));
+                }
             }
-            Some(Segment::plain(widget, text, pal.cost, false))
+            let usd = ctx.estimated_cost_usd?;
+            Some(Segment::plain(widget, format!("~${usd:.2}"), pal.cost, false))
         }
         WidgetId::Mode => {
             let mode = payload
@@ -1141,6 +1146,7 @@ pub fn write_statusline_with_quotas<W: IoWrite>(
         speed,
         ttft_secs: meta.ttft_secs,
         thinking_tokens: meta.thinking_tokens,
+        estimated_cost_usd: meta.estimated_cost_usd,
         quota_5h,
         quota_weekly,
         git,
@@ -1682,5 +1688,22 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text, format!("{} tok\n", format_tok_str(u64::MAX)));
+    }
+
+    #[test]
+    fn cost_widget_falls_back_to_meta_estimated_cost_when_payload_cost_missing() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.rows = vec![vec![WidgetId::Cost]];
+
+        let payload = StatuslinePayload::default();
+        let meta = SessionMetadata {
+            estimated_cost_usd: Some(1.2345),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        write_statusline(&payload, &meta, &GitInfo::default(), &cfg, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "~$1.23\n");
     }
 }
