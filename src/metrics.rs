@@ -1,10 +1,10 @@
 //! Pure metric derivation for cache hit rate, context tokens, and dynamic quota pacing.
 
 use std::collections::BTreeSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::statusline::{QuotaBucket, StatuslinePayload};
 pub use crate::timeutil::parse_rfc3339_unix_secs;
+use crate::timeutil::unix_now_secs;
 
 const SECS_PER_HOUR: u64 = 3_600;
 const SECS_PER_DAY: u64 = 86_400;
@@ -131,12 +131,6 @@ pub fn format_quota_pct(remaining_pct: f64) -> String {
     } else {
         format!("{:.0}%", pct.round())
     }
-}
-
-fn current_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 fn tokenize_alnum_lower(raw: &str) -> Vec<String> {
@@ -467,12 +461,12 @@ pub fn resolve_quota_weekly_at(
 
 /// Resolves the active short-window quota bucket dynamically from `payload.quota`.
 pub fn resolve_quota_5h(payload: &StatuslinePayload) -> Option<QuotaView> {
-    resolve_quota_5h_at(payload, current_unix_secs())
+    resolve_quota_5h_at(payload, unix_now_secs())
 }
 
 /// Resolves the active multi-day quota bucket dynamically from `payload.quota`.
 pub fn resolve_quota_weekly(payload: &StatuslinePayload) -> Option<QuotaView> {
-    resolve_quota_weekly_at(payload, current_unix_secs())
+    resolve_quota_weekly_at(payload, unix_now_secs())
 }
 
 #[cfg(test)]

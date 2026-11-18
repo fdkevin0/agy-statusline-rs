@@ -16,6 +16,7 @@ bundled = ["rusqlite/bundled"]
 
 [dependencies]
 crossterm = "0.29"
+jiff = "0.2"
 ratatui = "0.30"
 rusqlite = "0.43"
 serde = { version = "1", features = ["derive"] }

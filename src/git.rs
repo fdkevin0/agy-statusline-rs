@@ -6,7 +6,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
+
+use crate::timeutil::unix_now_secs;
 
 const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_millis(250);
 const DEFAULT_DIFF_CACHE_TTL_SECS: u64 = 3;
@@ -145,12 +147,6 @@ pub fn read_head_branch(gitdir: &Path) -> Option<String> {
     None
 }
 
-fn unix_now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in bytes {
@@ -236,11 +232,11 @@ fn run_git_diff_bounded(dir: &Path, timeout: Duration) -> Option<(u64, u64)> {
         .spawn()
         .ok()?;
 
-    let mut stdout = child.stdout.take()?;
+    let stdout = child.stdout.take()?;
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let res = stdout.read_to_end(&mut buf).map(|_| buf);
+        let res = stdout.take(2 * 1024 * 1024).read_to_end(&mut buf).map(|_| buf);
         let _ = tx.send(res);
     });
 

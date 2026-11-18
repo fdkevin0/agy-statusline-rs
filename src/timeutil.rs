@@ -1,6 +1,15 @@
 //! Shared Gregorian calendar math and overflow-safe RFC3339 timestamp parsing.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 const SECS_PER_DAY: i64 = 86_400;
+
+/// Returns the current Unix epoch timestamp in seconds (`0` if system clock is before 1970).
+pub fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// Returns `true` if `year` is a proleptic Gregorian leap year.
 pub fn is_leap_year(year: i64) -> bool {

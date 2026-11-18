@@ -105,6 +105,13 @@ pub fn format_tokens(value: u64, out: &mut String) {
     }
 }
 
+/// Formats a token count into a newly allocated compact string.
+pub fn format_tokens_string(value: u64) -> String {
+    let mut buf = String::with_capacity(8);
+    format_tokens(value, &mut buf);
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
