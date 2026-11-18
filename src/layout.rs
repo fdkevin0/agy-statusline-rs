@@ -16,7 +16,7 @@ use crate::db::resolve_home_dir;
 /// Maximum number of configurable statusline rows.
 pub const MAX_ROWS: usize = 3;
 
-/// All 21 statusline widgets available for placement on any row.
+/// All 22 statusline widgets available for placement on any row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WidgetId {
@@ -44,6 +44,8 @@ pub enum WidgetId {
     Speed,
     /// Time to first token (`⏱ 1.8s`).
     Ttft,
+    /// Thinking output tokens (`◆ think 4.2K`).
+    Thinking,
     /// Estimated session cost (`$0.14`).
     Cost,
     /// Active cycle mode (`◇ PLAN`, `◇ AUTO`, etc.) and `>200K` indicator.
@@ -64,7 +66,7 @@ pub enum WidgetId {
     Spacer,
 }
 
-const WIDGET_META: [(WidgetId, &str, &str); 21] = [
+const WIDGET_META: [(WidgetId, &str, &str); 22] = [
     (WidgetId::State, "state", "Agent State"),
     (WidgetId::Model, "model", "Model + Effort"),
     (WidgetId::Directory, "directory", "Workspace Dir"),
@@ -77,6 +79,7 @@ const WIDGET_META: [(WidgetId, &str, &str); 21] = [
     (WidgetId::CacheRead, "cache_read", "Cache Read Tokens"),
     (WidgetId::Speed, "speed", "Output Speed (tok/s)"),
     (WidgetId::Ttft, "ttft", "First Token (TTFT)"),
+    (WidgetId::Thinking, "thinking", "Thinking Tokens"),
     (WidgetId::Cost, "cost", "Session Cost ($)"),
     (WidgetId::Mode, "mode", "Cycle Mode (Plan/Auto)"),
     (WidgetId::Quota5h, "quota_5h", "5h Quota + Pace"),
@@ -89,8 +92,8 @@ const WIDGET_META: [(WidgetId, &str, &str); 21] = [
 ];
 
 impl WidgetId {
-    /// Canonical list of all 21 widgets in catalog display order.
-    pub const ALL: [WidgetId; 21] = [
+    /// Canonical list of all 22 widgets in catalog display order.
+    pub const ALL: [WidgetId; 22] = [
         Self::State,
         Self::Model,
         Self::Directory,
@@ -103,6 +106,7 @@ impl WidgetId {
         Self::CacheRead,
         Self::Speed,
         Self::Ttft,
+        Self::Thinking,
         Self::Cost,
         Self::Mode,
         Self::Quota5h,
@@ -133,6 +137,7 @@ impl WidgetId {
             Self::Directory | Self::CacheHit | Self::CtxTokens | Self::Worktree => 2,
             Self::CacheRead
             | Self::Ttft
+            | Self::Thinking
             | Self::Subagents
             | Self::Tasks
             | Self::Artifacts

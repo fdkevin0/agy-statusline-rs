@@ -265,6 +265,7 @@ pub fn run_doctor<W: Write>(
         last_turn_speed: Some(72.0),
         e2e_speed: Some(46.0),
         ttft_secs: Some(1.4),
+        thinking_tokens: Some(4_200),
         max_context_tokens: Some(512_000),
         ..Default::default()
     };
