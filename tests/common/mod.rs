@@ -6,48 +6,54 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use prost::Message;
 use unicode_width::UnicodeWidthStr;
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_agy-statusline");
 
 pub fn unix_now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+    jiff::Timestamp::now().as_second().max(0) as u64
 }
 
 /// Seeds a fresh empty `models_dev_pricing.json` under `cache_dir/agy-statusline`
-/// so offline CLI tests never trigger `SyncMode::SpawnIfStale` / `curl`.
-pub fn seed_offline_pricing(cache_dir: &Path) {
+/// when absent so offline CLI tests never trigger `SyncMode::SpawnIfStale` / `curl`
+/// and existing custom pricing fixtures are preserved.
+pub fn seed_offline_pricing_if_missing(cache_dir: &Path) {
     let app_cache = cache_dir.join("agy-statusline");
     fs::create_dir_all(&app_cache).unwrap();
     let now_secs = unix_now_secs();
-    fs::write(
-        app_cache.join("models_dev_pricing.json"),
-        format!("{{\"fetched_at\":{now_secs},\"models\":{{}}}}"),
-    )
-    .unwrap();
+    let payload = format!("{{\"fetched_at\":{now_secs},\"models\":{{}}}}");
+    let _ = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(app_cache.join("models_dev_pricing.json"))
+        .and_then(|mut f| f.write_all(payload.as_bytes()));
 }
 
-/// Returns a `Command` for `agy-statusline` isolated inside `dir` with
+/// Returns a `Command` for `program` isolated inside `dir` with a cleared environment,
 /// `XDG_CONFIG_HOME = dir/config`, `XDG_CACHE_HOME = dir/cache`,
-/// `ANTIGRAVITY_CLI_HOME = dir/.gemini/antigravity-cli`, and offline pricing pre-seeded.
-pub fn isolated_agy_cmd(dir: &Path) -> Command {
+/// `ANTIGRAVITY_CLI_HOME = dir/.gemini/antigravity-cli`, `TZ = UTC`,
+/// and offline pricing pre-seeded if missing.
+pub fn isolated_cmd(program: impl AsRef<Path>, dir: &Path) -> Command {
     let xdg_cache = dir.join("cache");
-    seed_offline_pricing(&xdg_cache);
+    seed_offline_pricing_if_missing(&xdg_cache);
 
-    let mut cmd = Command::new(BIN);
-    cmd.env("HOME", dir)
+    let mut cmd = Command::new(program.as_ref());
+    cmd.current_dir(dir)
+        .env_clear()
+        .env("HOME", dir)
         .env("USERPROFILE", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("XDG_CACHE_HOME", xdg_cache)
         .env("ANTIGRAVITY_CLI_HOME", dir.join(".gemini/antigravity-cli"))
-        .env_remove("AGY_HOME")
-        .env_remove("NO_COLOR");
+        .env("TZ", "UTC");
     cmd
+}
+
+/// Returns an isolated `Command` for the compiled `agy-statusline` binary inside `dir`.
+pub fn isolated_agy_cmd(dir: &Path) -> Command {
+    isolated_cmd(BIN, dir)
 }
 
 /// Runs `agy-statusline` with `NO_COLOR=1` and `payload` piped to stdin, returning stdout.
@@ -79,39 +85,88 @@ pub fn visible_line_width(rendered: &str) -> usize {
         .map_or(0, |line| strip_ansi_escapes::strip_str(line).width())
 }
 
-pub fn push_varint(buf: &mut Vec<u8>, mut val: u64) {
-    loop {
-        let mut byte = (val & 0x7f) as u8;
-        val >>= 7;
-        if val != 0 {
-            byte |= 0x80;
-        }
-        buf.push(byte);
-        if val == 0 {
-            break;
-        }
-    }
+#[derive(Clone, PartialEq, Message)]
+struct GenMetadataBlob {
+    #[prost(message, optional, tag = "1")]
+    chat_model: Option<ChatModelMetadata>,
+    #[prost(uint64, repeated, tag = "2")]
+    step_indices: Vec<u64>,
 }
 
-pub fn push_field_varint(buf: &mut Vec<u8>, id: u64, val: u64) {
-    push_varint(buf, id << 3);
-    push_varint(buf, val);
+#[derive(Clone, PartialEq, Message)]
+struct ChatModelMetadata {
+    #[prost(uint64, tag = "3")]
+    model: u64,
+    #[prost(message, optional, tag = "4")]
+    usage: Option<ModelUsage>,
+    #[prost(message, optional, tag = "9")]
+    chat_start_metadata: Option<ChatStartMetadata>,
+    #[prost(message, optional, tag = "11")]
+    time_to_first_token: Option<ProtoDuration>,
+    #[prost(message, optional, tag = "12")]
+    streaming_duration: Option<ProtoDuration>,
+    #[prost(string, tag = "19")]
+    response_model: String,
+    #[prost(string, tag = "21")]
+    model_display_name: String,
 }
 
-pub fn push_field_bytes(buf: &mut Vec<u8>, id: u64, bytes: &[u8]) {
-    push_varint(buf, (id << 3) | 2);
-    push_varint(buf, bytes.len() as u64);
-    buf.extend_from_slice(bytes);
+#[derive(Clone, PartialEq, Message)]
+struct ModelUsage {
+    #[prost(uint64, tag = "2")]
+    input_tokens: u64,
+    #[prost(uint64, tag = "3")]
+    output_tokens: u64,
+    #[prost(uint64, tag = "5")]
+    cache_read_tokens: u64,
+    #[prost(uint64, tag = "9")]
+    thinking_output_tokens: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ChatStartMetadata {
+    #[prost(message, optional, tag = "10")]
+    context_window_metadata: Option<ContextWindowMetadata>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ContextWindowMetadata {
+    #[prost(int64, tag = "1")]
+    estimated_tokens_used: i64,
+    #[prost(int64, tag = "4")]
+    max_context_tokens: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ProtoDuration {
+    #[prost(int64, tag = "1")]
+    seconds: i64,
+    #[prost(int64, tag = "2")]
+    nanos: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ProtoTimestamp {
+    #[prost(int64, tag = "1")]
+    seconds: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct StepMetadataBlob {
+    #[prost(message, optional, tag = "1")]
+    created_at: Option<ProtoTimestamp>,
 }
 
 pub fn build_step_meta_blob(secs: u64) -> Vec<u8> {
-    let mut ts = Vec::new();
-    push_field_varint(&mut ts, 1, secs);
-    let mut step = Vec::new();
-    push_field_bytes(&mut step, 1, &ts);
-    step
+    StepMetadataBlob {
+        created_at: Some(ProtoTimestamp {
+            seconds: secs as i64,
+        }),
+    }
+    .encode_to_vec()
 }
 
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TestGenSpec<'a> {
     pub step_idx: u64,
     pub model_enum: u64,
@@ -121,52 +176,40 @@ pub struct TestGenSpec<'a> {
     pub cache_read_tok: u64,
     pub output_tok: u64,
     pub thinking_tok: u64,
+    pub max_context_tokens: i64,
+    pub estimated_context_tokens: i64,
     pub dur_secs: u64,
     pub ttft_ms: u64,
 }
 
 pub fn build_gen_blob(spec: TestGenSpec<'_>) -> Vec<u8> {
-    let mut usage = Vec::new();
-    push_field_varint(&mut usage, 2, spec.input_tok);
-    push_field_varint(&mut usage, 3, spec.output_tok);
-    push_field_varint(&mut usage, 5, spec.cache_read_tok);
-    push_field_varint(&mut usage, 9, spec.thinking_tok);
-
-    let mut ttft = Vec::new();
-    push_field_varint(&mut ttft, 1, spec.ttft_ms / 1_000);
-    push_field_varint(&mut ttft, 2, (spec.ttft_ms % 1_000) * 1_000_000);
-
-    let mut dur = Vec::new();
-    push_field_varint(&mut dur, 1, spec.dur_secs);
-
-    let mut chat = Vec::new();
-    push_field_varint(&mut chat, 3, spec.model_enum);
-    push_field_bytes(&mut chat, 4, &usage);
-    push_field_bytes(&mut chat, 11, &ttft);
-    push_field_bytes(&mut chat, 12, &dur);
-    push_field_bytes(&mut chat, 19, spec.resp_model.as_bytes());
-    push_field_bytes(&mut chat, 21, spec.disp_name.as_bytes());
-
-    let mut packed = Vec::new();
-    push_varint(&mut packed, spec.step_idx);
-
-    let mut root = Vec::new();
-    push_field_bytes(&mut root, 1, &chat);
-    push_field_bytes(&mut root, 2, &packed);
-    root
-}
-
-pub fn speed_1s_blob(output_tokens: u8) -> [u8; 10] {
-    [
-        0x0a,
-        0x08,
-        0x22,
-        0x02,
-        0x18,
-        output_tokens,
-        0x62,
-        0x02,
-        0x08,
-        0x01,
-    ]
+    GenMetadataBlob {
+        chat_model: Some(ChatModelMetadata {
+            model: spec.model_enum,
+            usage: Some(ModelUsage {
+                input_tokens: spec.input_tok,
+                output_tokens: spec.output_tok,
+                cache_read_tokens: spec.cache_read_tok,
+                thinking_output_tokens: spec.thinking_tok,
+            }),
+            chat_start_metadata: Some(ChatStartMetadata {
+                context_window_metadata: Some(ContextWindowMetadata {
+                    estimated_tokens_used: spec.estimated_context_tokens,
+                    max_context_tokens: spec.max_context_tokens,
+                }),
+            }),
+            time_to_first_token: Some(ProtoDuration {
+                seconds: (spec.ttft_ms / 1_000) as i64,
+                nanos: ((spec.ttft_ms % 1_000) * 1_000_000) as i64,
+            }),
+            streaming_duration: Some(ProtoDuration {
+                seconds: spec.dur_secs as i64,
+                nanos: 0,
+            }),
+            response_model: spec.resp_model.to_owned(),
+            model_display_name: spec.disp_name.to_owned(),
+        }),
+        step_indices: vec![spec.step_idx],
+    }
+    .encode_to_vec()
 }

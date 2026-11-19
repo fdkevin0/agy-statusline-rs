@@ -660,30 +660,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_null_model_preserves_other_fields() {
-        let json = r#"{
-            "agent_state": "thinking",
-            "conversation_id": "8d0371e1-5a05-423b-a8bc-ed75995f9a8b",
-            "model": null,
-            "vcs": {"branch": "main", "dirty": true},
-            "workspace": null,
-            "cost": null
-        }"#;
-        let payload: StatuslinePayload = serde_json::from_str(json).unwrap();
-        assert_eq!(payload.agent_state.as_deref(), Some("thinking"));
-        assert_eq!(
-            payload.conversation_id.as_deref(),
-            Some("8d0371e1-5a05-423b-a8bc-ed75995f9a8b")
-        );
-        assert!(payload.model.is_none());
-        assert!(payload.workspace.is_none());
-        assert!(payload.cost.is_none());
-        let vcs = payload.vcs.as_ref().unwrap();
-        assert_eq!(vcs.branch.as_deref(), Some("main"));
-        assert_eq!(vcs.dirty, Some(true));
-    }
-
-    #[test]
     fn empty_and_invalid_json_degrades_gracefully() {
         let mut cfg = LayoutConfig::preset_addon();
         cfg.theme = crate::layout::ThemeStyle::Mono;
@@ -894,8 +870,11 @@ mod tests {
             [],
         )
         .unwrap();
-        // chat(1) -> { usage(4) -> { output(3)=100 }, model_cost(5)=0.25f32 }
-        let blob: &[u8] = &[0x0a, 0x09, 0x22, 0x02, 0x18, 0x64, 0x2d, 0x00, 0x00, 0x80, 0x3e];
+        let blob = crate::protobuf::encode_gen_blob(crate::protobuf::GenBlobSpec {
+            output_tok: 100,
+            model_cost: Some(0.25),
+            ..Default::default()
+        });
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [blob])
             .unwrap();
         drop(conn);

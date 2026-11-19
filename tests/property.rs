@@ -1,17 +1,14 @@
 #![forbid(unsafe_code)]
-//! Property-based (`proptest`) and end-to-end integration tests for `agy-statusline`.
+//! Property-based (`proptest`) invariant tests for `agy-statusline`.
 
 mod common;
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::process::Command;
 
 use proptest::prelude::*;
 
-use agy_statusline::db::{SessionMetadata, SqliteSpeedReader};
-use agy_statusline::format::format_tokens;
-use agy_statusline::git::{GitInfo, SystemGitProbe};
+use agy_statusline::db::SessionMetadata;
+use agy_statusline::git::GitInfo;
 use agy_statusline::layout::{GlyphMode, LayoutConfig, ThemeStyle, VisualStyle, WidgetId};
 use agy_statusline::protobuf::{
     extract_gen_metadata_record, extract_metadata_speed, extract_step_created_at_secs,
@@ -19,18 +16,73 @@ use agy_statusline::protobuf::{
 };
 use agy_statusline::render::{build_progress_bar, write_statusline};
 use agy_statusline::statusline::{
-    process_statusline, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket,
-    StatuslinePayload, StatuslineRuntime, WorkspaceInfo,
+    ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, StatuslinePayload, WorkspaceInfo,
 };
 
-use common::{isolated_agy_cmd, visible_line_width, BIN};
+use common::{build_gen_blob, build_step_meta_blob, visible_line_width, TestGenSpec};
 
 proptest! {
     #[test]
-    fn prop_extract_gen_metadata_record_never_panics(data in prop::collection::vec(any::<u8>(), 0..128)) {
+    fn prop_structured_protobuf_roundtrip_and_bounds(
+        step_idx in 0u64..10_000,
+        model_enum in 0u64..10_000,
+        input_tok in 0u64..5_000_000,
+        cache_read_tok in 0u64..5_000_000,
+        output_tok in 1u64..100_000,
+        thinking_tok in 0u64..100_000,
+        dur_secs in 11u64..3_600,
+        ttft_ms in 1u64..599_999,
+        step_secs in 1u64..=(MAX_TIMESTAMP_SECS as u64),
+    ) {
+        let gen_blob = build_gen_blob(TestGenSpec {
+            step_idx,
+            model_enum,
+            resp_model: "model-prop",
+            disp_name: "Model Prop",
+            input_tok,
+            cache_read_tok,
+            output_tok,
+            thinking_tok,
+            dur_secs,
+            ttft_ms,
+            ..Default::default()
+        });
+        let rec = extract_gen_metadata_record(&gen_blob).unwrap();
+        prop_assert_eq!(rec.first_step_index, Some(step_idx));
+        prop_assert_eq!(rec.model_enum, model_enum);
+        prop_assert_eq!(rec.input_tokens, input_tok);
+        prop_assert_eq!(rec.cache_read_tokens, cache_read_tok);
+        prop_assert_eq!(rec.output_tokens, output_tok);
+        prop_assert_eq!(rec.thinking_output_tokens, thinking_tok);
+        prop_assert_eq!(rec.response_model.as_deref(), Some("model-prop"));
+        prop_assert_eq!(rec.model_display_name.as_deref(), Some("Model Prop"));
+
+        let decode_secs = rec.decode_secs.unwrap();
+        prop_assert!((decode_secs - dur_secs as f64).abs() < 1e-9);
+        let ttft_secs = rec.ttft_secs.unwrap();
+        prop_assert!(ttft_secs > 0.0 && ttft_secs < MAX_TTFT_SECS);
+        prop_assert!((ttft_secs - (ttft_ms as f64) / 1_000.0).abs() < 1e-6);
+
+        let expected_tps = (output_tok as f64) / (dur_secs as f64);
+        let speed = extract_metadata_speed(&gen_blob).unwrap();
+        prop_assert!(speed > 0.0 && speed < MAX_TURN_SPEED_TPS);
+        prop_assert!((speed - expected_tps).abs() < 1e-9);
+        prop_assert_eq!(rec.decode_speed_tps(), Some(speed));
+
+        let step_blob = build_step_meta_blob(step_secs);
+        prop_assert_eq!(
+            extract_step_created_at_secs(&step_blob),
+            Some(step_secs as i64)
+        );
+    }
+
+    #[test]
+    fn prop_extract_gen_metadata_record_never_panics_on_arbitrary_bytes(
+        data in prop::collection::vec(any::<u8>(), 0..256),
+    ) {
         let rec = extract_gen_metadata_record(&data);
         let valid = rec.as_ref().is_none_or(|r| {
-            r.decode_secs.is_none_or(|s| s.is_finite() && s >= 0.0)
+            r.decode_secs.is_none_or(|s| s.is_finite() && s > 0.0)
                 && r.ttft_secs.is_none_or(|t| t > 0.0 && t < MAX_TTFT_SECS)
                 && r.model_cost_usd.is_none_or(|c| c.is_finite() && c > 0.0)
                 && r.chat_start_created_at_secs
@@ -40,50 +92,13 @@ proptest! {
     }
 
     #[test]
-    fn prop_extract_step_created_at_secs_bounds(data in prop::collection::vec(any::<u8>(), 0..128)) {
-        let ts = extract_step_created_at_secs(&data);
-        prop_assert!(ts.is_none_or(|t| (MIN_TIMESTAMP_SECS..=MAX_TIMESTAMP_SECS).contains(&t)));
-    }
-
-    #[test]
-    fn prop_extract_metadata_speed_bounds(data in prop::collection::vec(any::<u8>(), 0..128)) {
-        let speed = extract_metadata_speed(&data);
-        prop_assert!(speed.is_none_or(|s| s > 0.0 && s < MAX_TURN_SPEED_TPS));
-    }
-
-    #[test]
-    fn prop_format_tokens_small_no_suffix(value in 0u64..1000) {
-        let mut buf = String::new();
-        format_tokens(value, &mut buf);
-        prop_assert_eq!(buf, value.to_string());
-    }
-
-    #[test]
-    fn prop_format_tokens_k_range_has_k_suffix(value in 1000u64..999_500) {
-        let mut buf = String::new();
-        format_tokens(value, &mut buf);
-        prop_assert!(buf.ends_with('K'));
-    }
-
-    #[test]
-    fn prop_format_tokens_m_range_has_m_suffix(value in 999_500u64..999_500_000) {
-        let mut buf = String::new();
-        format_tokens(value, &mut buf);
-        prop_assert!(buf.ends_with('M'));
-    }
-
-    #[test]
-    fn prop_format_tokens_b_range_has_b_suffix(value in 999_500_000u64..100_000_000_000) {
-        let mut buf = String::new();
-        format_tokens(value, &mut buf);
-        prop_assert!(buf.ends_with('B'));
-    }
-
-    #[test]
-    fn prop_progress_bar_clamps_and_matches_char_len(pct in -50.0f64..200.0, bar_len in 4usize..40) {
+    fn prop_progress_bar_clamps_and_matches_char_len(
+        pct in any::<f64>(),
+        bar_len in 0usize..100,
+    ) {
         let (bar, clamped) = build_progress_bar(pct, bar_len);
-        prop_assert!((0.0..=100.0).contains(&clamped));
-        prop_assert_eq!(bar.chars().count(), bar_len);
+        prop_assert!(clamped.is_finite() && (0.0..=100.0).contains(&clamped));
+        prop_assert_eq!(bar.chars().count(), bar_len.clamp(4, 40));
     }
 
     #[test]
@@ -191,147 +206,4 @@ proptest! {
             raw
         );
     }
-}
-
-#[test]
-fn live_git_cli_probe_extracts_branch_and_diff_stats() {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path();
-
-    let init_ok = Command::new("git")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .args(["init"])
-        .arg(repo)
-        .output()
-        .unwrap();
-    assert!(init_ok.status.success());
-
-    let branch_ok = Command::new("git")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .args(["-C"])
-        .arg(repo)
-        .args(["checkout", "-b", "feat-live"])
-        .output()
-        .unwrap();
-    assert!(branch_ok.status.success());
-
-    fs::write(repo.join("notes.txt"), "line1\nline2\n").unwrap();
-    let add_ok = Command::new("git")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .args(["-C"])
-        .arg(repo)
-        .args(["add", "notes.txt"])
-        .output()
-        .unwrap();
-    assert!(add_ok.status.success());
-
-    let commit_ok = Command::new("git")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .args(["-C"])
-        .arg(repo)
-        .args([
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "init",
-        ])
-        .output()
-        .unwrap();
-    assert!(commit_ok.status.success());
-
-    fs::write(repo.join("notes.txt"), "line1\nchanged\nadded_line\n").unwrap();
-
-    let payload = serde_json::json!({
-        "agent_state": "idle",
-        "cwd": repo,
-        "vcs": { "type": "git" }
-    })
-    .to_string();
-
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.theme = ThemeStyle::Mono;
-    cfg.show_git_diff = true;
-    let probe = SystemGitProbe {
-        cache_dir: Some(repo.join(".tmp_cache")),
-    };
-
-    let reader = SqliteSpeedReader {
-        home_override: Some(repo.to_path_buf()),
-    };
-    let runtime = StatuslineRuntime::minimal(&reader, &probe);
-    let mut out = Vec::new();
-    process_statusline(&payload, &runtime, &cfg, &mut out).unwrap();
-    let rendered = String::from_utf8(out).unwrap();
-    assert!(rendered.contains("feat-live* +2 -1"));
-}
-
-#[test]
-fn tier2_apply_and_doctor_honor_antigravity_cli_home_and_agy_home() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path();
-    let cli_home = base.join("custom_cli_home");
-    let agy_home = base.join("custom_agy_home");
-
-    // ANTIGRAVITY_CLI_HOME takes precedence over AGY_HOME and HOME.
-    let apply_cli = isolated_agy_cmd(base)
-        .env("ANTIGRAVITY_CLI_HOME", &cli_home)
-        .env("AGY_HOME", &agy_home)
-        .env("NO_COLOR", "1")
-        .args(["apply", "--yes"])
-        .output()
-        .unwrap();
-    assert!(apply_cli.status.success());
-    assert!(cli_home.join("settings.json").is_file());
-    assert!(!agy_home.join("settings.json").exists());
-    assert!(!base.join(".gemini/antigravity-cli/settings.json").exists());
-
-    // AGY_HOME is used when ANTIGRAVITY_CLI_HOME is unset.
-    let apply_agy = isolated_agy_cmd(base)
-        .env_remove("ANTIGRAVITY_CLI_HOME")
-        .env("AGY_HOME", &agy_home)
-        .env("NO_COLOR", "1")
-        .args(["apply", "--yes"])
-        .output()
-        .unwrap();
-    assert!(apply_agy.status.success());
-    assert!(agy_home.join("settings.json").is_file());
-
-    let doctor_out = isolated_agy_cmd(base)
-        .env_remove("ANTIGRAVITY_CLI_HOME")
-        .env("AGY_HOME", &agy_home)
-        .env("NO_COLOR", "1")
-        .args(["doctor"])
-        .output()
-        .unwrap();
-    assert!(doctor_out.status.success());
-    let doctor_text = String::from_utf8(doctor_out.stdout).unwrap();
-    assert!(
-        doctor_text.contains(&agy_home.join("settings.json").display().to_string()),
-        "doctor stdout: {doctor_text}"
-    );
-    assert!(doctor_text.contains("enabled=true"));
-}
-
-#[test]
-fn cli_version_command_and_flags() {
-    let expected = format!("{} {}\n", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-
-    let out_cmd = Command::new(BIN).arg("version").output().unwrap();
-    assert!(out_cmd.status.success());
-    assert_eq!(String::from_utf8(out_cmd.stdout).unwrap(), expected);
-
-    let out_long = Command::new(BIN).arg("--version").output().unwrap();
-    assert!(out_long.status.success());
-    assert_eq!(String::from_utf8(out_long.stdout).unwrap(), expected);
-
-    let out_short = Command::new(BIN).arg("-V").output().unwrap();
-    assert!(out_short.status.success());
-    assert_eq!(String::from_utf8(out_short.stdout).unwrap(), expected);
 }

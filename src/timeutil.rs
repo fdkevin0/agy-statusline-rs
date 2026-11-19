@@ -50,49 +50,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn civil_date_roundtrips_unix_days_and_utc_formatting() {
+    fn civil_date_roundtrips_and_out_of_range_falls_back_to_epoch() {
         let epoch = civil::date(1970, 1, 1);
         assert_eq!(unix_day_from_civil_date(epoch), 0);
         assert_eq!(civil_date_from_unix_day(0), epoch);
         assert_eq!(unix_secs_to_utc_date(0), "1970-01-01");
 
+        let pre_epoch = civil::date(1969, 12, 31);
+        assert_eq!(unix_day_from_civil_date(pre_epoch), -1);
+        assert_eq!(civil_date_from_unix_day(-1), pre_epoch);
+
         let leap = civil::date(2024, 2, 29);
         let leap_day = unix_day_from_civil_date(leap);
         assert_eq!(civil_date_from_unix_day(leap_day), leap);
         assert_eq!(unix_secs_to_utc_date(1_709_251_199), "2024-02-29");
-    }
 
-    #[test]
-    fn rfc3339_parses_offsets_clamps_leap_second_and_rejects_invalid() {
-        assert_eq!(parse_rfc3339_unix_secs("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(
-            parse_rfc3339_unix_secs("  2026-11-18T12:00:00Z  "),
-            Some(1_795_003_200)
-        );
-        assert_eq!(
-            parse_rfc3339_unix_secs("2026-11-18t12:00:00.456z"),
-            Some(1_795_003_200)
-        );
-        assert_eq!(
-            parse_rfc3339_unix_secs("2026-11-18 20:00:00+08:00"),
-            Some(1_795_003_200)
-        );
-        assert_eq!(
-            parse_rfc3339_unix_secs("2026-11-18T07:00:00-05:00"),
-            Some(1_795_003_200)
-        );
-        assert_eq!(
-            parse_rfc3339_unix_secs("2024-02-29T23:59:59Z"),
-            Some(1_709_251_199)
-        );
-        assert_eq!(
-            parse_rfc3339_unix_secs("2026-11-18T23:59:60Z"),
-            parse_rfc3339_unix_secs("2026-11-18T23:59:59Z")
-        );
-        assert_eq!(parse_rfc3339_unix_secs("2026-02-29T00:00:00Z"), None);
-        assert_eq!(parse_rfc3339_unix_secs("2026-13-01T00:00:00Z"), None);
-        assert_eq!(parse_rfc3339_unix_secs("2026-11-18T12:00:00"), None);
-        assert_eq!(parse_rfc3339_unix_secs("2026-11-18T12:00:00.Z"), None);
-        assert_eq!(parse_rfc3339_unix_secs("2026-11-18T12:00:00Zextra"), None);
+        assert_eq!(civil_date_from_unix_day(i64::MAX), epoch);
+        assert_eq!(civil_date_from_unix_day(i64::MIN), epoch);
+        assert_eq!(unix_secs_to_utc_date(i64::MAX), "1970-01-01");
+        assert_eq!(unix_secs_to_utc_date(i64::MIN), "1970-01-01");
     }
 }

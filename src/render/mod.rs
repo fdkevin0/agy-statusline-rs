@@ -320,9 +320,94 @@ mod tests {
     use super::*;
     use crate::layout::{GlyphMode, ThemeStyle, VisualStyle};
     use crate::statusline::{
-        AgentInfo, BattleInfo, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, VcsInfo,
-        VimInfo, WorkspaceInfo,
+        AgentInfo, BattleInfo, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket,
+        SandboxInfo, VcsInfo, VimInfo, WorkspaceInfo,
     };
+
+    fn render_mono(
+        payload: &StatuslinePayload,
+        meta: &SessionMetadata,
+        git: &GitInfo,
+        cfg: &LayoutConfig,
+    ) -> String {
+        let mut out = Vec::new();
+        write_statusline(payload, meta, git, cfg, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn render_single(
+        widget: WidgetId,
+        payload: &StatuslinePayload,
+        meta: &SessionMetadata,
+        glyph_mode: GlyphMode,
+        smart_hide: bool,
+    ) -> String {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.rows = vec![vec![widget]];
+        cfg.glyph_mode = glyph_mode;
+        cfg.theme = ThemeStyle::Mono;
+        cfg.smart_hide = smart_hide;
+        cfg.no_color = true;
+        cfg.responsive = false;
+        render_mono(payload, meta, &GitInfo::default(), &cfg)
+    }
+
+    fn visible_line_width(rendered: &str) -> usize {
+        rendered
+            .lines()
+            .next()
+            .map_or(0, |line| strip_ansi_escapes::strip_str(line).width())
+    }
+
+    fn base_compaction_payload(width: usize) -> StatuslinePayload {
+        let mut quota = BTreeMap::new();
+        quota.insert(
+            "gemini-5h".to_string(),
+            QuotaBucket {
+                remaining_fraction: Some(0.84),
+                reset_in_seconds: Some(11_400),
+                ..Default::default()
+            },
+        );
+        quota.insert(
+            "gemini-weekly".to_string(),
+            QuotaBucket {
+                remaining_fraction: Some(0.92),
+                reset_in_seconds: Some(432_000),
+                ..Default::default()
+            },
+        );
+        StatuslinePayload {
+            agent_state: Some("thinking".to_string()),
+            cycle_mode: Some("plan".to_string()),
+            model: Some(ModelInfo {
+                id: None,
+                display_name: Some("Gemini 3.1 Pro Preview".to_string()),
+                effort: Some("high".to_string()),
+            }),
+            workspace: Some(WorkspaceInfo {
+                current_dir: Some("/work/agy-statusline".to_string()),
+                project_dir: Some("/work/agy-statusline".to_string()),
+            }),
+            context_window: Some(ContextWindow {
+                current_usage: Some(JsonUsage {
+                    input_tokens: Some(56_000),
+                    output_tokens: None,
+                    cache_read_input_tokens: Some(200_000),
+                    cache_creation_input_tokens: Some(0),
+                }),
+                ..Default::default()
+            }),
+            cost: Some(CostInfo {
+                total_usd: Some(0.42),
+                subagent_usd: None,
+                estimated: Some(true),
+            }),
+            quota: Some(quota),
+            terminal_width: Some(width),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn renders_all_three_styles_and_drops_overflow_when_responsive() {
@@ -1030,5 +1115,594 @@ mod tests {
         .unwrap();
         let text2 = String::from_utf8(out2).unwrap();
         assert_eq!(text2, "spd -- * ttft -- * $1.50\n");
+    }
+
+    #[test]
+    fn write_statusline_falls_back_to_estimated_context_tokens() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.rows = vec![vec![WidgetId::CtxBar, WidgetId::CtxTokens]];
+
+        let payload_no_usage = StatuslinePayload {
+            context_window: Some(ContextWindow {
+                context_window_size: Some(200_000),
+                used_percentage: None,
+                current_usage: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let meta_est = SessionMetadata {
+            estimated_context_tokens: Some(128_000),
+            max_context_tokens: Some(512_000),
+            ..Default::default()
+        };
+
+        let rendered_est = render_mono(&payload_no_usage, &meta_est, &GitInfo::default(), &cfg);
+        assert!(rendered_est.contains("25.0% (128K/512K)"));
+        assert!(rendered_est.contains("· 128K/512K"));
+
+        // Actual current_usage takes precedence over estimated_context_tokens.
+        let payload_with_usage = StatuslinePayload {
+            context_window: Some(ContextWindow {
+                current_usage: Some(JsonUsage {
+                    input_tokens: Some(56_000),
+                    output_tokens: None,
+                    cache_read_input_tokens: Some(200_000),
+                    cache_creation_input_tokens: Some(0),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rendered_actual =
+            render_mono(&payload_with_usage, &meta_est, &GitInfo::default(), &cfg);
+        assert!(rendered_actual.contains("50.0% (256K/512K)"));
+
+        // Zero estimated_context_tokens falls back to showing only the limit in ctx_bar.
+        let meta_zero = SessionMetadata {
+            estimated_context_tokens: Some(0),
+            max_context_tokens: Some(512_000),
+            ..Default::default()
+        };
+        let rendered_zero = render_mono(&payload_no_usage, &meta_zero, &GitInfo::default(), &cfg);
+        assert!(rendered_zero.contains("0.0% (512K)"));
+    }
+
+    #[test]
+    fn stage1_vcs_strips_diff_stats_then_caps_at_20_cols() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.rows = vec![vec![WidgetId::Vcs, WidgetId::Speed]];
+        let meta = SessionMetadata {
+            speed: Some(64.0),
+            ..Default::default()
+        };
+
+        // Strip diff stats (+120 -45) so branch + Speed both fit at width 28.
+        let git_short = GitInfo {
+            branch: Some("feat-branch".to_string()),
+            added: 120,
+            deleted: 45,
+            ..Default::default()
+        };
+        let s1 = render_mono(&base_compaction_payload(28), &meta, &git_short, &cfg);
+        assert!(s1.contains("feat-branch*"));
+        assert!(!s1.contains("+120"));
+        assert!(s1.contains("64 tok/s"));
+        assert!(visible_line_width(&s1) <= 28);
+
+        // Long branch still overflows after stripping diff stats -> capped at 20 cols with ellipsis.
+        let git_long = GitInfo {
+            branch: Some("feature/extremely-long-branch-name".to_string()),
+            added: 10,
+            deleted: 2,
+            ..Default::default()
+        };
+        let s2 = render_mono(&base_compaction_payload(35), &meta, &git_long, &cfg);
+        assert!(!s2.contains("+10"));
+        assert!(s2.contains('…'));
+        assert!(s2.contains("64 tok/s"));
+        assert!(visible_line_width(&s2) <= 35);
+    }
+
+    #[test]
+    fn stage2_quota_strips_timer_before_dropping_widgets() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.rows = vec![vec![
+            WidgetId::Vcs,
+            WidgetId::Speed,
+            WidgetId::Cost,
+            WidgetId::Quota5h,
+            WidgetId::QuotaWeekly,
+        ]];
+        let git = GitInfo {
+            branch: Some("main".to_string()),
+            ..Default::default()
+        };
+        let meta = SessionMetadata {
+            speed: Some(64.0),
+            ..Default::default()
+        };
+
+        // Uncompacted: "⎇ main · ⚡ 64 tok/s · ~$0.42 · 5h 84% ↻3h10m · 7d 92% ↻5d" (58 cols)
+        // After Stage 2: "⎇ main · ⚡ 64 tok/s · ~$0.42 · 5h 84% · 7d 92%" (47 cols)
+        let out = render_mono(&base_compaction_payload(48), &meta, &git, &cfg);
+        assert!(out.contains("64 tok/s"));
+        assert!(out.contains("~$0.42"));
+        assert!(out.contains("5h 84%"));
+        assert!(out.contains("7d 92%"));
+        assert!(!out.contains("3h10m"));
+        assert!(!out.contains("5d"));
+        assert!(visible_line_width(&out) <= 48);
+    }
+
+    #[test]
+    fn stage3_88col_row_compacts_ctx_bar_instead_of_dropping_speed_cost_vcs() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.rows = vec![vec![
+            WidgetId::State,
+            WidgetId::Model,
+            WidgetId::Vcs,
+            WidgetId::CtxBar,
+            WidgetId::Speed,
+            WidgetId::Cost,
+            WidgetId::Quota5h,
+        ]];
+        let git = GitInfo {
+            branch: Some("feat/ui".to_string()),
+            added: 12,
+            deleted: 3,
+            ..Default::default()
+        };
+        let meta = SessionMetadata {
+            speed: Some(82.0),
+            max_context_tokens: Some(512_000),
+            ..Default::default()
+        };
+
+        // At 90 cols, Stages 1-4 compact Vcs/Quota/CtxBar/Model so core widgets survive.
+        let out = render_mono(&base_compaction_payload(90), &meta, &git, &cfg);
+        assert!(out.contains("feat/ui*"));
+        assert!(out.contains("82 tok/s"));
+        assert!(out.contains("~$0.42"));
+        assert!(out.contains("ctx 50.0%"));
+        assert!(out.contains("5h 84%"));
+        assert!(!out.contains("512K"));
+        assert!(!out.contains('█'));
+        assert!(visible_line_width(&out) <= 90);
+
+        // Remaining mode collapses to "rem 50.0%".
+        let mut rem_cfg = cfg.clone();
+        rem_cfg.ctx_remaining = true;
+        let out_rem = render_mono(&base_compaction_payload(90), &meta, &git, &rem_cfg);
+        assert!(out_rem.contains("rem 50.0%"));
+        assert!(visible_line_width(&out_rem) <= 90);
+    }
+
+    #[test]
+    fn stage3_ctx_pct_strips_limit_suffix_and_stage4_abbreviates_models() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.rows = vec![vec![
+            WidgetId::Model,
+            WidgetId::CtxPct,
+            WidgetId::Speed,
+            WidgetId::Cost,
+        ]];
+        let meta = SessionMetadata {
+            speed: Some(75.0),
+            max_context_tokens: Some(512_000),
+            ..Default::default()
+        };
+
+        // Stage 3 strips (512K); Stage 4 abbreviates "Gemini " -> "G" & caps Model at 20 cols.
+        let out = render_mono(
+            &base_compaction_payload(56),
+            &meta,
+            &GitInfo::default(),
+            &cfg,
+        );
+        assert!(out.contains("G3.1 Pro Preview"));
+        assert!(out.contains("ctx 50.0%"));
+        assert!(!out.contains("(512K)"));
+        assert!(out.contains("75 tok/s"));
+        assert!(out.contains("~$0.42"));
+        assert!(visible_line_width(&out) <= 56);
+
+        // Claude abbreviation check: "Claude Sonnet 4.6 (Thinking)" -> "CSonnet 4.6 (Thin…"
+        let mut claude_payload = base_compaction_payload(55);
+        claude_payload.model = Some(ModelInfo {
+            id: None,
+            display_name: Some("Claude Sonnet 4.6 (Thinking)".to_string()),
+            effort: None,
+        });
+        let out_claude = render_mono(&claude_payload, &meta, &GitInfo::default(), &cfg);
+        assert!(out_claude.contains("CSonnet 4.6"));
+        assert!(out_claude.contains("75 tok/s"));
+        assert!(out_claude.contains("~$0.42"));
+        assert!(visible_line_width(&out_claude) <= 55);
+    }
+
+    #[test]
+    fn thinking_widget_renders_glyph_modes_and_smart_hide() {
+        let render_thinking = |thinking_tokens: Option<u64>, glyph_mode, smart_hide| {
+            let meta = SessionMetadata {
+                thinking_tokens,
+                ..Default::default()
+            };
+            render_single(
+                WidgetId::Thinking,
+                &StatuslinePayload::default(),
+                &meta,
+                glyph_mode,
+                smart_hide,
+            )
+        };
+
+        assert_eq!(
+            render_thinking(Some(4_200), GlyphMode::Unicode, false),
+            "◆ think 4.2K\n"
+        );
+        assert_eq!(
+            render_thinking(Some(4_200), GlyphMode::Nerd, false),
+            "\u{f0eb} think 4.2K\n"
+        );
+        assert_eq!(
+            render_thinking(Some(4_200), GlyphMode::Ascii, false),
+            "~ think 4.2K\n"
+        );
+        assert_eq!(render_thinking(None, GlyphMode::Unicode, true), "");
+        assert_eq!(render_thinking(Some(0), GlyphMode::Unicode, true), "");
+        assert_eq!(
+            render_thinking(None, GlyphMode::Unicode, false),
+            "◆ think --\n"
+        );
+        assert_eq!(
+            render_thinking(Some(0), GlyphMode::Nerd, false),
+            "\u{f0eb} think --\n"
+        );
+        assert_eq!(
+            render_thinking(None, GlyphMode::Ascii, false),
+            "~ think --\n"
+        );
+    }
+
+    #[test]
+    fn state_widget_renders_confirm_alert_on_tool_confirmation_pending() {
+        let empty_meta = SessionMetadata::default();
+        let pending = StatuslinePayload {
+            agent_state: Some("idle".to_string()),
+            tool_confirmation_pending: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_single(WidgetId::State, &pending, &empty_meta, GlyphMode::Unicode, true),
+            "◎ CONFIRM\n"
+        );
+        assert_eq!(
+            render_single(WidgetId::State, &pending, &empty_meta, GlyphMode::Ascii, true),
+            "@ CONFIRM\n"
+        );
+
+        let not_pending = StatuslinePayload {
+            agent_state: Some("idle".to_string()),
+            tool_confirmation_pending: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_single(
+                WidgetId::State,
+                &not_pending,
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            ),
+            "● READY\n"
+        );
+    }
+
+    #[test]
+    fn vim_widget_renders_modes_trimming_and_smart_hide() {
+        let empty_meta = SessionMetadata::default();
+        let render_vim = |mode: Option<&str>, smart_hide: bool| {
+            let payload = StatuslinePayload {
+                vim: mode.map(|m| VimInfo {
+                    mode: Some(m.to_string()),
+                }),
+                ..Default::default()
+            };
+            render_single(WidgetId::Vim, &payload, &empty_meta, GlyphMode::Unicode, smart_hide)
+        };
+
+        assert_eq!(render_vim(Some("insert"), true), "vim INSERT\n");
+        assert_eq!(render_vim(Some("visual"), true), "vim VISUAL\n");
+        assert_eq!(render_vim(Some("v-line"), true), "vim V-LINE\n");
+        assert_eq!(render_vim(Some("v-block"), true), "vim V-BLOCK\n");
+        assert_eq!(render_vim(Some("command"), true), "vim COMMAND\n");
+        assert_eq!(render_vim(Some("replace"), true), "vim REPLACE\n");
+        assert_eq!(render_vim(Some(" normal "), true), "vim NORMAL\n");
+        assert_eq!(render_vim(Some("   "), true), "");
+        assert_eq!(render_vim(None, false), "vim off\n");
+    }
+
+    #[test]
+    fn queue_widget_renders_count_and_smart_hide() {
+        let empty_meta = SessionMetadata::default();
+        let active = StatuslinePayload {
+            pending_input_count: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_single(WidgetId::Queue, &active, &empty_meta, GlyphMode::Unicode, true),
+            "queue 3\n"
+        );
+
+        let zero = StatuslinePayload {
+            pending_input_count: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_single(WidgetId::Queue, &zero, &empty_meta, GlyphMode::Unicode, true),
+            ""
+        );
+        assert_eq!(
+            render_single(
+                WidgetId::Queue,
+                &StatuslinePayload::default(),
+                &empty_meta,
+                GlyphMode::Unicode,
+                false
+            ),
+            "queue 0\n"
+        );
+    }
+
+    #[test]
+    fn battle_widget_renders_status_arm_and_smart_hide() {
+        let empty_meta = SessionMetadata::default();
+        let with_arm = StatuslinePayload {
+            battle: Some(BattleInfo {
+                status: Some("active".to_string()),
+                focused_arm: Some(2),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_single(WidgetId::Battle, &with_arm, &empty_meta, GlyphMode::Unicode, true),
+            "battle ACTIVE #2\n"
+        );
+
+        let no_arm = StatuslinePayload {
+            battle: Some(BattleInfo {
+                status: Some("tie".to_string()),
+                focused_arm: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_single(WidgetId::Battle, &no_arm, &empty_meta, GlyphMode::Unicode, true),
+            "battle TIE\n"
+        );
+        assert_eq!(
+            render_single(
+                WidgetId::Battle,
+                &StatuslinePayload::default(),
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            ),
+            ""
+        );
+        assert_eq!(
+            render_single(
+                WidgetId::Battle,
+                &StatuslinePayload::default(),
+                &empty_meta,
+                GlyphMode::Unicode,
+                false
+            ),
+            "battle off\n"
+        );
+    }
+
+    #[test]
+    fn sandbox_widget_renders_allow_network_states() {
+        let empty_meta = SessionMetadata::default();
+        let on_net = StatuslinePayload {
+            sandbox: Some(SandboxInfo {
+                enabled: Some(true),
+                allow_network: Some(true),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_single(WidgetId::Sandbox, &on_net, &empty_meta, GlyphMode::Unicode, true),
+            "sandbox ON+net\n"
+        );
+
+        let on_no_net = StatuslinePayload {
+            sandbox: Some(SandboxInfo {
+                enabled: Some(true),
+                allow_network: Some(false),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_single(WidgetId::Sandbox, &on_no_net, &empty_meta, GlyphMode::Unicode, true),
+            "sandbox ON\n"
+        );
+
+        let on_none_net = StatuslinePayload {
+            sandbox: Some(SandboxInfo {
+                enabled: Some(true),
+                allow_network: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_single(
+                WidgetId::Sandbox,
+                &on_none_net,
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            ),
+            "sandbox ON\n"
+        );
+
+        let off_with_net = StatuslinePayload {
+            sandbox: Some(SandboxInfo {
+                enabled: Some(false),
+                allow_network: Some(true),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_single(
+                WidgetId::Sandbox,
+                &off_with_net,
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            ),
+            ""
+        );
+        assert_eq!(
+            render_single(
+                WidgetId::Sandbox,
+                &off_with_net,
+                &empty_meta,
+                GlyphMode::Unicode,
+                false
+            ),
+            "sandbox off\n"
+        );
+    }
+
+    #[test]
+    fn version_widget_renders_payload_version_and_handles_missing_or_prefixed() {
+        let empty_meta = SessionMetadata::default();
+        let payload: StatuslinePayload =
+            serde_json::from_str(r#"{"agent_state":"idle","version":"1.5.11"}"#).unwrap();
+        assert_eq!(
+            render_single(WidgetId::Version, &payload, &empty_meta, GlyphMode::Unicode, true)
+                .trim(),
+            "v1.5.11"
+        );
+
+        let payload_prefixed: StatuslinePayload =
+            serde_json::from_str(r#"{"agent_state":"idle","version":" v1.5.11 "}"#).unwrap();
+        assert_eq!(
+            render_single(
+                WidgetId::Version,
+                &payload_prefixed,
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            )
+            .trim(),
+            "v1.5.11"
+        );
+
+        let payload_empty: StatuslinePayload =
+            serde_json::from_str(r#"{"agent_state":"idle","version":"  "}"#).unwrap();
+        assert_eq!(
+            render_single(
+                WidgetId::Version,
+                &payload_empty,
+                &empty_meta,
+                GlyphMode::Unicode,
+                false
+            )
+            .trim(),
+            ""
+        );
+    }
+
+    #[test]
+    fn agy_payload_widgets_render_and_omit_when_absent() {
+        let empty_meta = SessionMetadata::default();
+        let payload: StatuslinePayload = serde_json::from_str(
+            r#"{
+                "session_id": "8d0371e1-5a05-423b-a8bc-ed75995f9a8b",
+                "conversation_title": "Refactor\n  statusline\tpayload   widgets for long title test",
+                "transcript_path": "/home/user/.gemini/logs/transcript.jsonl",
+                "workspace": {"project_dir": "/work/agy-statusline"},
+                "agent": {"name": "researcher"},
+                "vcs": {"type": "citc", "client": "my-citc-ws", "dirty": true},
+                "subagents": [
+                    {"name": "sub-a", "role": "Codebase Researcher", "status": "running"},
+                    {"name": "sub-b", "role": "Done Worker", "status": "completed"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let r = |w, p, sh| {
+            render_single(w, p, &empty_meta, GlyphMode::Ascii, sh)
+                .trim()
+                .to_string()
+        };
+        assert_eq!(
+            r(WidgetId::Title, &payload, true),
+            "Refactor statusline payload wi.."
+        );
+        assert_eq!(r(WidgetId::Directory, &payload, true), "dir: agy-statusline");
+        assert_eq!(r(WidgetId::Agent, &payload, true), "agent researcher");
+        assert_eq!(r(WidgetId::Session, &payload, true), "sid:8d0371e1");
+        assert_eq!(
+            r(WidgetId::Transcript, &payload, true),
+            "log:transcript.jsonl"
+        );
+        assert_eq!(r(WidgetId::Vcs, &payload, true), "citc: my-citc-ws*");
+        assert_eq!(
+            r(WidgetId::Subagents, &payload, true),
+            "sub 1 (Codebase Researcher)"
+        );
+
+        let blank = StatuslinePayload::default();
+        assert_eq!(r(WidgetId::Title, &blank, false), "");
+        assert_eq!(r(WidgetId::Directory, &blank, false), "");
+        assert_eq!(r(WidgetId::Agent, &blank, false), "");
+        assert_eq!(r(WidgetId::Session, &blank, false), "");
+        assert_eq!(r(WidgetId::Transcript, &blank, false), "");
+        assert_eq!(r(WidgetId::Vcs, &blank, false), "");
+    }
+
+    #[test]
+    fn responsive_compaction_shortens_subagents_account_and_title() {
+        let payload: StatuslinePayload = serde_json::from_str(
+            r#"{
+                "agent_state": "idle",
+                "conversation_title": "Implement full AGY statusline payload widgets",
+                "email": "alice@example.com",
+                "subagents": [{"role": "Reviewer (Rust)", "status": "running"}],
+                "terminal_width": 52
+            }"#,
+        )
+        .unwrap();
+
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.rows = vec![vec![
+            WidgetId::State,
+            WidgetId::Title,
+            WidgetId::Account,
+            WidgetId::Subagents,
+        ]];
+        cfg.glyph_mode = GlyphMode::Ascii;
+        cfg.no_color = true;
+        cfg.responsive = true;
+
+        let rendered = render_mono(&payload, &SessionMetadata::default(), &GitInfo::default(), &cfg);
+        assert!(rendered.contains("READY"), "rendered: {rendered}");
+        assert!(rendered.contains("Implement full.."), "rendered: {rendered}");
+        assert!(rendered.contains("alice"), "rendered: {rendered}");
+        assert!(!rendered.contains("@example.com"), "rendered: {rendered}");
+        assert!(rendered.contains("sub 1"), "rendered: {rendered}");
+        assert!(!rendered.contains("Reviewer"), "rendered: {rendered}");
+        assert!(!rendered.contains('('), "unclosed paren in: {rendered}");
     }
 }

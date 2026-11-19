@@ -343,42 +343,95 @@ pub fn extract_metadata_speed(data: &[u8]) -> Option<f64> {
 }
 
 #[cfg(test)]
+#[derive(Default)]
+pub(crate) struct GenBlobSpec<'a> {
+    pub(crate) step_indices: Vec<u64>,
+    pub(crate) model_enum: u64,
+    pub(crate) resp_model: Option<&'a str>,
+    pub(crate) disp_name: Option<&'a str>,
+    pub(crate) model_cost: Option<f32>,
+    pub(crate) input_tok: u64,
+    pub(crate) output_tok: u64,
+    pub(crate) cache_write_tok: u64,
+    pub(crate) cache_read_tok: u64,
+    pub(crate) thinking_tok: u64,
+    pub(crate) created_at_secs: Option<i64>,
+    pub(crate) estimated_context_tokens: i64,
+    pub(crate) max_context_tokens: i64,
+    pub(crate) ttft_secs: i64,
+    pub(crate) ttft_nanos: i64,
+    pub(crate) dur_secs: i64,
+    pub(crate) dur_nanos: i64,
+}
+
+#[cfg(test)]
+pub(crate) fn encode_gen_blob(spec: GenBlobSpec<'_>) -> Vec<u8> {
+    GenMetadataBlob {
+        chat_model: Some(ChatModelMetadata {
+            model: spec.model_enum,
+            usage: Some(ModelUsage {
+                input_tokens: spec.input_tok,
+                output_tokens: spec.output_tok,
+                cache_write_tokens: spec.cache_write_tok,
+                cache_read_tokens: spec.cache_read_tok,
+                thinking_output_tokens: spec.thinking_tok,
+            }),
+            model_cost: spec.model_cost,
+            chat_start_metadata: Some(ChatStartMetadata {
+                created_at: spec
+                    .created_at_secs
+                    .map(|seconds| ProtoTimestamp { seconds }),
+                context_window_metadata: Some(ContextWindowMetadata {
+                    estimated_tokens_used: spec.estimated_context_tokens,
+                    max_context_tokens: spec.max_context_tokens,
+                }),
+            }),
+            time_to_first_token: Some(ProtoDuration {
+                seconds: spec.ttft_secs,
+                nanos: spec.ttft_nanos,
+            }),
+            streaming_duration: Some(ProtoDuration {
+                seconds: spec.dur_secs,
+                nanos: spec.dur_nanos,
+            }),
+            response_model: spec.resp_model.map(str::to_string),
+            model_display_name: spec.disp_name.map(str::to_string),
+        }),
+        step_indices: spec.step_indices,
+    }
+    .encode_to_vec()
+}
+
+#[cfg(test)]
+pub(crate) fn encode_step_meta_blob(created_at_secs: i64) -> Vec<u8> {
+    StepMetadataBlob {
+        created_at: Some(ProtoTimestamp {
+            seconds: created_at_secs,
+        }),
+    }
+    .encode_to_vec()
+}
+
+#[cfg(test)]
+pub(crate) fn encode_speed_1s_blob(output_tokens: u64) -> Vec<u8> {
+    encode_gen_blob(GenBlobSpec {
+        output_tok: output_tokens,
+        dur_secs: 1,
+        ..Default::default()
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn push_varint(buf: &mut Vec<u8>, mut val: u64) {
-        loop {
-            let mut byte = (val & 0x7f) as u8;
-            val >>= 7;
-            if val != 0 {
-                byte |= 0x80;
-            }
-            buf.push(byte);
-            if val == 0 {
-                break;
-            }
-        }
-    }
-
-    fn push_field_varint(buf: &mut Vec<u8>, id: u64, val: u64) {
-        push_varint(buf, id << 3);
-        push_varint(buf, val);
-    }
-
-    fn push_field_bytes(buf: &mut Vec<u8>, id: u64, bytes: &[u8]) {
-        push_varint(buf, (id << 3) | 2);
-        push_varint(buf, bytes.len() as u64);
-        buf.extend_from_slice(bytes);
-    }
-
-    fn push_field_f32(buf: &mut Vec<u8>, id: u64, val: f32) {
-        push_varint(buf, (id << 3) | 5);
-        buf.extend_from_slice(&val.to_le_bytes());
-    }
-
     #[test]
     fn metadata_speed_valid_and_invalid() {
-        let valid = [0x0a, 0x08, 0x22, 0x02, 0x18, 0x64, 0x62, 0x02, 0x08, 0x02];
+        let valid = encode_gen_blob(GenBlobSpec {
+            output_tok: 100,
+            dur_secs: 2,
+            ..Default::default()
+        });
         assert_eq!(extract_metadata_speed(&valid), Some(50.0));
         assert_eq!(extract_metadata_speed(&[0x0a, 0xff]), None);
         assert_eq!(extract_metadata_speed(&[]), None);
@@ -386,12 +439,18 @@ mod tests {
 
     #[test]
     fn max_context_tokens_valid_and_invalid() {
-        let valid = [0x0a, 0x08, 0x4a, 0x06, 0x52, 0x04, 0x20, 0x80, 0xa0, 0x1f];
+        let valid = encode_gen_blob(GenBlobSpec {
+            max_context_tokens: 512_000,
+            ..Default::default()
+        });
         assert_eq!(
             extract_gen_metadata_summary(&valid).and_then(|s| s.max_context_tokens),
             Some(512_000)
         );
-        let zero = [0x0a, 0x06, 0x4a, 0x04, 0x52, 0x02, 0x20, 0x00];
+        let zero = encode_gen_blob(GenBlobSpec {
+            max_context_tokens: 0,
+            ..Default::default()
+        });
         assert_eq!(
             extract_gen_metadata_summary(&zero).and_then(|s| s.max_context_tokens),
             None
@@ -401,10 +460,12 @@ mod tests {
 
     #[test]
     fn turn_metrics_extracts_ttft_and_short_decode() {
-        // chat(1) -> { usage(4) -> { output(3)=100 }, ttft(11) -> { sec(1)=1 }, dur(12) -> { sec(1)=2 } }
-        let blob = [
-            0x0a, 0x0c, 0x22, 0x02, 0x18, 0x64, 0x5a, 0x02, 0x08, 0x01, 0x62, 0x02, 0x08, 0x02,
-        ];
+        let blob = encode_gen_blob(GenBlobSpec {
+            output_tok: 100,
+            ttft_secs: 1,
+            dur_secs: 2,
+            ..Default::default()
+        });
         let m = extract_gen_metadata_summary(&blob).unwrap().turn.unwrap();
         assert_eq!(m.output_tokens, 100);
         assert_eq!(m.thinking_tokens, None);
@@ -414,10 +475,12 @@ mod tests {
 
     #[test]
     fn turn_metrics_extracts_thinking_tokens() {
-        // chat(1) -> { usage(4) -> { output(3)=100, thinking(9)=250 }, dur(12) -> { sec(1)=2 } }
-        let blob = [
-            0x0a, 0x0b, 0x22, 0x05, 0x18, 0x64, 0x48, 0xfa, 0x01, 0x62, 0x02, 0x08, 0x02,
-        ];
+        let blob = encode_gen_blob(GenBlobSpec {
+            output_tok: 100,
+            thinking_tok: 250,
+            dur_secs: 2,
+            ..Default::default()
+        });
         let m = extract_gen_metadata_summary(&blob).unwrap().turn.unwrap();
         assert_eq!(m.output_tokens, 100);
         assert_eq!(m.thinking_tokens, Some(250));
@@ -426,17 +489,20 @@ mod tests {
 
     #[test]
     fn estimated_context_tokens_valid_and_invalid() {
-        // chat(1) -> chat_start(9) -> ctx_window(10) -> { estimated(1)=64000, max(4)=512000 }
-        let valid = [
-            0x0a, 0x0c, 0x4a, 0x0a, 0x52, 0x08, 0x08, 0x80, 0xf4, 0x03, 0x20, 0x80, 0xa0, 0x1f,
-        ];
+        let valid = encode_gen_blob(GenBlobSpec {
+            estimated_context_tokens: 64_000,
+            max_context_tokens: 512_000,
+            ..Default::default()
+        });
         let summary = extract_gen_metadata_summary(&valid).unwrap();
         assert_eq!(summary.estimated_context_tokens, Some(64_000));
         assert_eq!(summary.max_context_tokens, Some(512_000));
         assert_eq!(summary.turn, None);
 
-        // estimated(1)=0 -> None
-        let zero = [0x0a, 0x06, 0x4a, 0x04, 0x52, 0x02, 0x08, 0x00];
+        let zero = encode_gen_blob(GenBlobSpec {
+            estimated_context_tokens: 0,
+            ..Default::default()
+        });
         assert_eq!(
             extract_gen_metadata_summary(&zero).and_then(|s| s.estimated_context_tokens),
             None
@@ -447,9 +513,11 @@ mod tests {
     #[test]
     fn unified_speed_sanity_bounds() {
         // decode_secs = 0.005s (5_000_000 nanos) -> rejected (< 0.01s)
-        let too_short = [
-            0x0a, 0x0b, 0x22, 0x02, 0x18, 0x0a, 0x62, 0x05, 0x10, 0xc0, 0x96, 0xb1, 0x02,
-        ];
+        let too_short = encode_gen_blob(GenBlobSpec {
+            output_tok: 10,
+            dur_nanos: 5_000_000,
+            ..Default::default()
+        });
         assert_eq!(
             extract_gen_metadata_summary(&too_short).and_then(|s| s.turn),
             None
@@ -457,21 +525,19 @@ mod tests {
         assert_eq!(extract_metadata_speed(&too_short), None);
 
         // decode_secs = 0.05s (50_000_000 nanos) -> accepted (10 / 0.05 = 200.0 tok/s)
-        let fast_50ms = [
-            0x0a, 0x0b, 0x22, 0x02, 0x18, 0x0a, 0x62, 0x05, 0x10, 0x80, 0xe1, 0xeb, 0x17,
-        ];
+        let fast_50ms = encode_gen_blob(GenBlobSpec {
+            output_tok: 10,
+            dur_nanos: 50_000_000,
+            ..Default::default()
+        });
         assert!((extract_metadata_speed(&fast_50ms).unwrap() - 200.0).abs() < 1e-6);
 
         // output = 1000, decode_secs = 1s -> 1000.0 tok/s -> accepted (< 10_000.0)
-        let fast_1000 = [
-            0x0a, 0x09, 0x22, 0x03, 0x18, 0xe8, 0x07, 0x62, 0x02, 0x08, 0x01,
-        ];
+        let fast_1000 = encode_speed_1s_blob(1_000);
         assert_eq!(extract_metadata_speed(&fast_1000), Some(1000.0));
 
         // output = 10_000, decode_secs = 1s -> 10_000.0 tok/s -> rejected (>= 10_000.0)
-        let too_fast = [
-            0x0a, 0x09, 0x22, 0x03, 0x18, 0x90, 0x4e, 0x62, 0x02, 0x08, 0x01,
-        ];
+        let too_fast = encode_speed_1s_blob(10_000);
         assert_eq!(
             extract_gen_metadata_summary(&too_fast).and_then(|s| s.turn),
             None
@@ -481,37 +547,21 @@ mod tests {
 
     #[test]
     fn gen_metadata_record_decodes_full_schema_and_packed_or_unpacked_steps() {
-        let mut usage = Vec::new();
-        push_field_varint(&mut usage, 2, 12_000);
-        push_field_varint(&mut usage, 3, 600);
-        push_field_varint(&mut usage, 4, 250);
-        push_field_varint(&mut usage, 5, 48_000);
-        push_field_varint(&mut usage, 9, 400);
-        push_field_varint(&mut usage, 10, 200);
-
-        let mut ttft = Vec::new();
-        push_field_varint(&mut ttft, 1, 0);
-        push_field_varint(&mut ttft, 2, 500_000_000);
-
-        let mut dur = Vec::new();
-        push_field_varint(&mut dur, 1, 2);
-
-        let mut chat = Vec::new();
-        push_field_varint(&mut chat, 3, 1526);
-        push_field_bytes(&mut chat, 4, &usage);
-        push_field_f32(&mut chat, 5, 0.0425);
-        push_field_bytes(&mut chat, 11, &ttft);
-        push_field_bytes(&mut chat, 12, &dur);
-        push_field_bytes(&mut chat, 19, b"model-alpha-v1");
-        push_field_bytes(&mut chat, 21, b"Model Alpha (Medium)");
-
-        // Packed step_indices = [7, 8]
-        let mut packed_steps = Vec::new();
-        push_varint(&mut packed_steps, 7);
-        push_varint(&mut packed_steps, 8);
-        let mut root_packed = Vec::new();
-        push_field_bytes(&mut root_packed, 1, &chat);
-        push_field_bytes(&mut root_packed, 2, &packed_steps);
+        let root_packed = encode_gen_blob(GenBlobSpec {
+            step_indices: vec![7, 8],
+            model_enum: 1526,
+            resp_model: Some("model-alpha-v1"),
+            disp_name: Some("Model Alpha (Medium)"),
+            model_cost: Some(0.0425),
+            input_tok: 12_000,
+            output_tok: 600,
+            cache_write_tok: 250,
+            cache_read_tok: 48_000,
+            thinking_tok: 400,
+            ttft_nanos: 500_000_000,
+            dur_secs: 2,
+            ..Default::default()
+        });
 
         let rec = extract_gen_metadata_record(&root_packed).unwrap();
         assert_eq!(rec.first_step_index, Some(7));
@@ -531,97 +581,84 @@ mod tests {
             Some("Model Alpha (Medium)")
         );
 
-        // Unpacked step_indices = [14, 15]
-        let mut root_unpacked = Vec::new();
-        push_field_bytes(&mut root_unpacked, 1, &chat);
-        push_field_varint(&mut root_unpacked, 2, 14);
-        push_field_varint(&mut root_unpacked, 2, 15);
-        let rec_unpacked = extract_gen_metadata_record(&root_unpacked).unwrap();
+        // Wire-compatibility: unpacked repeated step_indices = [14, 15] (prost emits packed by default).
+        // chat(1) -> { model(3)=1 }, step_indices(2)=14, step_indices(2)=15
+        let root_unpacked: &[u8] = &[0x0a, 0x02, 0x18, 0x01, 0x10, 0x0e, 0x10, 0x0f];
+        let rec_unpacked = extract_gen_metadata_record(root_unpacked).unwrap();
         assert_eq!(rec_unpacked.first_step_index, Some(14));
+        assert_eq!(rec_unpacked.model_enum, 1);
     }
 
     #[test]
     fn step_created_at_secs_rejects_out_of_range_years() {
-        let mut ts_min = Vec::new();
-        push_field_varint(&mut ts_min, 1, (-62_135_596_800_i64) as u64);
-        let mut meta_min = Vec::new();
-        push_field_bytes(&mut meta_min, 1, &ts_min);
         assert_eq!(
-            extract_step_created_at_secs(&meta_min),
+            extract_step_created_at_secs(&encode_step_meta_blob(-62_135_596_800)),
             Some(-62_135_596_800)
         );
-
-        let mut ts_max = Vec::new();
-        push_field_varint(&mut ts_max, 1, 253_402_300_799);
-        let mut meta_max = Vec::new();
-        push_field_bytes(&mut meta_max, 1, &ts_max);
         assert_eq!(
-            extract_step_created_at_secs(&meta_max),
+            extract_step_created_at_secs(&encode_step_meta_blob(253_402_300_799)),
             Some(253_402_300_799)
         );
-
-        let mut ts_too_low = Vec::new();
-        push_field_varint(&mut ts_too_low, 1, (-62_135_596_801_i64) as u64);
-        let mut meta_too_low = Vec::new();
-        push_field_bytes(&mut meta_too_low, 1, &ts_too_low);
-        assert_eq!(extract_step_created_at_secs(&meta_too_low), None);
-
-        let mut ts_too_high = Vec::new();
-        push_field_varint(&mut ts_too_high, 1, 253_402_300_800);
-        let mut meta_too_high = Vec::new();
-        push_field_bytes(&mut meta_too_high, 1, &ts_too_high);
-        assert_eq!(extract_step_created_at_secs(&meta_too_high), None);
+        assert_eq!(
+            extract_step_created_at_secs(&encode_step_meta_blob(-62_135_596_801)),
+            None
+        );
+        assert_eq!(
+            extract_step_created_at_secs(&encode_step_meta_blob(253_402_300_800)),
+            None
+        );
     }
 
     #[test]
     fn duration_rejects_negative_seconds_and_invalid_nanos() {
-        let mut neg_secs = Vec::new();
-        push_field_varint(&mut neg_secs, 1, (-1_i64) as u64);
+        let neg_secs = ProtoDuration {
+            seconds: -1,
+            nanos: 0,
+        }
+        .encode_to_vec();
         assert_eq!(ProtoDuration::decode(&neg_secs[..]).unwrap().to_secs(), None);
 
-        let mut neg_nanos = Vec::new();
-        push_field_varint(&mut neg_nanos, 1, 1);
-        push_field_varint(&mut neg_nanos, 2, (-1_i64) as u64);
+        let neg_nanos = ProtoDuration {
+            seconds: 1,
+            nanos: -1,
+        }
+        .encode_to_vec();
         assert_eq!(
             ProtoDuration::decode(&neg_nanos[..]).unwrap().to_secs(),
             None
         );
 
-        let mut huge_nanos = Vec::new();
-        push_field_varint(&mut huge_nanos, 1, 1);
-        push_field_varint(&mut huge_nanos, 2, 1_000_000_000);
+        let huge_nanos = ProtoDuration {
+            seconds: 1,
+            nanos: 1_000_000_000,
+        }
+        .encode_to_vec();
         assert_eq!(
             ProtoDuration::decode(&huge_nanos[..]).unwrap().to_secs(),
             None
         );
 
-        // Verify extract_gen_metadata_record also rejects negative duration.
-        let mut chat = Vec::new();
-        push_field_bytes(&mut chat, 12, &neg_secs);
-        let mut root = Vec::new();
-        push_field_bytes(&mut root, 1, &chat);
-        let rec = extract_gen_metadata_record(&root).unwrap();
-        assert_eq!(rec.decode_secs, None);
+        let root = encode_gen_blob(GenBlobSpec {
+            dur_secs: -1,
+            ..Default::default()
+        });
+        assert_eq!(extract_gen_metadata_record(&root).unwrap().decode_secs, None);
     }
 
     #[test]
     fn chat_start_created_at_rejects_out_of_range_timestamps() {
-        let decode_chat_start = |secs: u64| -> Option<i64> {
-            let mut ts = Vec::new();
-            push_field_varint(&mut ts, 1, secs);
-            let mut start = Vec::new();
-            push_field_bytes(&mut start, 4, &ts);
-            let mut chat = Vec::new();
-            push_field_bytes(&mut chat, 9, &start);
-            let mut root = Vec::new();
-            push_field_bytes(&mut root, 1, &chat);
+        let decode_chat_start = |secs: i64| -> Option<i64> {
+            let root = encode_gen_blob(GenBlobSpec {
+                created_at_secs: Some(secs),
+                ..Default::default()
+            });
             extract_gen_metadata_record(&root)
                 .unwrap()
                 .chat_start_created_at_secs
         };
 
         assert_eq!(decode_chat_start(1_763_400_000), Some(1_763_400_000));
-        assert_eq!(decode_chat_start((-62_135_596_801_i64) as u64), None);
+        assert_eq!(decode_chat_start(-62_135_596_801), None);
         assert_eq!(decode_chat_start(253_402_300_800), None);
     }
 }
