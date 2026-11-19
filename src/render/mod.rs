@@ -346,7 +346,7 @@ mod tests {
         assert!(pl_text.contains("\u{e0b0}"));
         assert!(pl_text.contains("Gemini 4 · high"));
         assert!(pl_text.contains("~$0.14"));
-        assert!(pl_text.contains("(512K)"));
+        assert!(pl_text.contains("(1K/512K)"));
 
         let mut pill_cfg = LayoutConfig::preset_full();
         pill_cfg.style = VisualStyle::Pill;
@@ -690,7 +690,7 @@ mod tests {
         write_statusline(&payload, &meta, &GitInfo::default(), &cfg_used, &mut out_used).unwrap();
         assert_eq!(
             String::from_utf8(out_used).unwrap(),
-            "ctx ████████ 104.7% (512K) · ctx 104.7% (512K)\n"
+            "ctx ████████ 104.7% (536K/512K) · ctx 104.7% (512K)\n"
         );
 
         let mut cfg_rem = LayoutConfig::preset_minimal();
@@ -703,7 +703,7 @@ mod tests {
         let rem_text = String::from_utf8(out_rem).unwrap();
         let crit_code = format!("\x1b[38;5;{}m", palette_for(ThemeStyle::Default).ctx_crit);
         assert!(rem_text.contains(&crit_code));
-        assert!(rem_text.contains("rem ████████ 0.0% (512K)"));
+        assert!(rem_text.contains("rem ████████ 0.0% (0/512K)"));
         assert!(rem_text.contains("rem 0.0% (512K)"));
     }
 

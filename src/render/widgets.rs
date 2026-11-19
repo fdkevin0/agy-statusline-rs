@@ -395,9 +395,21 @@ impl Renderer<'_> {
                     ctx_display_metrics(ctx.used_pct, self.cfg.ctx_remaining);
                 let compact_pct = format!("{tag} {disp_pct:.1}%");
                 let without_limit = format!("{tag} {bar} {disp_pct:.1}%");
-                let full = match ctx.eff_limit {
-                    Some(lim) => format!("{without_limit} ({})", format_tok_str(lim)),
-                    None => without_limit.clone(),
+                let full = match (ctx.cur_ctx, ctx.eff_limit) {
+                    (Some(cur), Some(lim)) => {
+                        let shown = if self.cfg.ctx_remaining {
+                            lim.saturating_sub(cur)
+                        } else {
+                            cur
+                        };
+                        format!(
+                            "{without_limit} ({}/{})",
+                            format_tok_str(shown),
+                            format_tok_str(lim)
+                        )
+                    }
+                    (None, Some(lim)) => format!("{without_limit} ({})", format_tok_str(lim)),
+                    (_, None) => without_limit.clone(),
                 };
                 let mut seg = Segment::plain(widget, full, ctx_color(raw_pct, pal), raw_pct >= 85.0);
                 if ctx.eff_limit.is_some() {

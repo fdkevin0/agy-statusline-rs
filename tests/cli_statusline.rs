@@ -178,7 +178,7 @@ fn cli_omits_duplicate_xhigh_effort_and_formats_rounded_k_tokens() {
     let stdout = run_statusline_stdin(dir.path(), &[], &payload);
     assert_eq!(
         stdout,
-        "GPT-OSS 120B (Extra High) * ctx ###### 105.0% (10K) * 11K/10K * r: 2K\n"
+        "GPT-OSS 120B (Extra High) * ctx ###### 105.0% (11K/10K) * 11K/10K * r: 2K\n"
     );
 }
 
@@ -208,9 +208,8 @@ fn write_statusline_falls_back_to_estimated_context_tokens() {
     };
 
     let rendered_est = render_mono(&payload_no_usage, &meta_est, &GitInfo::default(), &cfg);
-    assert!(rendered_est.contains("25.0%"));
-    assert!(rendered_est.contains("(512K)"));
-    assert!(rendered_est.contains("128K/512K"));
+    assert!(rendered_est.contains("25.0% (128K/512K)"));
+    assert!(rendered_est.contains("· 128K/512K"));
 
     // Actual current_usage takes precedence over estimated_context_tokens.
     let payload_with_usage = StatuslinePayload {
@@ -226,17 +225,16 @@ fn write_statusline_falls_back_to_estimated_context_tokens() {
         ..Default::default()
     };
     let rendered_actual = render_mono(&payload_with_usage, &meta_est, &GitInfo::default(), &cfg);
-    assert!(rendered_actual.contains("50.0%"));
-    assert!(rendered_actual.contains("256K/512K"));
+    assert!(rendered_actual.contains("50.0% (256K/512K)"));
 
-    // Zero estimated_context_tokens is ignored.
+    // Zero estimated_context_tokens falls back to showing only the limit in ctx_bar.
     let meta_zero = SessionMetadata {
         estimated_context_tokens: Some(0),
         max_context_tokens: Some(512_000),
         ..Default::default()
     };
     let rendered_zero = render_mono(&payload_no_usage, &meta_zero, &GitInfo::default(), &cfg);
-    assert!(rendered_zero.contains("0.0%"));
+    assert!(rendered_zero.contains("0.0% (512K)"));
 }
 
 #[test]
@@ -280,8 +278,8 @@ fn tier2_binary_reads_temp_sqlite_db_median_and_estimated_context() {
     let stdin_json =
         format!(r#"{{"conversation_id":"{uuid}","context_window":{{}},"terminal_width":120}}"#);
     let stdout = run_statusline_stdin(dir.path(), &[], &stdin_json);
-    assert!(stdout.contains("25.0% (512K)"), "stdout was: {stdout}");
-    assert!(stdout.contains("128K/512K"), "stdout was: {stdout}");
+    assert!(stdout.contains("25.0% (128K/512K)"), "stdout was: {stdout}");
+    assert!(stdout.contains("· 128K/512K"), "stdout was: {stdout}");
     assert!(stdout.contains("55 tok/s"), "stdout was: {stdout}");
 }
 
