@@ -30,9 +30,11 @@ pub use tz::{
 };
 
 use pricing::round_usd_6;
-use render::build_weekly_usage;
 use scan::{scan_sqlite_conversations, scan_transcripts, UsageEvent};
 use tz::format_day;
+
+const DAYS_PER_WEEK: i64 = 7;
+const ACTIVITY_WEEKS: usize = 20;
 
 use crate::db::compute_median;
 use crate::paths::{resolve_agy_cli_dir, xdg_cache_dir, xdg_config_dir};
@@ -227,17 +229,50 @@ fn accumulate_period(summary: &mut PeriodSummary, ev: &UsageEvent) {
 #[derive(Default)]
 struct ModelAccumulator {
     pricing_key: Option<String>,
-    requests: u64,
-    input_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    output_tokens: u64,
-    thinking_tokens: u64,
-    total_tokens: u64,
-    priced_usd: f64,
-    unpriced_requests: u64,
+    summary: PeriodSummary,
     speeds: Vec<f64>,
     ttfts: Vec<f64>,
+}
+
+/// Monday-based weekday index (`0 = Mon .. 6 = Sun`) for days since `1970-01-01` (Thursday).
+fn weekday_mon0(day_idx: i64) -> usize {
+    (day_idx + 3).rem_euclid(DAYS_PER_WEEK) as usize
+}
+
+fn build_weekly_usage(
+    today_idx: i64,
+    daily_by_date: &HashMap<&str, u64>,
+) -> Vec<WeeklyUsage> {
+    let today_wd = weekday_mon0(today_idx) as i64;
+    let curr_monday = today_idx - today_wd;
+    let first_monday = curr_monday - ((ACTIVITY_WEEKS as i64 - 1) * DAYS_PER_WEEK);
+    let mut weeks = Vec::with_capacity(ACTIVITY_WEEKS);
+
+    for w in 0..ACTIVITY_WEEKS {
+        let week_mon = first_monday + (w as i64) * DAYS_PER_WEEK;
+        let week_sun = week_mon + (DAYS_PER_WEEK - 1);
+        let mut daily_tokens = [None; 7];
+        let mut total_tokens = 0u64;
+
+        for (d, slot) in daily_tokens.iter_mut().enumerate() {
+            let day_idx = week_mon + (d as i64);
+            if day_idx <= today_idx {
+                let date = format_day(day_idx);
+                let tok = daily_by_date.get(date.as_str()).copied().unwrap_or(0);
+                *slot = Some(tok);
+                total_tokens = total_tokens.saturating_add(tok);
+            }
+        }
+
+        weeks.push(WeeklyUsage {
+            week_start: format_day(week_mon),
+            week_end: format_day(week_sun),
+            daily_tokens,
+            total_tokens,
+        });
+    }
+
+    weeks
 }
 
 /// Scans AGY local directories under `home` using the host local timezone and builds a [`StatsReport`].
@@ -290,7 +325,7 @@ pub fn collect_stats_for_roots(
 
     let mut windows = WindowSummaries::default();
     let mut totals = PeriodSummary::default();
-    let mut daily_map: BTreeMap<i64, DailyUsage> = BTreeMap::new();
+    let mut daily_map: BTreeMap<i64, (String, PeriodSummary)> = BTreeMap::new();
     let mut unfiltered_daily_tokens: BTreeMap<String, u64> = BTreeMap::new();
     let mut model_map: HashMap<String, ModelAccumulator> = HashMap::new();
     let mut first_day: Option<i64> = None;
@@ -325,47 +360,16 @@ pub fn collect_stats_for_roots(
 
         accumulate_period(&mut totals, ev);
 
-        let day_entry = daily_map.entry(ev.local_day).or_insert_with(|| DailyUsage {
-            date: ev.local_date.clone(),
-            ..Default::default()
-        });
-        day_entry.requests += 1;
-        day_entry.input_tokens = day_entry.input_tokens.saturating_add(ev.input_tokens);
-        day_entry.cache_read_tokens = day_entry
-            .cache_read_tokens
-            .saturating_add(ev.cache_read_tokens);
-        day_entry.cache_write_tokens = day_entry
-            .cache_write_tokens
-            .saturating_add(ev.cache_write_tokens);
-        day_entry.output_tokens = day_entry.output_tokens.saturating_add(ev.output_tokens);
-        day_entry.thinking_tokens = day_entry.thinking_tokens.saturating_add(ev.thinking_tokens);
-        day_entry.total_tokens = day_entry.total_tokens.saturating_add(ev.total_tokens);
-        match ev.cost_usd {
-            Some(usd) => day_entry.priced_usd += usd,
-            None => day_entry.unpriced_requests += 1,
-        }
+        let (_, day_summary) = daily_map
+            .entry(ev.local_day)
+            .or_insert_with(|| (ev.local_date.clone(), PeriodSummary::default()));
+        accumulate_period(day_summary, ev);
 
         let model_entry = model_map.entry(ev.model_group.clone()).or_default();
         if model_entry.pricing_key.is_none() {
             model_entry.pricing_key.clone_from(&ev.pricing_key);
         }
-        model_entry.requests += 1;
-        model_entry.input_tokens = model_entry.input_tokens.saturating_add(ev.input_tokens);
-        model_entry.cache_read_tokens = model_entry
-            .cache_read_tokens
-            .saturating_add(ev.cache_read_tokens);
-        model_entry.cache_write_tokens = model_entry
-            .cache_write_tokens
-            .saturating_add(ev.cache_write_tokens);
-        model_entry.output_tokens = model_entry.output_tokens.saturating_add(ev.output_tokens);
-        model_entry.thinking_tokens = model_entry
-            .thinking_tokens
-            .saturating_add(ev.thinking_tokens);
-        model_entry.total_tokens = model_entry.total_tokens.saturating_add(ev.total_tokens);
-        match ev.cost_usd {
-            Some(usd) => model_entry.priced_usd += usd,
-            None => model_entry.unpriced_requests += 1,
-        }
+        accumulate_period(&mut model_entry.summary, ev);
         if let Some(speed) = ev.decode_speed {
             model_entry.speeds.push(speed);
         }
@@ -386,29 +390,37 @@ pub fn collect_stats_for_roots(
 
     let daily: Vec<DailyUsage> = daily_map
         .into_values()
-        .map(|mut d| {
-            d.priced_usd = round_usd_6(d.priced_usd);
-            d
+        .map(|(date, s)| DailyUsage {
+            date,
+            requests: s.requests,
+            input_tokens: s.input_tokens,
+            cache_read_tokens: s.cache_read_tokens,
+            cache_write_tokens: s.cache_write_tokens,
+            output_tokens: s.output_tokens,
+            thinking_tokens: s.thinking_tokens,
+            total_tokens: s.total_tokens,
+            priced_usd: round_usd_6(s.priced_usd),
+            unpriced_requests: s.unpriced_requests,
         })
         .collect();
 
     let mut models: Vec<ModelStats> = model_map
         .into_iter()
         .map(|(model, acc)| {
-            let speed_samples = acc.speeds.len();
-            let ttft_samples = acc.ttfts.len();
+            let speed_samples = acc.speeds.iter().filter(|v| v.is_finite()).count();
+            let ttft_samples = acc.ttfts.iter().filter(|v| v.is_finite()).count();
             ModelStats {
                 model,
                 pricing_key: acc.pricing_key,
-                requests: acc.requests,
-                input_tokens: acc.input_tokens,
-                cache_read_tokens: acc.cache_read_tokens,
-                cache_write_tokens: acc.cache_write_tokens,
-                output_tokens: acc.output_tokens,
-                thinking_tokens: acc.thinking_tokens,
-                total_tokens: acc.total_tokens,
-                priced_usd: round_usd_6(acc.priced_usd),
-                unpriced_requests: acc.unpriced_requests,
+                requests: acc.summary.requests,
+                input_tokens: acc.summary.input_tokens,
+                cache_read_tokens: acc.summary.cache_read_tokens,
+                cache_write_tokens: acc.summary.cache_write_tokens,
+                output_tokens: acc.summary.output_tokens,
+                thinking_tokens: acc.summary.thinking_tokens,
+                total_tokens: acc.summary.total_tokens,
+                priced_usd: round_usd_6(acc.summary.priced_usd),
+                unpriced_requests: acc.summary.unpriced_requests,
                 speed_samples,
                 median_tok_per_sec: compute_median(&acc.speeds),
                 ttft_samples,
@@ -1180,7 +1192,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let catalog = PricingCatalog { models };
+        let catalog = PricingCatalog::from_models(models);
 
         // Exact specificity: response_model ("claude-sonnet-4-6-thinking") beats model_group ("claude-sonnet")
         // even though "claude-sonnet" < "claude-sonnet-4-6-thinking" in BTreeMap order.
@@ -1410,5 +1422,99 @@ mod tests {
         assert_eq!(cat3.models["gemini-4-hydrogen"].input_per_mtok, 9.0);
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn user_override_mixed_case_and_separator_variant_beats_models_dev_cache() {
+        let home = temp_home("pricing_override_precedence");
+        let cache_dir = home.join("cache");
+        let override_path = home.join("pricing.json");
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        let sample_api = r#"{
+          "google": {
+            "models": {
+              "gemini-4-hydrogen": { "cost": { "input": 1.5, "output": 7.5 } },
+              "gemini-4-carbon": { "cost": { "input": 2.0, "output": 10.0 } }
+            }
+          }
+        }"#;
+        let t0 = 1_700_000_000;
+        let _ = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            None,
+            SyncMode::BlockingIfStale,
+            t0,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| Ok(sample_api.to_string()),
+        );
+
+        // Mixed-case override ("Gemini-4-Hydrogen") beats lowercase cached "gemini-4-hydrogen".
+        fs::write(
+            &override_path,
+            r#"{"models":{"Gemini-4-Hydrogen":{"input_per_mtok":12.0,"output_per_mtok":24.0}}}"#,
+        )
+        .unwrap();
+        let cat_mixed = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            Some(&override_path),
+            SyncMode::Offline,
+            t0 + 10,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| unreachable!(),
+        );
+        let (k1, c1) = cat_mixed
+            .estimate_cost(&["gemini-4-hydrogen"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(k1, "Gemini-4-Hydrogen");
+        assert!((c1 - 12.0).abs() < 1e-6);
+
+        // Space-separated override ("Gemini 4 Hydrogen") also beats cached "gemini-4-hydrogen".
+        fs::write(
+            &override_path,
+            r#"{"models":{"Gemini 4 Hydrogen":{"input_per_mtok":15.0,"output_per_mtok":30.0}}}"#,
+        )
+        .unwrap();
+        let cat_sep = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            Some(&override_path),
+            SyncMode::Offline,
+            t0 + 10,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| unreachable!(),
+        );
+        let (k2, c2) = cat_sep
+            .estimate_cost(&["gemini-4-hydrogen"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(k2, "Gemini 4 Hydrogen");
+        assert!((c2 - 15.0).abs() < 1e-6);
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn orchestrator_alias_matches_normalized_user_override() {
+        let mut models = BTreeMap::new();
+        models.insert(
+            "Gemini 4 Carbon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 7.5,
+                output_per_mtok: 15.0,
+                ..Default::default()
+            },
+        );
+        let catalog = PricingCatalog::from_models(models);
+
+        let (matched_key, usd) = catalog
+            .estimate_cost(
+                &["gemini-pro-orchestrator", "Orchestrator (Carbon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(matched_key, "Gemini 4 Carbon");
+        assert!((usd - 7.5).abs() < 1e-6);
     }
 }

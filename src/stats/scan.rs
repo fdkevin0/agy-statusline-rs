@@ -326,6 +326,31 @@ fn collect_transcript_jobs_in_brain(
     }
 }
 
+fn resolve_turn_cost(
+    pricing: &PricingCatalog,
+    native_cost_usd: Option<f64>,
+    candidates: &[Option<&str>],
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    output_tokens: u64,
+) -> (Option<String>, Option<f64>) {
+    if let Some(usd) = native_cost_usd {
+        return (Some("native".to_string()), Some(round_usd_6(usd)));
+    }
+    let active: Vec<&str> = candidates.iter().copied().flatten().collect();
+    match pricing.estimate_cost(
+        &active,
+        input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        output_tokens,
+    ) {
+        Some((k, usd)) => (Some(k), Some(usd)),
+        None => (None, None),
+    }
+}
+
 fn parse_transcript_line(
     line: &str,
     job: &TranscriptJob,
@@ -421,28 +446,15 @@ fn parse_transcript_line(
         .or_else(|| value_as_positive_f64(obj.get("cost_usd")))
         .or_else(|| value_as_positive_f64(obj.get("cost")));
 
-    let (pricing_key, cost_usd) = if let Some(usd) = native_cost {
-        (Some("native".to_string()), Some(round_usd_6(usd)))
-    } else {
-        let mut candidates = Vec::with_capacity(3);
-        if let Some(r) = resp {
-            candidates.push(r);
-        }
-        if let Some(d) = disp {
-            candidates.push(d);
-        }
-        candidates.push(model_group.as_str());
-        match pricing.estimate_cost(
-            &candidates,
-            input_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            output_tokens,
-        ) {
-            Some((k, usd)) => (Some(k), Some(usd)),
-            None => (None, None),
-        }
-    };
+    let (pricing_key, cost_usd) = resolve_turn_cost(
+        pricing,
+        native_cost,
+        &[resp, disp, Some(model_group.as_str())],
+        input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        output_tokens,
+    );
 
     let streaming_secs = cm_obj
         .and_then(|cm| parse_duration_secs(cm.get("streamingDuration")))
@@ -622,11 +634,12 @@ fn scan_single_sqlite_db(
                 .total_output_tokens
                 .saturating_add(rec.output_tokens);
             out.speed_samples.push(speed);
-            if let Some(ttft) = rec.ttft_secs {
-                if ttft.is_finite() && ttft > 0.0 {
-                    out.ttft_samples.push(ttft);
-                }
-            }
+        }
+        let ttft_secs = rec
+            .ttft_secs
+            .filter(|&ttft| ttft.is_finite() && ttft > 0.0 && ttft < MAX_TTFT_SECS);
+        if let Some(ttft) = ttft_secs {
+            out.ttft_samples.push(ttft);
         }
 
         let total_tokens = rec
@@ -654,28 +667,19 @@ fn scan_single_sqlite_db(
             rec.model_enum,
         );
 
-        let (pricing_key, cost_usd) = if let Some(usd) = rec.model_cost_usd {
-            (Some("native".to_string()), Some(round_usd_6(usd)))
-        } else {
-            let mut candidates = Vec::with_capacity(3);
-            if let Some(r) = rec.response_model.as_deref() {
-                candidates.push(r);
-            }
-            if let Some(d) = rec.model_display_name.as_deref() {
-                candidates.push(d);
-            }
-            candidates.push(model_group.as_str());
-            match pricing.estimate_cost(
-                &candidates,
-                rec.input_tokens,
-                rec.cache_read_tokens,
-                rec.cache_write_tokens,
-                rec.output_tokens,
-            ) {
-                Some((k, usd)) => (Some(k), Some(usd)),
-                None => (None, None),
-            }
-        };
+        let (pricing_key, cost_usd) = resolve_turn_cost(
+            pricing,
+            rec.model_cost_usd,
+            &[
+                rec.response_model.as_deref(),
+                rec.model_display_name.as_deref(),
+                Some(model_group.as_str()),
+            ],
+            rec.input_tokens,
+            rec.cache_read_tokens,
+            rec.cache_write_tokens,
+            rec.output_tokens,
+        );
 
         out.events.push(UsageEvent {
             local_day,
@@ -690,7 +694,7 @@ fn scan_single_sqlite_db(
             total_tokens,
             cost_usd,
             decode_speed,
-            ttft_secs: rec.ttft_secs,
+            ttft_secs,
         });
     }
 
@@ -800,7 +804,7 @@ pub(super) fn scan_sqlite_conversations(
         events.extend(res.events);
     }
 
-    stats.ttft_samples = ttft_samples.len();
+    stats.ttft_samples = ttft_samples.iter().filter(|v| v.is_finite()).count();
     stats.median_tok_per_sec = compute_median(&speed_samples);
     stats.median_ttft_secs = compute_median(&ttft_samples);
     (stats, events, covered)
@@ -828,32 +832,24 @@ pub fn estimate_conversation_cost_usd(
         let Some(rec) = extract_gen_metadata_record(&blob) else {
             continue;
         };
-        let turn_usd = if let Some(usd) = rec.model_cost_usd {
-            Some(round_usd_6(usd))
-        } else {
-            let model_group = derive_model_name(
-                rec.model_display_name.as_deref(),
+        let model_group = derive_model_name(
+            rec.model_display_name.as_deref(),
+            rec.response_model.as_deref(),
+            rec.model_enum,
+        );
+        let (_, turn_usd) = resolve_turn_cost(
+            pricing,
+            rec.model_cost_usd,
+            &[
                 rec.response_model.as_deref(),
-                rec.model_enum,
-            );
-            let mut candidates = Vec::with_capacity(3);
-            if let Some(r) = rec.response_model.as_deref() {
-                candidates.push(r);
-            }
-            if let Some(d) = rec.model_display_name.as_deref() {
-                candidates.push(d);
-            }
-            candidates.push(model_group.as_str());
-            pricing
-                .estimate_cost(
-                    &candidates,
-                    rec.input_tokens,
-                    rec.cache_read_tokens,
-                    rec.cache_write_tokens,
-                    rec.output_tokens,
-                )
-                .map(|(_, usd)| usd)
-        };
+                rec.model_display_name.as_deref(),
+                Some(model_group.as_str()),
+            ],
+            rec.input_tokens,
+            rec.cache_read_tokens,
+            rec.cache_write_tokens,
+            rec.output_tokens,
+        );
         if let Some(usd) = turn_usd {
             total_usd += usd;
             priced_turns += 1;
