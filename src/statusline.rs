@@ -8,11 +8,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::calibration::calibrate_quota_views_at;
-use crate::db::SpeedReader;
-use crate::git::{GitInfo, GitProbe, SystemGitProbe};
+use crate::db::{SessionMetadata, SpeedReader};
+use crate::git::{GitInfo, GitProbe};
 use crate::layout::{LayoutConfig, WidgetId};
-use crate::metrics::{resolve_quota_5h, resolve_quota_weekly, QuotaView};
-use crate::paths::resolve_agy_cli_dir;
+use crate::metrics::QuotaView;
 use crate::render::write_statusline_with_quotas;
 use crate::stats::{estimate_conversation_cost_usd, PricingCatalog, SyncMode};
 
@@ -295,43 +294,141 @@ impl StatuslinePayload {
     }
 }
 
-/// Parses `input` JSON and writes the statusline using [`LayoutConfig::default`].
-///
-/// # Examples
-///
-/// ```
-/// use agy_statusline::db::SpeedReader;
-/// use agy_statusline::statusline::process_statusline;
-///
-/// struct FixedSpeed(Option<f64>);
-/// impl SpeedReader for FixedSpeed {
-///     fn last_speed(&self, _id: &str) -> Option<f64> { self.0 }
-/// }
-///
-/// let json = r#"{"agent_state":"idle","conversation_id":"8d0371e1-5a05-423b-a8bc-ed75995f9a8b","context_window":{"current_usage":{"input_tokens":200,"cache_read_input_tokens":800,"cache_creation_input_tokens":0}}}"#;
-/// let mut out = Vec::new();
-/// process_statusline(json, &FixedSpeed(Some(60.0)), &mut out).unwrap();
-/// let text = String::from_utf8(out).unwrap();
-/// assert!(text.contains("READY"));
-/// assert!(text.contains("80.0%"));
-/// assert!(text.contains("60 tok/s"));
-/// ```
-pub fn process_statusline<W: Write>(
-    input: &str,
-    reader: &dyn SpeedReader,
-    out: &mut W,
-) -> io::Result<()> {
-    process_statusline_with_config(input, reader, &LayoutConfig::default(), out)
+/// Builds a rich sample payload used for live preview and `doctor`.
+pub fn sample_preview_payload(width: usize) -> StatuslinePayload {
+    let mut quota = BTreeMap::new();
+    quota.insert(
+        "gemini-5h".to_string(),
+        QuotaBucket {
+            remaining_fraction: Some(0.84),
+            reset_in_seconds: Some(11_400),
+            ..Default::default()
+        },
+    );
+    quota.insert(
+        "gemini-weekly".to_string(),
+        QuotaBucket {
+            remaining_fraction: Some(0.92),
+            reset_in_seconds: Some(432_000),
+            ..Default::default()
+        },
+    );
+    StatuslinePayload {
+        agent_state: Some("thinking".to_string()),
+        session_id: Some("8d0371e1-5a05-423b-a8bc-ed75995f9a8b".to_string()),
+        conversation_title: Some("Add AGY payload widgets".to_string()),
+        transcript_path: Some("/tmp/agy/logs/transcript.jsonl".to_string()),
+        version: Some("1.5.11".to_string()),
+        product: Some("Antigravity".to_string()),
+        cycle_mode: Some("plan".to_string()),
+        plan_tier: Some("Pro".to_string()),
+        email: Some("dev@example.com".to_string()),
+        agent: Some(AgentInfo {
+            name: Some("researcher".to_string()),
+        }),
+        model: Some(ModelInfo {
+            id: None,
+            display_name: Some("Gemini 4".to_string()),
+            effort: Some("high".to_string()),
+        }),
+        workspace: Some(WorkspaceInfo {
+            current_dir: Some("/work/agy-statusline".to_string()),
+            project_dir: Some("/work/agy-statusline".to_string()),
+        }),
+        vcs: Some(VcsInfo {
+            vcs_type: Some("git".to_string()),
+            branch: Some("main".to_string()),
+            client: None,
+            dirty: Some(true),
+        }),
+        sandbox: Some(SandboxInfo {
+            enabled: Some(true),
+            allow_network: None,
+        }),
+        vim: Some(VimInfo {
+            mode: Some("NORMAL".to_string()),
+        }),
+        pending_input_count: Some(1),
+        artifact_count: Some(2),
+        subagents: Some(serde_json::json!([1, 2])),
+        task_count: Some(3),
+        context_window: Some(ContextWindow {
+            used_percentage: Some(42.5),
+            total_input_tokens: Some(48_000),
+            total_output_tokens: Some(4_200),
+            current_usage: Some(JsonUsage {
+                input_tokens: Some(18_000),
+                output_tokens: Some(50),
+                cache_read_input_tokens: Some(200_000),
+                cache_creation_input_tokens: Some(0),
+            }),
+            ..Default::default()
+        }),
+        cost: Some(CostInfo {
+            total_usd: Some(0.14),
+            subagent_usd: None,
+            estimated: Some(true),
+        }),
+        quota: Some(quota),
+        terminal_width: Some(width),
+        ..Default::default()
+    }
 }
 
-/// Parses `input` JSON and writes the statusline according to `cfg`.
-pub fn process_statusline_with_config<W: Write>(
-    input: &str,
-    reader: &dyn SpeedReader,
-    cfg: &LayoutConfig,
-    out: &mut W,
-) -> io::Result<()> {
-    process_statusline_with_probes(input, reader, &SystemGitProbe::default(), cfg, out)
+/// Controls how fallback session cost estimation loads model pricing rates.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum PricingSource<'a> {
+    /// Disable fallback cost pricing lookups (default for isolated tests).
+    #[default]
+    Disabled,
+    /// Use an explicitly provided in-memory pricing catalog.
+    Catalog(&'a PricingCatalog),
+    /// Lazily load effective pricing from XDG cache + user overrides using `SyncMode`.
+    Effective(SyncMode),
+}
+
+/// Explicit runtime dependencies for [`process_statusline`].
+pub struct StatuslineRuntime<'a> {
+    /// Session SQLite metadata reader.
+    pub reader: &'a dyn SpeedReader,
+    /// Git branch/worktree/diff probe.
+    pub git_probe: &'a dyn GitProbe,
+    /// Optional quota token calibration cache directory.
+    pub calibration_dir: Option<&'a Path>,
+    /// Optional AGY CLI directory (`~/.gemini/antigravity-cli`) for conversation cost estimation.
+    pub agy_cli_dir: Option<&'a Path>,
+    /// Pricing source for fallback cost estimation when `cost.total_usd` is absent.
+    pub pricing: PricingSource<'a>,
+    /// Current Unix epoch timestamp in seconds.
+    pub now_unix_secs: u64,
+}
+
+impl<'a> StatuslineRuntime<'a> {
+    /// Constructs an isolated runtime with no disk caches, no global AGY directory, and pricing disabled.
+    pub fn minimal(reader: &'a dyn SpeedReader, git_probe: &'a dyn GitProbe) -> Self {
+        Self {
+            reader,
+            git_probe,
+            calibration_dir: None,
+            agy_cli_dir: None,
+            pricing: PricingSource::Disabled,
+            now_unix_secs: 0,
+        }
+    }
+}
+
+fn layout_needs_session_metadata(cfg: &LayoutConfig) -> bool {
+    cfg.rows.iter().flatten().any(|w| {
+        matches!(
+            w,
+            WidgetId::Speed
+                | WidgetId::Ttft
+                | WidgetId::Thinking
+                | WidgetId::CtxBar
+                | WidgetId::CtxPct
+                | WidgetId::CtxTokens
+        )
+    })
 }
 
 fn probe_session_and_git(
@@ -339,12 +436,16 @@ fn probe_session_and_git(
     reader: &dyn SpeedReader,
     git_probe: &dyn GitProbe,
     cfg: &LayoutConfig,
-) -> (crate::db::SessionMetadata, GitInfo) {
-    let meta = payload
-        .conversation_id
-        .as_deref()
-        .map(|id| reader.session_metadata(id))
-        .unwrap_or_default();
+) -> (SessionMetadata, GitInfo) {
+    let meta = if layout_needs_session_metadata(cfg) {
+        payload
+            .conversation_id
+            .as_deref()
+            .map(|id| reader.session_metadata(id))
+            .unwrap_or_default()
+    } else {
+        SessionMetadata::default()
+    };
     let has_vcs = cfg.rows.iter().flatten().any(|w| matches!(w, WidgetId::Vcs));
     let has_wt = cfg
         .rows
@@ -375,21 +476,6 @@ fn probe_session_and_git(
         GitInfo::default()
     };
     (meta, git_info)
-}
-
-/// Parses `input` JSON using explicit [`SpeedReader`] and [`GitProbe`] boundaries.
-pub fn process_statusline_with_probes<W: Write>(
-    input: &str,
-    reader: &dyn SpeedReader,
-    git_probe: &dyn GitProbe,
-    cfg: &LayoutConfig,
-    out: &mut W,
-) -> io::Result<()> {
-    let payload: StatuslinePayload = serde_json::from_str(input).unwrap_or_default();
-    let (meta, git_info) = probe_session_and_git(&payload, reader, git_probe, cfg);
-    let quota_5h = resolve_quota_5h(&payload);
-    let quota_weekly = resolve_quota_weekly(&payload);
-    write_statusline_with_quotas(&payload, &meta, &git_info, quota_5h, quota_weekly, cfg, out)
 }
 
 fn estimate_payload_cost_usd(
@@ -437,33 +523,73 @@ fn estimate_payload_cost_usd(
         .map(|(_, usd)| usd)
 }
 
-/// Parses `input` JSON using explicit [`SpeedReader`], [`GitProbe`], and quota token calibration cache directory.
-pub fn process_statusline_with_calibration<W: Write>(
+/// Parses `input` JSON and writes the statusline according to `runtime` and `cfg`.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// use agy_statusline::db::{SessionMetadata, SpeedReader};
+/// use agy_statusline::git::{GitInfo, GitProbe};
+/// use agy_statusline::layout::LayoutConfig;
+/// use agy_statusline::statusline::{process_statusline, StatuslineRuntime};
+///
+/// struct FixedSpeed(Option<f64>);
+/// impl SpeedReader for FixedSpeed {
+///     fn session_metadata(&self, _id: &str) -> SessionMetadata {
+///         SessionMetadata { speed: self.0, ..Default::default() }
+///     }
+/// }
+/// struct NoopGit;
+/// impl GitProbe for NoopGit {
+///     fn probe(&self, _dir: &Path, _include_diff: bool) -> GitInfo { GitInfo::default() }
+/// }
+///
+/// let json = r#"{"agent_state":"idle","conversation_id":"8d0371e1-5a05-423b-a8bc-ed75995f9a8b","context_window":{"current_usage":{"input_tokens":200,"cache_read_input_tokens":800,"cache_creation_input_tokens":0}}}"#;
+/// let reader = FixedSpeed(Some(60.0));
+/// let git = NoopGit;
+/// let runtime = StatuslineRuntime::minimal(&reader, &git);
+/// let mut out = Vec::new();
+/// process_statusline(json, &runtime, &LayoutConfig::default(), &mut out).unwrap();
+/// let text = String::from_utf8(out).unwrap();
+/// assert!(text.contains("READY"));
+/// assert!(text.contains("80.0%"));
+/// assert!(text.contains("60 tok/s"));
+/// ```
+pub fn process_statusline<W: Write>(
     input: &str,
-    reader: &dyn SpeedReader,
-    git_probe: &dyn GitProbe,
-    calibration_dir: Option<&Path>,
-    now_unix_secs: u64,
+    runtime: &StatuslineRuntime<'_>,
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
     let payload: StatuslinePayload = serde_json::from_str(input).unwrap_or_default();
-    let (mut meta, git_info) = probe_session_and_git(&payload, reader, git_probe, cfg);
+    let (mut meta, git_info) =
+        probe_session_and_git(&payload, runtime.reader, runtime.git_probe, cfg);
     let needs_cost = cfg.rows.iter().flatten().any(|w| matches!(w, WidgetId::Cost))
         && payload.cost.as_ref().and_then(|c| c.total_usd).is_none();
     if needs_cost {
-        let pricing = PricingCatalog::load_effective(SyncMode::SpawnIfStale, now_unix_secs);
-        meta.estimated_cost_usd = payload
-            .conversation_id
-            .as_deref()
-            .and_then(|cid| {
-                resolve_agy_cli_dir()
-                    .and_then(|cli_dir| estimate_conversation_cost_usd(&cli_dir, cid, &pricing))
-            })
-            .or_else(|| estimate_payload_cost_usd(&payload, &pricing));
+        let estimate_with = |pricing: &PricingCatalog| {
+            payload
+                .conversation_id
+                .as_deref()
+                .and_then(|cid| {
+                    runtime
+                        .agy_cli_dir
+                        .and_then(|cli_dir| estimate_conversation_cost_usd(cli_dir, cid, pricing))
+                })
+                .or_else(|| estimate_payload_cost_usd(&payload, pricing))
+        };
+        meta.estimated_cost_usd = match runtime.pricing {
+            PricingSource::Disabled => None,
+            PricingSource::Catalog(pricing) => estimate_with(pricing),
+            PricingSource::Effective(mode) => {
+                let pricing = PricingCatalog::load_effective(mode, runtime.now_unix_secs);
+                estimate_with(&pricing)
+            }
+        };
     }
     let (quota_5h, quota_weekly): (Option<QuotaView>, Option<QuotaView>) =
-        calibrate_quota_views_at(&payload, calibration_dir, now_unix_secs);
+        calibrate_quota_views_at(&payload, runtime.calibration_dir, runtime.now_unix_secs);
     write_statusline_with_quotas(&payload, &meta, &git_info, quota_5h, quota_weekly, cfg, out)
 }
 
@@ -473,8 +599,13 @@ mod tests {
 
     struct StubReader(Option<f64>);
     impl SpeedReader for StubReader {
-        fn last_speed(&self, _id: &str) -> Option<f64> {
-            self.0
+        fn session_metadata(&self, _id: &str) -> SessionMetadata {
+            SessionMetadata {
+                speed: self.0,
+                median_speed: self.0,
+                last_turn_speed: self.0,
+                ..Default::default()
+            }
         }
     }
 
@@ -497,9 +628,12 @@ mod tests {
         }"#;
         let mut cfg = LayoutConfig::preset_minimal();
         cfg.theme = crate::layout::ThemeStyle::Mono;
+        let reader = StubReader(Some(88.0));
+        let git = StubGit(GitInfo::default());
+        let runtime = StatuslineRuntime::minimal(&reader, &git);
 
         let mut out = Vec::new();
-        process_statusline_with_config(json, &StubReader(Some(88.0)), &cfg, &mut out).unwrap();
+        process_statusline(json, &runtime, &cfg, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("THINKING"));
         assert!(text.contains("main*"));
@@ -510,14 +644,23 @@ mod tests {
     fn empty_and_invalid_json_degrades_gracefully() {
         let mut cfg = LayoutConfig::preset_addon();
         cfg.theme = crate::layout::ThemeStyle::Mono;
+        let git = StubGit(GitInfo::default());
 
+        let reader_none = StubReader(None);
         let mut out = Vec::new();
-        process_statusline_with_config("", &StubReader(None), &cfg, &mut out).unwrap();
+        process_statusline("", &StatuslineRuntime::minimal(&reader_none, &git), &cfg, &mut out)
+            .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "◈ cache -- ⚡ --\n");
 
+        let reader_some = StubReader(Some(100.0));
         let mut out2 = Vec::new();
-        process_statusline_with_config("{bad json", &StubReader(Some(100.0)), &cfg, &mut out2)
-            .unwrap();
+        process_statusline(
+            "{bad json",
+            &StatuslineRuntime::minimal(&reader_some, &git),
+            &cfg,
+            &mut out2,
+        )
+        .unwrap();
         assert_eq!(String::from_utf8(out2).unwrap(), "◈ cache -- ⚡ --\n");
     }
 
@@ -531,15 +674,17 @@ mod tests {
         let mut cfg = LayoutConfig::preset_minimal();
         cfg.theme = crate::layout::ThemeStyle::Mono;
         cfg.show_git_diff = false;
+        let reader = StubReader(None);
         let git = StubGit(GitInfo {
             branch: Some("feat/probe".to_string()),
             worktree: None,
             added: 0,
             deleted: 0,
         });
+        let runtime = StatuslineRuntime::minimal(&reader, &git);
 
         let mut out = Vec::new();
-        process_statusline_with_probes(json, &StubReader(None), &git, &cfg, &mut out).unwrap();
+        process_statusline(json, &runtime, &cfg, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("feat/probe"));
     }
@@ -598,14 +743,16 @@ mod tests {
         cfg.theme = crate::layout::ThemeStyle::Mono;
         cfg.show_git_diff = true;
         cfg.rows = vec![vec![WidgetId::Vcs, WidgetId::Worktree]];
+        let reader = StubReader(None);
+        let git = CountingGit(&calls);
+        let runtime = StatuslineRuntime::minimal(&reader, &git);
 
         let hg_json = r#"{
             "cwd": "/tmp/hg-repo",
             "vcs": {"type": "hg", "branch": "default"}
         }"#;
         let mut out = Vec::new();
-        process_statusline_with_probes(hg_json, &StubReader(None), &CountingGit(&calls), &cfg, &mut out)
-            .unwrap();
+        process_statusline(hg_json, &runtime, &cfg, &mut out).unwrap();
         assert_eq!(calls.get(), 0);
 
         let citc_json = r#"{
@@ -613,14 +760,7 @@ mod tests {
             "vcs": {"type": "citc", "client": "my-client"}
         }"#;
         out.clear();
-        process_statusline_with_probes(
-            citc_json,
-            &StubReader(None),
-            &CountingGit(&calls),
-            &cfg,
-            &mut out,
-        )
-        .unwrap();
+        process_statusline(citc_json, &runtime, &cfg, &mut out).unwrap();
         assert_eq!(calls.get(), 0);
 
         // Explicit "git" still probes.
@@ -629,8 +769,44 @@ mod tests {
             "vcs": {"type": "git"}
         }"#;
         out.clear();
-        process_statusline_with_probes(git_json, &StubReader(None), &CountingGit(&calls), &cfg, &mut out)
-            .unwrap();
+        process_statusline(git_json, &runtime, &cfg, &mut out).unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn skips_session_metadata_read_when_no_sqlite_widget_active() {
+        use std::cell::Cell;
+
+        struct CountingReader<'a>(&'a Cell<usize>);
+        impl SpeedReader for CountingReader<'_> {
+            fn session_metadata(&self, _id: &str) -> SessionMetadata {
+                self.0.set(self.0.get() + 1);
+                SessionMetadata {
+                    speed: Some(75.0),
+                    ..Default::default()
+                }
+            }
+        }
+
+        let calls = Cell::new(0usize);
+        let reader = CountingReader(&calls);
+        let git = StubGit(GitInfo::default());
+        let runtime = StatuslineRuntime::minimal(&reader, &git);
+        let json = r#"{
+            "agent_state": "idle",
+            "conversation_id": "8d0371e1-5a05-423b-a8bc-ed75995f9a8b"
+        }"#;
+
+        let mut cfg_no_db = LayoutConfig::preset_minimal();
+        cfg_no_db.rows = vec![vec![WidgetId::State, WidgetId::Model]];
+        let mut out = Vec::new();
+        process_statusline(json, &runtime, &cfg_no_db, &mut out).unwrap();
+        assert_eq!(calls.get(), 0);
+
+        let mut cfg_with_speed = LayoutConfig::preset_minimal();
+        cfg_with_speed.rows = vec![vec![WidgetId::State, WidgetId::Speed]];
+        out.clear();
+        process_statusline(json, &runtime, &cfg_with_speed, &mut out).unwrap();
         assert_eq!(calls.get(), 1);
     }
 

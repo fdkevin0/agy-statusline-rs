@@ -36,21 +36,10 @@ pub struct SessionMetadata {
     pub estimated_cost_usd: Option<f64>,
 }
 
-/// Trait abstracting last-turn speed and context limit lookup for testability.
+/// Trait abstracting session generation metadata lookup for testability.
 pub trait SpeedReader {
-    /// Returns the last completed turn's generation speed in tokens/sec, if available.
-    fn last_speed(&self, conversation_id: &str) -> Option<f64>;
-
-    /// Returns both generation speed and server-issued `max_context_tokens`.
-    fn session_metadata(&self, conversation_id: &str) -> SessionMetadata {
-        let speed = self.last_speed(conversation_id);
-        SessionMetadata {
-            speed,
-            median_speed: speed,
-            last_turn_speed: speed,
-            ..Default::default()
-        }
-    }
+    /// Returns session generation speed, TTFT, and context window metadata.
+    fn session_metadata(&self, conversation_id: &str) -> SessionMetadata;
 }
 
 /// Production [`SpeedReader`] backed by the local AGY SQLite conversation database.
@@ -61,10 +50,6 @@ pub struct SqliteSpeedReader {
 }
 
 impl SpeedReader for SqliteSpeedReader {
-    fn last_speed(&self, conversation_id: &str) -> Option<f64> {
-        self.session_metadata(conversation_id).speed
-    }
-
     fn session_metadata(&self, conversation_id: &str) -> SessionMetadata {
         if let Some(home) = &self.home_override {
             return query_session_metadata(home, conversation_id);
@@ -233,7 +218,6 @@ pub fn query_session_metadata_from_db(db_path: &Path) -> SessionMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     #[test]
     fn uuid_validation() {
@@ -246,44 +230,22 @@ mod tests {
 
     #[test]
     fn query_real_sqlite_db_in_temp_dir() {
-        let dir = env::temp_dir().join(format!("agy_statusline_test_{}", std::process::id()));
-        let conv_dir = dir.join(".gemini/antigravity-cli/conversations");
-        std::fs::create_dir_all(&conv_dir).unwrap();
-        let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
-        let db_path = conv_dir.join(format!("{uuid}.db"));
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
-            [],
-        )
-        .unwrap();
+        let (dir, conn, uuid) = create_temp_conv_db();
         let blob: &[u8] = &[0x0a, 0x08, 0x22, 0x02, 0x18, 0x64, 0x62, 0x02, 0x08, 0x02];
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [blob])
             .unwrap();
         drop(conn);
 
         let reader = SqliteSpeedReader {
-            home_override: Some(dir.clone()),
+            home_override: Some(dir.path().to_path_buf()),
         };
-        assert_eq!(reader.last_speed(uuid), Some(50.0));
-        assert_eq!(reader.last_speed("invalid"), None);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reader.session_metadata(uuid).speed, Some(50.0));
+        assert_eq!(reader.session_metadata("invalid").speed, None);
     }
 
     #[test]
     fn falls_back_when_newest_row_is_incomplete() {
-        let dir = env::temp_dir().join(format!("agy_statusline_fb_{}", std::process::id()));
-        let conv_dir = dir.join(".gemini/antigravity-cli/conversations");
-        std::fs::create_dir_all(&conv_dir).unwrap();
-        let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
-        let db_path = conv_dir.join(format!("{uuid}.db"));
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
-            [],
-        )
-        .unwrap();
+        let (dir, conn, uuid) = create_temp_conv_db();
         let valid: &[u8] = &[0x0a, 0x08, 0x22, 0x02, 0x18, 0x64, 0x62, 0x02, 0x08, 0x02];
         let incomplete: &[u8] = &[0x12, 0x00];
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [valid])
@@ -296,26 +258,14 @@ mod tests {
         drop(conn);
 
         let reader = SqliteSpeedReader {
-            home_override: Some(dir.clone()),
+            home_override: Some(dir.path().to_path_buf()),
         };
-        assert_eq!(reader.last_speed(uuid), Some(50.0));
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reader.session_metadata(uuid).speed, Some(50.0));
     }
 
     #[test]
     fn extracts_both_speed_and_max_context_tokens_from_db() {
-        let dir = env::temp_dir().join(format!("agy_statusline_meta_{}", std::process::id()));
-        let conv_dir = dir.join(".gemini/antigravity-cli/conversations");
-        std::fs::create_dir_all(&conv_dir).unwrap();
-        let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
-        let db_path = conv_dir.join(format!("{uuid}.db"));
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
-            [],
-        )
-        .unwrap();
+        let (dir, conn, uuid) = create_temp_conv_db();
         let speed_blob: &[u8] = &[0x0a, 0x08, 0x22, 0x02, 0x18, 0x64, 0x62, 0x02, 0x08, 0x02];
         let ctx_blob: &[u8] = &[0x0a, 0x08, 0x4a, 0x06, 0x52, 0x04, 0x20, 0x80, 0xa0, 0x1f];
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [speed_blob])
@@ -325,24 +275,21 @@ mod tests {
         drop(conn);
 
         let reader = SqliteSpeedReader {
-            home_override: Some(dir.clone()),
+            home_override: Some(dir.path().to_path_buf()),
         };
         let meta = reader.session_metadata(uuid);
         assert_eq!(meta.speed, Some(50.0));
         assert_eq!(meta.last_turn_speed, Some(50.0));
         assert_eq!(meta.max_context_tokens, Some(512_000));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn speed_1s_blob(output_tokens: u8) -> [u8; 10] {
         [0x0a, 0x08, 0x22, 0x02, 0x18, output_tokens, 0x62, 0x02, 0x08, 0x01]
     }
 
-    fn create_temp_conv_db(tag: &str) -> (PathBuf, Connection, &'static str) {
-        let dir = env::temp_dir().join(format!("agy_statusline_{tag}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let conv_dir = dir.join(".gemini/antigravity-cli/conversations");
+    fn create_temp_conv_db() -> (tempfile::TempDir, Connection, &'static str) {
+        let dir = tempfile::tempdir().unwrap();
+        let conv_dir = dir.path().join(".gemini/antigravity-cli/conversations");
         std::fs::create_dir_all(&conv_dir).unwrap();
         let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
         let db_path = conv_dir.join(format!("{uuid}.db"));
@@ -357,7 +304,7 @@ mod tests {
 
     #[test]
     fn median_speed_odd_nine_turns_and_weighted_five_turns() {
-        let (dir, conn, uuid) = create_temp_conv_db("median_odd9");
+        let (dir, conn, uuid) = create_temp_conv_db();
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (0, ?1)", [speed_1s_blob(5)]).unwrap();
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [speed_1s_blob(10)]).unwrap();
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [speed_1s_blob(20)]).unwrap();
@@ -371,19 +318,17 @@ mod tests {
         drop(conn);
 
         let reader = SqliteSpeedReader {
-            home_override: Some(dir.clone()),
+            home_override: Some(dir.path().to_path_buf()),
         };
         let meta = reader.session_metadata(uuid);
         assert_eq!(meta.speed, Some(100.0));
         assert_eq!(meta.median_speed, Some(80.0));
         assert_eq!(meta.last_turn_speed, Some(120.0));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn median_speed_even_turns_averages_middle_two() {
-        let (dir, conn, uuid) = create_temp_conv_db("median_even4");
+        let (dir, conn, uuid) = create_temp_conv_db();
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [speed_1s_blob(100)]).unwrap();
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [speed_1s_blob(20)]).unwrap();
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (3, ?1)", [speed_1s_blob(60)]).unwrap();
@@ -391,18 +336,16 @@ mod tests {
         drop(conn);
 
         let reader = SqliteSpeedReader {
-            home_override: Some(dir.clone()),
+            home_override: Some(dir.path().to_path_buf()),
         };
         let meta = reader.session_metadata(uuid);
         assert_eq!(meta.median_speed, Some(50.0));
         assert_eq!(meta.speed, Some(55.0));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn populates_estimated_context_and_thinking_tokens() {
-        let (dir, conn, uuid) = create_temp_conv_db("est_think");
+        let (dir, conn, uuid) = create_temp_conv_db();
         // idx 1: output=100, thinking=250, dur=2s
         let turn_with_thinking: &[u8] = &[
             0x0a, 0x0b, 0x22, 0x05, 0x18, 0x64, 0x48, 0xfa, 0x01, 0x62, 0x02, 0x08, 0x02,
@@ -418,15 +361,13 @@ mod tests {
         drop(conn);
 
         let reader = SqliteSpeedReader {
-            home_override: Some(dir.clone()),
+            home_override: Some(dir.path().to_path_buf()),
         };
         let meta = reader.session_metadata(uuid);
         assert_eq!(meta.estimated_context_tokens, Some(64_000));
         assert_eq!(meta.max_context_tokens, Some(512_000));
         assert_eq!(meta.thinking_tokens, Some(250));
         assert_eq!(meta.speed, Some(50.0));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -442,16 +383,14 @@ mod tests {
 
     #[test]
     fn resolve_conversation_db_path_falls_back_to_lowercase_uuid() {
-        let (dir, conn, uuid) = create_temp_conv_db("uuid_case");
+        let (dir, conn, uuid) = create_temp_conv_db();
         drop(conn);
-        let cli_dir = dir.join(".gemini/antigravity-cli");
+        let cli_dir = dir.path().join(".gemini/antigravity-cli");
         let upper = uuid.to_ascii_uppercase();
 
         let exact = resolve_conversation_db_path(&cli_dir, uuid).unwrap();
         let via_upper = resolve_conversation_db_path(&cli_dir, &upper).unwrap();
         assert_eq!(exact, via_upper);
         assert!(resolve_conversation_db_path(&cli_dir, "not-a-uuid").is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

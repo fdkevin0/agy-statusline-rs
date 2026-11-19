@@ -1,16 +1,20 @@
+#![forbid(unsafe_code)]
 //! Tier 2: settings updates and diagnostics through the installed CLI entry point.
+
+mod common;
 
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use serde_json::Value;
 
-const BIN: &str = env!("CARGO_BIN_EXE_agy-statusline");
+use common::{isolated_agy_cmd, seed_offline_pricing, BIN};
 
-fn isolated_command(program: impl AsRef<Path>, root: &Path) -> Command {
+fn isolated_program(program: impl AsRef<Path>, root: &Path) -> Command {
+    let cache_dir = root.join("cache");
+    seed_offline_pricing(&cache_dir);
     let mut cmd = Command::new(program.as_ref());
     cmd.current_dir(root)
         .env_clear()
@@ -18,7 +22,7 @@ fn isolated_command(program: impl AsRef<Path>, root: &Path) -> Command {
         .env("USERPROFILE", root)
         .env("ANTIGRAVITY_CLI_HOME", root.join("agy"))
         .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("XDG_CACHE_HOME", cache_dir)
         .env("NO_COLOR", "1");
     cmd
 }
@@ -39,7 +43,8 @@ fn tier2_settings_updates_preserve_permissions() {
     let settings = agy.join("settings.json");
     let mode = || fs::metadata(&settings).unwrap().permissions().mode() & 0o777;
 
-    let mut cmd = isolated_command(BIN, root.path());
+    let mut cmd = isolated_agy_cmd(root.path());
+    cmd.env("ANTIGRAVITY_CLI_HOME", &agy).env("NO_COLOR", "1");
     stdout(cmd.args(["apply", "--yes"]).output().unwrap());
     assert_eq!(mode() & 0o077, 0);
 
@@ -49,7 +54,9 @@ fn tier2_settings_updates_preserve_permissions() {
 
     fs::set_permissions(&settings, fs::Permissions::from_mode(0o640)).unwrap();
     stdout(
-        isolated_command(BIN, root.path())
+        isolated_agy_cmd(root.path())
+            .env("ANTIGRAVITY_CLI_HOME", &agy)
+            .env("NO_COLOR", "1")
             .args(["apply", "--disable"])
             .output()
             .unwrap(),
@@ -74,7 +81,7 @@ fn tier2_apply_preserves_path_and_explicit_relative_launchers() {
     let read = || serde_json::from_slice::<Value>(&fs::read(&settings).unwrap()).unwrap();
 
     stdout(
-        isolated_command(&path_launcher, root.path())
+        isolated_program(&path_launcher, root.path())
             .arg0("agy-statusline")
             .env("PATH", "missing:bin")
             .args(["apply", "--yes"])
@@ -87,7 +94,7 @@ fn tier2_apply_preserves_path_and_explicit_relative_launchers() {
     );
 
     stdout(
-        isolated_command(&relative_launcher, root.path())
+        isolated_program(&relative_launcher, root.path())
             .arg0("./bin/statusline")
             .args(["apply", "--yes"])
             .output()
@@ -113,7 +120,7 @@ fn tier2_tui_save_preserves_launcher_across_upgrade() {
     fs::copy(BIN, &old).unwrap();
     symlink(&old, &launcher).unwrap();
 
-    let mut tui = isolated_command("script", &dir)
+    let mut tui = isolated_program("script", &dir)
         .env("SHELL", "/bin/sh")
         .args([
             "-qec",
@@ -147,28 +154,19 @@ fn tier2_doctor_reports_config_states_and_render_uses_defaults_on_error() {
     let config = root.path().join("config/agy-statusline/config.json");
     let doctor = || {
         stdout(
-            isolated_command(BIN, root.path())
+            isolated_agy_cmd(root.path())
+                .env("NO_COLOR", "1")
                 .arg("doctor")
                 .output()
                 .unwrap(),
         )
     };
-    let cache = root.path().join("cache/agy-statusline");
-    fs::create_dir_all(&cache).unwrap();
-    let fetched_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    fs::write(
-        cache.join("models_dev_pricing.json"),
-        serde_json::json!({"fetched_at": fetched_at, "models": {}}).to_string(),
-    )
-    .unwrap();
     let input = root.path().join("payload.json");
     fs::write(&input, r#"{"cost":{"total_usd":1.0}}"#).unwrap();
     let render = || {
         stdout(
-            isolated_command(BIN, root.path())
+            isolated_agy_cmd(root.path())
+                .env("NO_COLOR", "1")
                 .stdin(fs::File::open(&input).unwrap())
                 .output()
                 .unwrap(),

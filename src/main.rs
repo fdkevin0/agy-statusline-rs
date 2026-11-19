@@ -8,16 +8,17 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agy_statusline::apply::{
-    resolve_invoked_binary_path, run_apply_command, run_doctor, set_statusline_enabled,
+    resolve_invoked_binary_path, run_apply_command, set_statusline_enabled,
 };
 use agy_statusline::db::SqliteSpeedReader;
+use agy_statusline::doctor::run_doctor;
 use agy_statusline::git::SystemGitProbe;
 use agy_statusline::layout::{load_layout_config, save_layout_config, LayoutConfig, Preset};
 use agy_statusline::paths::{
     agy_settings_path, resolve_agy_cli_dir, resolve_home_dir, xdg_cache_dir, xdg_config_dir,
 };
-use agy_statusline::stats::{run_pricing_command, run_stats_command};
-use agy_statusline::statusline::process_statusline_with_calibration;
+use agy_statusline::stats::{run_pricing_command, run_stats_command, SyncMode};
+use agy_statusline::statusline::{process_statusline, PricingSource, StatuslineRuntime};
 use agy_statusline::tui::run_tui_config;
 
 const MAX_STDIN_BYTES: u64 = 1024 * 1024;
@@ -324,17 +325,18 @@ fn main() -> io::Result<()> {
     let reader = SqliteSpeedReader::default();
     let git_probe = SystemGitProbe::with_default_cache();
     let calibration_dir = xdg_cache_dir();
+    let agy_cli_dir = resolve_agy_cli_dir();
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let mut stdout = io::stdout().lock();
-    process_statusline_with_calibration(
-        &input,
-        &reader,
-        &git_probe,
-        calibration_dir.as_deref(),
+    let runtime = StatuslineRuntime {
+        reader: &reader,
+        git_probe: &git_probe,
+        calibration_dir: calibration_dir.as_deref(),
+        agy_cli_dir: agy_cli_dir.as_deref(),
+        pricing: PricingSource::Effective(SyncMode::SpawnIfStale),
         now_unix_secs,
-        &cfg,
-        &mut stdout,
-    )
+    };
+    let mut stdout = io::stdout().lock();
+    process_statusline(&input, &runtime, &cfg, &mut stdout)
 }

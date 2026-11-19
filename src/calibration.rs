@@ -13,9 +13,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::fsutil::atomic_write;
-use crate::metrics::{
-    resolve_quota_5h_with_reset_at, resolve_quota_weekly_with_reset_at, QuotaView,
-};
+use crate::metrics::{resolve_quota_views_with_reset_at, QuotaResolution, QuotaView};
 use crate::statusline::StatuslinePayload;
 
 const SCHEMA_VERSION: u32 = 2;
@@ -296,13 +294,11 @@ fn bucket_state_changed(before: Option<&BucketCalibration>, after: &BucketCalibr
         || prev.external_divergence_in_cycle != after.external_divergence_in_cycle
 }
 
-type ResolvedViews = [Option<(QuotaView, Option<u64>)>; 2];
+type ResolvedViews = [Option<QuotaResolution>; 2];
 
 fn resolve_views(payload: &StatuslinePayload, now_unix_secs: u64) -> ResolvedViews {
-    [
-        resolve_quota_5h_with_reset_at(payload, now_unix_secs),
-        resolve_quota_weekly_with_reset_at(payload, now_unix_secs),
-    ]
+    let (short, weekly) = resolve_quota_views_with_reset_at(payload, now_unix_secs);
+    [short, weekly]
 }
 
 fn calibrate_resolved(
@@ -407,21 +403,6 @@ pub fn calibrate_quota_views_at(
 mod tests {
     use super::*;
     use crate::statusline::{ContextWindow, ModelInfo, QuotaBucket};
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_cache_dir(tag: &str) -> PathBuf {
-        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "agy_statusline_cal_{tag}_{}_{seq}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     fn make_payload(
         conv_id: &str,
@@ -564,66 +545,60 @@ mod tests {
 
     #[test]
     fn persists_atomically_to_isolated_cache_dir() {
-        let dir = temp_cache_dir("persist");
+        let dir = tempfile::tempdir().unwrap();
         let t0 = 1_795_000_000;
 
         let p1 = make_payload("conv-disk", 10_000, 0, 0.90, 14_000, 0.98, 500_000);
-        let (q1, _) = calibrate_quota_views_at(&p1, Some(&dir), t0);
+        let (q1, _) = calibrate_quota_views_at(&p1, Some(dir.path()), t0);
         assert_eq!(q1.unwrap().est_remaining_tokens, None);
-        assert!(dir.join(CACHE_FILENAME).is_file());
+        assert!(dir.path().join(CACHE_FILENAME).is_file());
 
         let p2 = make_payload("conv-disk", 210_000, 0, 0.80, 13_900, 0.97, 499_900);
-        let (q2, _) = calibrate_quota_views_at(&p2, Some(&dir), t0 + 60);
+        let (q2, _) = calibrate_quota_views_at(&p2, Some(dir.path()), t0 + 60);
         assert_eq!(q2.unwrap().est_remaining_tokens, Some(1_600_000));
 
-        let reloaded = load_calibration_store(&dir);
+        let reloaded = load_calibration_store(dir.path());
         assert_eq!(reloaded.buckets["acme-5h"].sample_count, 1);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn idle_ticks_do_not_rewrite_quota_cal_json() {
-        let dir = temp_cache_dir("idle_nowrite");
+        let dir = tempfile::tempdir().unwrap();
         let t0 = 1_795_000_000;
 
         let p1 = make_payload("conv-idle", 10_000, 0, 0.90, 14_000, 0.98, 500_000);
-        calibrate_quota_views_at(&p1, Some(&dir), t0);
-        let cal_path = dir.join(CACHE_FILENAME);
+        calibrate_quota_views_at(&p1, Some(dir.path()), t0);
+        let cal_path = dir.path().join(CACHE_FILENAME);
         let before_raw = fs::read_to_string(&cal_path).unwrap();
 
         // Idle tick 60s later: reset_in_seconds counts down by 60 (same reset_at), all meaningful fields unchanged.
         let p_idle = make_payload("conv-idle", 10_000, 0, 0.90, 13_940, 0.98, 499_940);
-        calibrate_quota_views_at(&p_idle, Some(&dir), t0 + 60);
+        calibrate_quota_views_at(&p_idle, Some(dir.path()), t0 + 60);
         let after_raw = fs::read_to_string(&cal_path).unwrap();
         assert_eq!(after_raw, before_raw);
-        let reloaded = load_calibration_store(&dir);
+        let reloaded = load_calibration_store(dir.path());
         assert_eq!(reloaded.buckets["acme-5h"].updated_at_secs, t0);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn save_calibration_store_returns_would_block_when_lock_held() {
-        let dir = temp_cache_dir("save_would_block");
-        let lock = try_lock_calibration(&dir).expect("acquire calibration lock");
+        let dir = tempfile::tempdir().unwrap();
+        let lock = try_lock_calibration(dir.path()).expect("acquire calibration lock");
 
-        let err = save_calibration_store(&dir, &CalibrationStore::default())
+        let err = save_calibration_store(dir.path(), &CalibrationStore::default())
             .expect_err("contended save should fail");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert!(!dir.join(CACHE_FILENAME).exists());
+        assert!(!dir.path().join(CACHE_FILENAME).exists());
 
         drop(lock);
-        save_calibration_store(&dir, &CalibrationStore::default())
+        save_calibration_store(dir.path(), &CalibrationStore::default())
             .expect("save should succeed after lock release");
-        assert!(dir.join(CACHE_FILENAME).is_file());
-
-        let _ = fs::remove_dir_all(&dir);
+        assert!(dir.path().join(CACHE_FILENAME).is_file());
     }
 
     #[test]
     fn schema_version_mismatch_clears_stale_buckets() {
-        let dir = temp_cache_dir("schema_mismatch");
+        let dir = tempfile::tempdir().unwrap();
         let stale = CalibrationStore {
             schema_version: SCHEMA_VERSION - 1,
             buckets: BTreeMap::from([(
@@ -636,35 +611,31 @@ mod tests {
                 },
             )]),
         };
-        write_calibration_store(&dir, &stale).unwrap();
+        write_calibration_store(dir.path(), &stale).unwrap();
 
-        let loaded = load_calibration_store(&dir);
+        let loaded = load_calibration_store(dir.path());
         assert_eq!(loaded.schema_version, SCHEMA_VERSION);
         assert!(loaded.buckets.is_empty());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn reset_at_jitter_within_two_seconds_does_not_rewrite_disk() {
-        let dir = temp_cache_dir("reset_jitter");
+        let dir = tempfile::tempdir().unwrap();
         let t0 = 1_795_000_000;
 
         let p1 = make_payload("conv-jitter", 10_000, 0, 0.90, 14_000, 0.98, 500_000);
-        calibrate_quota_views_at(&p1, Some(&dir), t0);
-        let cal_path = dir.join(CACHE_FILENAME);
+        calibrate_quota_views_at(&p1, Some(dir.path()), t0);
+        let cal_path = dir.path().join(CACHE_FILENAME);
         let before_raw = fs::read_to_string(&cal_path).unwrap();
 
         // +1s jitter in computed reset_at (t0 + 10 + 13_991 = t0 + 14_001 vs t0 + 14_000)
         let p_jitter_plus1 = make_payload("conv-jitter", 10_000, 0, 0.90, 13_991, 0.98, 499_989);
-        calibrate_quota_views_at(&p_jitter_plus1, Some(&dir), t0 + 10);
+        calibrate_quota_views_at(&p_jitter_plus1, Some(dir.path()), t0 + 10);
         assert_eq!(fs::read_to_string(&cal_path).unwrap(), before_raw);
 
         // -1s jitter in computed reset_at
         let p_jitter_minus1 = make_payload("conv-jitter", 10_000, 0, 0.90, 13_979, 0.98, 499_981);
-        calibrate_quota_views_at(&p_jitter_minus1, Some(&dir), t0 + 20);
+        calibrate_quota_views_at(&p_jitter_minus1, Some(dir.path()), t0 + 20);
         assert_eq!(fs::read_to_string(&cal_path).unwrap(), before_raw);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }

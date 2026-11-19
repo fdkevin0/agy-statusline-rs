@@ -6,21 +6,22 @@
 //! customizable multi-row statusline (`Plain`, `Pill`, or `Powerline`) with an
 //! interactive `ratatui` configurator (`agy-statusline config`).
 
-pub mod ansi;
+pub(crate) mod ansi;
 pub mod apply;
 pub mod calibration;
 pub mod db;
-pub mod editor;
+pub mod doctor;
+pub(crate) mod editor;
 pub mod format;
-pub mod fsutil;
+pub(crate) mod fsutil;
 pub mod git;
 pub mod layout;
-pub mod metrics;
+pub(crate) mod metrics;
 pub mod paths;
 pub mod protobuf;
 pub mod render;
 pub mod stats;
 pub mod statusline;
-pub mod theme;
-pub mod timeutil;
+pub(crate) mod theme;
+pub(crate) mod timeutil;
 pub mod tui;
