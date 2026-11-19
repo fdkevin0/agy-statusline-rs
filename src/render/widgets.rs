@@ -541,39 +541,50 @@ impl Renderer<'_> {
                 )),
             },
             WidgetId::Cost => {
-                let text = match ctx.cost? {
+                let (base, full) = match ctx.cost? {
                     ResolvedCost::Payload {
                         total_usd,
                         subagent_usd,
                         estimated,
                     } => {
                         let prefix = if estimated { "~$" } else { "$" };
-                        match subagent_usd {
-                            Some(sub) => format!("{prefix}{total_usd:.2} (sub ${sub:.2})"),
-                            None => format!("{prefix}{total_usd:.2}"),
-                        }
+                        let base = format!("{prefix}{total_usd:.2}");
+                        let full = match subagent_usd {
+                            Some(sub) => format!("{base} (sub ${sub:.2})"),
+                            None => base.clone(),
+                        };
+                        (base, full)
                     }
                     ResolvedCost::Estimated {
                         total_usd,
                         subagent_usd,
                         coverage,
-                    } => match (coverage, subagent_usd) {
-                        (CostCoverage::Session, None) => format!("~${total_usd:.2}"),
-                        (CostCoverage::Session, Some(sub)) => {
-                            format!("~${total_usd:.2} (sub ${sub:.2})")
-                        }
-                        (CostCoverage::Partial(n), None) => {
-                            format!("~${total_usd:.2} ({n} unpriced)")
-                        }
-                        (CostCoverage::Partial(n), Some(sub)) => {
-                            format!("~${total_usd:.2} (sub ${sub:.2}, {n} unpriced)")
-                        }
-                        (CostCoverage::LatestTurn, _) => {
-                            format!("~${total_usd:.2} (latest turn)")
-                        }
-                    },
+                    } => {
+                        let base = format!("~${total_usd:.2}");
+                        let full = match (coverage, subagent_usd) {
+                            (CostCoverage::Session, None) => base.clone(),
+                            (CostCoverage::Session, Some(sub)) => {
+                                format!("{base} (sub ${sub:.2})")
+                            }
+                            (CostCoverage::Partial(n), None) => {
+                                format!("{base} ({n} unpriced)")
+                            }
+                            (CostCoverage::Partial(n), Some(sub)) => {
+                                format!("{base} (sub ${sub:.2}, {n} unpriced)")
+                            }
+                            (CostCoverage::LatestTurn, _) => {
+                                format!("{base} (latest turn)")
+                            }
+                        };
+                        (base, full)
+                    }
                 };
-                Some(Segment::plain(widget, text, pal.cost, false))
+                let has_suffix = full != base;
+                let mut seg = Segment::plain(widget, full, pal.cost, false);
+                if has_suffix {
+                    seg.push_fallback(CompactStage::CostStripSuffix, base);
+                }
+                Some(seg)
             }
             _ => None,
         }
@@ -594,25 +605,18 @@ impl Renderer<'_> {
             });
         };
         let label = &q.label;
-        let (core, mut full, fg, bold) = if let Some(amt) = q.remaining_amount {
+        let (core, tokens_part, fg, bold) = if let Some(amt) = q.remaining_amount {
             let (fg, bold) = if amt <= 0 {
                 (pal.ctx_crit, true)
             } else {
                 (pal.ctx_ok, false)
             };
-            let core = format!("{label} {amt}");
-            (core.clone(), core, fg, bold)
+            (format!("{label} {amt}"), None, fg, bold)
         } else {
             let core = format!(
                 "{label} {}",
                 crate::metrics::format_quota_pct(q.remaining_pct)
             );
-            let mut full = core.clone();
-            if let Some(tok) = q.est_remaining_tokens {
-                full.push_str(" (~");
-                format_tokens(tok, &mut full);
-                full.push(')');
-            }
             let (fg, bold) = if q.remaining_pct <= 10.0 {
                 (pal.ctx_crit, true)
             } else if q.remaining_pct <= 30.0 || q.pace_behind {
@@ -620,17 +624,36 @@ impl Renderer<'_> {
             } else {
                 (pal.ctx_ok, false)
             };
-            (core, full, fg, bold)
+            (core, q.est_remaining_tokens, fg, bold)
         };
+        let mut without_tokens = core.clone();
         if let Some(reset) = &q.reset_compact {
-            full.push(' ');
-            full.push_str(glyphs.reset);
-            full.push_str(reset);
+            without_tokens.push(' ');
+            without_tokens.push_str(glyphs.reset);
+            without_tokens.push_str(reset);
         }
-        let has_trailers = full != core;
+        let full = if let Some(tok) = tokens_part {
+            let mut s = core.clone();
+            s.push_str(" (~");
+            format_tokens(tok, &mut s);
+            s.push(')');
+            if let Some(reset) = &q.reset_compact {
+                s.push(' ');
+                s.push_str(glyphs.reset);
+                s.push_str(reset);
+            }
+            s
+        } else {
+            without_tokens.clone()
+        };
+        let has_tokens = full != without_tokens;
+        let has_reset = without_tokens != core;
         let mut seg = Segment::plain(widget, full, fg, bold);
-        if has_trailers {
-            seg.push_fallback(CompactStage::QuotaStripTrailers, core);
+        if has_tokens {
+            seg.push_fallback(CompactStage::QuotaStripTokens, without_tokens);
+        }
+        if has_reset {
+            seg.push_fallback(CompactStage::QuotaStripReset, core);
         }
         Some(seg)
     }
@@ -852,12 +875,14 @@ fn display_includes_effort(display_name: &str, effort: &str) -> bool {
 
 fn abbreviate_leading_word(text: &str) -> String {
     if let Some((first, rest)) = text.split_once(' ') {
-        if first.len() >= 4
-            && first.bytes().all(|b| b.is_ascii_alphabetic())
-            && rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        {
+        if first.len() >= 4 && first.bytes().all(|b| b.is_ascii_alphabetic()) {
             if let Some(ch) = first.chars().next() {
-                return format!("{}{rest}", ch.to_ascii_uppercase());
+                if rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                    return format!("{}{rest}", ch.to_ascii_uppercase());
+                }
+                if rest.starts_with('(') {
+                    return format!("{} {rest}", ch.to_ascii_uppercase());
+                }
             }
         }
     }
@@ -911,6 +936,10 @@ mod tests {
         assert_eq!(
             abbreviate_leading_word("VendorName 3.1 Pro"),
             "V3.1 Pro"
+        );
+        assert_eq!(
+            abbreviate_leading_word("Orchestrator (Carbon) · high"),
+            "O (Carbon) · high"
         );
         assert_eq!(abbreviate_leading_word("M2 · max"), "M2 · max");
         assert_eq!(

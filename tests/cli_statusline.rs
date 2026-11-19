@@ -200,8 +200,14 @@ fn cli_renders_sub_one_percent_quota_and_expired_reset_time_with_preset_full() {
     .to_string();
 
     let stdout = run_statusline_stdin(dir.path(), &["--preset", "full"], &payload);
-    assert!(stdout.contains("3p 5h 0.4%"), "unexpected stdout: {stdout}");
-    assert!(!stdout.contains("3p 5h 0%"), "unexpected stdout: {stdout}");
+    let mut lines = stdout.lines();
+    let row1 = lines.next().expect("preset full should render row 1");
+    let row2 = lines.next().expect("preset full should render row 2");
+    assert_eq!(lines.next(), None, "expected 2 lines, got: {stdout}");
+    assert!(row1.contains("READY"), "unexpected row1: {row1}");
+    assert!(row1.contains("GPT-OSS 120B"), "unexpected row1: {row1}");
+    assert!(row2.contains("3p 5h 0.4%"), "unexpected row2: {row2}");
+    assert!(!row2.contains("3p 5h 0%"), "unexpected row2: {row2}");
     assert!(
         !stdout.contains('↻'),
         "unexpected timer in stdout: {stdout}"

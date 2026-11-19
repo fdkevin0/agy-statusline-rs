@@ -16,7 +16,7 @@ use crate::fsutil::atomic_write;
 pub const MAX_ROWS: usize = 3;
 
 /// Default speed threshold (tokens/s) below which speed highlights in warning amber.
-pub const DEFAULT_SPEED_WARN_THRESHOLD: f64 = 50.0;
+pub const DEFAULT_SPEED_WARN_THRESHOLD: f64 = 35.0;
 
 macro_rules! define_widgets {
     (
@@ -102,7 +102,7 @@ define_widgets! {
     /// Current/limit or cumulative session tokens.
     CtxTokens => ("ctx_tokens", "Session Tokens", 2),
     /// Cache hit percentage (`◈ cache 80.0%`).
-    CacheHit => ("cache_hit", "Cache Hit %", 2),
+    CacheHit => ("cache_hit", "Cache Hit %", 3),
     /// Formatted cache read token count (`↻ 800`).
     CacheRead => ("cache_read", "Cache Read Tokens", 1),
     /// Output generation speed (`⚡ 64 tok/s`).
@@ -116,6 +116,7 @@ define_widgets! {
     /// Active cycle mode (`◇ PLAN`, `◇ AUTO`, etc.) and `>200K` indicator.
     Mode => ("mode", "Cycle Mode (Plan/Auto)", 3),
     /// Rolling 5-hour quota remaining % + reset timer + pace warning.
+    #[serde(rename = "quota_5h", alias = "quota5h")]
     Quota5h => ("quota_5h", "5h Quota + Pace", 4),
     /// Weekly (or multi-day) quota remaining % + reset timer + pace warning.
     QuotaWeekly => ("quota_weekly", "Weekly Quota", 3),
@@ -324,7 +325,7 @@ impl SpeedMode {
 /// Built-in statusline layout presets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Preset {
-    /// Single-line Full preset (replaces default AGY bar).
+    /// Two-line Full preset (replaces default AGY bar).
     Full,
     /// Two-line Powerline preset with Catppuccin palette.
     Powerline,
@@ -419,7 +420,7 @@ impl LayoutConfig {
             separator: SeparatorStyle::Dot,
             glyph_mode: GlyphMode::Unicode,
             responsive: true,
-            bar_length: 12,
+            bar_length: 8,
             speed_warn_threshold: DEFAULT_SPEED_WARN_THRESHOLD,
             stack_with_default: false,
             speed_mode: SpeedMode::Weighted,
@@ -432,21 +433,30 @@ impl LayoutConfig {
         cfg
     }
 
-    /// Preset 1 (`Full`): Single-line layout (replaces default AGY bar).
+    /// Preset 1 (`Full`): Two-line layout (replaces default AGY bar).
     pub fn preset_full() -> Self {
-        Self::base_with_rows(vec![vec![
-            WidgetId::State,
-            WidgetId::Mode,
-            WidgetId::Directory,
-            WidgetId::Vcs,
-            WidgetId::Worktree,
-            WidgetId::CtxBar,
-            WidgetId::CacheHit,
-            WidgetId::Speed,
-            WidgetId::Ttft,
-            WidgetId::Cost,
-            WidgetId::Quota5h,
-        ]])
+        Self::base_with_rows(vec![
+            vec![
+                WidgetId::State,
+                WidgetId::Mode,
+                WidgetId::Model,
+                WidgetId::Directory,
+                WidgetId::Vcs,
+                WidgetId::Worktree,
+                WidgetId::Queue,
+                WidgetId::Vim,
+                WidgetId::Battle,
+            ],
+            vec![
+                WidgetId::CtxBar,
+                WidgetId::CacheHit,
+                WidgetId::Speed,
+                WidgetId::Cost,
+                WidgetId::Quota5h,
+                WidgetId::QuotaWeekly,
+                WidgetId::Subagents,
+            ],
+        ])
     }
 
     /// Preset 2 (`Powerline`): Two-line Powerline layout with Catppuccin palette.
@@ -641,5 +651,33 @@ mod tests {
         cfg.speed_warn_threshold = 35.5;
         cfg.normalize_rows();
         assert_eq!(cfg.speed_warn_threshold, 35.5);
+    }
+
+    #[test]
+    fn quota_5h_serializes_canonically_and_accepts_legacy_alias() {
+        assert_eq!(
+            serde_json::to_string(&WidgetId::Quota5h).unwrap(),
+            "\"quota_5h\""
+        );
+        assert_eq!(
+            serde_json::from_str::<WidgetId>("\"quota_5h\"").unwrap(),
+            WidgetId::Quota5h
+        );
+        assert_eq!(
+            serde_json::from_str::<WidgetId>("\"quota5h\"").unwrap(),
+            WidgetId::Quota5h
+        );
+    }
+
+    #[test]
+    fn preset_full_uses_tuned_two_row_defaults() {
+        let cfg = LayoutConfig::preset_full();
+        assert_eq!(cfg.bar_length, 8);
+        assert_eq!(cfg.speed_warn_threshold, 35.0);
+        assert_eq!(cfg.rows.len(), MAX_ROWS);
+        assert!(!cfg.rows[0].is_empty());
+        assert!(!cfg.rows[1].is_empty());
+        assert!(cfg.rows[2].is_empty());
+        assert_eq!(WidgetId::CacheHit.priority(), 3);
     }
 }
