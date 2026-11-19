@@ -224,6 +224,6 @@ fn cli_handles_agy_1510_negative_reset_disabled_credits_completed_subagents_and_
     assert!(output.status.success());
     assert_eq!(
         stdout,
-        "* DONE * DeepSeek R2 (Turbo) * sub 1 * 3p 5h 450 * 3p 7d 72% r:2d\n"
+        "* DONE * DeepSeek R2 (Turbo) * sub 1 (worker-a) * 3p 5h 450 * 3p 7d 72% r:2d\n"
     );
 }

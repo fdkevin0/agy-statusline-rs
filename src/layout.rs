@@ -16,7 +16,7 @@ use crate::db::resolve_home_dir;
 /// Maximum number of configurable statusline rows.
 pub const MAX_ROWS: usize = 3;
 
-/// All 25 statusline widgets available for placement on any row.
+/// All 33 statusline widgets available for placement on any row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WidgetId {
@@ -68,11 +68,27 @@ pub enum WidgetId {
     Battle,
     /// Sandbox status (`sandbox ON` / `sandbox ON+net` / `sandbox off`).
     Sandbox,
+    /// AGY CLI version (`v1.5.11`).
+    Version,
+    /// Account subscription tier (`Pro`, `Ultra`, etc.).
+    Plan,
+    /// Authenticated account email (`alice@example.com`).
+    Account,
+    /// Active conversation title (truncated to fit).
+    Title,
+    /// Active agent name (`agent researcher`).
+    Agent,
+    /// Product name (`Antigravity`).
+    Product,
+    /// Short active session identifier (`sid:8d0371e1`).
+    Session,
+    /// Active transcript filename (`log:transcript.jsonl`).
+    Transcript,
     /// Elastic left/center/right alignment spacer.
     Spacer,
 }
 
-const WIDGET_META: [(WidgetId, &str, &str); 25] = [
+const WIDGET_META: [(WidgetId, &str, &str); 33] = [
     (WidgetId::State, "state", "Agent State"),
     (WidgetId::Model, "model", "Model + Effort"),
     (WidgetId::Directory, "directory", "Workspace Dir"),
@@ -97,12 +113,20 @@ const WIDGET_META: [(WidgetId, &str, &str); 25] = [
     (WidgetId::Vim, "vim", "Vim Mode"),
     (WidgetId::Battle, "battle", "Battle Mode"),
     (WidgetId::Sandbox, "sandbox", "Sandbox Status"),
+    (WidgetId::Version, "version", "AGY Version"),
+    (WidgetId::Plan, "plan", "Plan Tier"),
+    (WidgetId::Account, "account", "Account Email"),
+    (WidgetId::Title, "title", "Conversation Title"),
+    (WidgetId::Agent, "agent", "Active Agent"),
+    (WidgetId::Product, "product", "Product Name"),
+    (WidgetId::Session, "session", "Session ID"),
+    (WidgetId::Transcript, "transcript", "Transcript File"),
     (WidgetId::Spacer, "spacer", "Flex Spacer (L|R)"),
 ];
 
 impl WidgetId {
-    /// Canonical list of all 25 widgets in catalog display order.
-    pub const ALL: [WidgetId; 25] = [
+    /// Canonical list of all 33 widgets in catalog display order.
+    pub const ALL: [WidgetId; 33] = [
         Self::State,
         Self::Model,
         Self::Directory,
@@ -127,6 +151,14 @@ impl WidgetId {
         Self::Vim,
         Self::Battle,
         Self::Sandbox,
+        Self::Version,
+        Self::Plan,
+        Self::Account,
+        Self::Title,
+        Self::Agent,
+        Self::Product,
+        Self::Session,
+        Self::Transcript,
         Self::Spacer,
     ];
 
@@ -151,7 +183,9 @@ impl WidgetId {
             | Self::CtxTokens
             | Self::Worktree
             | Self::Vim
-            | Self::Queue => 2,
+            | Self::Queue
+            | Self::Title
+            | Self::Agent => 2,
             Self::CacheRead
             | Self::Ttft
             | Self::Thinking
@@ -159,7 +193,13 @@ impl WidgetId {
             | Self::Tasks
             | Self::Artifacts
             | Self::Battle
-            | Self::Sandbox => 1,
+            | Self::Sandbox
+            | Self::Version
+            | Self::Plan
+            | Self::Account
+            | Self::Product
+            | Self::Session
+            | Self::Transcript => 1,
         }
     }
 }

@@ -41,7 +41,7 @@ fn render_single(
 
 #[test]
 fn telemetry_widgets_catalog_metadata_and_presets_unchanged() {
-    assert_eq!(WidgetId::ALL.len(), 25);
+    assert_eq!(WidgetId::ALL.len(), 33);
     assert_eq!(WidgetId::ALL[WidgetId::ALL.len() - 1], WidgetId::Spacer);
 
     assert_eq!(WidgetId::Vim.label(), "vim");
@@ -632,4 +632,151 @@ fn tier2_cli_renders_agy_1510_telemetry_widgets_and_confirm_override() {
         doctor_stdout.contains("vim NORMAL · queue 1"),
         "doctor stdout: {doctor_stdout}"
     );
+}
+
+#[test]
+fn version_widget_renders_payload_version_and_handles_missing_or_prefixed() {
+    let payload: StatuslinePayload =
+        serde_json::from_str(r#"{"agent_state":"idle","version":"1.5.11"}"#).unwrap();
+    let plain = render_single(
+        WidgetId::Version,
+        &payload,
+        GlyphMode::Unicode,
+        ThemeStyle::Default,
+        true,
+        true,
+    );
+    assert_eq!(plain.trim(), "v1.5.11");
+
+    let payload_prefixed: StatuslinePayload =
+        serde_json::from_str(r#"{"agent_state":"idle","version":" v1.5.11 "}"#).unwrap();
+    let prefixed = render_single(
+        WidgetId::Version,
+        &payload_prefixed,
+        GlyphMode::Unicode,
+        ThemeStyle::Default,
+        true,
+        true,
+    );
+    assert_eq!(prefixed.trim(), "v1.5.11");
+
+    let payload_empty: StatuslinePayload =
+        serde_json::from_str(r#"{"agent_state":"idle","version":"  "}"#).unwrap();
+    let empty = render_single(
+        WidgetId::Version,
+        &payload_empty,
+        GlyphMode::Unicode,
+        ThemeStyle::Default,
+        false,
+        true,
+    );
+    assert_eq!(empty.trim(), "");
+}
+
+#[test]
+fn agy_payload_widgets_render_and_omit_when_absent() {
+    let payload: StatuslinePayload = serde_json::from_str(
+        r#"{
+            "session_id": "8d0371e1-5a05-423b-a8bc-ed75995f9a8b",
+            "conversation_title": "Refactor\n  statusline\tpayload   widgets for long title test",
+            "transcript_path": "/home/user/.gemini/logs/transcript.jsonl",
+            "product": "Antigravity",
+            "plan_tier": "Ultra",
+            "email": "alice@example.com",
+            "agent": {"name": "researcher"},
+            "vcs": {"type": "citc", "client": "my-citc-ws", "dirty": true},
+            "subagents": [
+                {"name": "sub-a", "role": "Codebase Researcher", "status": "running"},
+                {"name": "sub-b", "role": "Done Worker", "status": "completed"}
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        render_single(WidgetId::Plan, &payload, GlyphMode::Ascii, ThemeStyle::Default, true, true).trim(),
+        "Ultra"
+    );
+    assert_eq!(
+        render_single(WidgetId::Account, &payload, GlyphMode::Ascii, ThemeStyle::Default, true, true).trim(),
+        "alice@example.com"
+    );
+    let title = render_single(WidgetId::Title, &payload, GlyphMode::Ascii, ThemeStyle::Default, true, true);
+    assert_eq!(title.trim(), "Refactor statusline payload wi..");
+    assert_eq!(
+        render_single(WidgetId::Agent, &payload, GlyphMode::Ascii, ThemeStyle::Default, true, true).trim(),
+        "agent researcher"
+    );
+    assert_eq!(
+        render_single(WidgetId::Product, &payload, GlyphMode::Ascii, ThemeStyle::Default, true, true).trim(),
+        "Antigravity"
+    );
+    assert_eq!(
+        render_single(WidgetId::Session, &payload, GlyphMode::Ascii, ThemeStyle::Default, true, true).trim(),
+        "sid:8d0371e1"
+    );
+    assert_eq!(
+        render_single(WidgetId::Transcript, &payload, GlyphMode::Ascii, ThemeStyle::Default, true, true).trim(),
+        "log:transcript.jsonl"
+    );
+    assert_eq!(
+        render_single(WidgetId::Vcs, &payload, GlyphMode::Ascii, ThemeStyle::Default, true, true).trim(),
+        "git: my-citc-ws*"
+    );
+    assert_eq!(
+        render_single(WidgetId::Subagents, &payload, GlyphMode::Ascii, ThemeStyle::Default, true, true).trim(),
+        "sub 1 (Codebase Researcher)"
+    );
+
+    let blank = StatuslinePayload::default();
+    assert_eq!(render_single(WidgetId::Plan, &blank, GlyphMode::Ascii, ThemeStyle::Default, false, true).trim(), "");
+    assert_eq!(render_single(WidgetId::Account, &blank, GlyphMode::Ascii, ThemeStyle::Default, false, true).trim(), "");
+    assert_eq!(render_single(WidgetId::Title, &blank, GlyphMode::Ascii, ThemeStyle::Default, false, true).trim(), "");
+    assert_eq!(render_single(WidgetId::Agent, &blank, GlyphMode::Ascii, ThemeStyle::Default, false, true).trim(), "");
+    assert_eq!(render_single(WidgetId::Product, &blank, GlyphMode::Ascii, ThemeStyle::Default, false, true).trim(), "");
+    assert_eq!(render_single(WidgetId::Session, &blank, GlyphMode::Ascii, ThemeStyle::Default, false, true).trim(), "");
+    assert_eq!(render_single(WidgetId::Transcript, &blank, GlyphMode::Ascii, ThemeStyle::Default, false, true).trim(), "");
+}
+
+#[test]
+fn responsive_compaction_shortens_subagents_account_and_title() {
+    let payload: StatuslinePayload = serde_json::from_str(
+        r#"{
+            "agent_state": "idle",
+            "conversation_title": "Implement full AGY statusline payload widgets",
+            "email": "alice@example.com",
+            "subagents": [{"role": "Reviewer (Rust)", "status": "running"}],
+            "terminal_width": 52
+        }"#,
+    )
+    .unwrap();
+
+    let mut cfg = LayoutConfig::preset_minimal();
+    cfg.rows = vec![vec![
+        WidgetId::State,
+        WidgetId::Title,
+        WidgetId::Account,
+        WidgetId::Subagents,
+    ]];
+    cfg.glyph_mode = GlyphMode::Ascii;
+    cfg.no_color = true;
+    cfg.responsive = true;
+
+    let mut out = Vec::new();
+    write_statusline(
+        &payload,
+        &SessionMetadata::default(),
+        &GitInfo::default(),
+        &cfg,
+        &mut out,
+    )
+    .unwrap();
+    let rendered = String::from_utf8(out).unwrap();
+    assert!(rendered.contains("READY"), "rendered: {rendered}");
+    assert!(rendered.contains("Implement full.."), "rendered: {rendered}");
+    assert!(rendered.contains("alice"), "rendered: {rendered}");
+    assert!(!rendered.contains("@example.com"), "rendered: {rendered}");
+    assert!(rendered.contains("sub 1"), "rendered: {rendered}");
+    assert!(!rendered.contains("Reviewer"), "rendered: {rendered}");
+    assert!(!rendered.contains('('), "unclosed paren in: {rendered}");
 }
