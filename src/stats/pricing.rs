@@ -250,7 +250,7 @@ impl PricingCatalog {
             matched = best.map(|(_, e)| e);
         }
 
-        // 3. Orchestrator alias fallback.
+        // Orchestrator alias fallback.
         let entry = matched.or_else(|| self.resolve_orchestrator_alias(&lowered_candidates))?;
         let cost = ((input_tokens as f64) * entry.rate.input_per_mtok
             + (cache_read_tokens as f64) * entry.rate.cache_read_per_mtok
@@ -264,16 +264,10 @@ impl PricingCatalog {
     }
 
     fn resolve_orchestrator_alias(&self, candidates: &[(String, String)]) -> Option<&IndexedEntry> {
-        let lookup = |raw: &str, norm: &str| {
-            self.exact_raw
-                .get(raw)
-                .or_else(|| self.exact_norm.get(norm))
-                .map(|&idx| &self.entries[idx])
-        };
-
-        // Prefer explicit Argon/Carbon qualifiers across all candidates before falling back
-        // to the bare `gemini-pro-orchestrator` alias.
-        candidates
+        // Resolve the target alias first: explicit Argon/Carbon qualifiers across all candidates
+        // take precedence over the bare `gemini-pro-orchestrator` fallback, and an explicit
+        // qualifier never silently falls back to the other tier when its rate is absent.
+        let (target_raw, target_norm) = candidates
             .iter()
             .find_map(|(_, norm)| {
                 if !norm.split_whitespace().any(|w| w == "orchestrator") {
@@ -282,20 +276,24 @@ impl PricingCatalog {
                 if norm.split_whitespace().any(|w| w == "argon")
                     || norm == "gemini pro orchestrator g1 pro"
                 {
-                    lookup("gemini-4-argon", "gemini 4 argon")
+                    Some(("gemini-4-argon", "gemini 4 argon"))
                 } else if norm.split_whitespace().any(|w| w == "carbon") {
-                    lookup("gemini-4-carbon", "gemini 4 carbon")
+                    Some(("gemini-4-carbon", "gemini 4 carbon"))
                 } else {
                     None
                 }
             })
             .or_else(|| {
-                candidates.iter().find_map(|(_, norm)| {
-                    (norm == "gemini pro orchestrator")
-                        .then(|| lookup("gemini-4-carbon", "gemini 4 carbon"))
-                        .flatten()
-                })
-            })
+                candidates
+                    .iter()
+                    .any(|(_, norm)| norm == "gemini pro orchestrator")
+                    .then_some(("gemini-4-carbon", "gemini 4 carbon"))
+            })?;
+
+        self.exact_raw
+            .get(target_raw)
+            .or_else(|| self.exact_norm.get(target_norm))
+            .map(|&idx| &self.entries[idx])
     }
 }
 
@@ -860,5 +858,28 @@ mod tests {
             .unwrap();
         assert_eq!(carbon_key, "gemini-4-carbon");
         assert!((carbon_usd - 2.0).abs() < 1e-6);
+
+        // When Argon's rate is absent from the catalog, explicit Argon must stay unpriced
+        // rather than falling back to Carbon's rate via bare `gemini-pro-orchestrator`.
+        let mut carbon_only = BTreeMap::new();
+        carbon_only.insert(
+            "gemini-4-carbon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 2.0,
+                output_per_mtok: 10.0,
+                ..Default::default()
+            },
+        );
+        let carbon_catalog = PricingCatalog::from_models(carbon_only);
+        assert_eq!(
+            carbon_catalog.estimate_cost(
+                &["gemini-pro-orchestrator", "Orchestrator (Argon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            ),
+            None
+        );
     }
 }
