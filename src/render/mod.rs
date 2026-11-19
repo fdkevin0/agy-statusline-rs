@@ -368,7 +368,7 @@ mod tests {
         write_statusline(&payload, &meta, &git, &narrow_cfg, &mut narrow_out).unwrap();
         let narrow_text = String::from_utf8(narrow_out).unwrap();
         assert!(narrow_text.contains("THINKING"));
-        assert!(!narrow_text.contains("sandbox"));
+        assert!(!narrow_text.contains("wt:feat-wt"));
         assert!(!narrow_text.contains("\u{e0b0}"));
         assert!(!narrow_text.contains("\u{e0b6}"));
     }
@@ -705,6 +705,32 @@ mod tests {
         assert!(rem_text.contains(&crit_code));
         assert!(rem_text.contains("rem ████████ 0.0% (0/512K)"));
         assert!(rem_text.contains("rem 0.0% (512K)"));
+
+        // Non-overflow remaining mode renders (remaining/limit) in ctx_bar.
+        let payload_half = StatuslinePayload {
+            context_window: Some(ContextWindow {
+                context_window_size: Some(200_000),
+                current_usage: Some(JsonUsage {
+                    input_tokens: Some(15_000),
+                    output_tokens: None,
+                    cache_read_input_tokens: Some(70_000),
+                    cache_creation_input_tokens: Some(0),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut out_rem_half = Vec::new();
+        write_statusline(
+            &payload_half,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg_rem,
+            &mut out_rem_half,
+        )
+        .unwrap();
+        let rem_half = String::from_utf8(out_rem_half).unwrap();
+        assert!(rem_half.contains("57.5% (115K/200K)"));
     }
 
     #[test]

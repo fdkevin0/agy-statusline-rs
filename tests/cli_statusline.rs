@@ -519,7 +519,7 @@ fn stage3_88col_row_compacts_ctx_bar_instead_of_dropping_speed_cost_vcs() {
     assert!(out.contains("~$0.42"));
     assert!(out.contains("ctx 50.0%"));
     assert!(out.contains("5h 84%"));
-    assert!(!out.contains("(512K)"));
+    assert!(!out.contains("512K"));
     assert!(!out.contains('█'));
     assert!(visible_line_width(&out) <= 90);
 
