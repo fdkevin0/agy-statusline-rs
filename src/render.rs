@@ -858,66 +858,23 @@ fn render_widget(
 }
 
 fn sanitize_inline_text(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = String::with_capacity(raw.len());
-    let mut pending_space = false;
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            i += 1;
-            if i < bytes.len() {
-                match bytes[i] {
-                    b'[' => {
-                        // CSI sequence: ESC [ <params 0x30..=0x3F> <intermediates 0x20..=0x2F> <final 0x40..=0x7E>
-                        i += 1;
-                        while i < bytes.len() && (0x30..=0x3F).contains(&bytes[i]) {
-                            i += 1;
-                        }
-                        while i < bytes.len() && (0x20..=0x2F).contains(&bytes[i]) {
-                            i += 1;
-                        }
-                        if i < bytes.len() && (0x40..=0x7E).contains(&bytes[i]) {
-                            i += 1;
-                        }
-                    }
-                    b']' => {
-                        // OSC sequence: ESC ] ... (BEL | ESC \)
-                        i += 1;
-                        while i < bytes.len() {
-                            if bytes[i] == 0x07 {
-                                i += 1;
-                                break;
-                            }
-                            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-                                i += 2;
-                                break;
-                            }
-                            i += 1;
-                        }
-                    }
-                    0x20..=0x2F => {
-                        while i < bytes.len() && (0x20..=0x2F).contains(&bytes[i]) {
-                            i += 1;
-                        }
-                        if i < bytes.len() && (0x30..=0x7E).contains(&bytes[i]) {
-                            i += 1;
-                        }
-                    }
-                    0x40..=0x7E => {
-                        i += 1;
-                    }
-                    _ => {}
-                }
+    // Normalize non-CR/LF whitespace (such as `\t` and NEL) before `strip_ansi_escapes`,
+    // whose VTE parser drops C0/C1 control characters other than `\n` and `\r`.
+    let normalized: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_whitespace() && !matches!(ch, ' ' | '\n' | '\r') {
+                ' '
+            } else {
+                ch
             }
-            continue;
-        }
+        })
+        .collect();
+    let stripped = strip_ansi_escapes::strip_str(&normalized);
+    let mut out = String::with_capacity(stripped.len());
+    let mut pending_space = false;
 
-        let Some(ch) = raw[i..].chars().next() else {
-            break;
-        };
-        i += ch.len_utf8();
-
+    for ch in stripped.chars() {
         if ch.is_whitespace() {
             if !out.is_empty() {
                 pending_space = true;

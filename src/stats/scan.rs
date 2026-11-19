@@ -648,17 +648,20 @@ fn scan_single_sqlite_db(
         };
 
         let (local_day, local_date) = tz.local_day_and_date(ts_secs);
-        let model_group =
-            derive_model_name(rec.model_display_name, rec.response_model, rec.model_enum);
+        let model_group = derive_model_name(
+            rec.model_display_name.as_deref(),
+            rec.response_model.as_deref(),
+            rec.model_enum,
+        );
 
         let (pricing_key, cost_usd) = if let Some(usd) = rec.model_cost_usd {
             (Some("native".to_string()), Some(round_usd_6(usd)))
         } else {
             let mut candidates = Vec::with_capacity(3);
-            if let Some(r) = rec.response_model {
+            if let Some(r) = rec.response_model.as_deref() {
                 candidates.push(r);
             }
-            if let Some(d) = rec.model_display_name {
+            if let Some(d) = rec.model_display_name.as_deref() {
                 candidates.push(d);
             }
             candidates.push(model_group.as_str());
@@ -828,13 +831,16 @@ pub fn estimate_conversation_cost_usd(
         let turn_usd = if let Some(usd) = rec.model_cost_usd {
             Some(round_usd_6(usd))
         } else {
-            let model_group =
-                derive_model_name(rec.model_display_name, rec.response_model, rec.model_enum);
+            let model_group = derive_model_name(
+                rec.model_display_name.as_deref(),
+                rec.response_model.as_deref(),
+                rec.model_enum,
+            );
             let mut candidates = Vec::with_capacity(3);
-            if let Some(r) = rec.response_model {
+            if let Some(r) = rec.response_model.as_deref() {
                 candidates.push(r);
             }
-            if let Some(d) = rec.model_display_name {
+            if let Some(d) = rec.model_display_name.as_deref() {
                 candidates.push(d);
             }
             candidates.push(model_group.as_str());

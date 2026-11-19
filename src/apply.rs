@@ -187,18 +187,7 @@ fn command_executable_exists_in_path(cmd: &str, path_env: Option<&std::ffi::OsSt
     if exe_path.components().count() > 1 {
         return exe_path.is_file();
     }
-    let Some(paths) = path_env else {
-        return false;
-    };
-    env::split_paths(paths).any(|dir| {
-        let candidate = dir.join(exe);
-        if candidate.is_file() {
-            return true;
-        }
-        cfg!(windows)
-            && candidate.extension().is_none()
-            && candidate.with_extension("exe").is_file()
-    })
+    path_env.is_some_and(|paths| which::which_in(exe, Some(paths), ".").is_ok())
 }
 
 /// Inspects XDG config, AGY `settings.json` wiring, and prints a live sample preview.
@@ -427,10 +416,20 @@ mod tests {
         fs::create_dir_all(&bin_dir).unwrap();
         fs::create_dir_all(&space_dir).unwrap();
 
-        let bin_path = bin_dir.join("agy-statusline-fake");
+        let bin_name = if cfg!(windows) {
+            "agy-statusline-fake.exe"
+        } else {
+            "agy-statusline-fake"
+        };
+        let bin_path = bin_dir.join(bin_name);
         let spaced_path = space_dir.join("agy-statusline-spaced");
         fs::write(&bin_path, b"").unwrap();
         fs::write(&spaced_path, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         let path_env = env::join_paths([&bin_dir]).unwrap();
 
