@@ -33,20 +33,8 @@ pub struct QuotaView {
     pub est_remaining_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowTarget {
-    Short,
-    MultiDay,
-}
-
-impl WindowTarget {
-    fn matches(self, window_secs: u64) -> bool {
-        match self {
-            Self::Short => window_secs < SECS_PER_DAY,
-            Self::MultiDay => window_secs >= SECS_PER_DAY,
-        }
-    }
-}
+/// Resolved quota view paired with its inferred reset Unix epoch timestamp.
+pub type QuotaResolution = (QuotaView, Option<u64>);
 
 #[derive(Debug, Clone)]
 struct BucketDescriptor {
@@ -295,7 +283,28 @@ fn build_quota_view(
     ))
 }
 
-type AffinityScore = (u8, usize, isize);
+/// Ordered bucket-to-model affinity precedence (higher variants win).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BucketMatchTier {
+    /// 3p bucket when model matches a known 1p provider and qualifiers are unmatched.
+    ThirdPartyMismatch,
+    /// 3p bucket when model matches a known 1p provider with no unmatched qualifiers.
+    ThirdPartyFallback,
+    /// 1p bucket from an unrelated provider when model identity is known.
+    UnrelatedProvider,
+    /// Qualified 1p bucket when model identity is absent.
+    NoModelQualified,
+    /// 1p bucket matching provider with unmatched qualifiers.
+    ProviderPartialQualifier,
+    /// Unqualified 1p bucket with no model identity, or 3p bucket for a 3p model with unmatched qualifiers.
+    GenericOrThirdPartyPartial,
+    /// Unqualified match on active provider, exact qualifier-only match, or unqualified 3p match for a 3p model.
+    ProviderOrThirdPartyExact,
+    /// Exact qualified match on active provider (or qualified 3p match for a 3p model).
+    ExactQualifiedMatch,
+}
+
+type AffinityScore = (BucketMatchTier, usize, isize);
 
 fn score_bucket(
     desc: &BucketDescriptor,
@@ -317,28 +326,28 @@ fn score_bucket(
 
     let tier = if desc.is_3p {
         if is_3p_model && unmatched_q == 0 && matched_q > 0 {
-            7
+            BucketMatchTier::ExactQualifiedMatch
         } else if is_3p_model && unmatched_q == 0 {
-            6
+            BucketMatchTier::ProviderOrThirdPartyExact
         } else if is_3p_model {
-            5
+            BucketMatchTier::GenericOrThirdPartyPartial
         } else if unmatched_q == 0 {
-            1
+            BucketMatchTier::ThirdPartyFallback
         } else {
-            0
+            BucketMatchTier::ThirdPartyMismatch
         }
     } else if provider_matched && unmatched_q == 0 && matched_q > 0 {
-        7
+        BucketMatchTier::ExactQualifiedMatch
     } else if (provider_matched && unmatched_q == 0) || (matched_q > 0 && unmatched_q == 0) {
-        6
+        BucketMatchTier::ProviderOrThirdPartyExact
     } else if provider_matched {
-        4
+        BucketMatchTier::ProviderPartialQualifier
     } else if !has_model_identity && unmatched_q == 0 {
-        5
+        BucketMatchTier::GenericOrThirdPartyPartial
     } else if !has_model_identity {
-        3
+        BucketMatchTier::NoModelQualified
     } else {
-        2
+        BucketMatchTier::UnrelatedProvider
     };
 
     (tier, matched_q, -(unmatched_q as isize))
@@ -362,12 +371,28 @@ fn is_tighter_equal_score(cand: &Candidate, cur: &Candidate) -> bool {
     }
 }
 
-fn resolve_quota_for_window(
+fn update_best_candidate(slot: &mut Option<Candidate>, cand: Candidate) {
+    let replace = match slot {
+        None => true,
+        Some(cur) => {
+            cand.score > cur.score
+                || (cand.score == cur.score && is_tighter_equal_score(&cand, cur))
+        }
+    };
+    if replace {
+        *slot = Some(cand);
+    }
+}
+
+/// Resolves both the active short-window (`< 24h`) and multi-day (`>= 24h`) quota buckets
+/// and their reset epoch timestamps in a single pass over `payload.quota`.
+pub fn resolve_quota_views_with_reset_at(
     payload: &StatuslinePayload,
-    target: WindowTarget,
     now_unix_secs: u64,
-) -> Option<(QuotaView, Option<u64>)> {
-    let quota = payload.quota.as_ref()?;
+) -> (Option<QuotaResolution>, Option<QuotaResolution>) {
+    let Some(quota) = payload.quota.as_ref() else {
+        return (None, None);
+    };
     let model_tokens = collect_model_tokens(payload);
     let has_model_identity = !model_tokens.is_empty();
 
@@ -402,11 +427,9 @@ fn resolve_quota_for_window(
         }
     }
 
-    let mut best: Option<Candidate> = None;
+    let mut best_short: Option<Candidate> = None;
+    let mut best_multi: Option<Candidate> = None;
     for (key, desc, bucket) in active_descriptors {
-        if !target.matches(desc.window_secs) {
-            continue;
-        }
         let Some((view, reset_at, has_frac)) = build_quota_view(key, &desc, bucket, now_unix_secs)
         else {
             continue;
@@ -418,32 +441,43 @@ fn resolve_quota_for_window(
             view,
             reset_at,
         };
-        let replace = match &best {
-            None => true,
-            Some(cur) => cand.score > cur.score || (cand.score == cur.score && is_tighter_equal_score(&cand, cur)),
-        };
-        if replace {
-            best = Some(cand);
+        if desc.window_secs < SECS_PER_DAY {
+            update_best_candidate(&mut best_short, cand);
+        } else {
+            update_best_candidate(&mut best_multi, cand);
         }
     }
 
-    best.map(|c| (c.view, c.reset_at))
+    (
+        best_short.map(|c| (c.view, c.reset_at)),
+        best_multi.map(|c| (c.view, c.reset_at)),
+    )
+}
+
+/// Resolves both active short-window (`< 24h`) and multi-day (`>= 24h`) quota views
+/// in a single pass at an explicit Unix epoch timestamp.
+pub fn resolve_quota_views_at(
+    payload: &StatuslinePayload,
+    now_unix_secs: u64,
+) -> (Option<QuotaView>, Option<QuotaView>) {
+    let (short, multi) = resolve_quota_views_with_reset_at(payload, now_unix_secs);
+    (short.map(|(v, _)| v), multi.map(|(v, _)| v))
 }
 
 /// Resolves the active short-window (`< 24h`) quota bucket and its reset epoch timestamp at `now_unix_secs`.
 pub fn resolve_quota_5h_with_reset_at(
     payload: &StatuslinePayload,
     now_unix_secs: u64,
-) -> Option<(QuotaView, Option<u64>)> {
-    resolve_quota_for_window(payload, WindowTarget::Short, now_unix_secs)
+) -> Option<QuotaResolution> {
+    resolve_quota_views_with_reset_at(payload, now_unix_secs).0
 }
 
 /// Resolves the active multi-day (`>= 24h`) quota bucket and its reset epoch timestamp at `now_unix_secs`.
 pub fn resolve_quota_weekly_with_reset_at(
     payload: &StatuslinePayload,
     now_unix_secs: u64,
-) -> Option<(QuotaView, Option<u64>)> {
-    resolve_quota_for_window(payload, WindowTarget::MultiDay, now_unix_secs)
+) -> Option<QuotaResolution> {
+    resolve_quota_views_with_reset_at(payload, now_unix_secs).1
 }
 
 /// Resolves the active short-window quota bucket at an explicit Unix epoch timestamp.

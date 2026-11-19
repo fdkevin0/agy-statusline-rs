@@ -98,7 +98,7 @@ struct RawPricingCatalog {
 pub struct PricingCatalog {
     /// Map of case-insensitive model name or substring pattern to per-million-token rates.
     #[serde(default)]
-    pub models: BTreeMap<String, ModelPricingRate>,
+    models: BTreeMap<String, ModelPricingRate>,
     #[serde(skip)]
     entries: Vec<IndexedEntry>,
     #[serde(skip)]
@@ -189,6 +189,11 @@ impl PricingCatalog {
             exact_raw,
             exact_norm,
         }
+    }
+
+    /// Returns a read-only view of the model pricing map.
+    pub fn models(&self) -> &BTreeMap<String, ModelPricingRate> {
+        &self.models
     }
 
     /// Returns `true` when the catalog contains no model entries.
@@ -470,9 +475,14 @@ pub fn fetch_models_dev_via_curl(url: &str) -> io::Result<String> {
 
     let mut stdout_buf = Vec::new();
     if let Some(stdout) = child.stdout.take() {
-        stdout
+        if let Err(err) = stdout
             .take(MAX_PRICING_JSON_BYTES + 1)
-            .read_to_end(&mut stdout_buf)?;
+            .read_to_end(&mut stdout_buf)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
     }
 
     if stdout_buf.len() as u64 > MAX_PRICING_JSON_BYTES {

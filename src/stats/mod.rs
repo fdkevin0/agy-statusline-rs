@@ -1358,7 +1358,7 @@ mod tests {
         );
         assert_eq!(fetch_calls, 1);
         // Canonical provider (`google`) takes precedence over `reseller`.
-        assert_eq!(cat1.models["gemini-4-hydrogen"].input_per_mtok, 1.5);
+        assert_eq!(cat1.models()["gemini-4-hydrogen"].input_per_mtok, 1.5);
 
         // Separator-normalized matching (`Claude Opus 5.5` -> `claude-opus-5-5`, `Gemini 4 Carbon (High)` -> `gemini-4-carbon`).
         let (_, opus_usd) = cat1
@@ -1419,7 +1419,7 @@ mod tests {
             DEFAULT_PRICING_TTL_SECS,
             |_| unreachable!(),
         );
-        assert_eq!(cat3.models["gemini-4-hydrogen"].input_per_mtok, 9.0);
+        assert_eq!(cat3.models()["gemini-4-hydrogen"].input_per_mtok, 9.0);
 
         let _ = fs::remove_dir_all(&home);
     }

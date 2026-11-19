@@ -1,0 +1,158 @@
+//! Responsive width measurement, spacer group splitting, and staged compaction.
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use super::emit::StyleGeometry;
+use super::{CompactStage, Segment};
+
+const COMPACT_STAGES: &[CompactStage] = &[
+    CompactStage::VcsDropDiff,
+    CompactStage::VcsTruncate,
+    CompactStage::QuotaStripTrailers,
+    CompactStage::CtxDropLimit,
+    CompactStage::CtxCollapseBar,
+    CompactStage::ModelAbbreviate,
+    CompactStage::ModelTruncate,
+    CompactStage::SubagentsDropLabel,
+    CompactStage::AccountDropDomain,
+    CompactStage::TitleTruncate,
+];
+
+pub(super) fn slice_visible_width(segments: &[Segment], geom: StyleGeometry) -> usize {
+    if segments.is_empty() {
+        return 0;
+    }
+    let body: usize = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| s.text.width() + geom.pad_per_seg + if i > 0 { geom.sep_w } else { 0 })
+        .sum();
+    body + geom.slice_trail_w
+}
+
+pub(super) fn groups_visible_width(groups: &[Vec<Segment>], geom: StyleGeometry) -> usize {
+    if groups.is_empty() {
+        return 0;
+    }
+    let sum: usize = groups.iter().map(|g| slice_visible_width(g, geom)).sum();
+    sum + groups.len().saturating_sub(1)
+}
+
+pub(crate) fn truncate_to_width(s: &str, max_cols: usize, ellipsis: &str) -> String {
+    if s.width() <= max_cols {
+        return s.to_string();
+    }
+    let ell_w = ellipsis.width();
+    if max_cols == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    let budget = if max_cols > ell_w {
+        max_cols - ell_w
+    } else {
+        max_cols
+    };
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    if max_cols > ell_w {
+        out.push_str(ellipsis);
+    }
+    out
+}
+
+pub(super) fn split_into_groups(segs: Vec<Segment>) -> Vec<Vec<Segment>> {
+    let mut groups: Vec<Vec<Segment>> = Vec::new();
+    let mut cur = Vec::new();
+    for seg in segs {
+        if seg.is_spacer {
+            if !cur.is_empty() {
+                groups.push(cur);
+                cur = Vec::new();
+            }
+        } else {
+            cur.push(seg);
+        }
+    }
+    if !cur.is_empty() {
+        groups.push(cur);
+    }
+    while groups.len() > 3 {
+        let tail = groups.remove(3);
+        groups[2].extend(tail);
+    }
+    groups
+}
+
+pub(super) fn fit_row_groups(
+    mut groups: Vec<Vec<Segment>>,
+    max_width: Option<usize>,
+    geom: StyleGeometry,
+    ellipsis: &str,
+) -> Vec<Vec<Segment>> {
+    let Some(limit) = max_width.filter(|&w| w > 0) else {
+        return groups;
+    };
+    if groups_visible_width(&groups, geom) <= limit {
+        return groups;
+    }
+
+    // Stages 1–4b: Apply structured per-segment compaction fallbacks in priority order.
+    for &stage in COMPACT_STAGES {
+        for group in &mut groups {
+            for seg in group {
+                seg.apply_compaction(stage);
+            }
+        }
+        if groups_visible_width(&groups, geom) <= limit {
+            return groups;
+        }
+    }
+
+    // Stage 5: Priority-based widget drop and final single-segment truncation.
+    while groups_visible_width(&groups, geom) > limit {
+        let total_segs: usize = groups.iter().map(Vec::len).sum();
+        if total_segs <= 1 {
+            break;
+        }
+        let mut drop_pos: Option<(usize, usize, u8)> = None;
+        for (gi, g) in groups.iter().enumerate() {
+            for (si, seg) in g.iter().enumerate() {
+                let p = seg.widget.priority();
+                let replace = match drop_pos {
+                    None => true,
+                    Some((_, _, best_p)) => p <= best_p,
+                };
+                if replace {
+                    drop_pos = Some((gi, si, p));
+                }
+            }
+        }
+        if let Some((gi, si, _)) = drop_pos {
+            groups[gi].remove(si);
+            if groups[gi].is_empty() {
+                groups.remove(gi);
+            }
+        } else {
+            break;
+        }
+    }
+
+    if groups_visible_width(&groups, geom) > limit && groups.len() == 1 && groups[0].len() == 1 {
+        let overhead = geom.pad_per_seg + geom.slice_trail_w;
+        let text_budget = limit.saturating_sub(overhead);
+        if text_budget == 0 {
+            groups.clear();
+        } else {
+            groups[0][0].text = truncate_to_width(&groups[0][0].text, text_budget, ellipsis);
+        }
+    }
+
+    groups
+}

@@ -1,6 +1,5 @@
 //! 3-pane `ratatui` + `crossterm` interactive TUI configurator with true-color live preview.
 
-use std::collections::BTreeMap;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::sync::Arc;
@@ -29,10 +28,7 @@ use crate::git::GitInfo;
 use crate::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
 use crate::paths::agy_settings_path;
 use crate::render::write_statusline;
-use crate::statusline::{
-    AgentInfo, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, SandboxInfo,
-    StatuslinePayload, VcsInfo, VimInfo, WorkspaceInfo,
-};
+use crate::statusline::sample_preview_payload;
 
 type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
 
@@ -153,87 +149,6 @@ pub fn run_tui_config(config_path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-/// Builds a rich sample payload used for live preview and `doctor`.
-pub fn sample_preview_payload(width: usize) -> StatuslinePayload {
-    let mut quota = BTreeMap::new();
-    quota.insert(
-        "gemini-5h".to_string(),
-        QuotaBucket {
-            remaining_fraction: Some(0.84),
-            reset_in_seconds: Some(11_400),
-            ..Default::default()
-        },
-    );
-    quota.insert(
-        "gemini-weekly".to_string(),
-        QuotaBucket {
-            remaining_fraction: Some(0.92),
-            reset_in_seconds: Some(432_000),
-            ..Default::default()
-        },
-    );
-    StatuslinePayload {
-        agent_state: Some("thinking".to_string()),
-        session_id: Some("8d0371e1-5a05-423b-a8bc-ed75995f9a8b".to_string()),
-        conversation_title: Some("Add AGY payload widgets".to_string()),
-        transcript_path: Some("/tmp/agy/logs/transcript.jsonl".to_string()),
-        version: Some("1.5.11".to_string()),
-        product: Some("Antigravity".to_string()),
-        cycle_mode: Some("plan".to_string()),
-        plan_tier: Some("Pro".to_string()),
-        email: Some("dev@example.com".to_string()),
-        agent: Some(AgentInfo {
-            name: Some("researcher".to_string()),
-        }),
-        model: Some(ModelInfo {
-            id: None,
-            display_name: Some("Gemini 4".to_string()),
-            effort: Some("high".to_string()),
-        }),
-        workspace: Some(WorkspaceInfo {
-            current_dir: Some("/work/agy-statusline".to_string()),
-            project_dir: Some("/work/agy-statusline".to_string()),
-        }),
-        vcs: Some(VcsInfo {
-            vcs_type: Some("git".to_string()),
-            branch: Some("main".to_string()),
-            client: None,
-            dirty: Some(true),
-        }),
-        sandbox: Some(SandboxInfo {
-            enabled: Some(true),
-            allow_network: None,
-        }),
-        vim: Some(VimInfo {
-            mode: Some("NORMAL".to_string()),
-        }),
-        pending_input_count: Some(1),
-        artifact_count: Some(2),
-        subagents: Some(serde_json::json!([1, 2])),
-        task_count: Some(3),
-        context_window: Some(ContextWindow {
-            used_percentage: Some(42.5),
-            total_input_tokens: Some(48_000),
-            total_output_tokens: Some(4_200),
-            current_usage: Some(JsonUsage {
-                input_tokens: Some(18_000),
-                output_tokens: Some(50),
-                cache_read_input_tokens: Some(200_000),
-                cache_creation_input_tokens: Some(0),
-            }),
-            ..Default::default()
-        }),
-        cost: Some(CostInfo {
-            total_usd: Some(0.14),
-            subagent_usd: None,
-            estimated: Some(true),
-        }),
-        quota: Some(quota),
-        terminal_width: Some(width),
-        ..Default::default()
-    }
 }
 
 fn build_preview_lines(state: &TuiEditorState, box_inner: u16) -> (Vec<Line<'static>>, usize) {

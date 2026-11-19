@@ -36,21 +36,10 @@ pub struct SessionMetadata {
     pub estimated_cost_usd: Option<f64>,
 }
 
-/// Trait abstracting last-turn speed and context limit lookup for testability.
+/// Trait abstracting session generation metadata lookup for testability.
 pub trait SpeedReader {
-    /// Returns the last completed turn's generation speed in tokens/sec, if available.
-    fn last_speed(&self, conversation_id: &str) -> Option<f64>;
-
-    /// Returns both generation speed and server-issued `max_context_tokens`.
-    fn session_metadata(&self, conversation_id: &str) -> SessionMetadata {
-        let speed = self.last_speed(conversation_id);
-        SessionMetadata {
-            speed,
-            median_speed: speed,
-            last_turn_speed: speed,
-            ..Default::default()
-        }
-    }
+    /// Returns session generation speed, TTFT, and context window metadata.
+    fn session_metadata(&self, conversation_id: &str) -> SessionMetadata;
 }
 
 /// Production [`SpeedReader`] backed by the local AGY SQLite conversation database.
@@ -61,10 +50,6 @@ pub struct SqliteSpeedReader {
 }
 
 impl SpeedReader for SqliteSpeedReader {
-    fn last_speed(&self, conversation_id: &str) -> Option<f64> {
-        self.session_metadata(conversation_id).speed
-    }
-
     fn session_metadata(&self, conversation_id: &str) -> SessionMetadata {
         if let Some(home) = &self.home_override {
             return query_session_metadata(home, conversation_id);
@@ -265,8 +250,8 @@ mod tests {
         let reader = SqliteSpeedReader {
             home_override: Some(dir.clone()),
         };
-        assert_eq!(reader.last_speed(uuid), Some(50.0));
-        assert_eq!(reader.last_speed("invalid"), None);
+        assert_eq!(reader.session_metadata(uuid).speed, Some(50.0));
+        assert_eq!(reader.session_metadata("invalid").speed, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -298,7 +283,7 @@ mod tests {
         let reader = SqliteSpeedReader {
             home_override: Some(dir.clone()),
         };
-        assert_eq!(reader.last_speed(uuid), Some(50.0));
+        assert_eq!(reader.session_metadata(uuid).speed, Some(50.0));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

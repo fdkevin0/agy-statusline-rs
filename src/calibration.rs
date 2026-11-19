@@ -13,9 +13,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::fsutil::atomic_write;
-use crate::metrics::{
-    resolve_quota_5h_with_reset_at, resolve_quota_weekly_with_reset_at, QuotaView,
-};
+use crate::metrics::{resolve_quota_views_with_reset_at, QuotaResolution, QuotaView};
 use crate::statusline::StatuslinePayload;
 
 const SCHEMA_VERSION: u32 = 2;
@@ -296,13 +294,11 @@ fn bucket_state_changed(before: Option<&BucketCalibration>, after: &BucketCalibr
         || prev.external_divergence_in_cycle != after.external_divergence_in_cycle
 }
 
-type ResolvedViews = [Option<(QuotaView, Option<u64>)>; 2];
+type ResolvedViews = [Option<QuotaResolution>; 2];
 
 fn resolve_views(payload: &StatuslinePayload, now_unix_secs: u64) -> ResolvedViews {
-    [
-        resolve_quota_5h_with_reset_at(payload, now_unix_secs),
-        resolve_quota_weekly_with_reset_at(payload, now_unix_secs),
-    ]
+    let (short, weekly) = resolve_quota_views_with_reset_at(payload, now_unix_secs);
+    [short, weekly]
 }
 
 fn calibrate_resolved(

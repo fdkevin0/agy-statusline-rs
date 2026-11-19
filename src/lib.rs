@@ -10,6 +10,7 @@ pub mod ansi;
 pub mod apply;
 pub mod calibration;
 pub mod db;
+pub mod doctor;
 pub mod editor;
 pub mod format;
 pub mod fsutil;

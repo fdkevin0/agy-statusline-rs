@@ -18,14 +18,19 @@ use agy_statusline::protobuf::{
 };
 use agy_statusline::render::{build_progress_bar, write_statusline};
 use agy_statusline::statusline::{
-    process_statusline, process_statusline_with_probes, ContextWindow, CostInfo, JsonUsage,
-    ModelInfo, QuotaBucket, StatuslinePayload, WorkspaceInfo,
+    process_statusline, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket,
+    StatuslinePayload, StatuslineRuntime, WorkspaceInfo,
 };
 
 struct FixedSpeed(Option<f64>);
 impl SpeedReader for FixedSpeed {
-    fn last_speed(&self, _id: &str) -> Option<f64> {
-        self.0
+    fn session_metadata(&self, _id: &str) -> SessionMetadata {
+        SessionMetadata {
+            speed: self.0,
+            median_speed: self.0,
+            last_turn_speed: self.0,
+            ..Default::default()
+        }
     }
 }
 
@@ -222,8 +227,11 @@ fn integration_full_json_and_uuid_checks() {
             }
         }
     }"#;
+    let reader = FixedSpeed(Some(120.4));
+    let git = SystemGitProbe::default();
+    let runtime = StatuslineRuntime::minimal(&reader, &git);
     let mut out = Vec::new();
-    process_statusline(json, &FixedSpeed(Some(120.4)), &mut out).unwrap();
+    process_statusline(json, &runtime, &LayoutConfig::default(), &mut out).unwrap();
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("WORKING"));
     assert!(!s.contains("Gemini 4"));
@@ -302,8 +310,10 @@ fn live_git_cli_probe_extracts_branch_and_diff_stats() {
         cache_dir: Some(dir.join(".tmp_cache")),
     };
 
+    let reader = FixedSpeed(None);
+    let runtime = StatuslineRuntime::minimal(&reader, &probe);
     let mut out = Vec::new();
-    process_statusline_with_probes(&payload, &FixedSpeed(None), &probe, &cfg, &mut out).unwrap();
+    process_statusline(&payload, &runtime, &cfg, &mut out).unwrap();
     let rendered = String::from_utf8(out).unwrap();
     assert!(rendered.contains("feat-live* +2 -1"));
 
