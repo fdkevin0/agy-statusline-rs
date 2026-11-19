@@ -71,6 +71,8 @@ pub fn run_tui_config(config_path: &Path) -> io::Result<()> {
         ));
     }
 
+    // An upgrade can replace the running executable while the editor is open.
+    let launcher = resolve_invoked_binary_path();
     let initial = load_layout_config(config_path);
     let mut state = TuiEditorState::new(initial);
 
@@ -107,8 +109,7 @@ pub fn run_tui_config(config_path: &Path) -> io::Result<()> {
         ExitOutcome::SaveAndApply => {
             save_layout_config(config_path, &state.config)?;
             let settings_path = default_settings_path()?;
-            let cmd = resolve_invoked_binary_path()?;
-            apply_statusline_config(&settings_path, &cmd, state.config.stack_with_default)?;
+            apply_statusline_config(&settings_path, &launcher?, state.config.stack_with_default)?;
             println!("Saved layout config to {}", config_path.display());
             println!(
                 "Applied statusLine (stack_with_default={}) to {}",
