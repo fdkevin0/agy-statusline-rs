@@ -1,6 +1,5 @@
 //! Pure-Rust Git branch/worktree probing and bounded, cached diff statistics.
 
-use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -8,6 +7,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::fsutil::atomic_write;
+use crate::paths::xdg_cache_dir;
 use crate::timeutil::unix_now_secs;
 
 const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -42,12 +43,8 @@ pub struct SystemGitProbe {
 impl SystemGitProbe {
     /// Creates a probe configured with the default per-user diff cache directory.
     pub fn with_default_cache() -> Self {
-        let base = env::var_os("XDG_CACHE_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir);
         Self {
-            cache_dir: Some(base.join("agy-statusline")),
+            cache_dir: xdg_cache_dir(),
         }
     }
 }
@@ -197,13 +194,8 @@ where
     let Some((added, deleted)) = runner() else {
         return (0, 0);
     };
-    if fs::create_dir_all(cache_dir).is_ok() {
-        let tmp = cache_dir.join(format!("diff_{hash:016x}.{}.tmp", std::process::id()));
-        let payload = format!("{idx_mtime} {now_secs} {added} {deleted}\n");
-        if fs::write(&tmp, payload.as_bytes()).is_ok() {
-            let _ = fs::rename(&tmp, &cache_path);
-        }
-    }
+    let payload = format!("{idx_mtime} {now_secs} {added} {deleted}\n");
+    let _ = atomic_write(&cache_path, payload.as_bytes());
     (added, deleted)
 }
 
@@ -257,6 +249,7 @@ fn run_git_diff_bounded(dir: &Path, timeout: Duration) -> Option<(u64, u64)> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::env;
 
     #[test]
     fn detects_linked_worktree_from_dot_git_file() {

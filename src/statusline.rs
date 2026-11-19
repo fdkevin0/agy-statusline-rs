@@ -8,10 +8,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::calibration::calibrate_quota_views_at;
-use crate::db::{resolve_agy_cli_dir, SpeedReader};
+use crate::db::SpeedReader;
 use crate::git::{GitInfo, GitProbe, SystemGitProbe};
 use crate::layout::{LayoutConfig, WidgetId};
 use crate::metrics::{resolve_quota_5h, resolve_quota_weekly, QuotaView};
+use crate::paths::resolve_agy_cli_dir;
 use crate::render::write_statusline_with_quotas;
 use crate::stats::{estimate_conversation_cost_usd, PricingCatalog, SyncMode};
 

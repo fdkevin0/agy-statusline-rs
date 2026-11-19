@@ -6,14 +6,13 @@
 //! cycles, and stale calibrations.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::db::resolve_home_dir;
+use crate::fsutil::atomic_write;
 use crate::metrics::{
     resolve_quota_5h_with_reset_at, resolve_quota_weekly_with_reset_at, QuotaView,
 };
@@ -87,14 +86,6 @@ impl Default for CalibrationStore {
     }
 }
 
-/// Resolves the default cache directory (`$XDG_CACHE_HOME/agy-statusline` or `~/.cache/agy-statusline`).
-pub fn default_calibration_cache_dir() -> Option<PathBuf> {
-    if let Some(xdg) = env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(xdg).join("agy-statusline"));
-    }
-    resolve_home_dir().map(|home| home.join(".cache").join("agy-statusline"))
-}
-
 /// Loads [`CalibrationStore`] from `cache_dir/quota_cal.json`, falling back to default on missing/invalid data.
 pub fn load_calibration_store(cache_dir: &Path) -> CalibrationStore {
     let path = cache_dir.join(CACHE_FILENAME);
@@ -130,19 +121,10 @@ pub fn save_calibration_store(cache_dir: &Path, store: &CalibrationStore) -> io:
 
 fn write_calibration_store(cache_dir: &Path, store: &CalibrationStore) -> io::Result<()> {
     let target = cache_dir.join(CACHE_FILENAME);
-    let tmp = cache_dir.join(format!("{CACHE_FILENAME}.tmp.{}", std::process::id()));
     let mut json = serde_json::to_string_pretty(store)
         .map_err(|e| io::Error::other(format!("failed to serialize calibration store: {e}")))?;
     json.push('\n');
-    if let Err(e) = fs::write(&tmp, json.as_bytes()) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = fs::rename(&tmp, &target) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    atomic_write(&target, json.as_bytes())
 }
 
 fn extract_session_tokens(payload: &StatuslinePayload) -> Option<u64> {
@@ -416,6 +398,7 @@ pub fn calibrate_quota_views_at(
 mod tests {
     use super::*;
     use crate::statusline::{ContextWindow, ModelInfo, QuotaBucket};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);

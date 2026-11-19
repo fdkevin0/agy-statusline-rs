@@ -10,7 +10,8 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::db::resolve_home_dir;
+use crate::fsutil::atomic_write;
+use crate::paths::{xdg_cache_dir, xdg_config_dir};
 use crate::timeutil::unix_now_secs;
 
 /// Default cache TTL for auto-fetched `models.dev` pricing data (24 hours).
@@ -95,8 +96,8 @@ impl PricingCatalog {
 
     /// Loads effective pricing (`models.dev` cache + user `pricing.json` overrides).
     pub fn load_effective(mode: SyncMode, now_secs: u64) -> Self {
-        let cache_dir = default_pricing_cache_dir();
-        let override_path = default_pricing_path();
+        let cache_dir = xdg_cache_dir();
+        let override_path = xdg_config_dir().ok().map(|d| d.join("pricing.json"));
         Self::load_effective_with(
             cache_dir.as_deref(),
             override_path.as_deref(),
@@ -496,13 +497,10 @@ where
         fetched_at: now_secs,
         models,
     };
-    fs::create_dir_all(cache_dir)?;
     let target = cache_dir.join(MODELS_DEV_CACHE_FILE);
-    let tmp = cache_dir.join(format!("{MODELS_DEV_CACHE_FILE}.{}.tmp", std::process::id()));
     let encoded = serde_json::to_string(&cached)
         .map_err(|e| io::Error::other(format!("serialize pricing cache: {e}")))?;
-    fs::write(&tmp, encoded.as_bytes())?;
-    fs::rename(&tmp, &target)?;
+    atomic_write(&target, encoded.as_bytes())?;
     clear_retry_cooldown(cache_dir);
     Ok(cached)
 }
@@ -554,14 +552,14 @@ where
 
 /// Inspects the current local pricing cache status without performing network I/O.
 pub fn pricing_cache_status(now_secs: u64) -> Option<PricingCacheStatus> {
-    let dir = default_pricing_cache_dir()?;
+    let dir = xdg_cache_dir()?;
     let cache_path = dir.join(MODELS_DEV_CACHE_FILE);
     let cached = load_cached_file(&cache_path);
     let fetched_at = cached.as_ref().map(|c| c.fetched_at);
     let fresh = fetched_at.is_some_and(|t| now_secs.saturating_sub(t) < DEFAULT_PRICING_TTL_SECS);
     Some(PricingCacheStatus {
         cache_path,
-        override_path: default_pricing_path(),
+        override_path: xdg_config_dir().ok().map(|d| d.join("pricing.json")),
         cached_models: cached.map_or(0, |c| c.models.len()),
         fetched_at,
         fresh,
@@ -576,13 +574,13 @@ pub fn run_pricing_command<W: io::Write>(
     out: &mut W,
 ) -> io::Result<()> {
     let now_secs = unix_now_secs();
-    let cache_dir = default_pricing_cache_dir().ok_or_else(|| {
+    let cache_dir = xdg_cache_dir().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "unable to resolve pricing cache directory",
         )
     })?;
-    let override_path = default_pricing_path();
+    let override_path = xdg_config_dir().ok().map(|d| d.join("pricing.json"));
 
     if sync {
         let (status, did_fetch) = sync_models_dev_pricing_with(
@@ -633,26 +631,6 @@ pub fn run_pricing_command<W: io::Write>(
         writeln!(out, "User override: {} ({exists})", ov.display())?;
     }
     Ok(())
-}
-
-/// Returns the default optional user pricing catalog path
-/// (`$XDG_CONFIG_HOME/agy-statusline/pricing.json` or `~/.config/agy-statusline/pricing.json`).
-pub fn default_pricing_path() -> Option<PathBuf> {
-    let cfg_base = env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| resolve_home_dir().map(|h| h.join(".config")))?;
-    Some(cfg_base.join("agy-statusline").join("pricing.json"))
-}
-
-/// Returns the default `models.dev` pricing cache directory
-/// (`$XDG_CACHE_HOME/agy-statusline` or `~/.cache/agy-statusline`).
-pub fn default_pricing_cache_dir() -> Option<PathBuf> {
-    let cache_base = env::var_os("XDG_CACHE_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| resolve_home_dir().map(|h| h.join(".cache")))?;
-    Some(cache_base.join("agy-statusline"))
 }
 
 pub(super) fn round_usd_6(v: f64) -> f64 {

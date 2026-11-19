@@ -4,14 +4,13 @@
 //! `$XDG_CONFIG_HOME/agy-statusline/config.json` (defaulting to
 //! `~/.config/agy-statusline/config.json`).
 
-use std::env;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::db::resolve_home_dir;
+use crate::fsutil::atomic_write;
 
 /// Maximum number of configurable statusline rows.
 pub const MAX_ROWS: usize = 3;
@@ -638,20 +637,6 @@ impl LayoutConfig {
     }
 }
 
-/// Resolves `$XDG_CONFIG_HOME/agy-statusline/config.json` or `<HOME>/.config/agy-statusline/config.json`.
-pub fn default_config_path() -> io::Result<PathBuf> {
-    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(xdg).join("agy-statusline").join("config.json"));
-    }
-    let home = resolve_home_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "neither XDG_CONFIG_HOME nor HOME/USERPROFILE is set",
-        )
-    })?;
-    Ok(home.join(".config").join("agy-statusline").join("config.json"))
-}
-
 /// Loads [`LayoutConfig`] from `path`, falling back to [`LayoutConfig::default`] if absent or invalid.
 pub fn load_layout_config(path: &Path) -> LayoutConfig {
     try_load_layout_config(path).unwrap_or_default()
@@ -667,21 +652,16 @@ pub(crate) fn try_load_layout_config(path: &Path) -> io::Result<LayoutConfig> {
 
 /// Atomically writes `config` to `path` as pretty-printed JSON.
 pub fn save_layout_config(path: &Path, config: &LayoutConfig) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let mut json = serde_json::to_string_pretty(config)
         .map_err(|e| io::Error::other(format!("failed to serialize layout config: {e}")))?;
     json.push('\n');
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json.as_bytes())?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    atomic_write(path, json.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     #[test]
     fn partial_config_json_deserializes_with_defaults() {

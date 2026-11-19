@@ -21,11 +21,12 @@ use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthStr;
 
 use crate::ansi::ansi_to_ratatui_lines;
-use crate::apply::{apply_statusline_config, resolve_invoked_binary_path, default_settings_path};
+use crate::apply::{apply_statusline_config, resolve_invoked_binary_path};
 use crate::db::SessionMetadata;
 use crate::editor::{ActivePane, ExitOutcome, TuiEditorState};
 use crate::git::GitInfo;
 use crate::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
+use crate::paths::agy_settings_path;
 use crate::render::write_statusline;
 use crate::statusline::{
     AgentInfo, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, SandboxInfo,
@@ -108,7 +109,7 @@ pub fn run_tui_config(config_path: &Path) -> io::Result<()> {
         }
         ExitOutcome::SaveAndApply => {
             save_layout_config(config_path, &state.config)?;
-            let settings_path = default_settings_path()?;
+            let settings_path = agy_settings_path()?;
             apply_statusline_config(&settings_path, &launcher?, state.config.stack_with_default)?;
             println!("Saved layout config to {}", config_path.display());
             println!(

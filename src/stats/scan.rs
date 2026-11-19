@@ -4,15 +4,14 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
-use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use super::pricing::{round_usd_6, PricingCatalog};
 use super::tz::TimeZoneSpec;
-use super::{compute_median, SqliteStats};
-use crate::db::is_valid_uuid;
+use super::SqliteStats;
+use crate::db::{compute_median, is_valid_uuid, open_readonly_db};
 use crate::protobuf::{
     extract_gen_metadata_record, extract_step_created_at_secs, MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
     MIN_TURN_DECODE_SECS,
@@ -20,7 +19,6 @@ use crate::protobuf::{
 use crate::timeutil::parse_rfc3339_unix_secs;
 
 const MAX_TRANSCRIPT_SCAN_DEPTH: usize = 4;
-const SQLITE_BUSY_TIMEOUT_MS: u64 = 25;
 
 const SKIP_DIRS: &[&str] = &[
     "steps",
@@ -567,15 +565,13 @@ fn scan_single_sqlite_db(
     tz: &TimeZoneSpec,
     pricing: &PricingCatalog,
 ) -> Option<SingleDbScan> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let db_mtime_secs = fs::metadata(&target.path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64);
 
-    let conn = Connection::open_with_flags(&target.path, flags).ok()?;
-    let _ = conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS));
+    let conn = open_readonly_db(&target.path).ok()?;
 
     let mut step_timestamps: HashMap<u64, i64> = HashMap::new();
     if let Ok(mut step_stmt) =
@@ -802,8 +798,8 @@ pub(super) fn scan_sqlite_conversations(
     }
 
     stats.ttft_samples = ttft_samples.len();
-    stats.median_tok_per_sec = compute_median(&mut speed_samples);
-    stats.median_ttft_secs = compute_median(&mut ttft_samples);
+    stats.median_tok_per_sec = compute_median(&speed_samples);
+    stats.median_ttft_secs = compute_median(&ttft_samples);
     (stats, events, covered)
 }
 
@@ -819,9 +815,7 @@ pub fn estimate_conversation_cost_usd(
     let db_path = cli_dir
         .join("conversations")
         .join(format!("{}.db", conversation_id.to_ascii_lowercase()));
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(&db_path, flags).ok()?;
-    let _ = conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS));
+    let conn = open_readonly_db(&db_path).ok()?;
     let mut stmt = conn
         .prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL")
         .ok()?;

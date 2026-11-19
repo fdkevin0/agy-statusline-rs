@@ -3,11 +3,12 @@
 //! Queries `~/.gemini/antigravity-cli/conversations/<conversation_id>.db`
 //! for the most recent `gen_metadata` blob and extracts generation speed.
 
-use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
+use crate::paths::resolve_agy_cli_dir;
 use crate::protobuf::{
     extract_estimated_context_tokens, extract_max_context_tokens, extract_turn_metrics, TurnMetrics,
 };
@@ -110,22 +111,27 @@ pub fn is_valid_uuid(id: &str) -> bool {
     true
 }
 
-/// Resolves the user's home directory from `HOME` or `USERPROFILE`.
-pub fn resolve_home_dir() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .or_else(|| env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
-        .map(PathBuf::from)
+/// Opens a SQLite database in read-only, no-mutex mode with a 25ms busy timeout.
+pub fn open_readonly_db(path: &Path) -> rusqlite::Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)?;
+    let _ = conn.busy_timeout(Duration::from_millis(25));
+    Ok(conn)
 }
 
-/// Resolves the AGY CLI data directory (`ANTIGRAVITY_CLI_HOME`, `AGY_HOME`,
-/// or `<home>/.gemini/antigravity-cli`).
-pub fn resolve_agy_cli_dir() -> Option<PathBuf> {
-    env::var_os("ANTIGRAVITY_CLI_HOME")
-        .filter(|v| !v.is_empty())
-        .or_else(|| env::var_os("AGY_HOME").filter(|v| !v.is_empty()))
-        .map(PathBuf::from)
-        .or_else(|| resolve_home_dir().map(|h| h.join(".gemini").join("antigravity-cli")))
+/// Computes the exact median of finite values in `values`, returning `None` if none are finite.
+pub fn compute_median(values: &[f64]) -> Option<f64> {
+    let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
+        return None;
+    }
+    finite.sort_by(f64::total_cmp);
+    let mid = finite.len() / 2;
+    if finite.len().is_multiple_of(2) {
+        Some((finite[mid - 1] + finite[mid]) / 2.0)
+    } else {
+        Some(finite[mid])
+    }
 }
 
 /// Queries `<home>/.gemini/antigravity-cli/conversations/<conversation_id>.db`
@@ -153,31 +159,12 @@ pub fn query_last_speed_from_db(db_path: &Path) -> Option<f64> {
     query_session_metadata_from_db(db_path).speed
 }
 
-fn compute_median_speed(turns: &[TurnMetrics]) -> Option<f64> {
-    if turns.is_empty() {
-        return None;
-    }
-    let mut speeds: Vec<f64> = turns
-        .iter()
-        .map(|t| (t.output_tokens as f64) / t.decode_secs)
-        .collect();
-    speeds.sort_by(f64::total_cmp);
-    let mid = speeds.len() / 2;
-    if speeds.len().is_multiple_of(2) {
-        Some((speeds[mid - 1] + speeds[mid]) / 2.0)
-    } else {
-        Some(speeds[mid])
-    }
-}
-
 /// Opens `db_path` in read-only mode and extracts speed, TTFT, and context window metadata.
 pub fn query_session_metadata_from_db(db_path: &Path) -> SessionMetadata {
     let mut meta = SessionMetadata::default();
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let Ok(conn) = Connection::open_with_flags(db_path, flags) else {
+    let Ok(conn) = open_readonly_db(db_path) else {
         return meta;
     };
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(25));
     let Ok(mut stmt) =
         conn.prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx DESC LIMIT 9")
     else {
@@ -216,7 +203,11 @@ pub fn query_session_metadata_from_db(db_path: &Path) -> SessionMetadata {
             meta.speed = Some((total_tokens as f64) / total_secs);
         }
 
-        meta.median_speed = compute_median_speed(&turns);
+        let speeds: Vec<f64> = turns
+            .iter()
+            .map(|t| (t.output_tokens as f64) / t.decode_secs)
+            .collect();
+        meta.median_speed = compute_median(&speeds);
     }
     meta
 }
@@ -224,6 +215,7 @@ pub fn query_session_metadata_from_db(db_path: &Path) -> SessionMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     #[test]
     fn uuid_validation() {
@@ -417,5 +409,16 @@ mod tests {
         assert_eq!(meta.speed, Some(50.0));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compute_median_handles_odd_even_and_non_finite() {
+        assert_eq!(compute_median(&[]), None);
+        assert_eq!(compute_median(&[f64::NAN, f64::INFINITY]), None);
+        assert_eq!(compute_median(&[30.0, 10.0, 20.0]), Some(20.0));
+        assert_eq!(
+            compute_median(&[40.0, f64::NAN, 10.0, 20.0, f64::NEG_INFINITY, 30.0]),
+            Some(25.0)
+        );
     }
 }

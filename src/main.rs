@@ -8,14 +8,13 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agy_statusline::apply::{
-    default_settings_path, resolve_invoked_binary_path, run_apply_command, run_doctor,
-    set_statusline_enabled,
+    resolve_invoked_binary_path, run_apply_command, run_doctor, set_statusline_enabled,
 };
-use agy_statusline::calibration::default_calibration_cache_dir;
-use agy_statusline::db::{resolve_agy_cli_dir, resolve_home_dir, SqliteSpeedReader};
+use agy_statusline::db::SqliteSpeedReader;
 use agy_statusline::git::SystemGitProbe;
-use agy_statusline::layout::{
-    default_config_path, load_layout_config, save_layout_config, LayoutConfig,
+use agy_statusline::layout::{load_layout_config, save_layout_config, LayoutConfig};
+use agy_statusline::paths::{
+    agy_settings_path, resolve_agy_cli_dir, resolve_home_dir, xdg_cache_dir, xdg_config_dir,
 };
 use agy_statusline::stats::{run_pricing_command, run_stats_command};
 use agy_statusline::statusline::process_statusline_with_calibration;
@@ -103,15 +102,15 @@ fn main() -> io::Result<()> {
                         }
                     }
                 }
-                let settings_path = default_settings_path()?;
+                let settings_path = agy_settings_path()?;
                 if disable {
                     set_statusline_enabled(&settings_path, false)?;
                     println!("Disabled statusLine in {}", settings_path.display());
                     return Ok(());
                 }
                 let stack_with_default = stack_override.unwrap_or_else(|| {
-                    default_config_path()
-                        .map(|p| load_layout_config(&p).stack_with_default)
+                    xdg_config_dir()
+                        .map(|d| load_layout_config(&d.join("config.json")).stack_with_default)
                         .unwrap_or(false)
                 });
                 let command_path = resolve_invoked_binary_path()?;
@@ -137,8 +136,8 @@ fn main() -> io::Result<()> {
                         format!("unknown option for doctor: {flag}"),
                     ));
                 }
-                let config_path = default_config_path()?;
-                let settings_path = default_settings_path()?;
+                let config_path = xdg_config_dir()?.join("config.json");
+                let settings_path = agy_settings_path()?;
                 let mut stdout = io::stdout().lock();
                 return run_doctor(&config_path, &settings_path, no_color, &mut stdout);
             }
@@ -196,7 +195,7 @@ fn main() -> io::Result<()> {
                 );
             }
             "config" => {
-                let config_path = default_config_path()?;
+                let config_path = xdg_config_dir()?.join("config.json");
                 if let Some(flag) = args.next() {
                     match flag.as_str() {
                         "--show" => {
@@ -316,8 +315,8 @@ fn main() -> io::Result<()> {
 
     let mut cfg = match preset_override {
         Some(c) => c,
-        None => default_config_path()
-            .map(|p| load_layout_config(&p))
+        None => xdg_config_dir()
+            .map(|d| load_layout_config(&d.join("config.json")))
             .unwrap_or_default(),
     };
     cfg.no_color = no_color;
@@ -328,7 +327,7 @@ fn main() -> io::Result<()> {
         .read_to_string(&mut input);
     let reader = SqliteSpeedReader::default();
     let git_probe = SystemGitProbe::with_default_cache();
-    let calibration_dir = default_calibration_cache_dir();
+    let calibration_dir = xdg_cache_dir();
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());

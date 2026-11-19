@@ -7,35 +7,12 @@ use std::path::{self, Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use crate::db::{resolve_agy_cli_dir, SessionMetadata};
+use crate::db::SessionMetadata;
+use crate::fsutil::atomic_write_preserving_mode;
 use crate::git::GitInfo;
 use crate::layout::try_load_layout_config;
 use crate::render::write_statusline;
 use crate::tui::sample_preview_payload;
-
-fn settings_path_from_cli_dir(cli_dir: Option<PathBuf>) -> io::Result<PathBuf> {
-    let dir = cli_dir.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "neither ANTIGRAVITY_CLI_HOME, AGY_HOME, HOME, nor USERPROFILE environment variable is set",
-        )
-    })?;
-    Ok(dir.join("settings.json"))
-}
-
-/// Returns the default AGY settings path (`<agy_cli_dir>/settings.json`).
-///
-/// Honors `ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, or `<home>/.gemini/antigravity-cli`.
-pub fn default_settings_path() -> io::Result<PathBuf> {
-    settings_path_from_cli_dir(resolve_agy_cli_dir())
-}
-
-/// Returns `<home>/.gemini/antigravity-cli/settings.json` for a given home directory.
-pub fn settings_path_for_home(home: &Path) -> PathBuf {
-    home.join(".gemini")
-        .join("antigravity-cli")
-        .join("settings.json")
-}
 
 /// Resolves the preferred binary path to register in AGY `settings.json`.
 ///
@@ -101,25 +78,10 @@ fn read_settings_object(settings_path: &Path, allow_missing: bool) -> io::Result
 }
 
 fn write_settings_object(settings_path: &Path, root: Map<String, Value>) -> io::Result<()> {
-    let parent = settings_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
     let mut formatted = serde_json::to_string_pretty(&Value::Object(root))
         .map_err(|e| io::Error::other(format!("failed to serialize settings: {e}")))?;
     formatted.push('\n');
-
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(formatted.as_bytes())?;
-    match fs::metadata(settings_path) {
-        Ok(metadata) => tmp.as_file().set_permissions(metadata.permissions())?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    tmp.as_file().sync_all()?;
-    tmp.persist(settings_path).map_err(|e| e.error)?;
-    Ok(())
+    atomic_write_preserving_mode(settings_path, formatted.as_bytes())
 }
 
 /// Updates `settings_path` in-place (preserving existing top-level keys and custom
@@ -305,6 +267,7 @@ pub fn run_doctor<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::agy_settings_path_for_home;
     use std::io::Cursor;
 
     fn temp_home(tag: &str) -> PathBuf {
@@ -321,7 +284,7 @@ mod tests {
     #[test]
     fn creates_new_settings_with_yes() {
         let home = temp_home("new");
-        let settings = settings_path_for_home(&home);
+        let settings = agy_settings_path_for_home(&home);
         let cmd = PathBuf::from("/usr/local/bin/agy-statusline");
         let mut stdin = Cursor::new(b"");
         let mut out = Vec::new();
@@ -342,7 +305,7 @@ mod tests {
     #[test]
     fn preserves_existing_keys_padding_and_supports_disable() {
         let home = temp_home("preserve");
-        let settings = settings_path_for_home(&home);
+        let settings = agy_settings_path_for_home(&home);
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
         fs::write(
             &settings,
@@ -397,7 +360,7 @@ mod tests {
     #[test]
     fn rejects_invalid_existing_json() {
         let home = temp_home("invalid");
-        let settings = settings_path_for_home(&home);
+        let settings = agy_settings_path_for_home(&home);
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
         fs::write(&settings, "{not json").unwrap();
 
@@ -411,7 +374,7 @@ mod tests {
     fn doctor_reports_config_settings_and_preview() {
         let home = temp_home("doctor");
         let cfg_path = home.join("config.json");
-        let settings = settings_path_for_home(&home);
+        let settings = agy_settings_path_for_home(&home);
         apply_statusline_config(&settings, Path::new("/nonexistent/agy-statusline"), false).unwrap();
 
         let mut out = Vec::new();
@@ -423,16 +386,5 @@ mod tests {
         assert!(text.contains("Preview:"));
         assert!(!text.contains('\x1b'));
         let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn settings_path_from_cli_dir_resolves_or_errors_not_found() {
-        let dir = PathBuf::from("/tmp/custom-agy-cli");
-        assert_eq!(
-            settings_path_from_cli_dir(Some(dir.clone())).unwrap(),
-            dir.join("settings.json")
-        );
-        let err = settings_path_from_cli_dir(None).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }
