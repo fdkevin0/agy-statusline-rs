@@ -218,3 +218,173 @@ fn cost_widget_labels_partial_and_latest_turn_estimates() {
     conn.execute("DELETE FROM gen_metadata WHERE idx = 1", []).unwrap();
     assert!(!render(&payload).contains('$'));
 }
+
+fn seed_conv_turn(cli_root: &Path, uuid: &str, idx: i64, spec: TestGenSpec<'_>) {
+    let db_path = cli_root.join("conversations").join(format!("{uuid}.db"));
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO gen_metadata (idx, data) VALUES (?1, ?2)",
+        rusqlite::params![idx, build_gen_blob(spec)],
+    )
+    .unwrap();
+}
+
+#[test]
+fn cost_widget_attributes_descendant_subagent_dbs_from_conversation_summaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let cli = home.join(".gemini/antigravity-cli");
+    let parent = "11111111-1111-4111-8111-111111111111";
+    let child = "22222222-2222-4222-8222-222222222222";
+    let grandchild = "33333333-3333-4333-8333-333333333333";
+
+    seed_conv_turn(
+        &cli,
+        parent,
+        1,
+        TestGenSpec {
+            step_idx: 1,
+            model_enum: 1526,
+            resp_model: "model-alpha",
+            disp_name: "Model Alpha",
+            input_tok: 100_000,
+            cache_read_tok: 0,
+            output_tok: 0,
+            thinking_tok: 0,
+            dur_secs: 1,
+            ttft_ms: 200,
+        },
+    );
+    seed_conv_turn(
+        &cli,
+        child,
+        1,
+        TestGenSpec {
+            step_idx: 1,
+            model_enum: 1526,
+            resp_model: "model-alpha",
+            disp_name: "Model Alpha",
+            input_tok: 200_000,
+            cache_read_tok: 0,
+            output_tok: 0,
+            thinking_tok: 0,
+            dur_secs: 1,
+            ttft_ms: 200,
+        },
+    );
+    seed_conv_turn(
+        &cli,
+        grandchild,
+        1,
+        TestGenSpec {
+            step_idx: 1,
+            model_enum: 1526,
+            resp_model: "model-alpha",
+            disp_name: "Model Alpha",
+            input_tok: 150_000,
+            cache_read_tok: 0,
+            output_tok: 0,
+            thinking_tok: 0,
+            dur_secs: 1,
+            ttft_ms: 200,
+        },
+    );
+
+    let mut cmd = isolated_agy_cmd(home);
+    cmd.arg("--full").env("NO_COLOR", "1");
+    seed_alpha_rate(home);
+    let input = home.join("payload.json");
+    let payload = serde_json::json!({
+        "conversation_id": parent,
+        "terminal_width": 240
+    });
+    fs::write(&input, payload.to_string()).unwrap();
+
+    // Without conversation_summaries.db, only parent spend ($0.10) is shown.
+    let out_parent_only = cmd
+        .stdin(fs::File::open(&input).unwrap())
+        .output()
+        .unwrap();
+    assert!(out_parent_only.status.success());
+    let text_parent_only = String::from_utf8(out_parent_only.stdout).unwrap();
+    assert!(
+        text_parent_only.contains("~$0.10"),
+        "expected ~$0.10 in: {text_parent_only}"
+    );
+    assert!(
+        !text_parent_only.contains("(sub "),
+        "unexpected subagent suffix in: {text_parent_only}"
+    );
+
+    // Link parent -> child -> grandchild in conversation_summaries.db.
+    let summaries = Connection::open(cli.join("conversation_summaries.db")).unwrap();
+    summaries
+        .execute(
+            "CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                parent_conversation_id TEXT,
+                nesting_depth INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+    summaries
+        .execute(
+            "INSERT INTO conversation_summaries (conversation_id, parent_conversation_id, nesting_depth) VALUES (?1, ?2, 1)",
+            [child, parent],
+        )
+        .unwrap();
+    summaries
+        .execute(
+            "INSERT INTO conversation_summaries (conversation_id, parent_conversation_id, nesting_depth) VALUES (?1, ?2, 2)",
+            [grandchild, child],
+        )
+        .unwrap();
+    drop(summaries);
+
+    let out_with_subs = cmd
+        .stdin(fs::File::open(&input).unwrap())
+        .output()
+        .unwrap();
+    assert!(out_with_subs.status.success());
+    let text_with_subs = String::from_utf8(out_with_subs.stdout).unwrap();
+    assert!(
+        text_with_subs.contains("~$0.45 (sub $0.35)"),
+        "expected ~$0.45 (sub $0.35) in: {text_with_subs}"
+    );
+
+    // Adding an unpriced turn in the grandchild renders combined sub + unpriced suffix.
+    seed_conv_turn(
+        &cli,
+        grandchild,
+        2,
+        TestGenSpec {
+            step_idx: 2,
+            model_enum: 1437,
+            resp_model: "model-beta",
+            disp_name: "Model Beta",
+            input_tok: 50_000,
+            cache_read_tok: 0,
+            output_tok: 0,
+            thinking_tok: 0,
+            dur_secs: 1,
+            ttft_ms: 200,
+        },
+    );
+    let out_partial = cmd
+        .stdin(fs::File::open(&input).unwrap())
+        .output()
+        .unwrap();
+    assert!(out_partial.status.success());
+    let text_partial = String::from_utf8(out_partial.stdout).unwrap();
+    assert!(
+        text_partial.contains("~$0.45 (sub $0.35, 1 unpriced)"),
+        "expected ~$0.45 (sub $0.35, 1 unpriced) in: {text_partial}"
+    );
+}

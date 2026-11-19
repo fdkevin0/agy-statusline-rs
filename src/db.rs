@@ -35,6 +35,8 @@ pub struct SessionMetadata {
     pub thinking_tokens: Option<u64>,
     /// Locally estimated session cost in USD (used when AGY payload omits `cost.total_usd`).
     pub estimated_cost_usd: Option<f64>,
+    /// Locally estimated subagent spend in USD (subset of `estimated_cost_usd`).
+    pub estimated_subagent_cost_usd: Option<f64>,
 }
 
 /// Trait abstracting session generation metadata lookup for testability.

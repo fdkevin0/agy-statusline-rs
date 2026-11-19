@@ -818,15 +818,57 @@ fn has_billable_usage(rec: &GenMetadataRecord) -> bool {
 
 pub(crate) struct ConversationCost {
     pub(crate) usd: Option<f64>,
+    pub(crate) subagent_usd: Option<f64>,
     pub(crate) unpriced_turns: u64,
 }
 
-/// Estimates the subtotal for priced usage in a single SQLite conversation.
-pub(crate) fn estimate_conversation_cost_usd(
+fn resolve_descendant_conversation_ids(cli_dir: &Path, root_id: &str) -> Vec<String> {
+    if !is_valid_uuid(root_id) {
+        return Vec::new();
+    }
+    let summaries_path = cli_dir.join("conversation_summaries.db");
+    let Ok(conn) = open_readonly_db(&summaries_path) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "WITH RECURSIVE descendants(conversation_id, depth) AS (
+             SELECT conversation_id, 1
+             FROM conversation_summaries
+             WHERE parent_conversation_id = ?1 COLLATE NOCASE
+             UNION
+             SELECT cs.conversation_id, d.depth + 1
+             FROM conversation_summaries cs
+             JOIN descendants d ON cs.parent_conversation_id = d.conversation_id COLLATE NOCASE
+             WHERE d.depth < 8
+         )
+         SELECT DISTINCT conversation_id FROM descendants",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(mut rows) = stmt.query([root_id]) else {
+        return Vec::new();
+    };
+
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    while let Ok(Some(row)) = rows.next() {
+        if let Ok(id) = row.get::<_, String>(0) {
+            if is_valid_uuid(&id)
+                && !id.eq_ignore_ascii_case(root_id)
+                && seen.insert(id.to_ascii_lowercase())
+            {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+fn accumulate_single_db_cost(
     cli_dir: &Path,
     conversation_id: &str,
     pricing: &PricingCatalog,
-) -> Option<ConversationCost> {
+) -> Option<(f64, u64, u64)> {
     let db_path = resolve_conversation_db_path(cli_dir, conversation_id)?;
     let conn = open_readonly_db(&db_path).ok()?;
     let mut stmt = conn
@@ -836,7 +878,7 @@ pub(crate) fn estimate_conversation_cost_usd(
 
     let mut total_usd = 0.0_f64;
     let mut priced_turns = 0_u64;
-    let mut unpriced_turns = 0;
+    let mut unpriced_turns = 0_u64;
     while let Some(row) = rows.next().ok()? {
         let Some(blob) = row.get_ref(0).ok().and_then(|value| value.as_blob().ok()) else {
             continue;
@@ -872,9 +914,47 @@ pub(crate) fn estimate_conversation_cost_usd(
             unpriced_turns += 1;
         }
     }
-    (priced_turns > 0 || unpriced_turns > 0).then(|| ConversationCost {
-        usd: (priced_turns > 0 && total_usd.is_finite()).then(|| round_usd_6(total_usd)),
-        unpriced_turns,
+    Some((total_usd, priced_turns, unpriced_turns))
+}
+
+/// Estimates the subtotal for priced usage in a SQLite conversation and any descendant subagents.
+pub(crate) fn estimate_conversation_cost_usd(
+    cli_dir: &Path,
+    conversation_id: &str,
+    pricing: &PricingCatalog,
+) -> Option<ConversationCost> {
+    if !is_valid_uuid(conversation_id) {
+        return None;
+    }
+    let (parent_usd, parent_priced, parent_unpriced) =
+        match accumulate_single_db_cost(cli_dir, conversation_id, pricing) {
+            Some(counts) => counts,
+            None if resolve_conversation_db_path(cli_dir, conversation_id).is_some() => {
+                return None;
+            }
+            None => (0.0, 0, 0),
+        };
+
+    let mut sub_usd = 0.0_f64;
+    let mut sub_priced = 0_u64;
+    let mut sub_unpriced = 0_u64;
+    for desc_id in resolve_descendant_conversation_ids(cli_dir, conversation_id) {
+        if let Some((usd, priced, unpriced)) =
+            accumulate_single_db_cost(cli_dir, &desc_id, pricing)
+        {
+            sub_usd += usd;
+            sub_priced += priced;
+            sub_unpriced += unpriced;
+        }
+    }
+
+    let total_priced = parent_priced + sub_priced;
+    let total_unpriced = parent_unpriced + sub_unpriced;
+    let total_usd = parent_usd + sub_usd;
+    (total_priced > 0 || total_unpriced > 0).then(|| ConversationCost {
+        usd: (total_priced > 0 && total_usd.is_finite()).then(|| round_usd_6(total_usd)),
+        subagent_usd: (sub_priced > 0 && sub_usd.is_finite()).then(|| round_usd_6(sub_usd)),
+        unpriced_turns: total_unpriced,
     })
 }
 
@@ -1057,5 +1137,130 @@ mod tests {
         let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
         assert_eq!(report.sqlite.db_files, 1);
         assert_eq!(report.totals.total_tokens, 1350);
+    }
+
+    fn seed_cost_db(cli_dir: &Path, uuid: &str, idx: i64, blob: Vec<u8>) {
+        let db_path = cli_dir.join("conversations").join(format!("{uuid}.db"));
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (?1, ?2)",
+            rusqlite::params![idx, blob],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn estimate_conversation_cost_aggregates_descendant_subagents_and_guards_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli_dir = dir.path().join(".gemini/antigravity-cli");
+        let parent = "11111111-1111-4111-8111-111111111111";
+        let child = "22222222-2222-4222-8222-222222222222";
+        let grandchild = "33333333-3333-4333-8333-333333333333";
+        let missing_child = "44444444-4444-4444-8444-444444444444";
+        let unrelated = "55555555-5555-4555-8555-555555555555";
+        let pricing = PricingCatalog::default();
+
+        seed_cost_db(
+            &cli_dir,
+            parent,
+            1,
+            build_gen_blob(None, 10, "m-parent", "", 100, 0, 50, 0, 1, 100, Some(0.10)),
+        );
+        seed_cost_db(
+            &cli_dir,
+            child,
+            1,
+            build_gen_blob(None, 10, "m-child", "", 100, 0, 50, 0, 1, 100, Some(0.20)),
+        );
+        seed_cost_db(
+            &cli_dir,
+            grandchild,
+            1,
+            build_gen_blob(None, 10, "m-grand", "", 100, 0, 50, 0, 1, 100, Some(0.15)),
+        );
+        seed_cost_db(
+            &cli_dir,
+            grandchild,
+            2,
+            build_gen_blob(None, 10, "m-unpriced", "", 100, 0, 50, 0, 1, 100, None),
+        );
+        seed_cost_db(
+            &cli_dir,
+            unrelated,
+            1,
+            build_gen_blob(None, 10, "m-other", "", 100, 0, 50, 0, 1, 100, Some(9.99)),
+        );
+
+        // Without conversation_summaries.db, only parent is attributed.
+        let parent_only = estimate_conversation_cost_usd(&cli_dir, parent, &pricing).unwrap();
+        assert_eq!(parent_only.usd, Some(0.1));
+        assert_eq!(parent_only.subagent_usd, None);
+        assert_eq!(parent_only.unpriced_turns, 0);
+
+        let summaries = Connection::open(cli_dir.join("conversation_summaries.db")).unwrap();
+        summaries
+            .execute(
+                "CREATE TABLE conversation_summaries (
+                    conversation_id TEXT,
+                    parent_conversation_id TEXT,
+                    nesting_depth INTEGER
+                )",
+                [],
+            )
+            .unwrap();
+        summaries
+            .execute(
+                "INSERT INTO conversation_summaries VALUES (?1, ?2, 1)",
+                [child, parent],
+            )
+            .unwrap();
+        summaries
+            .execute(
+                "INSERT INTO conversation_summaries VALUES (?1, ?2, 2)",
+                [grandchild, child],
+            )
+            .unwrap();
+        summaries
+            .execute(
+                "INSERT INTO conversation_summaries VALUES (?1, ?2, 1)",
+                [missing_child, parent],
+            )
+            .unwrap();
+        summaries
+            .execute(
+                "INSERT INTO conversation_summaries VALUES (?1, ?2, 1)",
+                [parent, parent],
+            )
+            .unwrap();
+        summaries
+            .execute(
+                "INSERT INTO conversation_summaries VALUES (?1, ?2, 3)",
+                [parent, grandchild],
+            )
+            .unwrap();
+        summaries
+            .execute(
+                "INSERT INTO conversation_summaries VALUES ('not-a-uuid', ?1, 1)",
+                [parent],
+            )
+            .unwrap();
+        summaries
+            .execute(
+                "INSERT INTO conversation_summaries VALUES (?1, NULL, 0)",
+                [unrelated],
+            )
+            .unwrap();
+        drop(summaries);
+
+        let combined = estimate_conversation_cost_usd(&cli_dir, parent, &pricing).unwrap();
+        assert_eq!(combined.usd, Some(0.45));
+        assert_eq!(combined.subagent_usd, Some(0.35));
+        assert_eq!(combined.unpriced_turns, 1);
     }
 }

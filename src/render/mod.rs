@@ -130,6 +130,7 @@ struct RenderContext<'a> {
     ttft_secs: Option<f64>,
     thinking_tokens: Option<u64>,
     estimated_cost_usd: Option<f64>,
+    estimated_subagent_cost_usd: Option<f64>,
     cost_coverage: CostCoverage,
     quota_5h: Option<QuotaView>,
     quota_weekly: Option<QuotaView>,
@@ -178,6 +179,7 @@ impl<'a> RenderContext<'a> {
             ttft_secs: meta.ttft_secs,
             thinking_tokens: meta.thinking_tokens,
             estimated_cost_usd: meta.estimated_cost_usd,
+            estimated_subagent_cost_usd: meta.estimated_subagent_cost_usd,
             cost_coverage,
             quota_5h,
             quota_weekly,
@@ -782,8 +784,64 @@ mod tests {
         };
         let mut out = Vec::new();
         write_statusline(&payload, &meta, &GitInfo::default(), &cfg, &mut out).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert_eq!(text, "~$1.23\n");
+        assert_eq!(String::from_utf8(out).unwrap(), "~$1.23\n");
+
+        let meta_sub = SessionMetadata {
+            estimated_cost_usd: Some(1.2345),
+            estimated_subagent_cost_usd: Some(0.25),
+            ..Default::default()
+        };
+        let mut out_sub = Vec::new();
+        write_statusline(&payload, &meta_sub, &GitInfo::default(), &cfg, &mut out_sub).unwrap();
+        assert_eq!(String::from_utf8(out_sub).unwrap(), "~$1.23 (sub $0.25)\n");
+
+        let meta_tiny_sub = SessionMetadata {
+            estimated_cost_usd: Some(1.2345),
+            estimated_subagent_cost_usd: Some(0.004),
+            ..Default::default()
+        };
+        let mut out_tiny = Vec::new();
+        write_statusline(
+            &payload,
+            &meta_tiny_sub,
+            &GitInfo::default(),
+            &cfg,
+            &mut out_tiny,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out_tiny).unwrap(), "~$1.23\n");
+
+        let mut out_partial_sub = Vec::new();
+        write_statusline_with_quotas(
+            &payload,
+            &meta_sub,
+            &GitInfo::default(),
+            (None, None),
+            CostCoverage::Partial(2),
+            &cfg,
+            &mut out_partial_sub,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out_partial_sub).unwrap(),
+            "~$1.23 (sub $0.25, 2 unpriced)\n"
+        );
+
+        let mut out_partial_only = Vec::new();
+        write_statusline_with_quotas(
+            &payload,
+            &meta,
+            &GitInfo::default(),
+            (None, None),
+            CostCoverage::Partial(2),
+            &cfg,
+            &mut out_partial_only,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out_partial_only).unwrap(),
+            "~$1.23 (2 unpriced)\n"
+        );
     }
 
     #[test]
