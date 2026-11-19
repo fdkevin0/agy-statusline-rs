@@ -788,7 +788,9 @@ pub(super) fn scan_sqlite_conversations(
     };
 
     for res in results {
-        covered.insert((res.source, res.uuid));
+        if !res.events.is_empty() {
+            covered.insert((res.source, res.uuid));
+        }
         stats.db_files += 1;
         stats.completed_turns += res.completed_turns;
         stats.total_output_tokens = stats
@@ -805,12 +807,17 @@ pub(super) fn scan_sqlite_conversations(
     (stats, events, covered)
 }
 
-/// Estimates total USD cost for a single conversation from its SQLite `gen_metadata` table.
+pub(crate) struct ConversationCost {
+    pub(crate) usd: Option<f64>,
+    pub(crate) unpriced_turns: u64,
+}
+
+/// Estimates the subtotal for priced usage in a single SQLite conversation.
 pub(crate) fn estimate_conversation_cost_usd(
     cli_dir: &Path,
     conversation_id: &str,
     pricing: &PricingCatalog,
-) -> Option<f64> {
+) -> Option<ConversationCost> {
     let db_path = resolve_conversation_db_path(cli_dir, conversation_id)?;
     let conn = open_readonly_db(&db_path).ok()?;
     let mut stmt = conn
@@ -820,13 +827,22 @@ pub(crate) fn estimate_conversation_cost_usd(
 
     let mut total_usd = 0.0_f64;
     let mut priced_turns = 0_u64;
-    while let Ok(Some(row)) = rows.next() {
-        let Ok(blob) = row.get::<_, Vec<u8>>(0) else {
+    let mut unpriced_turns = 0;
+    while let Some(row) = rows.next().ok()? {
+        let Some(blob) = row.get_ref(0).ok().and_then(|value| value.as_blob().ok()) else {
             continue;
         };
-        let Some(rec) = extract_gen_metadata_record(&blob) else {
+        let Some(rec) = extract_gen_metadata_record(blob) else {
             continue;
         };
+        if rec.input_tokens == 0
+            && rec.output_tokens == 0
+            && rec.cache_read_tokens == 0
+            && rec.cache_write_tokens == 0
+            && rec.model_cost_usd.is_none()
+        {
+            continue;
+        }
         let model_group = derive_model_name(
             rec.model_display_name.as_deref(),
             rec.response_model.as_deref(),
@@ -848,9 +864,14 @@ pub(crate) fn estimate_conversation_cost_usd(
         if let Some(usd) = turn_usd {
             total_usd += usd;
             priced_turns += 1;
+        } else {
+            unpriced_turns += 1;
         }
     }
-    (priced_turns > 0 && total_usd.is_finite()).then(|| round_usd_6(total_usd))
+    (priced_turns > 0 || unpriced_turns > 0).then(|| ConversationCost {
+        usd: (priced_turns > 0 && total_usd.is_finite()).then(|| round_usd_6(total_usd)),
+        unpriced_turns,
+    })
 }
 
 #[cfg(test)]
@@ -1021,6 +1042,16 @@ mod tests {
         let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
         assert_eq!(report.sqlite.db_files, 0);
         assert_eq!(report.totals.requests, 2);
+        assert_eq!(report.totals.total_tokens, 1350);
+
+        let db = Connection::open(conv_dir.join(format!("{uuid_empty}.db"))).unwrap();
+        db.execute(
+            "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+            [],
+        )
+        .unwrap();
+        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
+        assert_eq!(report.sqlite.db_files, 1);
         assert_eq!(report.totals.total_tokens, 1350);
     }
 }

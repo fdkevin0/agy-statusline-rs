@@ -1,11 +1,11 @@
-//! Read-only local usage, optional user-defined cost, and speed statistics (`agy-statusline stats`).
+//! Read-only local usage, estimated cost, and speed statistics (`agy-statusline stats`).
 //!
 //! Scans AGY local directories in read-only mode:
 //! - `conversations/<uuid>.db` (`gen_metadata` joined with `steps.metadata`) as the
 //!   authoritative primary source for turns, tokens, thinking tokens, model names,
 //!   timestamps, decode speed, and TTFT.
 //! - `brain/**/transcript.jsonl` as a deduplicated fallback ONLY for conversations that
-//!   do not have a corresponding `<uuid>.db`.
+//!   have no usable SQLite usage records.
 
 mod pricing;
 mod render;
@@ -23,7 +23,7 @@ pub(crate) use scan::estimate_conversation_cost_usd;
 pub use tz::unix_secs_to_utc_date;
 
 use crate::db::compute_median;
-use crate::paths::{resolve_agy_cli_dir, xdg_cache_dir, xdg_config_dir};
+use crate::paths::{resolve_agy_cli_dir, xdg_cache_dir};
 use crate::timeutil::civil_date_from_unix_day;
 use pricing::{fetch_models_dev_via_curl, round_usd_6, DEFAULT_PRICING_TTL_SECS};
 use render::render_stats_report;
@@ -50,7 +50,7 @@ pub struct PeriodSummary {
     pub thinking_tokens: u64,
     /// Total tokens (`input_tokens + cache_read_tokens + cache_write_tokens + output_tokens`).
     pub total_tokens: u64,
-    /// Estimated cost in USD across priced turns (from native `model_cost` or user `pricing.json`).
+    /// Estimated cost in USD across priced turns (from native `model_cost` or `models.dev` rates).
     pub priced_usd: f64,
     /// Count of turns with a price entry or native cost.
     pub priced_requests: u64,
@@ -114,7 +114,7 @@ pub struct WeeklyUsage {
 pub struct ModelStats {
     /// Display model name derived dynamically from AGY metadata.
     pub model: String,
-    /// Matched user `pricing.json` key (or `"native"`) when priced.
+    /// Matched catalog model key (or `"native"`) when priced.
     pub pricing_key: Option<String>,
     /// Total turns attributed to this model.
     pub requests: u64,
@@ -270,11 +270,12 @@ fn collect_stats_with_tz(
         ("cli", home.join(".gemini").join("antigravity-cli")),
         ("desktop", home.join(".gemini").join("antigravity")),
     ];
-    let pricing = PricingCatalog::load_from_file(
-        &home
-            .join(".config")
-            .join("agy-statusline")
-            .join("pricing.json"),
+    let pricing = PricingCatalog::load_effective_with(
+        Some(&home.join(".cache/agy-statusline")),
+        SyncMode::Offline,
+        now_unix_secs,
+        DEFAULT_PRICING_TTL_SECS,
+        |_| unreachable!(),
     );
     collect_stats_for_roots(&roots, days, now_unix_secs, tz, &pricing)
 }
@@ -453,13 +454,8 @@ pub fn run_stats_command<W: Write>(
 
     let cache_dir =
         xdg_cache_dir().or_else(|| home_dir.map(|h| h.join(".cache").join("agy-statusline")));
-    let pricing_path = xdg_config_dir()
-        .ok()
-        .or_else(|| home_dir.map(|h| h.join(".config").join("agy-statusline")))
-        .map(|d| d.join("pricing.json"));
     let pricing = PricingCatalog::load_effective_with(
         cache_dir.as_deref(),
-        pricing_path.as_deref(),
         SyncMode::BlockingIfStale,
         now_unix_secs,
         DEFAULT_PRICING_TTL_SECS,
@@ -742,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_pricing_json_and_native_cost_enable_cost_column() {
+    fn cached_rates_and_native_cost_enable_cost_column() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         let uuid = "33333333-3333-4333-8333-333333333333";
@@ -788,11 +784,11 @@ mod tests {
         ];
         create_full_conv_db(&db_path, &steps, &gens);
 
-        let pricing_path = home.join(".config/agy-statusline/pricing.json");
+        let pricing_path = home.join(".cache/agy-statusline/models_dev_pricing.json");
         fs::create_dir_all(pricing_path.parent().unwrap()).unwrap();
         fs::write(
             &pricing_path,
-            r#"{"models":{"custom-pro":{"input_per_mtok":2.0,"cache_read_per_mtok":0.2,"output_per_mtok":8.0}}}"#,
+            r#"{"fetched_at":0,"models":{"custom-pro":{"input_per_mtok":2.0,"cache_read_per_mtok":0.2,"output_per_mtok":8.0}}}"#,
         )
         .unwrap();
 

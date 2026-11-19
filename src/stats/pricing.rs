@@ -1,6 +1,6 @@
-//! Model token pricing catalog (`pricing.json` + TTL-cached `models.dev` sync).
+//! Model token pricing catalog (TTL-cached `models.dev` rates).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::io::{self, Read};
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::fsutil::atomic_write;
-use crate::paths::{xdg_cache_dir, xdg_config_dir};
+use crate::paths::xdg_cache_dir;
 use crate::timeutil::{unix_now_secs, SECS_PER_DAY};
 
 /// Default cache TTL for auto-fetched `models.dev` pricing data (24 hours).
@@ -35,7 +35,7 @@ pub enum SyncMode {
     SpawnIfStale,
 }
 
-/// Per-million-token pricing rates supplied by user-configured `pricing.json` or `models.dev`.
+/// Per-million-token pricing rates supplied by `models.dev`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct ModelPricingRate {
     /// USD per 1M uncached input tokens.
@@ -60,13 +60,11 @@ struct CachedPricingFile {
     models: BTreeMap<String, ModelPricingRate>,
 }
 
-/// Diagnostic summary of the local pricing cache and user override file.
+/// Diagnostic summary of the local pricing cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PricingCacheStatus {
     /// Path to `models_dev_pricing.json`.
     cache_path: PathBuf,
-    /// Path to user override `pricing.json`.
-    override_path: Option<PathBuf>,
     /// Number of cached `models.dev` entries (`0` if missing).
     cached_models: usize,
     /// Unix timestamp when cache was last fetched, if present.
@@ -83,7 +81,6 @@ struct IndexedEntry {
     pat_lower: String,
     pat_norm: String,
     rate: ModelPricingRate,
-    is_user_override: bool,
 }
 
 #[derive(Deserialize)]
@@ -92,7 +89,7 @@ struct RawPricingCatalog {
     models: BTreeMap<String, ModelPricingRate>,
 }
 
-/// Optional user-defined and cached pricing catalog.
+/// Indexed model pricing catalog.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(from = "RawPricingCatalog")]
 pub struct PricingCatalog {
@@ -116,19 +113,11 @@ impl From<RawPricingCatalog> for PricingCatalog {
 impl PricingCatalog {
     /// Builds a pre-indexed [`PricingCatalog`] from a map of model patterns to rates.
     fn from_models(models: BTreeMap<String, ModelPricingRate>) -> Self {
-        Self::from_layers(BTreeMap::new(), models)
-    }
+        let mut entries = Vec::with_capacity(models.len());
+        let mut exact_raw: HashMap<String, usize> = HashMap::with_capacity(models.len());
+        let mut exact_norm: HashMap<String, usize> = HashMap::with_capacity(models.len());
 
-    fn from_layers(
-        cached: BTreeMap<String, ModelPricingRate>,
-        user_overrides: BTreeMap<String, ModelPricingRate>,
-    ) -> Self {
-        let mut override_raw = HashSet::new();
-        let mut override_norm = HashSet::new();
-        let mut user_keys = HashSet::with_capacity(user_overrides.len());
-
-        for (pattern, rate) in &user_overrides {
-            user_keys.insert(pattern.clone());
+        for (pattern, rate) in &models {
             if !is_valid_rate(rate) {
                 continue;
             }
@@ -137,45 +126,12 @@ impl PricingCatalog {
                 continue;
             }
             let pat_norm = normalize_model_key(&pat_lower);
-            override_raw.insert(pat_lower);
-            if !pat_norm.is_empty() {
-                override_norm.insert(pat_norm);
-            }
-        }
-
-        let mut merged = BTreeMap::new();
-        for (pattern, rate) in cached {
-            let pat_lower = pattern.trim().to_ascii_lowercase();
-            let pat_norm = normalize_model_key(&pat_lower);
-            let shadowed = override_raw.contains(&pat_lower)
-                || (!pat_norm.is_empty() && override_norm.contains(&pat_norm));
-            if !shadowed {
-                merged.insert(pattern, rate);
-            }
-        }
-        merged.extend(user_overrides);
-
-        let mut entries = Vec::with_capacity(merged.len());
-        let mut exact_raw: HashMap<String, usize> = HashMap::with_capacity(merged.len());
-        let mut exact_norm: HashMap<String, usize> = HashMap::with_capacity(merged.len());
-
-        for (pattern, rate) in &merged {
-            if !is_valid_rate(rate) {
-                continue;
-            }
-            let pat_lower = pattern.trim().to_ascii_lowercase();
-            if pat_lower.is_empty() {
-                continue;
-            }
-            let pat_norm = normalize_model_key(&pat_lower);
-            let is_user_override = user_keys.contains(pattern);
             let idx = entries.len();
             entries.push(IndexedEntry {
                 key: pattern.clone(),
                 pat_lower: pat_lower.clone(),
                 pat_norm: pat_norm.clone(),
                 rate: rate.clone(),
-                is_user_override,
             });
             exact_raw.entry(pat_lower).or_insert(idx);
             if !pat_norm.is_empty() {
@@ -184,28 +140,18 @@ impl PricingCatalog {
         }
 
         Self {
-            models: merged,
+            models,
             entries,
             exact_raw,
             exact_norm,
         }
     }
 
-    /// Loads a [`PricingCatalog`] from `path`, returning an empty catalog if missing or invalid.
-    pub(super) fn load_from_file(path: &Path) -> Self {
-        let Ok(raw) = fs::read_to_string(path) else {
-            return Self::default();
-        };
-        serde_json::from_str::<Self>(&raw).unwrap_or_default()
-    }
-
-    /// Loads effective pricing (`models.dev` cache + user `pricing.json` overrides).
+    /// Loads rates from the models.dev cache using the requested refresh mode.
     pub(crate) fn load_effective(mode: SyncMode, now_secs: u64) -> Self {
         let cache_dir = xdg_cache_dir();
-        let override_path = xdg_config_dir().ok().map(|d| d.join("pricing.json"));
         Self::load_effective_with(
             cache_dir.as_deref(),
-            override_path.as_deref(),
             mode,
             now_secs,
             DEFAULT_PRICING_TTL_SECS,
@@ -213,10 +159,9 @@ impl PricingCatalog {
         )
     }
 
-    /// Loads effective pricing with explicit paths, TTL, and fetcher boundary for deterministic tests.
+    /// Loads effective pricing with an explicit cache path, TTL, and fetcher boundary for deterministic tests.
     pub(super) fn load_effective_with<F>(
         cache_dir: Option<&Path>,
-        override_path: Option<&Path>,
         mode: SyncMode,
         now_secs: u64,
         ttl_secs: u64,
@@ -267,11 +212,7 @@ impl PricingCatalog {
             }
         }
 
-        let user_overrides = override_path
-            .map(|path| Self::load_from_file(path).models)
-            .unwrap_or_default();
-
-        Self::from_layers(cached_models, user_overrides)
+        Self::from_models(cached_models)
     }
 
     /// Estimates USD cost for one turn if any candidate model string matches a valid entry.
@@ -299,43 +240,31 @@ impl PricingCatalog {
             return None;
         }
 
-        // 1. O(1) exact matches (raw lowercase, then separator-normalized) in candidate specificity order.
-        let mut matched: Option<&IndexedEntry> = None;
-        for (cand_raw, cand_norm) in &lowered_candidates {
-            if let Some(&idx) = self.exact_raw.get(cand_raw.as_str()).or_else(|| {
-                (!cand_norm.is_empty())
-                    .then(|| self.exact_norm.get(cand_norm.as_str()))
-                    .flatten()
-            }) {
-                matched = Some(&self.entries[idx]);
-                break;
-            }
-        }
+        let mut matched = lowered_candidates
+            .iter()
+            .find_map(|(raw, _)| self.exact_raw.get(raw))
+            .or_else(|| {
+                lowered_candidates.iter().find_map(|(_, norm)| self.exact_norm.get(norm))
+            })
+            .map(|&idx| &self.entries[idx]);
 
-        // 2. Zero-allocation substring fallback prefers the longest match, then user overrides, then key order.
+        // Substring fallback prefers the longest match, then key order.
         if matched.is_none() {
             let mut best: Option<(usize, &IndexedEntry)> = None;
             for entry in &self.entries {
-                let is_match = lowered_candidates.iter().any(|(cand_raw, cand_norm)| {
-                    cand_raw.contains(entry.pat_lower.as_str())
-                        || (!entry.pat_norm.is_empty()
-                            && cand_norm.contains(entry.pat_norm.as_str()))
-                });
-                if is_match {
-                    let match_len = entry.pat_lower.len().max(entry.pat_norm.len());
-                    let replace = match best {
-                        None => true,
-                        Some((best_len, best_entry)) => {
-                            match_len > best_len
-                                || (match_len == best_len
-                                    && ((entry.is_user_override && !best_entry.is_user_override)
-                                        || (entry.is_user_override == best_entry.is_user_override
-                                            && entry.key < best_entry.key)))
-                        }
-                    };
-                    if replace {
-                        best = Some((match_len, entry));
-                    }
+                let match_len = if lowered_candidates.iter().any(|(raw, _)| raw.contains(&entry.pat_lower)) {
+                    entry.pat_lower.len()
+                } else if !entry.pat_norm.is_empty()
+                    && lowered_candidates.iter().any(|(_, norm)| norm.contains(&entry.pat_norm))
+                {
+                    entry.pat_norm.len()
+                } else {
+                    continue;
+                };
+                if best.is_none_or(|(len, previous)| {
+                    match_len > len || (match_len == len && entry.key < previous.key)
+                }) {
+                    best = Some((match_len, entry));
                 }
             }
             matched = best.map(|(_, e)| e);
@@ -615,7 +544,6 @@ where
 /// Syncs `models.dev` pricing into the cache directory, returning `(status, did_fetch)`.
 fn sync_models_dev_pricing_with<F>(
     cache_dir: &Path,
-    override_path: Option<&Path>,
     if_stale_only: bool,
     now_secs: u64,
     ttl_secs: u64,
@@ -631,7 +559,6 @@ where
                 return Ok((
                     PricingCacheStatus {
                         cache_path,
-                        override_path: override_path.map(Path::to_path_buf),
                         cached_models: existing.models.len(),
                         fetched_at: Some(existing.fetched_at),
                         fresh: true,
@@ -647,7 +574,6 @@ where
     Ok((
         PricingCacheStatus {
             cache_path,
-            override_path: override_path.map(Path::to_path_buf),
             cached_models: synced.models.len(),
             fetched_at: Some(synced.fetched_at),
             fresh: true,
@@ -666,7 +592,6 @@ fn pricing_cache_status(now_secs: u64) -> Option<PricingCacheStatus> {
     let fresh = fetched_at.is_some_and(|t| now_secs.saturating_sub(t) < DEFAULT_PRICING_TTL_SECS);
     Some(PricingCacheStatus {
         cache_path,
-        override_path: xdg_config_dir().ok().map(|d| d.join("pricing.json")),
         cached_models: cached.map_or(0, |c| c.models.len()),
         fetched_at,
         fresh,
@@ -687,12 +612,10 @@ pub fn run_pricing_command<W: io::Write>(
             "unable to resolve pricing cache directory",
         )
     })?;
-    let override_path = xdg_config_dir().ok().map(|d| d.join("pricing.json"));
 
     if sync {
         let (status, did_fetch) = sync_models_dev_pricing_with(
             &cache_dir,
-            override_path.as_deref(),
             if_stale,
             now_secs,
             DEFAULT_PRICING_TTL_SECS,
@@ -733,10 +656,6 @@ pub fn run_pricing_command<W: io::Write>(
     };
     writeln!(out, "Pricing cache: {}", status.cache_path.display())?;
     writeln!(out, "Models cached: {} ({age_desc})", status.cached_models)?;
-    if let Some(ov) = status.override_path {
-        let exists = if ov.is_file() { "present" } else { "not set" };
-        writeln!(out, "User override: {} ({exists})", ov.display())?;
-    }
     Ok(())
 }
 
@@ -805,6 +724,12 @@ mod tests {
         assert_eq!(matched_key, "claude-sonnet-4-6-thinking");
         assert!((cost - 10.0).abs() < 1e-6);
 
+        // Across all candidates, a literal catalog ID precedes a punctuation-normalized match.
+        assert_eq!(
+            catalog.estimate_cost(&["alpha.b", "alpha-a"], 1_000_000, 0, 0, 0),
+            Some(("alpha-a".to_owned(), 3.0))
+        );
+
         // Substring fallback: longest match wins, and equal-length tie breaks by BTreeMap key order ("alpha-a" < "alpha-b").
         let (tie_key, tie_cost) = catalog
             .estimate_cost(&["alpha-b-and-alpha-a-model"], 1_000_000, 0, 0, 0)
@@ -814,10 +739,9 @@ mod tests {
     }
 
     #[test]
-    fn models_dev_sync_respects_ttl_overrides_and_normalizes_model_names() {
+    fn models_dev_sync_respects_ttl_and_normalizes_model_names() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
-        let override_path = dir.path().join("pricing.json");
         fs::create_dir_all(&cache_dir).unwrap();
 
         let sample_api = r#"{
@@ -844,7 +768,6 @@ mod tests {
         let mut fetch_calls = 0usize;
         let cat1 = PricingCatalog::load_effective_with(
             Some(&cache_dir),
-            Some(&override_path),
             SyncMode::BlockingIfStale,
             t0,
             DEFAULT_PRICING_TTL_SECS,
@@ -895,98 +818,15 @@ mod tests {
         // Within TTL: fetcher must NOT be called.
         let _cat2 = PricingCatalog::load_effective_with(
             Some(&cache_dir),
-            Some(&override_path),
             SyncMode::BlockingIfStale,
             t0 + 100,
             DEFAULT_PRICING_TTL_SECS,
             |_| -> io::Result<String> { panic!("unexpected fetch while cache is fresh") },
         );
-
-        // User override `pricing.json` overrides cached rate.
-        fs::write(
-            &override_path,
-            r#"{"models":{"gemini-4-hydrogen":{"input_per_mtok":9.0,"output_per_mtok":9.0}}}"#,
-        )
-        .unwrap();
-        let cat3 = PricingCatalog::load_effective_with(
-            Some(&cache_dir),
-            Some(&override_path),
-            SyncMode::Offline,
-            t0 + 100,
-            DEFAULT_PRICING_TTL_SECS,
-            |_| unreachable!(),
-        );
-        assert_eq!(cat3.models["gemini-4-hydrogen"].input_per_mtok, 9.0);
     }
 
     #[test]
-    fn user_override_mixed_case_and_separator_variant_beats_models_dev_cache() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache_dir = dir.path().join("cache");
-        let override_path = dir.path().join("pricing.json");
-        fs::create_dir_all(&cache_dir).unwrap();
-
-        let sample_api = r#"{
-          "google": {
-            "models": {
-              "gemini-4-hydrogen": { "cost": { "input": 1.5, "output": 7.5 } },
-              "gemini-4-carbon": { "cost": { "input": 2.0, "output": 10.0 } }
-            }
-          }
-        }"#;
-        let t0 = 1_700_000_000;
-        let _ = PricingCatalog::load_effective_with(
-            Some(&cache_dir),
-            None,
-            SyncMode::BlockingIfStale,
-            t0,
-            DEFAULT_PRICING_TTL_SECS,
-            |_| Ok(sample_api.to_string()),
-        );
-
-        // Mixed-case override ("Gemini-4-Hydrogen") beats lowercase cached "gemini-4-hydrogen".
-        fs::write(
-            &override_path,
-            r#"{"models":{"Gemini-4-Hydrogen":{"input_per_mtok":12.0,"output_per_mtok":24.0}}}"#,
-        )
-        .unwrap();
-        let cat_mixed = PricingCatalog::load_effective_with(
-            Some(&cache_dir),
-            Some(&override_path),
-            SyncMode::Offline,
-            t0 + 10,
-            DEFAULT_PRICING_TTL_SECS,
-            |_| unreachable!(),
-        );
-        let (k1, c1) = cat_mixed
-            .estimate_cost(&["gemini-4-hydrogen"], 1_000_000, 0, 0, 0)
-            .unwrap();
-        assert_eq!(k1, "Gemini-4-Hydrogen");
-        assert!((c1 - 12.0).abs() < 1e-6);
-
-        // Space-separated override ("Gemini 4 Hydrogen") also beats cached "gemini-4-hydrogen".
-        fs::write(
-            &override_path,
-            r#"{"models":{"Gemini 4 Hydrogen":{"input_per_mtok":15.0,"output_per_mtok":30.0}}}"#,
-        )
-        .unwrap();
-        let cat_sep = PricingCatalog::load_effective_with(
-            Some(&cache_dir),
-            Some(&override_path),
-            SyncMode::Offline,
-            t0 + 10,
-            DEFAULT_PRICING_TTL_SECS,
-            |_| unreachable!(),
-        );
-        let (k2, c2) = cat_sep
-            .estimate_cost(&["gemini-4-hydrogen"], 1_000_000, 0, 0, 0)
-            .unwrap();
-        assert_eq!(k2, "Gemini 4 Hydrogen");
-        assert!((c2 - 15.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn orchestrator_alias_matches_normalized_user_override() {
+    fn orchestrator_alias_matches_normalized_catalog_name() {
         let mut models = BTreeMap::new();
         models.insert(
             "Gemini 4 Carbon".to_string(),

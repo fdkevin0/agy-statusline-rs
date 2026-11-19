@@ -129,7 +129,7 @@ fn cli_stats_renders_text_no_color_and_json_in_isolated_home() {
 }
 
 #[test]
-fn cli_stats_supports_agy_home_override_and_optional_pricing_json() {
+fn cli_stats_prices_custom_agy_home_from_cache_and_ignores_legacy_rates() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let custom_cli = home.join("custom-agy-cli");
@@ -144,17 +144,17 @@ fn cli_stats_supports_agy_home_override_and_optional_pricing_json() {
     )
     .unwrap();
 
-    let out = isolated_agy_cmd(home)
+    let mut cmd = isolated_agy_cmd(home);
+    seed_alpha_rate(home);
+    let out = cmd
         .env("ANTIGRAVITY_CLI_HOME", &custom_cli)
-        .env("TZ", "CST-8")
-        .env("NO_COLOR", "1")
-        .args(["stats", "--ascii"])
+        .args(["stats", "--json"])
         .output()
         .unwrap();
     assert!(out.status.success());
-    let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.contains("Est. Cost"));
-    assert!(text.contains("Model Alpha"));
+    let report: StatsReport = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report.totals.priced_usd, 0.01);
+    assert_eq!(report.totals.unpriced_requests, 1);
 }
 
 #[test]
@@ -180,4 +180,41 @@ fn cli_stats_handles_empty_home_and_help() {
     assert!(help_out.status.success());
     let help_text = String::from_utf8(help_out.stdout).unwrap();
     assert!(help_text.contains("Usage: agy-statusline stats"));
+}
+
+fn seed_alpha_rate(home: &Path) {
+    let cache = serde_json::json!({
+        "fetched_at": unix_now_secs(),
+        "models": {"model-alpha": {"input_per_mtok": 1.0}}
+    });
+    fs::write(home.join("cache/agy-statusline/models_dev_pricing.json"), cache.to_string()).unwrap();
+}
+
+#[test]
+fn cost_widget_labels_partial_and_latest_turn_estimates() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let cli = home.join(".gemini/antigravity-cli");
+    let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
+    seed_sqlite_fixtures(&cli, 1_600_000_000, 1_600_000_000);
+    let mut cmd = isolated_agy_cmd(home);
+    cmd.arg("--full").env("NO_COLOR", "1");
+    seed_alpha_rate(home);
+    let input = home.join("payload.json");
+    let mut render = |payload: &serde_json::Value| {
+        fs::write(&input, payload.to_string()).unwrap();
+        let out = cmd.stdin(fs::File::open(&input).unwrap()).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let mut payload = serde_json::json!({
+        "model": {"id": "model-alpha"},
+        "context_window": {"current_usage": {"input_tokens": 1000000}}
+    });
+    assert!(render(&payload).contains("~$1.00 (latest turn)"));
+    payload["conversation_id"] = uuid.into();
+    assert!(render(&payload).contains("~$0.01 (1 unpriced)"));
+    let conn = Connection::open(cli.join(format!("conversations/{uuid}.db"))).unwrap();
+    conn.execute("DELETE FROM gen_metadata WHERE idx = 1", []).unwrap();
+    assert!(!render(&payload).contains('$'));
 }
