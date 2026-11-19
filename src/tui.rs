@@ -574,9 +574,7 @@ mod tests {
 
     #[test]
     fn canvas_wrapping_updates_line_y_and_pill_hit_coordinates() {
-        let mut cfg = LayoutConfig::preset_full();
-        cfg.rows[1] = vec![WidgetId::Model];
-        let state = TuiEditorState::new(cfg);
+        let state = TuiEditorState::new(LayoutConfig::preset_full());
         let area = Rect::new(0, 0, 48, 18);
         let (_lines, line_y, pills) = layout_canvas_lines(area, &state);
 

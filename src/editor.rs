@@ -539,7 +539,7 @@ mod tests {
         ed.adjust_setting_at(11, 1);
         assert!(!ed.config.responsive);
         ed.adjust_setting_at(12, 1);
-        assert!((ed.config.speed_warn_threshold - 55.0).abs() < 1e-6);
+        assert!((ed.config.speed_warn_threshold - 40.0).abs() < 1e-6);
 
         assert_eq!(ed.handle_key(KeyCode::Char('s'), KeyModifiers::NONE), ExitOutcome::SaveAndApply);
     }

@@ -8,12 +8,14 @@ use super::{CompactStage, Segment};
 const COMPACT_STAGES: &[CompactStage] = &[
     CompactStage::VcsDropDiff,
     CompactStage::VcsTruncate,
-    CompactStage::QuotaStripTrailers,
+    CompactStage::SubagentsDropLabel,
+    CompactStage::CostStripSuffix,
+    CompactStage::QuotaStripTokens,
+    CompactStage::QuotaStripReset,
     CompactStage::CtxDropLimit,
     CompactStage::CtxCollapseBar,
     CompactStage::ModelAbbreviate,
     CompactStage::ModelTruncate,
-    CompactStage::SubagentsDropLabel,
     CompactStage::AccountDropDomain,
     CompactStage::TitleTruncate,
 ];

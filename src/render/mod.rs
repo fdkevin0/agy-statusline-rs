@@ -24,12 +24,14 @@ use emit::{compute_geometry, StyleGeometry};
 enum CompactStage {
     VcsDropDiff,
     VcsTruncate,
-    QuotaStripTrailers,
+    SubagentsDropLabel,
+    CostStripSuffix,
+    QuotaStripTokens,
+    QuotaStripReset,
     CtxDropLimit,
     CtxCollapseBar,
     ModelAbbreviate,
     ModelTruncate,
-    SubagentsDropLabel,
     AccountDropDomain,
     TitleTruncate,
 }
@@ -490,8 +492,17 @@ mod tests {
         let mut narrow_out = Vec::new();
         write_statusline(&payload, &meta, &git, &narrow_cfg, &mut narrow_out).unwrap();
         let narrow_text = String::from_utf8(narrow_out).unwrap();
-        assert!(narrow_text.contains("THINKING"));
-        assert!(!narrow_text.contains("wt:feat-wt"));
+        let mut narrow_lines = narrow_text.lines();
+        let narrow_row1 = narrow_lines.next().unwrap();
+        let narrow_row2 = narrow_lines.next().unwrap();
+        assert!(narrow_lines.next().is_none());
+        assert!(narrow_row1.width() <= 40, "row1: {narrow_row1:?}");
+        assert!(narrow_row2.width() <= 40, "row2: {narrow_row2:?}");
+        assert!(narrow_row1.contains("THINKING"));
+        assert!(!narrow_row1.contains("wt:feat-wt"));
+        assert!(!narrow_row1.contains("agy-statusline"));
+        assert!(narrow_row2.contains("ctx 0.2%"));
+        assert!(!narrow_row2.contains("~$0.14"));
         assert!(!narrow_text.contains("\u{e0b0}"));
         assert!(!narrow_text.contains("\u{e0b6}"));
     }
@@ -1704,5 +1715,153 @@ mod tests {
         assert!(rendered.contains("sub 1"), "rendered: {rendered}");
         assert!(!rendered.contains("Reviewer"), "rendered: {rendered}");
         assert!(!rendered.contains('('), "unclosed paren in: {rendered}");
+    }
+
+    #[test]
+    fn cost_strip_suffix_runs_before_ctx_bar_compaction() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.bar_length = 8;
+        cfg.rows = vec![vec![WidgetId::CtxBar, WidgetId::Cost]];
+
+        let mut payload = base_compaction_payload(40);
+        payload.cost = Some(CostInfo {
+            total_usd: Some(0.42),
+            subagent_usd: Some(0.12),
+            estimated: Some(true),
+        });
+        let meta = SessionMetadata {
+            max_context_tokens: Some(512_000),
+            ..Default::default()
+        };
+
+        // Uncompacted: "ctx ████···· 50.0% (256K/512K) · ~$0.42 (sub $0.12)" (51 cols)
+        // After CostStripSuffix: "ctx ████···· 50.0% (256K/512K) · ~$0.42" (39 cols)
+        let out = render_mono(&payload, &meta, &GitInfo::default(), &cfg);
+        assert!(
+            out.contains("ctx ████···· 50.0% (256K/512K)"),
+            "out: {out:?}"
+        );
+        assert!(out.contains("~$0.42"), "out: {out:?}");
+        assert!(!out.contains("sub $0.12"), "out: {out:?}");
+        assert!(visible_line_width(&out) <= 40, "out: {out:?}");
+    }
+
+    #[test]
+    fn quota_two_step_compaction_and_subagents_label_order() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.rows = vec![vec![WidgetId::Quota5h, WidgetId::Subagents]];
+
+        let quota_5h = QuotaView {
+            label: "5h".to_string(),
+            bucket_key: "gemini-5h".to_string(),
+            window_secs: 18_000,
+            remaining_pct: 84.0,
+            remaining_amount: None,
+            reset_compact: Some("2h45m".to_string()),
+            pace_behind: false,
+            est_remaining_tokens: Some(130_000),
+        };
+        let render_at = |width: usize| {
+            let payload = StatuslinePayload {
+                subagents: Some(serde_json::json!([
+                    {"role": "Codebase Researcher", "status": "running"}
+                ])),
+                terminal_width: Some(width),
+                ..Default::default()
+            };
+            let mut out = Vec::new();
+            write_statusline_with_quotas(
+                &payload,
+                &SessionMetadata::default(),
+                &GitInfo::default(),
+                (Some(quota_5h.clone()), None),
+                CostCoverage::Session,
+                &cfg,
+                &mut out,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+
+        // Full (51 cols): "5h 84% (~130K) ↻2h45m · sub 1 (Codebase Researcher)"
+        // SubagentsDropLabel runs before QuotaStripTokens / QuotaStripReset (29 cols):
+        assert_eq!(render_at(30), "5h 84% (~130K) ↻2h45m · sub 1\n");
+        // QuotaStripTokens drops (~130K) while keeping ↻2h45m (21 cols):
+        assert_eq!(render_at(22), "5h 84% ↻2h45m · sub 1\n");
+        // QuotaStripReset drops ↻2h45m when narrower (14 cols):
+        assert_eq!(render_at(15), "5h 84% · sub 1\n");
+    }
+
+    #[test]
+    fn cache_hit_outlives_directory_on_narrow_row() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.rows = vec![vec![WidgetId::State, WidgetId::Directory, WidgetId::CacheHit]];
+
+        let payload = StatuslinePayload {
+            agent_state: Some("idle".to_string()),
+            workspace: Some(WorkspaceInfo {
+                current_dir: Some("/work/agy-statusline".to_string()),
+                project_dir: None,
+            }),
+            context_window: Some(ContextWindow {
+                current_usage: Some(JsonUsage {
+                    input_tokens: Some(200),
+                    output_tokens: None,
+                    cache_read_input_tokens: Some(800),
+                    cache_creation_input_tokens: Some(0),
+                }),
+                ..Default::default()
+            }),
+            terminal_width: Some(25),
+            ..Default::default()
+        };
+
+        // Full: "● READY · ⌂ agy-statusline · ◈ cache 80.0%" (42 cols).
+        // Even though CacheHit is rightmost, Directory (p2) drops before CacheHit (p3).
+        let out = render_mono(&payload, &SessionMetadata::default(), &GitInfo::default(), &cfg);
+        assert_eq!(out, "● READY · ◈ cache 80.0%\n");
+    }
+
+    #[test]
+    fn preset_full_fits_realistic_session_uncompacted_at_120_cols() {
+        let cfg = LayoutConfig::preset_full();
+        let payload = base_compaction_payload(120);
+        let meta = SessionMetadata {
+            speed: Some(82.0),
+            max_context_tokens: Some(512_000),
+            ..Default::default()
+        };
+        let git = GitInfo {
+            branch: Some("feat/ui".to_string()),
+            added: 12,
+            deleted: 3,
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        write_statusline(&payload, &meta, &git, &cfg, &mut out).unwrap();
+        let plain = strip_ansi_escapes::strip_str(String::from_utf8(out).unwrap());
+        let mut lines = plain.lines();
+        let row1 = lines.next().unwrap();
+        let row2 = lines.next().unwrap();
+        assert!(lines.next().is_none(), "expected 2 rows: {plain:?}");
+
+        assert!(row1.width() <= 120, "row1 width {} > 120: {row1:?}", row1.width());
+        assert!(row1.contains("THINKING"), "row1: {row1:?}");
+        assert!(row1.contains("PLAN"), "row1: {row1:?}");
+        assert!(row1.contains("Gemini 3.1 Pro Preview · high"), "row1: {row1:?}");
+        assert!(row1.contains("agy-statusline"), "row1: {row1:?}");
+        assert!(row1.contains("feat/ui* +12 -3"), "row1: {row1:?}");
+
+        assert!(row2.width() <= 120, "row2 width {} > 120: {row2:?}", row2.width());
+        assert!(row2.contains("ctx ████···· 50.0% (256K/512K)"), "row2: {row2:?}");
+        assert!(row2.contains("cache 78.1%"), "row2: {row2:?}");
+        assert!(row2.contains("82 tok/s"), "row2: {row2:?}");
+        assert!(row2.contains("~$0.42"), "row2: {row2:?}");
+        assert!(row2.contains("5h 84% ↻3h10m"), "row2: {row2:?}");
+        assert!(row2.contains("7d 92% ↻5d"), "row2: {row2:?}");
     }
 }

@@ -6,6 +6,7 @@ mod common;
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
+use unicode_width::UnicodeWidthStr;
 
 use agy_statusline::db::SessionMetadata;
 use agy_statusline::git::GitInfo;
@@ -19,7 +20,7 @@ use agy_statusline::statusline::{
     ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, StatuslinePayload, WorkspaceInfo,
 };
 
-use common::{build_gen_blob, build_step_meta_blob, visible_line_width, TestGenSpec};
+use common::{build_gen_blob, build_step_meta_blob, TestGenSpec};
 
 proptest! {
     #[test]
@@ -195,11 +196,15 @@ proptest! {
         let mut out = Vec::new();
         write_statusline(&payload, &meta, &git, &cfg, &mut out).unwrap();
         let raw = String::from_utf8(out).unwrap();
-        prop_assert_eq!(raw.lines().count(), 1);
-        let visible_w = visible_line_width(&raw);
+        prop_assert_eq!(raw.lines().count(), 2);
+        let max_visible_w = raw
+            .lines()
+            .map(|line| strip_ansi_escapes::strip_str(line).width())
+            .max()
+            .unwrap_or(0);
         prop_assert!(
-            visible_w <= term_width,
-            "visible_w={visible_w} exceeded term_width={term_width} for {:?}/{:?}/{:?}: {:?}",
+            max_visible_w <= term_width,
+            "max_visible_w={max_visible_w} exceeded term_width={term_width} for {:?}/{:?}/{:?}: {:?}",
             cfg.style,
             cfg.theme,
             cfg.glyph_mode,
