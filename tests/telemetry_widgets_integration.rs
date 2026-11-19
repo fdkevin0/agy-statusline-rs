@@ -721,7 +721,7 @@ fn agy_payload_widgets_render_and_omit_when_absent() {
     );
     assert_eq!(
         render_single(WidgetId::Vcs, &payload, GlyphMode::Ascii, ThemeStyle::Default, true, true).trim(),
-        "git: my-citc-ws*"
+        "citc: my-citc-ws*"
     );
     assert_eq!(
         render_single(WidgetId::Subagents, &payload, GlyphMode::Ascii, ThemeStyle::Default, true, true).trim(),

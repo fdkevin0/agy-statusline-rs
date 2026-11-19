@@ -373,18 +373,38 @@ fn render_widget(
                 .and_then(|v| {
                     v.branch
                         .as_deref()
-                        .map(str::trim)
+                        .map(collapse_whitespace)
                         .filter(|b| !b.is_empty())
-                        .or_else(|| v.client.as_deref().map(str::trim).filter(|c| !c.is_empty()))
+                        .or_else(|| {
+                            v.client
+                                .as_deref()
+                                .map(collapse_whitespace)
+                                .filter(|c| !c.is_empty())
+                        })
                 })
-                .or_else(|| ctx.git.branch.as_deref().filter(|b| !b.is_empty()))?;
+                .or_else(|| {
+                    ctx.git
+                        .branch
+                        .as_deref()
+                        .map(collapse_whitespace)
+                        .filter(|b| !b.is_empty())
+                })?;
             let dirty = vcs.and_then(|v| v.dirty).unwrap_or(false)
                 || ctx.git.added > 0
                 || ctx.git.deleted > 0;
-            let mut text = if dirty {
-                format!("{} {branch}*", glyphs.branch)
+            let prefix = if cfg.glyph_mode == GlyphMode::Ascii {
+                vcs.and_then(|v| v.vcs_type.as_deref())
+                    .map(collapse_whitespace)
+                    .filter(|t| !t.is_empty())
+                    .map(|t| format!("{t}:"))
+                    .unwrap_or_else(|| glyphs.branch.to_string())
             } else {
-                format!("{} {branch}", glyphs.branch)
+                glyphs.branch.to_string()
+            };
+            let mut text = if dirty {
+                format!("{prefix} {branch}*")
+            } else {
+                format!("{prefix} {branch}")
             };
             if cfg.show_git_diff && (ctx.git.added > 0 || ctx.git.deleted > 0) {
                 text.push_str(&format!(" +{} -{}", ctx.git.added, ctx.git.deleted));
@@ -706,10 +726,10 @@ fn render_widget(
             let ver = payload
                 .version
                 .as_deref()
-                .map(str::trim)
+                .map(collapse_whitespace)
                 .filter(|s| !s.is_empty())?;
             let text = if ver.starts_with('v') || ver.starts_with('V') {
-                ver.to_string()
+                ver
             } else {
                 format!("v{ver}")
             };
@@ -719,17 +739,17 @@ fn render_widget(
             let tier = payload
                 .plan_tier
                 .as_deref()
-                .map(str::trim)
+                .map(collapse_whitespace)
                 .filter(|s| !s.is_empty())?;
-            Some(Segment::plain(widget, tier.to_string(), pal.model, true))
+            Some(Segment::plain(widget, tier, pal.model, true))
         }
         WidgetId::Account => {
             let email = payload
                 .email
                 .as_deref()
-                .map(str::trim)
+                .map(collapse_whitespace)
                 .filter(|s| !s.is_empty())?;
-            Some(Segment::plain(widget, email.to_string(), pal.muted, false))
+            Some(Segment::plain(widget, email, pal.muted, false))
         }
         WidgetId::Title => {
             let raw = payload
@@ -758,15 +778,15 @@ fn render_widget(
             let prod = payload
                 .product
                 .as_deref()
-                .map(str::trim)
+                .map(collapse_whitespace)
                 .filter(|s| !s.is_empty())?;
-            Some(Segment::plain(widget, prod.to_string(), pal.muted, false))
+            Some(Segment::plain(widget, prod, pal.muted, false))
         }
         WidgetId::Session => {
             let sid = payload
                 .session_id
                 .as_deref()
-                .map(str::trim)
+                .map(collapse_whitespace)
                 .filter(|s| !s.is_empty())?;
             let short: String = sid.chars().take(8).collect();
             Some(Segment::plain(
@@ -782,11 +802,16 @@ fn render_widget(
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())?;
-            let name = Path::new(raw)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(raw);
+            let name = collapse_whitespace(
+                Path::new(raw)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(raw),
+            );
+            if name.is_empty() {
+                return None;
+            }
             Some(Segment::plain(
                 widget,
                 format!("log:{name}"),
