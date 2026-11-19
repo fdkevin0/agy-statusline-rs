@@ -11,8 +11,7 @@ use crate::calibration::calibrate_quota_views_at;
 use crate::db::{SessionMetadata, SpeedReader};
 use crate::git::{GitInfo, GitProbe};
 use crate::layout::{LayoutConfig, WidgetId};
-use crate::metrics::QuotaView;
-use crate::render::write_statusline_with_quotas;
+use crate::render::{write_statusline_with_quotas, CostCoverage};
 use crate::stats::{estimate_conversation_cost_usd, PricingCatalog, SyncMode};
 
 /// Active AI model metadata (`"model": null` before a model is selected).
@@ -405,7 +404,7 @@ pub enum PricingSource<'a> {
     Disabled,
     /// Use an explicitly provided in-memory pricing catalog.
     Catalog(&'a PricingCatalog),
-    /// Lazily load effective pricing from XDG cache + user overrides using `SyncMode`.
+    /// Load models.dev rates from the XDG cache using `SyncMode`.
     Effective(SyncMode),
 }
 
@@ -503,7 +502,7 @@ fn probe_session_and_git(
 fn estimate_payload_cost_usd(
     payload: &StatuslinePayload,
     pricing: &PricingCatalog,
-) -> Option<f64> {
+) -> Option<(f64, CostCoverage)> {
     let model = payload.model.as_ref()?;
     let mut candidates = Vec::with_capacity(2);
     if let Some(id) = model.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -528,7 +527,7 @@ fn estimate_payload_cost_usd(
         if inp > 0 || out > 0 {
             return pricing
                 .estimate_cost(&candidates, inp, 0, 0, out)
-                .map(|(_, usd)| usd);
+                .map(|(_, usd)| (usd, CostCoverage::Session));
         }
     }
 
@@ -542,7 +541,7 @@ fn estimate_payload_cost_usd(
     }
     pricing
         .estimate_cost(&candidates, inp, cache_read, cache_write, out)
-        .map(|(_, usd)| usd)
+        .map(|(_, usd)| (usd, CostCoverage::LatestTurn))
 }
 
 /// Parses `input` JSON and writes the statusline according to `runtime` and `cfg`.
@@ -589,17 +588,22 @@ pub fn process_statusline<W: Write>(
         probe_session_and_git(&payload, runtime.reader, runtime.git_probe, cfg);
     let needs_cost = cfg.rows.iter().flatten().any(|w| matches!(w, WidgetId::Cost))
         && payload.cost.as_ref().and_then(|c| c.total_usd).is_none();
+    let mut coverage = CostCoverage::Session;
     if needs_cost {
-        let estimate_with = |pricing: &PricingCatalog| {
-            payload
-                .conversation_id
-                .as_deref()
-                .and_then(|cid| {
-                    runtime
-                        .agy_cli_dir
-                        .and_then(|cli_dir| estimate_conversation_cost_usd(cli_dir, cid, pricing))
-                })
-                .or_else(|| estimate_payload_cost_usd(&payload, pricing))
+        let mut estimate_with = |pricing: &PricingCatalog| {
+            if let Some(cost) = payload.conversation_id.as_deref().and_then(|cid| {
+                runtime
+                    .agy_cli_dir
+                    .and_then(|dir| estimate_conversation_cost_usd(dir, cid, pricing))
+            }) {
+                if cost.unpriced_turns > 0 {
+                    coverage = CostCoverage::Partial(cost.unpriced_turns);
+                }
+                return cost.usd;
+            }
+            let (usd, source) = estimate_payload_cost_usd(&payload, pricing)?;
+            coverage = source;
+            Some(usd)
         };
         meta.estimated_cost_usd = match runtime.pricing {
             PricingSource::Disabled => None,
@@ -610,9 +614,8 @@ pub fn process_statusline<W: Write>(
             }
         };
     }
-    let (quota_5h, quota_weekly): (Option<QuotaView>, Option<QuotaView>) =
-        calibrate_quota_views_at(&payload, runtime.calibration_dir, runtime.now_unix_secs);
-    write_statusline_with_quotas(&payload, &meta, &git_info, quota_5h, quota_weekly, cfg, out)
+    let quotas = calibrate_quota_views_at(&payload, runtime.calibration_dir, runtime.now_unix_secs);
+    write_statusline_with_quotas(&payload, &meta, &git_info, quotas, coverage, cfg, out)
 }
 
 #[cfg(test)]

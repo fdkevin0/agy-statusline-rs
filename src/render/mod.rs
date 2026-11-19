@@ -114,6 +114,13 @@ impl<'a> Renderer<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CostCoverage {
+    Session,
+    Partial(u64),
+    LatestTurn,
+}
+
 struct RenderContext<'a> {
     cache: Option<(f64, u64)>,
     used_pct: f64,
@@ -123,6 +130,7 @@ struct RenderContext<'a> {
     ttft_secs: Option<f64>,
     thinking_tokens: Option<u64>,
     estimated_cost_usd: Option<f64>,
+    cost_coverage: CostCoverage,
     quota_5h: Option<QuotaView>,
     quota_weekly: Option<QuotaView>,
     git: &'a GitInfo,
@@ -133,8 +141,8 @@ impl<'a> RenderContext<'a> {
         payload: &StatuslinePayload,
         meta: &SessionMetadata,
         git: &'a GitInfo,
-        quota_5h: Option<QuotaView>,
-        quota_weekly: Option<QuotaView>,
+        (quota_5h, quota_weekly): (Option<QuotaView>, Option<QuotaView>),
+        cost_coverage: CostCoverage,
         cfg: &LayoutConfig,
     ) -> Self {
         let cache = valid_cache_usage(payload);
@@ -170,6 +178,7 @@ impl<'a> RenderContext<'a> {
             ttft_secs: meta.ttft_secs,
             thinking_tokens: meta.thinking_tokens,
             estimated_cost_usd: meta.estimated_cost_usd,
+            cost_coverage,
             quota_5h,
             quota_weekly,
             git,
@@ -228,8 +237,8 @@ pub fn write_statusline<W: IoWrite>(
         payload,
         meta,
         git,
-        quota_5h.map(|(v, _)| v),
-        quota_weekly.map(|(v, _)| v),
+        (quota_5h.map(|(v, _)| v), quota_weekly.map(|(v, _)| v)),
+        CostCoverage::Session,
         cfg,
         out,
     )
@@ -240,13 +249,13 @@ pub(crate) fn write_statusline_with_quotas<W: IoWrite>(
     payload: &StatuslinePayload,
     meta: &SessionMetadata,
     git: &GitInfo,
-    quota_5h: Option<QuotaView>,
-    quota_weekly: Option<QuotaView>,
+    quotas: (Option<QuotaView>, Option<QuotaView>),
+    cost_coverage: CostCoverage,
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
     let renderer = Renderer::new(cfg);
-    let ctx = RenderContext::build(payload, meta, git, quota_5h, quota_weekly, cfg);
+    let ctx = RenderContext::build(payload, meta, git, quotas, cost_coverage, cfg);
     let max_width = cfg.responsive.then_some(payload.terminal_width).flatten();
 
     for row in &cfg.rows {

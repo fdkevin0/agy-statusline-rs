@@ -11,7 +11,7 @@ use crate::statusline::StatuslinePayload;
 use crate::theme::Palette;
 
 use super::fit::truncate_to_width;
-use super::{build_progress_bar_with_chars, CompactStage, RenderContext, Renderer, Segment};
+use super::{build_progress_bar_with_chars, CompactStage, CostCoverage, RenderContext, Renderer, Segment};
 
 impl Renderer<'_> {
     pub(super) fn render_widget(
@@ -551,7 +551,12 @@ impl Renderer<'_> {
                 let usd = ctx
                     .estimated_cost_usd
                     .filter(|v| v.is_finite() && *v >= 0.0)?;
-                Some(Segment::plain(widget, format!("~${usd:.2}"), pal.cost, false))
+                let text = match ctx.cost_coverage {
+                    CostCoverage::Session => format!("~${usd:.2}"),
+                    CostCoverage::Partial(n) => format!("~${usd:.2} ({n} unpriced)"),
+                    CostCoverage::LatestTurn => format!("~${usd:.2} (latest turn)"),
+                };
+                Some(Segment::plain(widget, text, pal.cost, false))
             }
             _ => None,
         }
