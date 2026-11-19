@@ -13,7 +13,8 @@ use super::tz::TimeZoneSpec;
 use super::SqliteStats;
 use crate::db::{compute_median, is_valid_uuid, open_readonly_db, resolve_conversation_db_path};
 use crate::protobuf::{
-    extract_gen_metadata_record, extract_step_created_at_secs, is_sane_decode_speed, MAX_TTFT_SECS,
+    extract_gen_metadata_record, extract_step_created_at_secs, is_sane_decode_speed,
+    GenMetadataRecord, MAX_TTFT_SECS,
 };
 use crate::timeutil::parse_rfc3339_unix_secs;
 
@@ -642,7 +643,7 @@ fn scan_single_sqlite_db(
             .saturating_add(rec.cache_read_tokens)
             .saturating_add(rec.cache_write_tokens)
             .saturating_add(rec.output_tokens);
-        if total_tokens == 0 {
+        if !has_billable_usage(&rec) {
             continue;
         }
 
@@ -807,6 +808,14 @@ pub(super) fn scan_sqlite_conversations(
     (stats, events, covered)
 }
 
+fn has_billable_usage(rec: &GenMetadataRecord) -> bool {
+    rec.input_tokens > 0
+        || rec.output_tokens > 0
+        || rec.cache_read_tokens > 0
+        || rec.cache_write_tokens > 0
+        || rec.model_cost_usd.is_some()
+}
+
 pub(crate) struct ConversationCost {
     pub(crate) usd: Option<f64>,
     pub(crate) unpriced_turns: u64,
@@ -835,12 +844,7 @@ pub(crate) fn estimate_conversation_cost_usd(
         let Some(rec) = extract_gen_metadata_record(blob) else {
             continue;
         };
-        if rec.input_tokens == 0
-            && rec.output_tokens == 0
-            && rec.cache_read_tokens == 0
-            && rec.cache_write_tokens == 0
-            && rec.model_cost_usd.is_none()
-        {
+        if !has_billable_usage(&rec) {
             continue;
         }
         let model_group = derive_model_name(

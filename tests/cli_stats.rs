@@ -140,7 +140,7 @@ fn cli_stats_prices_custom_agy_home_from_cache_and_ignores_legacy_rates() {
     fs::create_dir_all(pricing_file.parent().unwrap()).unwrap();
     fs::write(
         &pricing_file,
-        r#"{"models":{"model-alpha":{"input_per_mtok":2.0,"cache_read_per_mtok":0.2,"output_per_mtok":10.0}}}"#,
+        r#"{"models":{"model-alpha":{"input_per_mtok":2.0,"cache_read_per_mtok":0.2,"output_per_mtok":10.0},"model-beta":{"input_per_mtok":5.0,"output_per_mtok":20.0}}}"#,
     )
     .unwrap();
 

@@ -83,31 +83,12 @@ struct IndexedEntry {
     rate: ModelPricingRate,
 }
 
-#[derive(Deserialize)]
-struct RawPricingCatalog {
-    #[serde(default)]
-    models: BTreeMap<String, ModelPricingRate>,
-}
-
 /// Indexed model pricing catalog.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(from = "RawPricingCatalog")]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PricingCatalog {
-    /// Map of case-insensitive model name or substring pattern to per-million-token rates.
-    #[serde(default)]
-    models: BTreeMap<String, ModelPricingRate>,
-    #[serde(skip)]
     entries: Vec<IndexedEntry>,
-    #[serde(skip)]
     exact_raw: HashMap<String, usize>,
-    #[serde(skip)]
     exact_norm: HashMap<String, usize>,
-}
-
-impl From<RawPricingCatalog> for PricingCatalog {
-    fn from(raw: RawPricingCatalog) -> Self {
-        Self::from_models(raw.models)
-    }
 }
 
 impl PricingCatalog {
@@ -117,8 +98,8 @@ impl PricingCatalog {
         let mut exact_raw: HashMap<String, usize> = HashMap::with_capacity(models.len());
         let mut exact_norm: HashMap<String, usize> = HashMap::with_capacity(models.len());
 
-        for (pattern, rate) in &models {
-            if !is_valid_rate(rate) {
+        for (pattern, rate) in models {
+            if !is_valid_rate(&rate) {
                 continue;
             }
             let pat_lower = pattern.trim().to_ascii_lowercase();
@@ -128,10 +109,10 @@ impl PricingCatalog {
             let pat_norm = normalize_model_key(&pat_lower);
             let idx = entries.len();
             entries.push(IndexedEntry {
-                key: pattern.clone(),
+                key: pattern,
                 pat_lower: pat_lower.clone(),
                 pat_norm: pat_norm.clone(),
-                rate: rate.clone(),
+                rate,
             });
             exact_raw.entry(pat_lower).or_insert(idx);
             if !pat_norm.is_empty() {
@@ -140,7 +121,6 @@ impl PricingCatalog {
         }
 
         Self {
-            models,
             entries,
             exact_raw,
             exact_norm,
@@ -284,27 +264,38 @@ impl PricingCatalog {
     }
 
     fn resolve_orchestrator_alias(&self, candidates: &[(String, String)]) -> Option<&IndexedEntry> {
-        candidates.iter().find_map(|(_, norm)| {
-            let has_orch = norm.split_whitespace().any(|w| w == "orchestrator");
-            if !has_orch {
-                return None;
-            }
-            let (target_raw, target_norm) = if norm.split_whitespace().any(|w| w == "argon")
-                || norm == "gemini pro orchestrator g1 pro"
-            {
-                ("gemini-4-argon", "gemini 4 argon")
-            } else if norm.split_whitespace().any(|w| w == "carbon")
-                || norm == "gemini pro orchestrator"
-            {
-                ("gemini-4-carbon", "gemini 4 carbon")
-            } else {
-                return None;
-            };
+        let lookup = |raw: &str, norm: &str| {
             self.exact_raw
-                .get(target_raw)
-                .or_else(|| self.exact_norm.get(target_norm))
+                .get(raw)
+                .or_else(|| self.exact_norm.get(norm))
                 .map(|&idx| &self.entries[idx])
-        })
+        };
+
+        // Prefer explicit Argon/Carbon qualifiers across all candidates before falling back
+        // to the bare `gemini-pro-orchestrator` alias.
+        candidates
+            .iter()
+            .find_map(|(_, norm)| {
+                if !norm.split_whitespace().any(|w| w == "orchestrator") {
+                    return None;
+                }
+                if norm.split_whitespace().any(|w| w == "argon")
+                    || norm == "gemini pro orchestrator g1 pro"
+                {
+                    lookup("gemini-4-argon", "gemini 4 argon")
+                } else if norm.split_whitespace().any(|w| w == "carbon") {
+                    lookup("gemini-4-carbon", "gemini 4 carbon")
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                candidates.iter().find_map(|(_, norm)| {
+                    (norm == "gemini pro orchestrator")
+                        .then(|| lookup("gemini-4-carbon", "gemini 4 carbon"))
+                        .flatten()
+                })
+            })
     }
 }
 
@@ -777,7 +768,11 @@ mod tests {
         );
         assert_eq!(fetch_calls, 1);
         // Canonical provider (`google`) takes precedence over `reseller`.
-        assert_eq!(cat1.models["gemini-4-hydrogen"].input_per_mtok, 1.5);
+        let (h_key, h_usd) = cat1
+            .estimate_cost(&["gemini-4-hydrogen"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(h_key, "gemini-4-hydrogen");
+        assert!((h_usd - 1.5).abs() < 1e-6);
 
         // Separator-normalized matching (`Claude Opus 5.5` -> `claude-opus-5-5`, `Gemini 4 Carbon (High)` -> `gemini-4-carbon`).
         let (_, opus_usd) = cat1
@@ -825,8 +820,16 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_alias_skips_missing_rate_and_matches_normalized_catalog_name() {
+    fn orchestrator_alias_prefers_explicit_qualifier_and_matches_normalized_catalog_name() {
         let mut models = BTreeMap::new();
+        models.insert(
+            "gemini-4-carbon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 2.0,
+                output_per_mtok: 10.0,
+                ..Default::default()
+            },
+        );
         models.insert(
             "Gemini 4 Argon".to_string(),
             ModelPricingRate {
@@ -837,6 +840,8 @@ mod tests {
         );
         let catalog = PricingCatalog::from_models(models);
 
+        // Even when `gemini-4-carbon` is present, an explicit Argon display name wins over
+        // the bare `gemini-pro-orchestrator` ID.
         let (matched_key, usd) = catalog
             .estimate_cost(
                 &["gemini-pro-orchestrator", "Orchestrator (Argon)"],
@@ -848,5 +853,12 @@ mod tests {
             .unwrap();
         assert_eq!(matched_key, "Gemini 4 Argon");
         assert!((usd - 7.5).abs() < 1e-6);
+
+        // Without an explicit Argon qualifier, bare `gemini-pro-orchestrator` still resolves to Carbon.
+        let (carbon_key, carbon_usd) = catalog
+            .estimate_cost(&["gemini-pro-orchestrator"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(carbon_key, "gemini-4-carbon");
+        assert!((carbon_usd - 2.0).abs() < 1e-6);
     }
 }
