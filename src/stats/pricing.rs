@@ -284,28 +284,27 @@ impl PricingCatalog {
     }
 
     fn resolve_orchestrator_alias(&self, candidates: &[(String, String)]) -> Option<&IndexedEntry> {
-        let (target_raw, target_norm) = candidates.iter().find_map(|(_, norm)| {
+        candidates.iter().find_map(|(_, norm)| {
             let has_orch = norm.split_whitespace().any(|w| w == "orchestrator");
             if !has_orch {
                 return None;
             }
-            if norm.split_whitespace().any(|w| w == "argon")
+            let (target_raw, target_norm) = if norm.split_whitespace().any(|w| w == "argon")
                 || norm == "gemini pro orchestrator g1 pro"
             {
-                Some(("gemini-4-argon", "gemini 4 argon"))
+                ("gemini-4-argon", "gemini 4 argon")
             } else if norm.split_whitespace().any(|w| w == "carbon")
                 || norm == "gemini pro orchestrator"
             {
-                Some(("gemini-4-carbon", "gemini 4 carbon"))
+                ("gemini-4-carbon", "gemini 4 carbon")
             } else {
-                None
-            }
-        })?;
-
-        self.exact_raw
-            .get(target_raw)
-            .or_else(|| self.exact_norm.get(target_norm))
-            .map(|&idx| &self.entries[idx])
+                return None;
+            };
+            self.exact_raw
+                .get(target_raw)
+                .or_else(|| self.exact_norm.get(target_norm))
+                .map(|&idx| &self.entries[idx])
+        })
     }
 }
 
@@ -826,10 +825,10 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_alias_matches_normalized_catalog_name() {
+    fn orchestrator_alias_skips_missing_rate_and_matches_normalized_catalog_name() {
         let mut models = BTreeMap::new();
         models.insert(
-            "Gemini 4 Carbon".to_string(),
+            "Gemini 4 Argon".to_string(),
             ModelPricingRate {
                 input_per_mtok: 7.5,
                 output_per_mtok: 15.0,
@@ -840,14 +839,14 @@ mod tests {
 
         let (matched_key, usd) = catalog
             .estimate_cost(
-                &["gemini-pro-orchestrator", "Orchestrator (Carbon)"],
+                &["gemini-pro-orchestrator", "Orchestrator (Argon)"],
                 1_000_000,
                 0,
                 0,
                 0,
             )
             .unwrap();
-        assert_eq!(matched_key, "Gemini 4 Carbon");
+        assert_eq!(matched_key, "Gemini 4 Argon");
         assert!((usd - 7.5).abs() < 1e-6);
     }
 }
