@@ -334,7 +334,14 @@ fn calibrate_resolved(
         }
         let prev = store.buckets.get(&view.bucket_key).cloned();
         let entry = store.buckets.entry(view.bucket_key.clone()).or_default();
-        let view = calibrate_bucket(entry, view, reset_at, conv_id, session_tokens, now_unix_secs);
+        let view = calibrate_bucket(
+            entry,
+            view,
+            reset_at,
+            conv_id,
+            session_tokens,
+            now_unix_secs,
+        );
         if bucket_state_changed(prev.as_ref(), entry) {
             entry.updated_at_secs = now_unix_secs;
             changed = true;
@@ -600,6 +607,24 @@ mod tests {
         assert_eq!(after_raw, before_raw);
         let reloaded = load_calibration_store(&dir);
         assert_eq!(reloaded.buckets["acme-5h"].updated_at_secs, t0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_calibration_store_returns_would_block_when_lock_held() {
+        let dir = temp_cache_dir("save_would_block");
+        let lock = try_lock_calibration(&dir).expect("acquire calibration lock");
+
+        let err = save_calibration_store(&dir, &CalibrationStore::default())
+            .expect_err("contended save should fail");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(!dir.join(CACHE_FILENAME).exists());
+
+        drop(lock);
+        save_calibration_store(&dir, &CalibrationStore::default())
+            .expect("save should succeed after lock release");
+        assert!(dir.join(CACHE_FILENAME).is_file());
 
         let _ = fs::remove_dir_all(&dir);
     }
