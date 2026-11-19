@@ -24,7 +24,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::ansi::ansi_to_ratatui_lines;
 use crate::apply::{apply_statusline_config, resolve_invoked_binary_path};
 use crate::db::SessionMetadata;
-use crate::editor::{ActivePane, ExitOutcome, TuiEditorState};
+use crate::editor::{ActivePane, ExitOutcome, SettingField, TuiEditorState};
 use crate::git::GitInfo;
 use crate::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
 use crate::paths::agy_settings_path;
@@ -602,34 +602,36 @@ fn draw_catalog_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState) 
     offset
 }
 
-fn draw_settings_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState) -> usize {
-    let active = state.active_pane == ActivePane::Settings;
+fn setting_row(state: &TuiEditorState, field: SettingField) -> (&'static str, String) {
     let cfg = &state.config;
-    let base_preset = match state.preset_idx {
-        0 => "Full Dashboard",
-        1 => "Powerline Pro",
-        2 => "Minimal 1-Line",
-        _ => "Metrics Addon",
-    };
-    let preset_name = if state.is_custom_preset() {
-        format!("{base_preset}*")
-    } else {
-        base_preset.to_string()
-    };
-    let rows = [
-        ("Preset", preset_name),
-        ("Style", cfg.style.name().to_string()),
-        ("Theme", cfg.theme.name().to_string()),
-        ("Separator", cfg.separator.name().to_string()),
-        ("Speed mode", cfg.speed_mode.name().to_string()),
-        (
+    match field {
+        SettingField::Preset => {
+            let base = state.preset.display_name();
+            let val = if state.is_custom_preset() {
+                format!("{base}*")
+            } else {
+                base.to_string()
+            };
+            ("Preset", val)
+        }
+        SettingField::Style => ("Style", cfg.style.name().to_string()),
+        SettingField::Theme => ("Theme", cfg.theme.name().to_string()),
+        SettingField::Separator => ("Separator", cfg.separator.name().to_string()),
+        SettingField::SpeedMode => ("Speed mode", cfg.speed_mode.name().to_string()),
+        SettingField::CtxMode => (
             "Ctx mode",
             if cfg.ctx_remaining { "Remaining %" } else { "Used %" }.to_string(),
         ),
-        ("Smart hide", if cfg.smart_hide { "ON" } else { "OFF" }.to_string()),
-        ("Git diff", if cfg.show_git_diff { "ON" } else { "OFF" }.to_string()),
-        ("Bar width", format!("{} cols", cfg.bar_length)),
-        (
+        SettingField::SmartHide => (
+            "Smart hide",
+            if cfg.smart_hide { "ON" } else { "OFF" }.to_string(),
+        ),
+        SettingField::GitDiff => (
+            "Git diff",
+            if cfg.show_git_diff { "ON" } else { "OFF" }.to_string(),
+        ),
+        SettingField::BarWidth => ("Bar width", format!("{} cols", cfg.bar_length)),
+        SettingField::AgyMode => (
             "AGY mode",
             if cfg.stack_with_default {
                 "Stack Below"
@@ -638,19 +640,29 @@ fn draw_settings_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState)
             }
             .to_string(),
         ),
-        ("Glyphs", cfg.glyph_mode.name().to_string()),
-        ("Responsive", if cfg.responsive { "ON" } else { "OFF" }.to_string()),
-        ("Speed warn", format!("{:.0} tok/s", cfg.speed_warn_threshold)),
-    ];
+        SettingField::Glyphs => ("Glyphs", cfg.glyph_mode.name().to_string()),
+        SettingField::Responsive => (
+            "Responsive",
+            if cfg.responsive { "ON" } else { "OFF" }.to_string(),
+        ),
+        SettingField::SpeedWarn => (
+            "Speed warn",
+            format!("{:.0} tok/s", cfg.speed_warn_threshold),
+        ),
+    }
+}
 
+fn draw_settings_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState) -> usize {
+    let active = state.active_pane == ActivePane::Settings;
     let inner_h = usize::from(area.height.saturating_sub(2)).max(1);
     let offset = state.settings_idx.saturating_sub(inner_h.saturating_sub(1));
-    let lines: Vec<Line<'static>> = rows
+    let lines: Vec<Line<'static>> = SettingField::ALL
         .iter()
         .enumerate()
         .skip(offset)
         .take(inner_h)
-        .map(|(idx, (k, v))| {
+        .map(|(idx, &field)| {
+            let (k, v) = setting_row(state, field);
             let is_cur = active && idx == state.settings_idx;
             if is_cur {
                 Line::styled(
@@ -662,7 +674,7 @@ fn draw_settings_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState)
             } else {
                 Line::from(vec![
                     Span::styled(format!("  {k:<10} "), Style::default().fg(Color::Gray)),
-                    Span::styled(v.clone(), Style::default().fg(Color::Yellow)),
+                    Span::styled(v, Style::default().fg(Color::Yellow)),
                 ])
             }
         })

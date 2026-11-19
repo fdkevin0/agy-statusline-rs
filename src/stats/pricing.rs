@@ -1,9 +1,9 @@
 //! Model token pricing catalog (`pricing.json` + TTL-cached `models.dev` sync).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -77,15 +77,130 @@ pub struct PricingCacheStatus {
     pub ttl_secs: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct IndexedEntry {
+    key: String,
+    pat_lower: String,
+    pat_norm: String,
+    rate: ModelPricingRate,
+    is_user_override: bool,
+}
+
+#[derive(Deserialize)]
+struct RawPricingCatalog {
+    #[serde(default)]
+    models: BTreeMap<String, ModelPricingRate>,
+}
+
 /// Optional user-defined and cached pricing catalog.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "RawPricingCatalog")]
 pub struct PricingCatalog {
     /// Map of case-insensitive model name or substring pattern to per-million-token rates.
     #[serde(default)]
     pub models: BTreeMap<String, ModelPricingRate>,
+    #[serde(skip)]
+    entries: Vec<IndexedEntry>,
+    #[serde(skip)]
+    exact_raw: HashMap<String, usize>,
+    #[serde(skip)]
+    exact_norm: HashMap<String, usize>,
+}
+
+impl From<RawPricingCatalog> for PricingCatalog {
+    fn from(raw: RawPricingCatalog) -> Self {
+        Self::from_models(raw.models)
+    }
 }
 
 impl PricingCatalog {
+    /// Builds a pre-indexed [`PricingCatalog`] from a map of model patterns to rates.
+    pub fn from_models(models: BTreeMap<String, ModelPricingRate>) -> Self {
+        Self::from_layers(BTreeMap::new(), models)
+    }
+
+    fn from_layers(
+        cached: BTreeMap<String, ModelPricingRate>,
+        user_overrides: BTreeMap<String, ModelPricingRate>,
+    ) -> Self {
+        let mut override_raw = HashSet::new();
+        let mut override_norm = HashSet::new();
+        let mut user_keys = HashSet::with_capacity(user_overrides.len());
+
+        for (pattern, rate) in &user_overrides {
+            user_keys.insert(pattern.clone());
+            if !is_valid_rate(rate) {
+                continue;
+            }
+            let pat_lower = pattern.trim().to_ascii_lowercase();
+            if pat_lower.is_empty() {
+                continue;
+            }
+            let pat_norm = normalize_model_key(&pat_lower);
+            override_raw.insert(pat_lower);
+            if !pat_norm.is_empty() {
+                override_norm.insert(pat_norm);
+            }
+        }
+
+        let mut merged = BTreeMap::new();
+        for (pattern, rate) in cached {
+            let pat_lower = pattern.trim().to_ascii_lowercase();
+            let pat_norm = normalize_model_key(&pat_lower);
+            let shadowed = override_raw.contains(&pat_lower)
+                || (!pat_norm.is_empty() && override_norm.contains(&pat_norm));
+            if !shadowed {
+                merged.insert(pattern, rate);
+            }
+        }
+        merged.extend(user_overrides);
+
+        let mut entries = Vec::with_capacity(merged.len());
+        let mut exact_raw: HashMap<String, usize> = HashMap::with_capacity(merged.len());
+        let mut exact_norm: HashMap<String, usize> = HashMap::with_capacity(merged.len());
+
+        for (pattern, rate) in &merged {
+            if !is_valid_rate(rate) {
+                continue;
+            }
+            let pat_lower = pattern.trim().to_ascii_lowercase();
+            if pat_lower.is_empty() {
+                continue;
+            }
+            let pat_norm = normalize_model_key(&pat_lower);
+            let is_user_override = user_keys.contains(pattern);
+            let idx = entries.len();
+            entries.push(IndexedEntry {
+                key: pattern.clone(),
+                pat_lower: pat_lower.clone(),
+                pat_norm: pat_norm.clone(),
+                rate: rate.clone(),
+                is_user_override,
+            });
+            exact_raw.entry(pat_lower).or_insert(idx);
+            if !pat_norm.is_empty() {
+                exact_norm.entry(pat_norm).or_insert(idx);
+            }
+        }
+
+        Self {
+            models: merged,
+            entries,
+            exact_raw,
+            exact_norm,
+        }
+    }
+
+    /// Returns `true` when the catalog contains no model entries.
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty()
+    }
+
+    /// Returns the number of model entries in the catalog.
+    pub fn len(&self) -> usize {
+        self.models.len()
+    }
+
     /// Loads a [`PricingCatalog`] from `path`, returning an empty catalog if missing or invalid.
     pub fn load_from_file(path: &Path) -> Self {
         let Ok(raw) = fs::read_to_string(path) else {
@@ -120,7 +235,7 @@ impl PricingCatalog {
     where
         F: FnOnce(&str) -> io::Result<String>,
     {
-        let mut merged = BTreeMap::new();
+        let mut cached_models = BTreeMap::new();
 
         if let Some(dir) = cache_dir {
             let cache_path = dir.join(MODELS_DEV_CACHE_FILE);
@@ -158,18 +273,15 @@ impl PricingCatalog {
             };
 
             if let Some(c) = active_cache {
-                merged.extend(c.models);
+                cached_models = c.models;
             }
         }
 
-        if let Some(path) = override_path {
-            let user_cfg = Self::load_from_file(path);
-            for (k, v) in user_cfg.models {
-                merged.insert(k, v);
-            }
-        }
+        let user_overrides = override_path
+            .map(|path| Self::load_from_file(path).models)
+            .unwrap_or_default();
 
-        Self { models: merged }
+        Self::from_layers(cached_models, user_overrides)
     }
 
     /// Estimates USD cost for one turn if any candidate model string matches a valid entry.
@@ -181,7 +293,7 @@ impl PricingCatalog {
         cache_write_tokens: u64,
         output_tokens: u64,
     ) -> Option<(String, f64)> {
-        if self.models.is_empty() {
+        if self.entries.is_empty() {
             return None;
         }
         let lowered_candidates: Vec<(String, String)> = candidates
@@ -197,103 +309,85 @@ impl PricingCatalog {
             return None;
         }
 
-        let valid_entries: Vec<(&str, String, String, &ModelPricingRate)> = self
-            .models
-            .iter()
-            .filter(|(_, rate)| is_valid_rate(rate))
-            .filter_map(|(pattern, rate)| {
-                let pat_lower = pattern.trim().to_ascii_lowercase();
-                if pat_lower.is_empty() {
-                    return None;
-                }
-                let pat_norm = normalize_model_key(&pat_lower);
-                Some((pattern.as_str(), pat_lower, pat_norm, rate))
-            })
-            .collect();
-
-        // 1. Exact matches (raw lowercase, then separator-normalized) in candidate specificity order.
-        let mut exact_match: Option<(&str, &ModelPricingRate)> = None;
+        // 1. O(1) exact matches (raw lowercase, then separator-normalized) in candidate specificity order.
+        let mut matched: Option<&IndexedEntry> = None;
         for (cand_raw, cand_norm) in &lowered_candidates {
-            if let Some((key, _, _, rate)) = valid_entries
-                .iter()
-                .find(|(_, pat_raw, pat_norm, _)| pat_raw == cand_raw || (!cand_norm.is_empty() && pat_norm == cand_norm))
-            {
-                exact_match = Some((*key, *rate));
+            if let Some(&idx) = self.exact_raw.get(cand_raw.as_str()).or_else(|| {
+                (!cand_norm.is_empty())
+                    .then(|| self.exact_norm.get(cand_norm.as_str()))
+                    .flatten()
+            }) {
+                matched = Some(&self.entries[idx]);
                 break;
             }
         }
 
-        // 2. Substring fallback (raw or separator-normalized) prefers the longest pattern match.
-        let mut substr_match: Option<(usize, &str, &ModelPricingRate)> = None;
-        if exact_match.is_none() {
-            for (pattern, pat_lower, pat_norm, rate) in &valid_entries {
-                let matched = lowered_candidates.iter().any(|(cand_raw, cand_norm)| {
-                    cand_raw.contains(pat_lower.as_str())
-                        || (!pat_norm.is_empty() && cand_norm.contains(pat_norm.as_str()))
+        // 2. Zero-allocation substring fallback prefers the longest match, then user overrides, then key order.
+        if matched.is_none() {
+            let mut best: Option<(usize, &IndexedEntry)> = None;
+            for entry in &self.entries {
+                let is_match = lowered_candidates.iter().any(|(cand_raw, cand_norm)| {
+                    cand_raw.contains(entry.pat_lower.as_str())
+                        || (!entry.pat_norm.is_empty()
+                            && cand_norm.contains(entry.pat_norm.as_str()))
                 });
-                if matched {
-                    let match_len = pat_lower.len().max(pat_norm.len());
-                    let replace = match substr_match {
+                if is_match {
+                    let match_len = entry.pat_lower.len().max(entry.pat_norm.len());
+                    let replace = match best {
                         None => true,
-                        Some((best_len, best_key, _)) => {
+                        Some((best_len, best_entry)) => {
                             match_len > best_len
-                                || (match_len == best_len && *pattern < best_key)
+                                || (match_len == best_len
+                                    && ((entry.is_user_override && !best_entry.is_user_override)
+                                        || (entry.is_user_override == best_entry.is_user_override
+                                            && entry.key < best_entry.key)))
                         }
                     };
                     if replace {
-                        substr_match = Some((match_len, *pattern, *rate));
+                        best = Some((match_len, entry));
                     }
                 }
             }
+            matched = best.map(|(_, e)| e);
         }
 
-        let alias_match = if exact_match.is_none() && substr_match.is_none() {
-            resolve_orchestrator_alias(&lowered_candidates, &valid_entries)
-        } else {
-            None
-        };
-
-        let (matched_key, rate) = exact_match
-            .or_else(|| substr_match.map(|(_, k, r)| (k, r)))
-            .or(alias_match)?;
-        let cost = ((input_tokens as f64) * rate.input_per_mtok
-            + (cache_read_tokens as f64) * rate.cache_read_per_mtok
-            + (cache_write_tokens as f64) * rate.cache_write_per_mtok
-            + (output_tokens as f64) * rate.output_per_mtok)
+        // 3. Orchestrator alias fallback.
+        let entry = matched.or_else(|| self.resolve_orchestrator_alias(&lowered_candidates))?;
+        let cost = ((input_tokens as f64) * entry.rate.input_per_mtok
+            + (cache_read_tokens as f64) * entry.rate.cache_read_per_mtok
+            + (cache_write_tokens as f64) * entry.rate.cache_write_per_mtok
+            + (output_tokens as f64) * entry.rate.output_per_mtok)
             / 1_000_000.0;
         if !cost.is_finite() || cost < 0.0 {
             return None;
         }
-        Some((matched_key.to_string(), round_usd_6(cost)))
+        Some((entry.key.clone(), round_usd_6(cost)))
     }
-}
 
-fn resolve_orchestrator_alias<'a>(
-    candidates: &[(String, String)],
-    valid_entries: &[(&'a str, String, String, &'a ModelPricingRate)],
-) -> Option<(&'a str, &'a ModelPricingRate)> {
-    let target = candidates.iter().find_map(|(_, norm)| {
-        let has_orch = norm.split_whitespace().any(|w| w == "orchestrator");
-        if !has_orch {
-            return None;
-        }
-        if norm.split_whitespace().any(|w| w == "argon")
-            || norm == "gemini pro orchestrator g1 pro"
-        {
-            Some("gemini-4-argon")
-        } else if norm.split_whitespace().any(|w| w == "carbon")
-            || norm == "gemini pro orchestrator"
-        {
-            Some("gemini-4-carbon")
-        } else {
-            None
-        }
-    })?;
+    fn resolve_orchestrator_alias(&self, candidates: &[(String, String)]) -> Option<&IndexedEntry> {
+        let (target_raw, target_norm) = candidates.iter().find_map(|(_, norm)| {
+            let has_orch = norm.split_whitespace().any(|w| w == "orchestrator");
+            if !has_orch {
+                return None;
+            }
+            if norm.split_whitespace().any(|w| w == "argon")
+                || norm == "gemini pro orchestrator g1 pro"
+            {
+                Some(("gemini-4-argon", "gemini 4 argon"))
+            } else if norm.split_whitespace().any(|w| w == "carbon")
+                || norm == "gemini pro orchestrator"
+            {
+                Some(("gemini-4-carbon", "gemini 4 carbon"))
+            } else {
+                None
+            }
+        })?;
 
-    valid_entries
-        .iter()
-        .find(|(_, pat_raw, _, _)| pat_raw == target)
-        .map(|(key, _, _, rate)| (*key, *rate))
+        self.exact_raw
+            .get(target_raw)
+            .or_else(|| self.exact_norm.get(target_norm))
+            .map(|&idx| &self.entries[idx])
+    }
 }
 
 fn normalize_model_key(raw: &str) -> String {
@@ -365,28 +459,46 @@ fn spawn_background_pricing_sync() {
         .spawn();
 }
 
-/// Fetches `url` using `curl` with a bounded 15-second timeout.
+/// Fetches `url` using `curl` with bounded connect/total timeouts and response size limit.
 pub fn fetch_models_dev_via_curl(url: &str) -> io::Result<String> {
-    let output = Command::new("curl")
-        .args(["-fsSL", "--max-time", "15", url])
+    let mut child = Command::new("curl")
+        .args(["-fsSL", "--connect-timeout", "5", "--max-time", "15", url])
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::other(format!(
-            "curl failed ({}): {}",
-            output.status,
-            stderr.trim()
-        )));
+        .spawn()?;
+
+    let mut stdout_buf = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take(MAX_PRICING_JSON_BYTES + 1)
+            .read_to_end(&mut stdout_buf)?;
     }
-    if output.stdout.len() as u64 > MAX_PRICING_JSON_BYTES {
+
+    if stdout_buf.len() as u64 > MAX_PRICING_JSON_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "models.dev response exceeded size limit",
         ));
     }
-    String::from_utf8(output.stdout).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+
+    let mut stderr_buf = Vec::new();
+    if let Some(stderr) = child.stderr.take() {
+        let _ = stderr.take(4096).read_to_end(&mut stderr_buf);
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_buf);
+        return Err(io::Error::other(format!(
+            "curl failed ({status}): {}",
+            stderr.trim()
+        )));
+    }
+
+    String::from_utf8(stdout_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 const CANONICAL_PROVIDERS: &[&str] = &[

@@ -6,13 +6,11 @@ use std::io::{self, Write};
 use unicode_width::UnicodeWidthStr;
 
 use super::tz::{format_day, parse_civil_date_day};
-use super::{PeriodSummary, StatsReport, WeeklyUsage};
+use super::{build_weekly_usage, PeriodSummary, StatsReport, WeeklyUsage, ACTIVITY_WEEKS};
 use crate::format::format_tokens_string as fmt_tok;
 use crate::render::truncate_to_width;
 use crate::timeutil::civil_from_days;
 
-const DAYS_PER_WEEK: i64 = 7;
-const ACTIVITY_WEEKS: usize = 20;
 const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTH_NAMES: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -63,44 +61,6 @@ fn heatmap_level(tokens: u64, peak: u64) -> usize {
     } else {
         4
     }
-}
-
-/// Monday-based weekday index (`0 = Mon .. 6 = Sun`) for days since `1970-01-01` (Thursday).
-fn weekday_mon0(day_idx: i64) -> usize {
-    (day_idx + 3).rem_euclid(DAYS_PER_WEEK) as usize
-}
-
-pub(super) fn build_weekly_usage(today_idx: i64, daily_by_date: &HashMap<&str, u64>) -> Vec<WeeklyUsage> {
-    let today_wd = weekday_mon0(today_idx) as i64;
-    let curr_monday = today_idx - today_wd;
-    let first_monday = curr_monday - ((ACTIVITY_WEEKS as i64 - 1) * DAYS_PER_WEEK);
-    let mut weeks = Vec::with_capacity(ACTIVITY_WEEKS);
-
-    for w in 0..ACTIVITY_WEEKS {
-        let week_mon = first_monday + (w as i64) * DAYS_PER_WEEK;
-        let week_sun = week_mon + (DAYS_PER_WEEK - 1);
-        let mut daily_tokens = [None; 7];
-        let mut total_tokens = 0u64;
-
-        for (d, slot) in daily_tokens.iter_mut().enumerate() {
-            let day_idx = week_mon + (d as i64);
-            if day_idx <= today_idx {
-                let date = format_day(day_idx);
-                let tok = daily_by_date.get(date.as_str()).copied().unwrap_or(0);
-                *slot = Some(tok);
-                total_tokens = total_tokens.saturating_add(tok);
-            }
-        }
-
-        weeks.push(WeeklyUsage {
-            week_start: format_day(week_mon),
-            week_end: format_day(week_sun),
-            daily_tokens,
-            total_tokens,
-        });
-    }
-
-    weeks
 }
 
 fn resolve_weekly_usage(report: &StatsReport) -> Vec<WeeklyUsage> {
@@ -272,36 +232,29 @@ fn write_window_row<W: Write>(
     summary: &PeriodSummary,
     show_cost: bool,
 ) -> io::Result<()> {
+    write!(
+        out,
+        "  {:<10} {:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {:>9}",
+        label,
+        summary.requests,
+        fmt_tok(summary.input_tokens),
+        fmt_tok(summary.cache_read_tokens),
+        fmt_tok(summary.output_tokens),
+        fmt_tok(summary.thinking_tokens),
+        fmt_cache_hit(summary),
+    )?;
     if show_cost {
-        writeln!(
+        write!(
             out,
-            "  {:<10} {:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {:>9}  {}",
-            label,
-            summary.requests,
-            fmt_tok(summary.input_tokens),
-            fmt_tok(summary.cache_read_tokens),
-            fmt_tok(summary.output_tokens),
-            fmt_tok(summary.thinking_tokens),
-            fmt_cache_hit(summary),
+            "  {}",
             fmt_usd(
                 summary.priced_usd,
                 summary.priced_requests,
-                summary.unpriced_requests
-            ),
-        )
-    } else {
-        writeln!(
-            out,
-            "  {:<10} {:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {:>9}",
-            label,
-            summary.requests,
-            fmt_tok(summary.input_tokens),
-            fmt_tok(summary.cache_read_tokens),
-            fmt_tok(summary.output_tokens),
-            fmt_tok(summary.thinking_tokens),
-            fmt_cache_hit(summary),
-        )
+                summary.unpriced_requests,
+            )
+        )?;
     }
+    writeln!(out)
 }
 
 fn pad_model_cell(name: &str, width: usize, ascii: bool) -> String {
@@ -339,13 +292,12 @@ pub fn render_stats_report<W: Write>(
 
     let show_cost =
         report.windows.all_time.priced_requests > 0 || report.totals.priced_requests > 0;
+    let cost_hdr = if show_cost { "  Est. Cost" } else { "" };
 
-    let window_header = if show_cost {
-        "  Window      Turns     Input     Cache    Output  Thinking  Cache Hit  Est. Cost"
-    } else {
-        "  Window      Turns     Input     Cache    Output  Thinking  Cache Hit"
-    };
-    writeln!(out, "{}", style_wrap(no_color, "2", window_header))?;
+    let window_header = format!(
+        "  Window      Turns     Input     Cache    Output  Thinking  Cache Hit{cost_hdr}"
+    );
+    writeln!(out, "{}", style_wrap(no_color, "2", &window_header))?;
 
     if let Some(d) = report.filter_days {
         write_window_row(out, &format!("Last {d}d"), &report.totals, show_cost)?;
@@ -367,17 +319,10 @@ pub fn render_stats_report<W: Write>(
             .max()
             .unwrap_or(24)
             .clamp(24, 38);
-        let model_hdr = if show_cost {
-            format!(
-                "  {:<model_w$} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}  Est. Cost",
-                "Model", "Turns", "Tokens", "Output", "Thinking", "Med tok/s", "Med TTFT"
-            )
-        } else {
-            format!(
-                "  {:<model_w$} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}",
-                "Model", "Turns", "Tokens", "Output", "Thinking", "Med tok/s", "Med TTFT"
-            )
-        };
+        let model_hdr = format!(
+            "  {:<model_w$} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}{cost_hdr}",
+            "Model", "Turns", "Tokens", "Output", "Thinking", "Med tok/s", "Med TTFT"
+        );
         writeln!(out, "\n{}", style_wrap(no_color, "2", &model_hdr))?;
 
         for m in &report.models {
@@ -388,34 +333,26 @@ pub fn render_stats_report<W: Write>(
             let ttft_str = m
                 .median_ttft_secs
                 .map_or_else(|| "-".to_string(), |t| format!("{t:.2}s"));
+            write!(
+                out,
+                "  {} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}",
+                model_cell,
+                m.requests,
+                fmt_tok(m.total_tokens),
+                fmt_tok(m.output_tokens),
+                fmt_tok(m.thinking_tokens),
+                speed_str,
+                ttft_str
+            )?;
             if show_cost {
                 let priced_reqs = m.requests.saturating_sub(m.unpriced_requests);
-                let cost_str = fmt_usd(m.priced_usd, priced_reqs, m.unpriced_requests);
-                writeln!(
+                write!(
                     out,
-                    "  {} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}  {}",
-                    model_cell,
-                    m.requests,
-                    fmt_tok(m.total_tokens),
-                    fmt_tok(m.output_tokens),
-                    fmt_tok(m.thinking_tokens),
-                    speed_str,
-                    ttft_str,
-                    cost_str
-                )?;
-            } else {
-                writeln!(
-                    out,
-                    "  {} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}",
-                    model_cell,
-                    m.requests,
-                    fmt_tok(m.total_tokens),
-                    fmt_tok(m.output_tokens),
-                    fmt_tok(m.thinking_tokens),
-                    speed_str,
-                    ttft_str
+                    "  {}",
+                    fmt_usd(m.priced_usd, priced_reqs, m.unpriced_requests)
                 )?;
             }
+            writeln!(out)?;
         }
     }
 

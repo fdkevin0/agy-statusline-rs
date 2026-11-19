@@ -57,16 +57,22 @@ fn thinking_widget_catalog_metadata_and_presets_unchanged() {
     let parsed: WidgetId = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, WidgetId::Thinking);
 
-    assert_eq!(LayoutConfig::preset_full().matching_preset_index(), Some(0));
     assert_eq!(
-        LayoutConfig::preset_powerline().matching_preset_index(),
-        Some(1)
+        LayoutConfig::preset_full().matching_preset(),
+        Some(agy_statusline::layout::Preset::Full)
     );
     assert_eq!(
-        LayoutConfig::preset_minimal().matching_preset_index(),
-        Some(2)
+        LayoutConfig::preset_powerline().matching_preset(),
+        Some(agy_statusline::layout::Preset::Powerline)
     );
-    assert_eq!(LayoutConfig::preset_addon().matching_preset_index(), Some(3));
+    assert_eq!(
+        LayoutConfig::preset_minimal().matching_preset(),
+        Some(agy_statusline::layout::Preset::Minimal)
+    );
+    assert_eq!(
+        LayoutConfig::preset_addon().matching_preset(),
+        Some(agy_statusline::layout::Preset::Addon)
+    );
 
     let thinking_idx = WidgetId::ALL
         .iter()
