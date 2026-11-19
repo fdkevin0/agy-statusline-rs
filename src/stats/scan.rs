@@ -834,11 +834,11 @@ fn resolve_descendant_conversation_ids(cli_dir: &Path, root_id: &str) -> Vec<Str
         "WITH RECURSIVE descendants(conversation_id, depth) AS (
              SELECT conversation_id, 1
              FROM conversation_summaries
-             WHERE parent_conversation_id = ?1
+             WHERE parent_conversation_id = ?1 COLLATE NOCASE
              UNION
              SELECT cs.conversation_id, d.depth + 1
              FROM conversation_summaries cs
-             JOIN descendants d ON cs.parent_conversation_id = d.conversation_id
+             JOIN descendants d ON cs.parent_conversation_id = d.conversation_id COLLATE NOCASE
              WHERE d.depth < 8
          )
          SELECT DISTINCT conversation_id FROM descendants",

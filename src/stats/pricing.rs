@@ -226,6 +226,45 @@ impl PricingCatalog {
         cache_write_tokens: u64,
         output_tokens: u64,
     ) -> Option<(String, f64)> {
+        self.estimate_cost_inner(
+            candidates,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+            true,
+        )
+    }
+
+    /// Estimates USD cost using base rates only (for cumulative multi-turn token totals
+    /// where per-turn prompt context length is unknown).
+    pub(crate) fn estimate_cost_base_rate(
+        &self,
+        candidates: &[&str],
+        input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+    ) -> Option<(String, f64)> {
+        self.estimate_cost_inner(
+            candidates,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+            false,
+        )
+    }
+
+    fn estimate_cost_inner(
+        &self,
+        candidates: &[&str],
+        input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+        apply_context_tiers: bool,
+    ) -> Option<(String, f64)> {
         if self.entries.is_empty() {
             return None;
         }
@@ -250,30 +289,30 @@ impl PricingCatalog {
             })
             .map(|&idx| &self.entries[idx]);
 
-        // Substring fallback prefers literal raw matches over separator-normalized matches,
-        // then longest match, then key order.
+        // Substring fallback prefers the longest match, breaking equal-length ties by
+        // preferring literal raw matches over separator-normalized matches, then key order.
         if matched.is_none() {
-            let mut best: Option<(bool, usize, &IndexedEntry)> = None;
+            let mut best: Option<(usize, bool, &IndexedEntry)> = None;
             for entry in &self.entries {
-                let (is_raw, match_len) = if lowered_candidates
+                let (match_len, is_raw) = if lowered_candidates
                     .iter()
                     .any(|(raw, _)| raw.contains(&entry.pat_lower))
                 {
-                    (true, entry.pat_lower.len())
+                    (entry.pat_lower.len(), true)
                 } else if !entry.pat_norm.is_empty()
                     && lowered_candidates
                         .iter()
                         .any(|(_, norm)| norm.contains(&entry.pat_norm))
                 {
-                    (false, entry.pat_norm.len())
+                    (entry.pat_norm.len(), false)
                 } else {
                     continue;
                 };
-                if best.is_none_or(|(best_raw, best_len, previous)| {
-                    (is_raw, match_len) > (best_raw, best_len)
-                        || ((is_raw, match_len) == (best_raw, best_len) && entry.key < previous.key)
+                if best.is_none_or(|(best_len, best_raw, previous)| {
+                    (match_len, is_raw) > (best_len, best_raw)
+                        || ((match_len, is_raw) == (best_len, best_raw) && entry.key < previous.key)
                 }) {
-                    best = Some((is_raw, match_len, entry));
+                    best = Some((match_len, is_raw, entry));
                 }
             }
             matched = best.map(|(_, _, e)| e);
@@ -284,14 +323,18 @@ impl PricingCatalog {
         let prompt_context_tokens = input_tokens
             .saturating_add(cache_read_tokens)
             .saturating_add(cache_write_tokens);
-        let active_tier = entry
-            .rate
-            .context_tiers
-            .iter()
-            .filter(|tier| {
-                is_valid_tier_rate(tier) && prompt_context_tokens > tier.min_context_tokens
+        let active_tier = apply_context_tiers
+            .then(|| {
+                entry
+                    .rate
+                    .context_tiers
+                    .iter()
+                    .filter(|tier| {
+                        is_valid_tier_rate(tier) && prompt_context_tokens > tier.min_context_tokens
+                    })
+                    .max_by_key(|tier| tier.min_context_tokens)
             })
-            .max_by_key(|tier| tier.min_context_tokens);
+            .flatten();
         let (input_rate, cache_read_rate, cache_write_rate, output_rate) = match active_tier {
             Some(tier) => (
                 tier.input_per_mtok,
@@ -548,10 +591,13 @@ fn extract_rate_from_cost(cost_obj: &serde_json::Map<String, Value>) -> Option<M
             let Some(tier_obj) = tier_val.as_object() else {
                 continue;
             };
-            if tier_obj.get("type").and_then(Value::as_str) != Some("context") {
+            let Some(tier_meta) = tier_obj.get("tier").and_then(Value::as_object) else {
+                continue;
+            };
+            if tier_meta.get("type").and_then(Value::as_str) != Some("context") {
                 continue;
             }
-            let Some(size) = tier_obj.get("size").and_then(Value::as_u64) else {
+            let Some(size) = tier_meta.get("size").and_then(Value::as_u64) else {
                 continue;
             };
             if size == 0 {
@@ -1170,6 +1216,31 @@ mod tests {
             .unwrap();
         assert_eq!(dash_key, "gemini-3-8-flash");
         assert!((dash_usd - 1.50).abs() < 1e-6);
+
+        // Longer normalized substring (`o3-pro`, len 6) still beats shorter raw substring (`o3`, len 2).
+        let mut short_vs_long = BTreeMap::new();
+        short_vs_long.insert(
+            "o3".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 2.0,
+                output_per_mtok: 8.0,
+                ..Default::default()
+            },
+        );
+        short_vs_long.insert(
+            "o3-pro".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 20.0,
+                output_per_mtok: 80.0,
+                ..Default::default()
+            },
+        );
+        let short_vs_long_catalog = PricingCatalog::from_models(short_vs_long);
+        let (o3_key, o3_usd) = short_vs_long_catalog
+            .estimate_cost(&["o3 Pro (High)"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(o3_key, "o3-pro");
+        assert!((o3_usd - 20.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1184,8 +1255,8 @@ mod tests {
                   "cache_read": 0.25,
                   "cache_write": 3.0,
                   "tiers": [
-                    { "type": "batch", "size": 1000, "input": 99.0 },
-                    { "type": "context", "size": 272000, "input": 5.0, "output": 22.5, "cache_read": 0.5 }
+                    { "tier": { "type": "batch", "size": 1000 }, "input": 99.0 },
+                    { "tier": { "type": "context", "size": 272000 }, "input": 5.0, "output": 22.5, "cache_read": 0.5 }
                   ]
                 }
               }
@@ -1200,8 +1271,8 @@ mod tests {
                   "cache_read": 0.1,
                   "cache_write": 1.25,
                   "tiers": [
-                    { "type": "context", "size": 200000, "input": 3.0, "output": 15.0 },
-                    { "type": "context", "size": 100000, "input": 2.0, "output": 10.0 }
+                    { "tier": { "type": "context", "size": 200000 }, "input": 3.0, "output": 15.0 },
+                    { "tier": { "type": "context", "size": 100000 }, "input": 2.0, "output": 10.0 }
                   ],
                   "context_over_200k": { "input": 99.0, "output": 99.0 }
                 }

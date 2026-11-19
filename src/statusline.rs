@@ -526,7 +526,7 @@ fn estimate_payload_cost_usd(
         let out = cw.total_output_tokens.unwrap_or(0);
         if inp > 0 || out > 0 {
             return pricing
-                .estimate_cost(&candidates, inp, 0, 0, out)
+                .estimate_cost_base_rate(&candidates, inp, 0, 0, out)
                 .map(|(_, usd)| (usd, CostCoverage::Session));
         }
     }
