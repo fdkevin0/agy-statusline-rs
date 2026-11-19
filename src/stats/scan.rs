@@ -112,11 +112,6 @@ fn value_as_positive_f64(v: Option<&Value>) -> Option<f64> {
     (f.is_finite() && f > 0.0).then_some(f)
 }
 
-fn has_non_null_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> bool {
-    keys.iter()
-        .any(|k| obj.get(*k).is_some_and(|v| !v.is_null()))
-}
-
 fn parse_duration_secs(v: Option<&Value>) -> Option<f64> {
     let val = v?;
     match val {
@@ -222,10 +217,6 @@ struct TranscriptJob {
     cascade_hint: String,
 }
 
-fn is_skipped_dir_name(name: &str) -> bool {
-    SKIP_DIRS.contains(&name)
-}
-
 fn canonical_or_self(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -272,7 +263,7 @@ fn collect_transcript_jobs_in_brain(
     for entry in sorted_entries {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if is_skipped_dir_name(&name_str) {
+        if SKIP_DIRS.contains(&name_str.as_ref()) {
             continue;
         }
         let path = entry.path();
@@ -387,10 +378,10 @@ fn parse_transcript_line(
         .and_then(Value::as_object);
 
     let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens) =
-        if has_non_null_field(
-            &obj,
-            &["input_tokens", "output_tokens", "cache_read_tokens"],
-        ) {
+        if ["input_tokens", "output_tokens", "cache_read_tokens"]
+            .iter()
+            .any(|k| obj.get(*k).is_some_and(|v| !v.is_null()))
+        {
             (
                 value_as_u64(obj.get("input_tokens")),
                 value_as_u64(obj.get("output_tokens")),
@@ -631,9 +622,7 @@ fn scan_single_sqlite_db(
                 .saturating_add(rec.output_tokens);
             out.speed_samples.push(speed);
         }
-        let ttft_secs = rec
-            .ttft_secs
-            .filter(|&ttft| ttft.is_finite() && ttft > 0.0 && ttft < MAX_TTFT_SECS);
+        let ttft_secs = rec.ttft_secs;
         if let Some(ttft) = ttft_secs {
             out.ttft_samples.push(ttft);
         }
@@ -720,12 +709,6 @@ pub(super) fn scan_sqlite_conversations(
         for entry in sorted {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.ends_with("-wal")
-                || name_str.ends_with("-shm")
-                || name_str.ends_with("-journal")
-            {
-                continue;
-            }
             let Some(stem) = name_str.strip_suffix(".db") else {
                 continue;
             };
@@ -802,7 +785,7 @@ pub(super) fn scan_sqlite_conversations(
         events.extend(res.events);
     }
 
-    stats.ttft_samples = ttft_samples.iter().filter(|v| v.is_finite()).count();
+    stats.ttft_samples = ttft_samples.len();
     stats.median_tok_per_sec = compute_median(&speed_samples);
     stats.median_ttft_secs = compute_median(&ttft_samples);
     (stats, events, covered)
@@ -865,12 +848,10 @@ fn resolve_descendant_conversation_ids(cli_dir: &Path, root_id: &str) -> Vec<Str
 }
 
 fn accumulate_single_db_cost(
-    cli_dir: &Path,
-    conversation_id: &str,
+    db_path: &Path,
     pricing: &PricingCatalog,
 ) -> Option<(f64, u64, u64)> {
-    let db_path = resolve_conversation_db_path(cli_dir, conversation_id)?;
-    let conn = open_readonly_db(&db_path).ok()?;
+    let conn = open_readonly_db(db_path).ok()?;
     let mut stmt = conn
         .prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL")
         .ok()?;
@@ -927,11 +908,8 @@ pub(crate) fn estimate_conversation_cost_usd(
         return None;
     }
     let (parent_usd, parent_priced, parent_unpriced) =
-        match accumulate_single_db_cost(cli_dir, conversation_id, pricing) {
-            Some(counts) => counts,
-            None if resolve_conversation_db_path(cli_dir, conversation_id).is_some() => {
-                return None;
-            }
+        match resolve_conversation_db_path(cli_dir, conversation_id) {
+            Some(db_path) => accumulate_single_db_cost(&db_path, pricing)?,
             None => (0.0, 0, 0),
         };
 
@@ -939,9 +917,10 @@ pub(crate) fn estimate_conversation_cost_usd(
     let mut sub_priced = 0_u64;
     let mut sub_unpriced = 0_u64;
     for desc_id in resolve_descendant_conversation_ids(cli_dir, conversation_id) {
-        if let Some((usd, priced, unpriced)) =
-            accumulate_single_db_cost(cli_dir, &desc_id, pricing)
-        {
+        let Some(db_path) = resolve_conversation_db_path(cli_dir, &desc_id) else {
+            continue;
+        };
+        if let Some((usd, priced, unpriced)) = accumulate_single_db_cost(&db_path, pricing) {
             sub_usd += usd;
             sub_priced += priced;
             sub_unpriced += unpriced;

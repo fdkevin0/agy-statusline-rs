@@ -4,6 +4,7 @@ use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::sync::Arc;
 
+use ansi_to_tui::IntoText;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEvent,
     MouseEventKind,
@@ -20,9 +21,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthStr;
 
-use crate::ansi::ansi_to_ratatui_lines;
 use crate::apply::{apply_statusline_config, resolve_invoked_binary_path};
-use crate::editor::{ActivePane, ExitOutcome, SettingField, TuiEditorState};
+use crate::editor::{ActivePane, ExitOutcome, PreviewWidth, SettingField, TuiEditorState};
 use crate::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
 use crate::paths::agy_settings_path;
 use crate::render::write_statusline;
@@ -157,7 +157,14 @@ fn build_preview_lines(state: &TuiEditorState, box_inner: u16) -> (Vec<Line<'sta
     let mut buf = Vec::new();
     let _ = write_statusline(&sample, &meta, &git, &state.config, &mut buf);
     let raw = String::from_utf8_lossy(&buf);
-    (ansi_to_ratatui_lines(&raw), width)
+    let lines = match raw.as_ref().into_text() {
+        Ok(text) => text.lines,
+        Err(_) => strip_ansi_escapes::strip_str(raw.as_ref())
+            .lines()
+            .map(|line| Line::from(line.to_owned()))
+            .collect(),
+    };
+    (lines, width)
 }
 
 fn pane_block(title: String, active: bool, grabbed: bool) -> Block<'static> {
@@ -272,20 +279,10 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiEditorState) -> UiHitMap {
         .split(area);
 
     let (preview_lines, eff_w) = build_preview_lines(state, chunks[0].width.saturating_sub(4));
-    let agy_mode = if state.config.stack_with_default {
-        "Stack"
-    } else {
-        "Replace"
+    let preview_title = match state.preview_width {
+        PreviewWidth::Auto => format!(" Live Preview [Auto · {eff_w}col] "),
+        _ => format!(" Live Preview [{}] ", state.preview_width.label()),
     };
-    let preview_title = format!(
-        " Live Preview [{} ({}col) · {} · {} · {} · AGY: {}] ",
-        state.preview_width.label(),
-        eff_w,
-        state.config.style.name(),
-        state.config.theme.name(),
-        state.config.glyph_mode.name(),
-        agy_mode
-    );
     let preview = Paragraph::new(preview_lines)
         .block(
             Block::default()
@@ -367,11 +364,7 @@ fn layout_canvas_lines(
         let items = &state.config.rows[r];
         if items.is_empty() {
             spans.push(Span::styled(
-                if row_focused {
-                    "(empty — press Enter/Space to add)"
-                } else {
-                    "(empty)"
-                },
+                "(empty)",
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
@@ -431,13 +424,6 @@ fn layout_canvas_lines(
         lines.push(Line::raw(""));
         cur_y += 1;
     }
-
-    let hint = if state.grabbed {
-        "Moving widget: use arrows to place, Enter to drop."
-    } else {
-        "Tip: Click pill to select/grab, Right-click to remove."
-    };
-    lines.push(Line::styled(hint, Style::default().fg(Color::DarkGray)));
 
     (lines, line_y, pills)
 }
@@ -503,7 +489,7 @@ fn setting_row(state: &TuiEditorState, field: SettingField) -> (&'static str, St
     match field {
         SettingField::Preset => {
             let base = state.preset.display_name();
-            let val = if state.is_custom_preset() {
+            let val = if state.config.matching_preset().is_none() {
                 format!("{base}*")
             } else {
                 base.to_string()

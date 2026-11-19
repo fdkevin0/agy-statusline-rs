@@ -148,6 +148,17 @@ pub(crate) struct TurnMetrics {
     pub(crate) ttft_secs: Option<f64>,
 }
 
+/// Single-pass summary extracted from one `gen_metadata.data` Protobuf blob.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct GenMetadataSummary {
+    /// Completed turn timing/output metrics when sanity bounds are satisfied.
+    pub(crate) turn: Option<TurnMetrics>,
+    /// Server-issued `max_context_tokens` when `> 0`.
+    pub(crate) max_context_tokens: Option<u64>,
+    /// Server-estimated `estimated_tokens_used` when `> 0`.
+    pub(crate) estimated_context_tokens: Option<u64>,
+}
+
 /// Full generation record decoded from `CortexStepGeneratorMetadata` (`gen_metadata.data`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GenMetadataRecord {
@@ -211,30 +222,46 @@ fn trim_non_empty(value: Option<String>) -> Option<String> {
     }
 }
 
-/// Extracts [`TurnMetrics`] (output tokens, optional thinking tokens, decode duration,
-/// and optional TTFT) from a `gen_metadata.data` Protobuf blob.
+/// Decodes a `gen_metadata.data` Protobuf blob once to extract turn speed/TTFT metrics
+/// and server-reported context window metadata.
 ///
-/// Enforces unified sanity bounds: `decode_secs >= 0.01`, `output_tokens > 0`,
+/// Enforces unified speed sanity bounds: `decode_secs >= 0.01`, `output_tokens > 0`,
 /// and `0.0 < output_tokens / decode_secs < 10_000.0`.
-pub(crate) fn extract_turn_metrics(data: &[u8]) -> Option<TurnMetrics> {
-    let blob = GenMetadataBlob::decode(data).ok()?;
-    let chat = blob.chat_model?;
-    let usage = chat.usage?;
-    let decode_secs = chat.streaming_duration?.to_secs()?;
-    let output_tokens = usage.output_tokens;
-    if !is_sane_decode_speed(output_tokens, decode_secs) {
-        return None;
-    }
-    let thinking_tokens = (usage.thinking_output_tokens > 0).then_some(usage.thinking_output_tokens);
-    let ttft_secs = chat
-        .time_to_first_token
-        .and_then(|d| d.to_secs())
-        .filter(|&t| t > 0.0 && t < MAX_TTFT_SECS);
-    Some(TurnMetrics {
-        output_tokens,
-        thinking_tokens,
-        decode_secs,
-        ttft_secs,
+pub(crate) fn extract_gen_metadata_summary(data: &[u8]) -> Option<GenMetadataSummary> {
+    let chat = GenMetadataBlob::decode(data).ok()?.chat_model?;
+    let turn = match (chat.usage, chat.streaming_duration.and_then(|d| d.to_secs())) {
+        (Some(usage), Some(decode_secs))
+            if is_sane_decode_speed(usage.output_tokens, decode_secs) =>
+        {
+            Some(TurnMetrics {
+                output_tokens: usage.output_tokens,
+                thinking_tokens: (usage.thinking_output_tokens > 0)
+                    .then_some(usage.thinking_output_tokens),
+                decode_secs,
+                ttft_secs: chat
+                    .time_to_first_token
+                    .and_then(|d| d.to_secs())
+                    .filter(|&t| t > 0.0 && t < MAX_TTFT_SECS),
+            })
+        }
+        _ => None,
+    };
+    let ctx_window = chat
+        .chat_start_metadata
+        .and_then(|start| start.context_window_metadata);
+    let max_context_tokens = ctx_window
+        .as_ref()
+        .map(|cw| cw.max_context_tokens)
+        .filter(|&v| v > 0)
+        .map(|v| v as u64);
+    let estimated_context_tokens = ctx_window
+        .map(|cw| cw.estimated_tokens_used)
+        .filter(|&v| v > 0)
+        .map(|v| v as u64);
+    Some(GenMetadataSummary {
+        turn,
+        max_context_tokens,
+        estimated_context_tokens,
     })
 }
 
@@ -265,7 +292,7 @@ pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord> {
     let decode_secs = chat
         .streaming_duration
         .and_then(|d| d.to_secs())
-        .filter(|&d| d.is_finite() && d > 0.0);
+        .filter(|&d| d > 0.0);
 
     Some(GenMetadataRecord {
         first_step_index,
@@ -311,34 +338,8 @@ pub fn extract_step_created_at_secs(data: &[u8]) -> Option<i64> {
 /// assert_eq!(extract_metadata_speed(&blob), Some(50.0));
 /// ```
 pub fn extract_metadata_speed(data: &[u8]) -> Option<f64> {
-    let metrics = extract_turn_metrics(data)?;
+    let metrics = extract_gen_metadata_summary(data)?.turn?;
     Some((metrics.output_tokens as f64) / metrics.decode_secs)
-}
-
-fn extract_ctx_window(data: &[u8]) -> Option<ContextWindowMetadata> {
-    GenMetadataBlob::decode(data)
-        .ok()?
-        .chat_model?
-        .chat_start_metadata?
-        .context_window_metadata
-}
-
-/// Extracts server-issued `max_context_tokens` from `gen_metadata.data`
-/// along verified wire path `chat(1) -> chat_start_metadata(9) -> context_window_metadata(10) -> max_context_tokens(4)`.
-///
-/// Returns `None` if any nested field is missing, malformed, or `<= 0`.
-pub(crate) fn extract_max_context_tokens(data: &[u8]) -> Option<u64> {
-    let v = extract_ctx_window(data)?.max_context_tokens;
-    (v > 0).then_some(v as u64)
-}
-
-/// Extracts server-estimated `estimated_tokens_used` from `gen_metadata.data`
-/// along verified wire path `chat(1) -> chat_start_metadata(9) -> context_window_metadata(10) -> estimated_tokens_used(1)`.
-///
-/// Returns `None` if any nested field is missing, malformed, or `<= 0`.
-pub(crate) fn extract_estimated_context_tokens(data: &[u8]) -> Option<u64> {
-    let v = extract_ctx_window(data)?.estimated_tokens_used;
-    (v > 0).then_some(v as u64)
 }
 
 #[cfg(test)]
@@ -386,10 +387,16 @@ mod tests {
     #[test]
     fn max_context_tokens_valid_and_invalid() {
         let valid = [0x0a, 0x08, 0x4a, 0x06, 0x52, 0x04, 0x20, 0x80, 0xa0, 0x1f];
-        assert_eq!(extract_max_context_tokens(&valid), Some(512_000));
+        assert_eq!(
+            extract_gen_metadata_summary(&valid).and_then(|s| s.max_context_tokens),
+            Some(512_000)
+        );
         let zero = [0x0a, 0x06, 0x4a, 0x04, 0x52, 0x02, 0x20, 0x00];
-        assert_eq!(extract_max_context_tokens(&zero), None);
-        assert_eq!(extract_max_context_tokens(&[]), None);
+        assert_eq!(
+            extract_gen_metadata_summary(&zero).and_then(|s| s.max_context_tokens),
+            None
+        );
+        assert_eq!(extract_gen_metadata_summary(&[]), None);
     }
 
     #[test]
@@ -398,7 +405,7 @@ mod tests {
         let blob = [
             0x0a, 0x0c, 0x22, 0x02, 0x18, 0x64, 0x5a, 0x02, 0x08, 0x01, 0x62, 0x02, 0x08, 0x02,
         ];
-        let m = extract_turn_metrics(&blob).unwrap();
+        let m = extract_gen_metadata_summary(&blob).unwrap().turn.unwrap();
         assert_eq!(m.output_tokens, 100);
         assert_eq!(m.thinking_tokens, None);
         assert!((m.decode_secs - 2.0).abs() < 1e-9);
@@ -411,7 +418,7 @@ mod tests {
         let blob = [
             0x0a, 0x0b, 0x22, 0x05, 0x18, 0x64, 0x48, 0xfa, 0x01, 0x62, 0x02, 0x08, 0x02,
         ];
-        let m = extract_turn_metrics(&blob).unwrap();
+        let m = extract_gen_metadata_summary(&blob).unwrap().turn.unwrap();
         assert_eq!(m.output_tokens, 100);
         assert_eq!(m.thinking_tokens, Some(250));
         assert!((m.decode_secs - 2.0).abs() < 1e-9);
@@ -423,13 +430,18 @@ mod tests {
         let valid = [
             0x0a, 0x0c, 0x4a, 0x0a, 0x52, 0x08, 0x08, 0x80, 0xf4, 0x03, 0x20, 0x80, 0xa0, 0x1f,
         ];
-        assert_eq!(extract_estimated_context_tokens(&valid), Some(64_000));
-        assert_eq!(extract_max_context_tokens(&valid), Some(512_000));
+        let summary = extract_gen_metadata_summary(&valid).unwrap();
+        assert_eq!(summary.estimated_context_tokens, Some(64_000));
+        assert_eq!(summary.max_context_tokens, Some(512_000));
+        assert_eq!(summary.turn, None);
 
         // estimated(1)=0 -> None
         let zero = [0x0a, 0x06, 0x4a, 0x04, 0x52, 0x02, 0x08, 0x00];
-        assert_eq!(extract_estimated_context_tokens(&zero), None);
-        assert_eq!(extract_estimated_context_tokens(&[]), None);
+        assert_eq!(
+            extract_gen_metadata_summary(&zero).and_then(|s| s.estimated_context_tokens),
+            None
+        );
+        assert_eq!(extract_gen_metadata_summary(&[]), None);
     }
 
     #[test]
@@ -438,7 +450,10 @@ mod tests {
         let too_short = [
             0x0a, 0x0b, 0x22, 0x02, 0x18, 0x0a, 0x62, 0x05, 0x10, 0xc0, 0x96, 0xb1, 0x02,
         ];
-        assert_eq!(extract_turn_metrics(&too_short), None);
+        assert_eq!(
+            extract_gen_metadata_summary(&too_short).and_then(|s| s.turn),
+            None
+        );
         assert_eq!(extract_metadata_speed(&too_short), None);
 
         // decode_secs = 0.05s (50_000_000 nanos) -> accepted (10 / 0.05 = 200.0 tok/s)
@@ -457,7 +472,10 @@ mod tests {
         let too_fast = [
             0x0a, 0x09, 0x22, 0x03, 0x18, 0x90, 0x4e, 0x62, 0x02, 0x08, 0x01,
         ];
-        assert_eq!(extract_turn_metrics(&too_fast), None);
+        assert_eq!(
+            extract_gen_metadata_summary(&too_fast).and_then(|s| s.turn),
+            None
+        );
         assert_eq!(extract_metadata_speed(&too_fast), None);
     }
 

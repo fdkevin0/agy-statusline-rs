@@ -8,7 +8,7 @@ use std::io::{self, Write as IoWrite};
 
 use crate::db::SessionMetadata;
 use crate::git::GitInfo;
-use crate::layout::{LayoutConfig, SpeedMode, WidgetId};
+use crate::layout::{LayoutConfig, SpeedMode, WidgetId, DEFAULT_SPEED_WARN_THRESHOLD};
 use crate::metrics::{
     current_context_tokens, resolve_quota_views_with_reset_at, valid_cache_usage, QuotaView,
 };
@@ -121,17 +121,30 @@ pub(crate) enum CostCoverage {
     LatestTurn,
 }
 
+#[derive(Clone, Copy)]
+enum ResolvedCost {
+    Payload {
+        total_usd: f64,
+        subagent_usd: Option<f64>,
+        estimated: bool,
+    },
+    Estimated {
+        total_usd: f64,
+        subagent_usd: Option<f64>,
+        coverage: CostCoverage,
+    },
+}
+
 struct RenderContext<'a> {
     cache: Option<(f64, u64)>,
     used_pct: f64,
     cur_ctx: Option<u64>,
     eff_limit: Option<u64>,
     speed: Option<f64>,
+    speed_warn_threshold: f64,
     ttft_secs: Option<f64>,
     thinking_tokens: Option<u64>,
-    estimated_cost_usd: Option<f64>,
-    estimated_subagent_cost_usd: Option<f64>,
-    cost_coverage: CostCoverage,
+    cost: Option<ResolvedCost>,
     quota_5h: Option<QuotaView>,
     quota_weekly: Option<QuotaView>,
     git: &'a GitInfo,
@@ -157,18 +170,46 @@ impl<'a> RenderContext<'a> {
                 .filter(|&v| v > 0)
         });
         let used_pct = match (cur_ctx, eff_limit) {
-            (Some(cur), Some(lim)) if lim > 0 => ((cur as f64) * 100.0 / (lim as f64)).max(0.0),
+            (Some(cur), Some(lim)) => (cur as f64) * 100.0 / (lim as f64),
             _ => payload
                 .context_window
                 .as_ref()
                 .and_then(|c| c.used_percentage)
-                .unwrap_or(0.0),
+                .filter(|v| v.is_finite())
+                .map_or(0.0, |v| v.max(0.0)),
         };
         let speed = match cfg.speed_mode {
             SpeedMode::Weighted => meta.speed,
             SpeedMode::Median => meta.median_speed.or(meta.speed),
             SpeedMode::Instant => meta.last_turn_speed.or(meta.speed),
             SpeedMode::E2e => meta.e2e_speed.or(meta.speed),
+        }
+        .filter(|s| s.is_finite() && *s >= 0.0);
+        let speed_warn_threshold =
+            if cfg.speed_warn_threshold.is_finite() && cfg.speed_warn_threshold >= 0.0 {
+                cfg.speed_warn_threshold
+            } else {
+                DEFAULT_SPEED_WARN_THRESHOLD
+            };
+        let cost = if let Some(total_usd) = payload.valid_cost_usd() {
+            let payload_cost = payload.cost.as_ref();
+            Some(ResolvedCost::Payload {
+                total_usd,
+                subagent_usd: payload_cost
+                    .and_then(|c| c.subagent_usd)
+                    .filter(|&s| s.is_finite() && s >= 0.01),
+                estimated: payload_cost.is_some_and(|c| c.estimated == Some(true)),
+            })
+        } else {
+            meta.estimated_cost_usd
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|total_usd| ResolvedCost::Estimated {
+                    total_usd,
+                    subagent_usd: meta
+                        .estimated_subagent_cost_usd
+                        .filter(|&s| s.is_finite() && s >= 0.01),
+                    coverage: cost_coverage,
+                })
         };
         Self {
             cache,
@@ -176,11 +217,10 @@ impl<'a> RenderContext<'a> {
             cur_ctx,
             eff_limit,
             speed,
-            ttft_secs: meta.ttft_secs,
-            thinking_tokens: meta.thinking_tokens,
-            estimated_cost_usd: meta.estimated_cost_usd,
-            estimated_subagent_cost_usd: meta.estimated_subagent_cost_usd,
-            cost_coverage,
+            speed_warn_threshold,
+            ttft_secs: meta.ttft_secs.filter(|t| t.is_finite() && *t >= 0.0),
+            thinking_tokens: meta.thinking_tokens.filter(|&t| t > 0),
+            cost,
             quota_5h,
             quota_weekly,
             git,
@@ -190,20 +230,19 @@ impl<'a> RenderContext<'a> {
 
 /// Builds a `bar_len`-segment Unicode context progress bar (`█▓▒░·`).
 pub fn build_progress_bar(used_percentage: f64, bar_len: usize) -> (String, f64) {
-    build_progress_bar_with_chars(used_percentage, bar_len, ['█', '▓', '▒', '░', '·'])
-}
-
-fn build_progress_bar_with_chars(
-    used_percentage: f64,
-    bar_len: usize,
-    chars: [char; 5],
-) -> (String, f64) {
     let clamped = if used_percentage.is_finite() {
         used_percentage.clamp(0.0, 100.0)
     } else {
         0.0
     };
-    let pct_int = clamped.trunc() as usize;
+    (
+        build_progress_bar_with_chars(clamped, bar_len, ['█', '▓', '▒', '░', '·']),
+        clamped,
+    )
+}
+
+fn build_progress_bar_with_chars(used_percentage: f64, bar_len: usize, chars: [char; 5]) -> String {
+    let pct_int = used_percentage.clamp(0.0, 100.0).trunc() as usize;
     let len = bar_len.clamp(4, 40);
     let filled = (pct_int * len) / 100;
     let remainder = (pct_int * len) % 100;
@@ -223,7 +262,7 @@ fn build_progress_bar_with_chars(
         };
         bar.push(ch);
     }
-    (bar, clamped)
+    bar
 }
 
 /// Renders all non-empty configured rows in `cfg` for `payload`, `meta`, and `git`.
@@ -279,7 +318,6 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use super::*;
-    use crate::format::format_tokens_string as format_tok_str;
     use crate::layout::{GlyphMode, ThemeStyle, VisualStyle};
     use crate::statusline::{
         AgentInfo, BattleInfo, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, VcsInfo,
@@ -794,7 +832,7 @@ mod tests {
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert_eq!(text, format!("{} tok\n", format_tok_str(u64::MAX)));
+        assert_eq!(text, "18,446,744,073B tok\n");
     }
 
     #[test]

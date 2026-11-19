@@ -381,26 +381,22 @@ fn collect_stats_for_roots(
 
     let mut models: Vec<ModelStats> = model_map
         .into_iter()
-        .map(|(model, acc)| {
-            let speed_samples = acc.speeds.iter().filter(|v| v.is_finite()).count();
-            let ttft_samples = acc.ttfts.iter().filter(|v| v.is_finite()).count();
-            ModelStats {
-                model,
-                pricing_key: acc.pricing_key,
-                requests: acc.summary.requests,
-                input_tokens: acc.summary.input_tokens,
-                cache_read_tokens: acc.summary.cache_read_tokens,
-                cache_write_tokens: acc.summary.cache_write_tokens,
-                output_tokens: acc.summary.output_tokens,
-                thinking_tokens: acc.summary.thinking_tokens,
-                total_tokens: acc.summary.total_tokens,
-                priced_usd: round_usd_6(acc.summary.priced_usd),
-                unpriced_requests: acc.summary.unpriced_requests,
-                speed_samples,
-                median_tok_per_sec: compute_median(&acc.speeds),
-                ttft_samples,
-                median_ttft_secs: compute_median(&acc.ttfts),
-            }
+        .map(|(model, acc)| ModelStats {
+            model,
+            pricing_key: acc.pricing_key,
+            requests: acc.summary.requests,
+            input_tokens: acc.summary.input_tokens,
+            cache_read_tokens: acc.summary.cache_read_tokens,
+            cache_write_tokens: acc.summary.cache_write_tokens,
+            output_tokens: acc.summary.output_tokens,
+            thinking_tokens: acc.summary.thinking_tokens,
+            total_tokens: acc.summary.total_tokens,
+            priced_usd: round_usd_6(acc.summary.priced_usd),
+            unpriced_requests: acc.summary.unpriced_requests,
+            speed_samples: acc.speeds.len(),
+            median_tok_per_sec: compute_median(&acc.speeds),
+            ttft_samples: acc.ttfts.len(),
+            median_ttft_secs: compute_median(&acc.ttfts),
         })
         .collect();
 
@@ -433,7 +429,7 @@ fn collect_stats_for_roots(
 
 /// Runs the `agy-statusline stats` subcommand against the resolved environment directories.
 pub fn run_stats_command<W: Write>(
-    home: &Path,
+    home: Option<&Path>,
     days: Option<u32>,
     json: bool,
     no_color: bool,
@@ -441,19 +437,18 @@ pub fn run_stats_command<W: Write>(
     now_unix_secs: u64,
     out: &mut W,
 ) -> io::Result<()> {
-    let home_dir = (!home.as_os_str().is_empty()).then_some(home);
     let mut roots: Vec<(&'static str, PathBuf)> = Vec::new();
     if let Some(cli_dir) = resolve_agy_cli_dir()
-        .or_else(|| home_dir.map(|h| h.join(".gemini").join("antigravity-cli")))
+        .or_else(|| home.map(|h| h.join(".gemini").join("antigravity-cli")))
     {
         roots.push(("cli", cli_dir));
     }
-    if let Some(h) = home_dir {
+    if let Some(h) = home {
         roots.push(("desktop", h.join(".gemini").join("antigravity")));
     }
 
     let cache_dir =
-        xdg_cache_dir().or_else(|| home_dir.map(|h| h.join(".cache").join("agy-statusline")));
+        xdg_cache_dir().or_else(|| home.map(|h| h.join(".cache").join("agy-statusline")));
     let pricing = PricingCatalog::load_effective_with(
         cache_dir.as_deref(),
         SyncMode::BlockingIfStale,

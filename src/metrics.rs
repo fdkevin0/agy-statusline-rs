@@ -101,22 +101,20 @@ fn format_duration_compact(secs: u64) -> String {
     }
 }
 
-/// Formats remaining quota percentage (`0.0..=100.0`) without rounding sub-1% values to `0%`.
+/// Formats a validated remaining quota percentage (`0.0..=100.0`) without rounding sub-1% values to `0%`.
 ///
-/// Returns `"0%"` strictly when `remaining_pct <= 0.0` (or non-finite), `"<0.1%"`
+/// Returns `"0%"` strictly when `remaining_pct <= 0.0`, `"<0.1%"`
 /// when `0.0 < pct < 0.1`, `"{:.1}%"` when `0.1 <= pct < 1.0`, and rounded `"{:.0}%"`
 /// when `pct >= 1.0`.
 pub(crate) fn format_quota_pct(remaining_pct: f64) -> String {
-    if !remaining_pct.is_finite() || remaining_pct <= 0.0 {
-        return "0%".to_string();
-    }
-    let pct = remaining_pct.min(100.0);
-    if pct < 0.1 {
+    if remaining_pct <= 0.0 {
+        "0%".to_string()
+    } else if remaining_pct < 0.1 {
         "<0.1%".to_string()
-    } else if pct < 1.0 {
-        format!("{pct:.1}%")
+    } else if remaining_pct < 1.0 {
+        format!("{remaining_pct:.1}%")
     } else {
-        format!("{:.0}%", pct.round())
+        format!("{:.0}%", remaining_pct.round())
     }
 }
 
@@ -213,33 +211,27 @@ fn collect_model_tokens(payload: &StatuslinePayload) -> BTreeSet<String> {
     tokens
 }
 
-fn resolve_reset_secs(bucket: &QuotaBucket, now_unix_secs: u64) -> Option<u64> {
-    match bucket.reset_in_seconds {
-        Some(secs) if secs <= 0 => None,
-        Some(secs) => Some(secs as u64),
-        None => {
-            let reset_unix = bucket
-                .reset_time
-                .as_deref()
-                .and_then(parse_rfc3339_unix_secs)?;
-            let diff = i128::from(reset_unix) - i128::from(now_unix_secs);
-            (diff > 0).then(|| diff.min(i128::from(u64::MAX)) as u64)
-        }
-    }
-}
-
-fn resolve_reset_at_secs(bucket: &QuotaBucket, now_unix_secs: u64) -> Option<u64> {
-    if let Some(ts) = bucket
+fn resolve_reset_timing(bucket: &QuotaBucket, now_unix_secs: u64) -> (Option<u64>, Option<u64>) {
+    let parsed_reset_time = bucket
         .reset_time
         .as_deref()
-        .and_then(parse_rfc3339_unix_secs)
-    {
-        return (ts >= 0).then_some(ts as u64);
-    }
-    bucket
-        .reset_in_seconds
-        .filter(|&s| s > 0)
-        .map(|s| now_unix_secs.saturating_add(s as u64))
+        .and_then(parse_rfc3339_unix_secs);
+    let reset_secs = match bucket.reset_in_seconds {
+        Some(secs) if secs <= 0 => None,
+        Some(secs) => Some(secs as u64),
+        None => parsed_reset_time.and_then(|reset_unix| {
+            let diff = i128::from(reset_unix) - i128::from(now_unix_secs);
+            (diff > 0).then(|| diff.min(i128::from(u64::MAX)) as u64)
+        }),
+    };
+    let reset_at_secs = match parsed_reset_time {
+        Some(ts) => (ts >= 0).then_some(ts as u64),
+        None => bucket
+            .reset_in_seconds
+            .filter(|&s| s > 0)
+            .map(|s| now_unix_secs.saturating_add(s as u64)),
+    };
+    (reset_secs, reset_at_secs)
 }
 
 fn build_quota_view(
@@ -248,16 +240,14 @@ fn build_quota_view(
     bucket: &QuotaBucket,
     now_unix_secs: u64,
 ) -> Option<(QuotaView, Option<u64>, bool)> {
-    let has_frac = bucket.remaining_fraction.is_some_and(f64::is_finite);
-    let (remaining_pct, remaining_amount) =
+    let (remaining_pct, remaining_amount, has_frac) =
         if let Some(frac) = bucket.remaining_fraction.filter(|f| f.is_finite()) {
-            ((frac * 100.0).clamp(0.0, 100.0), None)
+            ((frac * 100.0).clamp(0.0, 100.0), None, true)
         } else {
             let amt = bucket.remaining_amount.filter(|&a| a >= 0)?;
-            (0.0, Some(amt))
+            (0.0, Some(amt), false)
         };
-    let reset_secs = resolve_reset_secs(bucket, now_unix_secs);
-    let reset_at_secs = resolve_reset_at_secs(bucket, now_unix_secs);
+    let (reset_secs, reset_at_secs) = resolve_reset_timing(bucket, now_unix_secs);
     let reset_compact = reset_secs.map(format_duration_compact);
     let pace_behind = has_frac
         && reset_secs
@@ -585,8 +575,6 @@ mod tests {
     #[test]
     fn formats_sub_one_percent_quota_without_false_zero() {
         assert_eq!(format_quota_pct(0.0), "0%");
-        assert_eq!(format_quota_pct(-2.0), "0%");
-        assert_eq!(format_quota_pct(f64::NAN), "0%");
         assert_eq!(format_quota_pct(0.0001), "<0.1%");
         assert_eq!(format_quota_pct(0.05), "<0.1%");
         assert_eq!(format_quota_pct(0.099), "<0.1%");

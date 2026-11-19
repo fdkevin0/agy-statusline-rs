@@ -33,15 +33,14 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Atomically writes `bytes` to `path`, preserving existing file permissions and
 /// replacing the canonical target when `path` is a symlink.
 pub fn atomic_write_preserving_mode(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let target = match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)?,
-        Ok(_) => path.to_path_buf(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
-        Err(e) => return Err(e),
-    };
-    let permissions = match fs::metadata(&target) {
-        Ok(meta) => Some(meta.permissions()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+    let (target, permissions) = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let target = fs::canonicalize(path)?;
+            let perms = fs::metadata(&target)?.permissions();
+            (target, Some(perms))
+        }
+        Ok(meta) => (path.to_path_buf(), Some(meta.permissions())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (path.to_path_buf(), None),
         Err(e) => return Err(e),
     };
     atomic_write_impl(&target, bytes, permissions)

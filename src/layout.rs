@@ -322,7 +322,7 @@ impl SpeedMode {
 }
 
 /// Built-in statusline layout presets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Preset {
     /// Single-line Full preset (replaces default AGY bar).
     Full,
@@ -355,11 +355,6 @@ impl Preset {
             Self::Minimal => "Minimal",
             Self::Addon => "Addon",
         }
-    }
-
-    /// Parses a preset by its canonical CLI name.
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|p| p.name() == name)
     }
 
     /// Builds the [`LayoutConfig`] corresponding to this preset.
@@ -528,10 +523,38 @@ impl LayoutConfig {
 
     /// Returns the matching built-in [`Preset`], ignoring runtime `no_color`.
     pub fn matching_preset(&self) -> Option<Preset> {
-        let mut norm = self.clone();
-        norm.normalize_rows();
-        norm.no_color = false;
-        Preset::ALL.iter().copied().find(|p| p.to_layout() == norm)
+        let Self {
+            rows,
+            style,
+            theme,
+            separator,
+            glyph_mode,
+            responsive,
+            bar_length,
+            speed_warn_threshold,
+            stack_with_default,
+            speed_mode,
+            ctx_remaining,
+            smart_hide,
+            show_git_diff,
+            no_color: _,
+        } = self;
+        Preset::ALL.iter().copied().find(|p| {
+            let target = p.to_layout();
+            style == &target.style
+                && theme == &target.theme
+                && separator == &target.separator
+                && glyph_mode == &target.glyph_mode
+                && responsive == &target.responsive
+                && bar_length == &target.bar_length
+                && speed_warn_threshold.to_bits() == target.speed_warn_threshold.to_bits()
+                && stack_with_default == &target.stack_with_default
+                && speed_mode == &target.speed_mode
+                && ctx_remaining == &target.ctx_remaining
+                && smart_hide == &target.smart_hide
+                && show_git_diff == &target.show_git_diff
+                && rows == &target.rows
+        })
     }
 }
 

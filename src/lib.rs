@@ -8,7 +8,6 @@
 //! (`agy-statusline stats`), pricing sync (`agy-statusline pricing`), and an
 //! interactive `ratatui` configurator (`agy-statusline config`).
 
-pub(crate) mod ansi;
 pub mod apply;
 pub mod calibration;
 pub mod db;

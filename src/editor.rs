@@ -179,11 +179,6 @@ impl TuiEditorState {
         }
     }
 
-    /// Returns true if `config` has been modified away from all built-in presets.
-    pub fn is_custom_preset(&self) -> bool {
-        self.config.matching_preset().is_none()
-    }
-
     /// Applies one of the built-in presets.
     pub fn apply_preset(&mut self, preset: Preset) {
         self.config = preset.to_layout();
@@ -316,10 +311,7 @@ impl TuiEditorState {
     }
 
     fn adjust_setting(&mut self, dir: isize) {
-        let Some(&field) = SettingField::ALL.get(self.settings_idx) else {
-            return;
-        };
-        match field {
+        match SettingField::ALL[self.settings_idx] {
             SettingField::Preset => self.apply_preset(self.preset.step(dir)),
             SettingField::Style => self.config.style = self.config.style.step(dir),
             SettingField::Theme => self.config.theme = self.config.theme.step(dir),
@@ -510,7 +502,7 @@ mod tests {
     fn catalog_adds_to_selected_target_line_and_settings_cycle() {
         let mut ed = TuiEditorState::new(LayoutConfig::preset_minimal());
         assert_eq!(ed.preset, Preset::Minimal);
-        assert!(!ed.is_custom_preset());
+        assert!(ed.config.matching_preset().is_some());
 
         ed.handle_key(KeyCode::Down, KeyModifiers::NONE);
         ed.handle_key(KeyCode::Down, KeyModifiers::NONE);
@@ -522,7 +514,7 @@ mod tests {
         ed.handle_key(KeyCode::Down, KeyModifiers::NONE);
         ed.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
         assert_eq!(ed.config.rows[2], vec![WidgetId::Directory]);
-        assert!(ed.is_custom_preset());
+        assert!(ed.config.matching_preset().is_none());
 
         ed.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(ed.active_pane, ActivePane::Settings);

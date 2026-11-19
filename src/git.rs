@@ -119,14 +119,6 @@ fn extract_worktree_name(gitdir: &Path) -> Option<String> {
     }
 }
 
-/// Detects whether `dir` (or an ancestor) is a linked `git worktree` by inspecting `.git`.
-///
-/// A linked worktree has a `.git` regular file containing `gitdir: .../worktrees/<name>`.
-#[cfg(test)]
-fn detect_worktree_name(dir: &Path) -> Option<String> {
-    resolve_git_repo(dir).and_then(|(_, wt)| wt)
-}
-
 /// Reads the current branch or detached `@<short_sha>` directly from `<gitdir>/HEAD`.
 fn read_head_branch(gitdir: &Path) -> Option<String> {
     let raw = fs::read_to_string(gitdir.join("HEAD")).ok()?;
@@ -296,7 +288,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            detect_worktree_name(&sub),
+            resolve_git_repo(&sub).and_then(|(_, wt)| wt),
             Some("feat-statusline".to_string())
         );
     }
@@ -332,7 +324,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".git")).unwrap();
 
-        assert_eq!(detect_worktree_name(dir.path()), None);
+        assert_eq!(resolve_git_repo(dir.path()).and_then(|(_, wt)| wt), None);
     }
 
     #[test]

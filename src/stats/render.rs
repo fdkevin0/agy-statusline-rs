@@ -6,7 +6,7 @@ use jiff::civil::Date;
 use jiff::ToSpan;
 use unicode_width::UnicodeWidthStr;
 
-use super::{PeriodSummary, StatsReport, WeeklyUsage, ACTIVITY_WEEKS};
+use super::{PeriodSummary, StatsReport, ACTIVITY_WEEKS};
 use crate::format::format_tokens_string as fmt_tok;
 use crate::render::truncate_to_width;
 
@@ -62,13 +62,10 @@ fn heatmap_level(tokens: u64, peak: u64) -> usize {
     }
 }
 
-fn build_month_header(weeks: &[WeeklyUsage]) -> String {
-    let week_months: Vec<Option<usize>> = weeks
+fn build_month_header(week_dates: &[Option<Date>]) -> String {
+    let week_months: Vec<Option<usize>> = week_dates
         .iter()
-        .map(|w| {
-            let date: Date = w.week_start.parse().ok()?;
-            Some((date.month() - 1) as usize)
-        })
+        .map(|d| d.map(|date| (date.month() - 1) as usize))
         .collect();
 
     let mut out = String::new();
@@ -104,10 +101,10 @@ fn write_weekly_activity<W: Write>(
     ascii: bool,
 ) -> io::Result<()> {
     let weeks = &report.weekly;
+    let week_dates: Vec<Option<Date>> = weeks.iter().map(|w| w.week_start.parse().ok()).collect();
     let mut peak: Option<(String, &'static str, u64)> = None;
 
-    for week in weeks {
-        let mon_date: Option<Date> = week.week_start.parse().ok();
+    for (week, &mon_date) in weeks.iter().zip(&week_dates) {
         for (wd_idx, maybe_tok) in week.daily_tokens.iter().enumerate() {
             if let Some(tok) = *maybe_tok {
                 if tok > 0 && peak.as_ref().is_none_or(|(_, _, p)| tok > *p) {
@@ -156,7 +153,7 @@ fn write_weekly_activity<W: Write>(
         return Ok(());
     }
 
-    let month_hdr = build_month_header(weeks);
+    let month_hdr = build_month_header(&week_dates);
     if !month_hdr.is_empty() {
         writeln!(
             out,
@@ -240,17 +237,10 @@ pub(super) fn render_stats_report<W: Write>(
     ascii: bool,
     out: &mut W,
 ) -> io::Result<()> {
-    let date_label = if report.today_local.is_empty() {
-        &report.today_utc
-    } else {
-        &report.today_local
-    };
-    let tz_label = if report.timezone.is_empty() {
-        "UTC"
-    } else {
-        &report.timezone
-    };
-    let mut header = format!("agy-statusline stats · Local {date_label} ({tz_label})");
+    let mut header = format!(
+        "agy-statusline stats · Local {} ({})",
+        report.today_local, report.timezone
+    );
     if let Some(d) = report.filter_days {
         header.push_str(&format!(" · Last {d}d"));
     }
@@ -347,7 +337,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::stats::{build_weekly_usage, ModelStats};
+    use crate::stats::{build_weekly_usage, ModelStats, WeeklyUsage};
     use crate::timeutil::unix_day_from_civil_date;
 
     fn weekly_for(today: &str, daily: &[(&str, u64)]) -> Vec<WeeklyUsage> {

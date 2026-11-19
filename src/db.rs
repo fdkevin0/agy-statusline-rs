@@ -10,9 +10,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::paths::resolve_agy_cli_dir;
-use crate::protobuf::{
-    extract_estimated_context_tokens, extract_max_context_tokens, extract_turn_metrics, TurnMetrics,
-};
+use crate::protobuf::{extract_gen_metadata_summary, TurnMetrics};
 
 /// Session generation metadata sniffed from `gen_metadata`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -54,10 +52,12 @@ pub struct SqliteSpeedReader {
 
 impl SpeedReader for SqliteSpeedReader {
     fn session_metadata(&self, conversation_id: &str) -> SessionMetadata {
-        if let Some(home) = &self.home_override {
-            return query_session_metadata(home, conversation_id);
-        }
-        let Some(cli_dir) = resolve_agy_cli_dir() else {
+        let Some(cli_dir) = self
+            .home_override
+            .as_ref()
+            .map(|home| home.join(".gemini").join("antigravity-cli"))
+            .or_else(resolve_agy_cli_dir)
+        else {
             return SessionMetadata::default();
         };
         let Some(db_path) = resolve_conversation_db_path(&cli_dir, conversation_id) else {
@@ -125,29 +125,19 @@ pub(crate) fn open_readonly_db(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// Computes the exact median of finite values in `values`, returning `None` if none are finite.
+/// Computes the exact median of finite values in `values`, returning `None` if empty.
 pub(crate) fn compute_median(values: &[f64]) -> Option<f64> {
-    let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
-    if finite.is_empty() {
+    if values.is_empty() {
         return None;
     }
-    finite.sort_by(f64::total_cmp);
-    let mid = finite.len() / 2;
-    if finite.len().is_multiple_of(2) {
-        Some((finite[mid - 1] + finite[mid]) / 2.0)
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        Some((sorted[mid - 1] + sorted[mid]) / 2.0)
     } else {
-        Some(finite[mid])
+        Some(sorted[mid])
     }
-}
-
-/// Queries `<home>/.gemini/antigravity-cli/conversations/<conversation_id>.db`
-/// in read-only mode for generation speed, TTFT, thinking tokens, and context window metadata.
-fn query_session_metadata(home: &Path, conversation_id: &str) -> SessionMetadata {
-    let cli_dir = home.join(".gemini").join("antigravity-cli");
-    let Some(db_path) = resolve_conversation_db_path(&cli_dir, conversation_id) else {
-        return SessionMetadata::default();
-    };
-    query_session_metadata_from_db(&db_path)
 }
 
 /// Opens `db_path` in read-only mode and extracts speed, TTFT, and context window metadata.
@@ -168,14 +158,14 @@ fn query_session_metadata_from_db(db_path: &Path) -> SessionMetadata {
     let mut turns: Vec<TurnMetrics> = Vec::with_capacity(9);
     while let Ok(Some(row)) = rows.next() {
         if let Ok(blob) = row.get::<_, Vec<u8>>(0) {
-            if let Some(tm) = extract_turn_metrics(&blob) {
-                turns.push(tm);
-            }
-            if meta.max_context_tokens.is_none() {
-                meta.max_context_tokens = extract_max_context_tokens(&blob);
-            }
-            if meta.estimated_context_tokens.is_none() {
-                meta.estimated_context_tokens = extract_estimated_context_tokens(&blob);
+            if let Some(summary) = extract_gen_metadata_summary(&blob) {
+                if let Some(tm) = summary.turn {
+                    turns.push(tm);
+                }
+                meta.max_context_tokens = meta.max_context_tokens.or(summary.max_context_tokens);
+                meta.estimated_context_tokens = meta
+                    .estimated_context_tokens
+                    .or(summary.estimated_context_tokens);
             }
         }
     }
@@ -343,14 +333,10 @@ mod tests {
     }
 
     #[test]
-    fn compute_median_handles_odd_even_and_non_finite() {
+    fn compute_median_handles_empty_odd_and_even() {
         assert_eq!(compute_median(&[]), None);
-        assert_eq!(compute_median(&[f64::NAN, f64::INFINITY]), None);
         assert_eq!(compute_median(&[30.0, 10.0, 20.0]), Some(20.0));
-        assert_eq!(
-            compute_median(&[40.0, f64::NAN, 10.0, 20.0, f64::NEG_INFINITY, 30.0]),
-            Some(25.0)
-        );
+        assert_eq!(compute_median(&[40.0, 10.0, 20.0, 30.0]), Some(25.0));
     }
 
     #[test]
