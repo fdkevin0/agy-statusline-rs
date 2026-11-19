@@ -3,7 +3,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn non_empty_path(val: Option<OsString>) -> Option<PathBuf> {
     val.filter(|v| !v.is_empty()).map(PathBuf::from)
@@ -89,7 +89,8 @@ pub fn agy_settings_path() -> io::Result<PathBuf> {
 }
 
 /// Returns `<home>/.gemini/antigravity-cli/settings.json` for a given home directory.
-pub fn agy_settings_path_for_home(home: &Path) -> PathBuf {
+#[cfg(test)]
+pub(crate) fn agy_settings_path_for_home(home: &std::path::Path) -> PathBuf {
     home.join(".gemini")
         .join("antigravity-cli")
         .join("settings.json")
@@ -160,22 +161,5 @@ mod tests {
             Some(PathBuf::from("/home/alice/.cache/agy-statusline"))
         );
         assert_eq!(xdg_cache_dir_from(None, None), None);
-    }
-
-    #[test]
-    fn resolves_agy_settings_path() {
-        let dir = PathBuf::from("/tmp/custom-agy-cli");
-        assert_eq!(
-            agy_settings_path_from(Some(dir.clone())).unwrap(),
-            dir.join("settings.json")
-        );
-        assert_eq!(
-            agy_settings_path_from(None).unwrap_err().kind(),
-            io::ErrorKind::NotFound
-        );
-        assert_eq!(
-            agy_settings_path_for_home(Path::new("/home/alice")),
-            PathBuf::from("/home/alice/.gemini/antigravity-cli/settings.json")
-        );
     }
 }

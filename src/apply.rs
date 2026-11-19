@@ -18,26 +18,28 @@ pub fn resolve_invoked_binary_path() -> io::Result<PathBuf> {
         return Ok(exe);
     };
     let arg0 = Path::new(&arg0);
-    let launcher = |candidate: PathBuf| {
-        let with_exe = (cfg!(windows) && candidate.extension().is_none())
-            .then(|| candidate.with_extension("exe"));
-        std::iter::once(candidate)
-            .chain(with_exe)
-            .filter_map(|candidate| path::absolute(candidate).ok())
-            .find(|candidate| candidate.canonicalize().is_ok_and(|p| p == target))
+    let matches_target = |candidate: PathBuf| {
+        path::absolute(candidate)
+            .ok()
+            .filter(|abs| abs.canonicalize().is_ok_and(|p| p == target))
     };
 
     let resolved = if arg0.components().count() > 1 {
-        launcher(arg0.to_owned())
+        let with_exe =
+            (cfg!(windows) && arg0.extension().is_none()).then(|| arg0.with_extension("exe"));
+        std::iter::once(arg0.to_owned())
+            .chain(with_exe)
+            .find_map(matches_target)
     } else {
-        env::var_os("PATH")
-            .and_then(|path| env::split_paths(&path).find_map(|dir| launcher(dir.join(arg0))))
+        which::which_all(arg0)
+            .ok()
+            .and_then(|mut iter| iter.find_map(matches_target))
     };
     Ok(resolved.unwrap_or(exe))
 }
 
 /// Builds the `statusLine` JSON object pointing to `command_path`.
-pub fn build_statusline_entry(command_path: &Path, stack_with_default: bool) -> Value {
+fn build_statusline_entry(command_path: &Path, stack_with_default: bool) -> Value {
     json!({
         "type": "command",
         "command": command_path.to_string_lossy(),
@@ -89,7 +91,7 @@ fn write_settings_object(settings_path: &Path, root: Map<String, Value>) -> io::
 ///
 /// Returns an error if an existing `settings.json` cannot be read, is not a
 /// valid JSON object, or cannot be written back.
-pub fn apply_statusline_config(
+pub(crate) fn apply_statusline_config(
     settings_path: &Path,
     command_path: &Path,
     stack_with_default: bool,

@@ -13,8 +13,7 @@ use super::tz::TimeZoneSpec;
 use super::SqliteStats;
 use crate::db::{compute_median, is_valid_uuid, open_readonly_db, resolve_conversation_db_path};
 use crate::protobuf::{
-    extract_gen_metadata_record, extract_step_created_at_secs, MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
-    MIN_TURN_DECODE_SECS,
+    extract_gen_metadata_record, extract_step_created_at_secs, is_sane_decode_speed, MAX_TTFT_SECS,
 };
 use crate::timeutil::parse_rfc3339_unix_secs;
 
@@ -58,7 +57,7 @@ fn is_effort_qualifier(tag: &str) -> bool {
 ///
 /// Strips trailing parenthetical effort tiers (e.g. `(Low)`, `(Medium)`, `(High)`) while
 /// preserving non-effort qualifiers (e.g. `(Orchestrator)` or tier/backend labels).
-pub fn derive_model_name(
+fn derive_model_name(
     model_display_name: Option<&str>,
     response_model: Option<&str>,
     model_enum: u64,
@@ -117,7 +116,7 @@ fn has_non_null_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> bo
         .any(|k| obj.get(*k).is_some_and(|v| !v.is_null()))
 }
 
-pub(super) fn parse_duration_secs(v: Option<&Value>) -> Option<f64> {
+fn parse_duration_secs(v: Option<&Value>) -> Option<f64> {
     let val = v?;
     match val {
         Value::Number(n) => {
@@ -151,7 +150,7 @@ fn non_empty_str(v: Option<&Value>) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-pub(super) fn extract_canonical_event_key(
+fn extract_canonical_event_key(
     obj: &serde_json::Map<String, Value>,
     root_source: &str,
     default_cascade: &str,
@@ -459,13 +458,9 @@ fn parse_transcript_line(
     let streaming_secs = cm_obj
         .and_then(|cm| parse_duration_secs(cm.get("streamingDuration")))
         .or_else(|| parse_duration_secs(obj.get("streamingSec")));
-    let decode_speed = streaming_secs.and_then(|secs| {
-        if secs < MIN_TURN_DECODE_SECS || output_tokens == 0 {
-            return None;
-        }
-        let speed = (output_tokens as f64) / secs;
-        (speed.is_finite() && speed > 0.0 && speed < MAX_TURN_SPEED_TPS).then_some(speed)
-    });
+    let decode_speed = streaming_secs
+        .filter(|&secs| is_sane_decode_speed(output_tokens, secs))
+        .map(|secs| (output_tokens as f64) / secs);
 
     let ttft_secs = cm_obj
         .and_then(|cm| parse_duration_secs(cm.get("timeToFirstToken")))
@@ -811,7 +806,7 @@ pub(super) fn scan_sqlite_conversations(
 }
 
 /// Estimates total USD cost for a single conversation from its SQLite `gen_metadata` table.
-pub fn estimate_conversation_cost_usd(
+pub(crate) fn estimate_conversation_cost_usd(
     cli_dir: &Path,
     conversation_id: &str,
     pricing: &PricingCatalog,
@@ -863,8 +858,9 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+    use crate::stats::render::render_stats_report;
     use crate::stats::test_helpers::build_gen_blob;
-    use crate::stats::{collect_stats_with_tz, render_stats_report};
+    use crate::stats::collect_stats_with_tz;
 
     #[test]
     fn derive_model_name_is_dynamic_and_strips_only_effort_suffixes() {

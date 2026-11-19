@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 //! Safe Rust statusline for Antigravity CLI (`agy`).
 //!
-//! Reads AGY statusline JSON from stdin, queries the local SQLite conversation
-//! database for the last completed turn's generation speed, and renders a
-//! customizable multi-row statusline (`Plain`, `Pill`, or `Powerline`) with an
+//! Reads AGY statusline JSON from stdin, inspects local SQLite conversation
+//! metadata for decode/e2e speed, TTFT, thinking tokens, and compaction limits,
+//! calibrates rolling quota pools, and renders a customizable multi-row
+//! statusline (`Plain`, `Pill`, or `Powerline`) alongside local usage stats
+//! (`agy-statusline stats`), pricing sync (`agy-statusline pricing`), and an
 //! interactive `ratatui` configurator (`agy-statusline config`).
 
 pub(crate) mod ansi;

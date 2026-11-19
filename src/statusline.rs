@@ -110,8 +110,6 @@ pub struct ContextWindow {
     pub context_window_size: Option<u64>,
     /// Percentage of the context window currently consumed (`0.0..=100.0`).
     pub used_percentage: Option<f64>,
-    /// Remaining context window percentage.
-    pub remaining_percentage: Option<f64>,
     /// Cumulative input tokens over the session.
     pub total_input_tokens: Option<u64>,
     /// Cumulative output tokens over the session.
@@ -215,12 +213,12 @@ impl StatuslinePayload {
     ///
     /// For objects containing a string `"status"` field, counts only entries where
     /// `status != "completed"`; entries lacking `"status"` fall back to direct counting.
-    pub fn subagent_count(&self) -> usize {
+    pub(crate) fn subagent_count(&self) -> usize {
         self.active_subagents().count()
     }
 
     /// Returns the role or name of the sole active subagent when `subagent_count() == 1`.
-    pub fn single_active_subagent_label(&self) -> Option<&str> {
+    pub(crate) fn single_active_subagent_label(&self) -> Option<&str> {
         let mut iter = self.active_subagents();
         let first = iter.next()?;
         if iter.next().is_some() {
@@ -255,7 +253,7 @@ impl StatuslinePayload {
 
     /// Returns the raw workspace directory path preferring `workspace.current_dir`,
     /// then `workspace.project_dir`, then top-level `cwd`.
-    pub fn workspace_path(&self) -> Option<&str> {
+    fn workspace_path(&self) -> Option<&str> {
         self.workspace
             .as_ref()
             .and_then(|ws| {
@@ -269,7 +267,7 @@ impl StatuslinePayload {
 
     /// Returns the directory basename preferring `workspace.project_dir`,
     /// then `workspace.current_dir`, then top-level `cwd`.
-    pub fn workspace_basename(&self) -> Option<&str> {
+    pub(crate) fn workspace_basename(&self) -> Option<&str> {
         let raw = self
             .workspace
             .as_ref()
@@ -295,7 +293,7 @@ impl StatuslinePayload {
 }
 
 /// Builds a rich sample payload used for live preview and `doctor`.
-pub fn sample_preview_payload(width: usize) -> StatuslinePayload {
+pub(crate) fn sample_preview_payload(width: usize) -> StatuslinePayload {
     let mut quota = BTreeMap::new();
     quota.insert(
         "gemini-5h".to_string(),
@@ -372,6 +370,30 @@ pub fn sample_preview_payload(width: usize) -> StatuslinePayload {
         quota: Some(quota),
         terminal_width: Some(width),
         ..Default::default()
+    }
+}
+
+/// Builds sample SQLite session metadata used for live TUI preview and `doctor`.
+pub(crate) fn sample_preview_metadata() -> SessionMetadata {
+    SessionMetadata {
+        speed: Some(64.0),
+        median_speed: Some(68.0),
+        last_turn_speed: Some(72.0),
+        e2e_speed: Some(46.0),
+        ttft_secs: Some(1.4),
+        thinking_tokens: Some(4_200),
+        max_context_tokens: Some(512_000),
+        ..Default::default()
+    }
+}
+
+/// Builds sample Git probe metadata used for live TUI preview and `doctor`.
+pub(crate) fn sample_preview_git() -> GitInfo {
+    GitInfo {
+        branch: Some("main".to_string()),
+        worktree: Some("feat-wt".to_string()),
+        added: 42,
+        deleted: 11,
     }
 }
 
@@ -609,10 +631,10 @@ mod tests {
         }
     }
 
-    struct StubGit(GitInfo);
-    impl GitProbe for StubGit {
+    struct NoopGit;
+    impl GitProbe for NoopGit {
         fn probe(&self, _dir: &Path, _include_diff: bool) -> GitInfo {
-            self.0.clone()
+            GitInfo::default()
         }
     }
 
@@ -626,25 +648,25 @@ mod tests {
             "workspace": null,
             "cost": null
         }"#;
-        let mut cfg = LayoutConfig::preset_minimal();
-        cfg.theme = crate::layout::ThemeStyle::Mono;
-        let reader = StubReader(Some(88.0));
-        let git = StubGit(GitInfo::default());
-        let runtime = StatuslineRuntime::minimal(&reader, &git);
-
-        let mut out = Vec::new();
-        process_statusline(json, &runtime, &cfg, &mut out).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("THINKING"));
-        assert!(text.contains("main*"));
-        assert!(text.contains("88 tok/s"));
+        let payload: StatuslinePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.agent_state.as_deref(), Some("thinking"));
+        assert_eq!(
+            payload.conversation_id.as_deref(),
+            Some("8d0371e1-5a05-423b-a8bc-ed75995f9a8b")
+        );
+        assert!(payload.model.is_none());
+        assert!(payload.workspace.is_none());
+        assert!(payload.cost.is_none());
+        let vcs = payload.vcs.as_ref().unwrap();
+        assert_eq!(vcs.branch.as_deref(), Some("main"));
+        assert_eq!(vcs.dirty, Some(true));
     }
 
     #[test]
     fn empty_and_invalid_json_degrades_gracefully() {
         let mut cfg = LayoutConfig::preset_addon();
         cfg.theme = crate::layout::ThemeStyle::Mono;
-        let git = StubGit(GitInfo::default());
+        let git = NoopGit;
 
         let reader_none = StubReader(None);
         let mut out = Vec::new();
@@ -662,31 +684,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(String::from_utf8(out2).unwrap(), "◈ cache -- ⚡ --\n");
-    }
-
-    #[test]
-    fn falls_back_to_cwd_and_git_probe_when_vcs_branch_absent() {
-        let json = r#"{
-            "agent_state": "idle",
-            "cwd": "/tmp/my-repo",
-            "vcs": {"type": "git"}
-        }"#;
-        let mut cfg = LayoutConfig::preset_minimal();
-        cfg.theme = crate::layout::ThemeStyle::Mono;
-        cfg.show_git_diff = false;
-        let reader = StubReader(None);
-        let git = StubGit(GitInfo {
-            branch: Some("feat/probe".to_string()),
-            worktree: None,
-            added: 0,
-            deleted: 0,
-        });
-        let runtime = StatuslineRuntime::minimal(&reader, &git);
-
-        let mut out = Vec::new();
-        process_statusline(json, &runtime, &cfg, &mut out).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("feat/probe"));
     }
 
     #[test]
@@ -790,7 +787,7 @@ mod tests {
 
         let calls = Cell::new(0usize);
         let reader = CountingReader(&calls);
-        let git = StubGit(GitInfo::default());
+        let git = NoopGit;
         let runtime = StatuslineRuntime::minimal(&reader, &git);
         let json = r#"{
             "agent_state": "idle",

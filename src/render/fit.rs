@@ -30,7 +30,7 @@ pub(super) fn slice_visible_width(segments: &[Segment], geom: StyleGeometry) -> 
     body + geom.slice_trail_w
 }
 
-pub(super) fn groups_visible_width(groups: &[Vec<Segment>], geom: StyleGeometry) -> usize {
+fn groups_visible_width(groups: &[Vec<Segment>], geom: StyleGeometry) -> usize {
     if groups.is_empty() {
         return 0;
     }
@@ -103,7 +103,7 @@ pub(super) fn fit_row_groups(
         return groups;
     }
 
-    // Stages 1–4b: Apply structured per-segment compaction fallbacks in priority order.
+    // Apply structured per-segment compaction fallbacks in priority order.
     for &stage in COMPACT_STAGES {
         for group in &mut groups {
             for seg in group {
@@ -115,7 +115,7 @@ pub(super) fn fit_row_groups(
         }
     }
 
-    // Stage 5: Priority-based widget drop and final single-segment truncation.
+    // Priority-based widget drop and final single-segment truncation.
     while groups_visible_width(&groups, geom) > limit {
         let total_segs: usize = groups.iter().map(Vec::len).sum();
         if total_segs <= 1 {

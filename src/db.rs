@@ -1,7 +1,8 @@
 //! Read-only SQLite conversation database reader and UUID validation.
 //!
-//! Queries `~/.gemini/antigravity-cli/conversations/<conversation_id>.db`
-//! for the most recent `gen_metadata` blob and extracts generation speed.
+//! Queries `<agy_cli_dir>/conversations/<conversation_id>.db` for recent
+//! `gen_metadata` rows and extracts decode/e2e speed, TTFT, thinking tokens,
+//! and context window metadata.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -66,7 +67,7 @@ impl SpeedReader for SqliteSpeedReader {
 
 /// Resolves `<cli_dir>/conversations/<conversation_id>.db`, falling back to lowercase
 /// `<conversation_id_lower>.db` on case-sensitive filesystems.
-pub fn resolve_conversation_db_path(cli_dir: &Path, conversation_id: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_conversation_db_path(cli_dir: &Path, conversation_id: &str) -> Option<PathBuf> {
     if !is_valid_uuid(conversation_id) {
         return None;
     }
@@ -115,7 +116,7 @@ pub fn is_valid_uuid(id: &str) -> bool {
 }
 
 /// Opens a SQLite database in read-only, no-mutex mode with a 25ms busy timeout.
-pub fn open_readonly_db(path: &Path) -> rusqlite::Result<Connection> {
+pub(crate) fn open_readonly_db(path: &Path) -> rusqlite::Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
     let _ = conn.busy_timeout(Duration::from_millis(25));
@@ -123,7 +124,7 @@ pub fn open_readonly_db(path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// Computes the exact median of finite values in `values`, returning `None` if none are finite.
-pub fn compute_median(values: &[f64]) -> Option<f64> {
+pub(crate) fn compute_median(values: &[f64]) -> Option<f64> {
     let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
     if finite.is_empty() {
         return None;
@@ -138,14 +139,8 @@ pub fn compute_median(values: &[f64]) -> Option<f64> {
 }
 
 /// Queries `<home>/.gemini/antigravity-cli/conversations/<conversation_id>.db`
-/// in read-only mode and extracts the latest generation speed.
-pub fn query_last_speed(home: &Path, conversation_id: &str) -> Option<f64> {
-    query_session_metadata(home, conversation_id).speed
-}
-
-/// Queries `<home>/.gemini/antigravity-cli/conversations/<conversation_id>.db`
-/// in read-only mode for both generation speed and `max_context_tokens`.
-pub fn query_session_metadata(home: &Path, conversation_id: &str) -> SessionMetadata {
+/// in read-only mode for generation speed, TTFT, thinking tokens, and context window metadata.
+fn query_session_metadata(home: &Path, conversation_id: &str) -> SessionMetadata {
     let cli_dir = home.join(".gemini").join("antigravity-cli");
     let Some(db_path) = resolve_conversation_db_path(&cli_dir, conversation_id) else {
         return SessionMetadata::default();
@@ -153,13 +148,8 @@ pub fn query_session_metadata(home: &Path, conversation_id: &str) -> SessionMeta
     query_session_metadata_from_db(&db_path)
 }
 
-/// Opens `db_path` in read-only mode and extracts the latest completed `gen_metadata` speed.
-pub fn query_last_speed_from_db(db_path: &Path) -> Option<f64> {
-    query_session_metadata_from_db(db_path).speed
-}
-
 /// Opens `db_path` in read-only mode and extracts speed, TTFT, and context window metadata.
-pub fn query_session_metadata_from_db(db_path: &Path) -> SessionMetadata {
+fn query_session_metadata_from_db(db_path: &Path) -> SessionMetadata {
     let mut meta = SessionMetadata::default();
     let Ok(conn) = open_readonly_db(db_path) else {
         return meta;
@@ -261,26 +251,6 @@ mod tests {
             home_override: Some(dir.path().to_path_buf()),
         };
         assert_eq!(reader.session_metadata(uuid).speed, Some(50.0));
-    }
-
-    #[test]
-    fn extracts_both_speed_and_max_context_tokens_from_db() {
-        let (dir, conn, uuid) = create_temp_conv_db();
-        let speed_blob: &[u8] = &[0x0a, 0x08, 0x22, 0x02, 0x18, 0x64, 0x62, 0x02, 0x08, 0x02];
-        let ctx_blob: &[u8] = &[0x0a, 0x08, 0x4a, 0x06, 0x52, 0x04, 0x20, 0x80, 0xa0, 0x1f];
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [speed_blob])
-            .unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [ctx_blob])
-            .unwrap();
-        drop(conn);
-
-        let reader = SqliteSpeedReader {
-            home_override: Some(dir.path().to_path_buf()),
-        };
-        let meta = reader.session_metadata(uuid);
-        assert_eq!(meta.speed, Some(50.0));
-        assert_eq!(meta.last_turn_speed, Some(50.0));
-        assert_eq!(meta.max_context_tokens, Some(512_000));
     }
 
     fn speed_1s_blob(output_tokens: u8) -> [u8; 10] {

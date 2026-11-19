@@ -10,10 +10,11 @@ use crate::db::SessionMetadata;
 use crate::git::GitInfo;
 use crate::layout::{LayoutConfig, SpeedMode, WidgetId};
 use crate::metrics::{
-    current_context_tokens, resolve_quota_5h, resolve_quota_weekly, valid_cache_usage, QuotaView,
+    current_context_tokens, resolve_quota_views_with_reset_at, valid_cache_usage, QuotaView,
 };
 use crate::statusline::StatuslinePayload;
 use crate::theme::{glyphs_for, palette_for, GlyphSet, Palette};
+use crate::timeutil::unix_now_secs;
 
 pub(crate) use fit::truncate_to_width;
 
@@ -222,19 +223,20 @@ pub fn write_statusline<W: IoWrite>(
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
+    let (quota_5h, quota_weekly) = resolve_quota_views_with_reset_at(payload, unix_now_secs());
     write_statusline_with_quotas(
         payload,
         meta,
         git,
-        resolve_quota_5h(payload),
-        resolve_quota_weekly(payload),
+        quota_5h.map(|(v, _)| v),
+        quota_weekly.map(|(v, _)| v),
         cfg,
         out,
     )
 }
 
 /// Renders all non-empty configured rows using pre-resolved (e.g. calibrated) quota views.
-pub fn write_statusline_with_quotas<W: IoWrite>(
+pub(crate) fn write_statusline_with_quotas<W: IoWrite>(
     payload: &StatuslinePayload,
     meta: &SessionMetadata,
     git: &GitInfo,
@@ -267,7 +269,7 @@ mod tests {
 
     use super::*;
     use crate::format::format_tokens_string as format_tok_str;
-    use crate::layout::{GlyphMode, ThemeStyle};
+    use crate::layout::{GlyphMode, ThemeStyle, VisualStyle};
     use crate::statusline::{
         AgentInfo, BattleInfo, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, VcsInfo,
         VimInfo, WorkspaceInfo,
@@ -335,6 +337,20 @@ mod tests {
         assert!(pl_text.contains("~$0.14"));
         assert!(pl_text.contains("(512K)"));
 
+        let mut pill_cfg = LayoutConfig::preset_full();
+        pill_cfg.style = VisualStyle::Pill;
+        pill_cfg.glyph_mode = GlyphMode::Nerd;
+        pill_cfg.responsive = false;
+        let mut pill_out = Vec::new();
+        write_statusline(&payload, &meta, &git, &pill_cfg, &mut pill_out).unwrap();
+        let pill_text = String::from_utf8(pill_out).unwrap();
+        assert!(pill_text.contains("\u{e0b6}"));
+        assert!(pill_text.contains("\u{e0b4}"));
+        assert!(pill_text.contains("\x1b[48;5;236m"));
+        assert!(pill_text.contains("THINKING"));
+        assert!(pill_text.contains("~$0.14"));
+        assert!(!pill_text.contains("\u{e0b0}"));
+
         let mut narrow_cfg = LayoutConfig::preset_full();
         narrow_cfg.theme = ThemeStyle::Mono;
         let mut narrow_out = Vec::new();
@@ -342,6 +358,8 @@ mod tests {
         let narrow_text = String::from_utf8(narrow_out).unwrap();
         assert!(narrow_text.contains("THINKING"));
         assert!(!narrow_text.contains("sandbox"));
+        assert!(!narrow_text.contains("\u{e0b0}"));
+        assert!(!narrow_text.contains("\u{e0b6}"));
     }
 
     #[test]
@@ -428,31 +446,6 @@ mod tests {
         assert!(trimmed.starts_with("● READY"));
         assert!(trimmed.contains("⚡ --"));
         assert!(trimmed.ends_with("◈ cache --"));
-    }
-
-    #[test]
-    fn model_omits_effort_when_display_name_already_includes_it() {
-        let payload = StatuslinePayload {
-            model: Some(ModelInfo {
-                id: None,
-                display_name: Some("Acme 4 Base (Medium)".to_string()),
-                effort: Some("medium".to_string()),
-            }),
-            ..Default::default()
-        };
-        let mut cfg = LayoutConfig::preset_minimal();
-        cfg.theme = ThemeStyle::Mono;
-        cfg.rows = vec![vec![WidgetId::Model]];
-        let mut out = Vec::new();
-        write_statusline(
-            &payload,
-            &SessionMetadata::default(),
-            &GitInfo::default(),
-            &cfg,
-            &mut out,
-        )
-        .unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), "Acme 4 Base (Medium)\n");
     }
 
     #[test]

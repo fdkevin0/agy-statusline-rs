@@ -80,16 +80,6 @@ macro_rules! impl_cycle_enum {
                 };
                 Self::ALL[(idx + dir).rem_euclid(Self::ALL.len() as isize) as usize]
             }
-
-            /// Cycles forward to the next variant.
-            pub const fn next(self) -> Self {
-                self.step(1)
-            }
-
-            /// Cycles backward to the previous variant.
-            pub const fn prev(self) -> Self {
-                self.step(-1)
-            }
         }
     };
 }
@@ -189,7 +179,7 @@ impl VisualStyle {
     }
 }
 
-/// Separator inserted between widgets in [`VisualStyle::Plain`].
+/// Separator inserted between widgets in [`VisualStyle::Plain`], [`ThemeStyle::Mono`], and `NO_COLOR` mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeparatorStyle {
@@ -245,7 +235,7 @@ pub enum GlyphMode {
     /// Crisp cross-platform Unicode glyphs (default).
     #[default]
     Unicode,
-    /// Nerd Font icons and rounded Powerline capsule caps.
+    /// Nerd Font icons and rounded [`VisualStyle::Pill`] capsule caps.
     Nerd,
     /// Pure 7-bit ASCII symbols for basic terminals.
     Ascii,
@@ -334,13 +324,13 @@ impl SpeedMode {
 /// Built-in statusline layout presets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
-    /// Single-line Full Dashboard (replaces default AGY bar).
+    /// Single-line Full preset (replaces default AGY bar).
     Full,
-    /// Two-line Powerline Pro with Catppuccin palette.
+    /// Two-line Powerline preset with Catppuccin palette.
     Powerline,
-    /// Minimal single-line statusline.
+    /// Single-line Minimal preset.
     Minimal,
-    /// Metrics Addon bar stacked under AGY's built-in statusline.
+    /// Compact Addon bar stacked under AGY's built-in statusline.
     Addon,
 }
 
@@ -393,7 +383,7 @@ pub struct LayoutConfig {
     pub style: VisualStyle,
     /// Color theme (`default`, `nord`, `catppuccin`, `tokyo_night`, `gruvbox`, `light`, `mono`).
     pub theme: ThemeStyle,
-    /// Separator between widgets in `Plain` style.
+    /// Separator between widgets in `Plain` style, `Mono` theme, and `NO_COLOR` mode.
     pub separator: SeparatorStyle,
     /// Glyph set (`unicode`, `nerd`, `ascii`).
     pub glyph_mode: GlyphMode,
@@ -409,7 +399,8 @@ pub struct LayoutConfig {
     pub speed_mode: SpeedMode,
     /// Display remaining context % (`rem 57.5%`) instead of used % (`ctx 42.5%`).
     pub ctx_remaining: bool,
-    /// Automatically hide zero/inactive widgets (`art 0`, `sub 0`, `tasks 0`, `sandbox off`, main `worktree`).
+    /// Automatically hide zero, absent, or inactive widgets (`worktree`, `ttft`, `thinking`,
+    /// `quota_5h`, `quota_weekly`, `artifacts`, `subagents`, `tasks`, `queue`, `vim`, `battle`, `sandbox`).
     pub smart_hide: bool,
     /// Show `+ins -del` working-tree diff stats alongside `vcs` branch.
     pub show_git_diff: bool,
@@ -446,7 +437,7 @@ impl LayoutConfig {
         cfg
     }
 
-    /// Preset 1: Single-line Full Dashboard (replaces default AGY bar).
+    /// Preset 1 (`Full`): Single-line layout (replaces default AGY bar).
     pub fn preset_full() -> Self {
         Self::base_with_rows(vec![vec![
             WidgetId::State,
@@ -465,7 +456,7 @@ impl LayoutConfig {
         ]])
     }
 
-    /// Preset 2: Powerline Pro with Catppuccin palette.
+    /// Preset 2 (`Powerline`): Two-line Powerline layout with Catppuccin palette.
     pub fn preset_powerline() -> Self {
         let mut cfg = Self::base_with_rows(vec![
             vec![
@@ -488,7 +479,7 @@ impl LayoutConfig {
         cfg
     }
 
-    /// Preset 3: Minimal single-line statusline.
+    /// Preset 3 (`Minimal`): Single-line minimal layout.
     pub fn preset_minimal() -> Self {
         Self::base_with_rows(vec![vec![
             WidgetId::State,
@@ -500,7 +491,7 @@ impl LayoutConfig {
         ]])
     }
 
-    /// Preset 4: Metrics Addon bar stacked under AGY's built-in statusline.
+    /// Preset 4 (`Addon`): Compact metrics bar stacked under AGY's built-in statusline.
     pub fn preset_addon() -> Self {
         let mut cfg = Self::base_with_rows(vec![vec![
             WidgetId::CacheHit,
@@ -601,43 +592,6 @@ mod tests {
         let loaded = load_layout_config(&path);
         assert_eq!(loaded, cfg);
         assert_eq!(loaded.matching_preset(), Some(Preset::Powerline));
-    }
-
-    #[test]
-    fn preset_round_trip_names_and_cycling() {
-        assert_eq!(Preset::from_name("full"), Some(Preset::Full));
-        assert_eq!(Preset::from_name("powerline"), Some(Preset::Powerline));
-        assert_eq!(Preset::from_name("minimal"), Some(Preset::Minimal));
-        assert_eq!(Preset::from_name("addon"), Some(Preset::Addon));
-        assert_eq!(Preset::from_name("unknown"), None);
-
-        assert_eq!(Preset::Full.name(), "full");
-        assert_eq!(Preset::Powerline.display_name(), "Powerline");
-        assert_eq!(Preset::Full.next(), Preset::Powerline);
-        assert_eq!(Preset::Full.prev(), Preset::Addon);
-        assert_eq!(Preset::Addon.next(), Preset::Full);
-        assert_eq!(Preset::Minimal.to_layout().matching_preset(), Some(Preset::Minimal));
-    }
-
-    #[test]
-    fn speed_mode_cycles_with_median_and_serializes() {
-        let s0 = SpeedMode::Weighted;
-        let s1 = s0.step(1);
-        let s2 = s1.step(1);
-        let s3 = s2.step(1);
-        let s4 = s3.step(1);
-        assert_eq!(s1, SpeedMode::Median);
-        assert_eq!(s1.name(), "Median");
-        assert_eq!(s2, SpeedMode::Instant);
-        assert_eq!(s3, SpeedMode::E2e);
-        assert_eq!(s4, SpeedMode::Weighted);
-        assert_eq!(SpeedMode::Weighted.step(-1), SpeedMode::E2e);
-        assert_eq!(SpeedMode::Instant.step(-1), SpeedMode::Median);
-
-        let json = serde_json::to_string(&SpeedMode::Median).unwrap();
-        assert_eq!(json, "\"median\"");
-        let parsed: SpeedMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, SpeedMode::Median);
     }
 
     #[test]

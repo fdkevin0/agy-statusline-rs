@@ -8,11 +8,9 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::apply::read_settings_object;
-use crate::db::SessionMetadata;
-use crate::git::GitInfo;
 use crate::layout::try_load_layout_config;
 use crate::render::write_statusline;
-use crate::statusline::sample_preview_payload;
+use crate::statusline::{sample_preview_git, sample_preview_metadata, sample_preview_payload};
 
 fn command_executable_exists(cmd: &str) -> bool {
     command_executable_exists_in_path(cmd, env::var_os("PATH").as_deref())
@@ -110,22 +108,8 @@ pub fn run_doctor<W: Write>(
 
     writeln!(out, "Preview:")?;
     let sample = sample_preview_payload(100);
-    let meta = SessionMetadata {
-        speed: Some(64.0),
-        median_speed: Some(66.0),
-        last_turn_speed: Some(72.0),
-        e2e_speed: Some(46.0),
-        ttft_secs: Some(1.4),
-        thinking_tokens: Some(4_200),
-        max_context_tokens: Some(512_000),
-        ..Default::default()
-    };
-    let git = GitInfo {
-        branch: Some("main".to_string()),
-        worktree: Some("feat-wt".to_string()),
-        added: 42,
-        deleted: 11,
-    };
+    let meta = sample_preview_metadata();
+    let git = sample_preview_git();
     write_statusline(&sample, &meta, &git, &cfg, out)?;
     Ok(())
 }

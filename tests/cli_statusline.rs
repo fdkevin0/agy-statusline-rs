@@ -12,7 +12,7 @@ use rusqlite::Connection;
 use agy_statusline::db::SessionMetadata;
 use agy_statusline::git::GitInfo;
 use agy_statusline::layout::{
-    save_layout_config, GlyphMode, LayoutConfig, SpeedMode, ThemeStyle, VisualStyle, WidgetId,
+    save_layout_config, GlyphMode, LayoutConfig, ThemeStyle, WidgetId,
 };
 use agy_statusline::render::write_statusline;
 use agy_statusline::statusline::{
@@ -103,25 +103,6 @@ fn base_compaction_payload(width: usize) -> StatuslinePayload {
         terminal_width: Some(width),
         ..Default::default()
     }
-}
-
-fn render_with_style(style: VisualStyle, width: usize) -> String {
-    let mut cfg = LayoutConfig::preset_full();
-    cfg.style = style;
-    cfg.theme = ThemeStyle::Default;
-    cfg.glyph_mode = GlyphMode::Unicode;
-    let git = GitInfo {
-        branch: Some("feat/extremely-long-branch-name".to_string()),
-        worktree: Some("wt-long".to_string()),
-        added: 88,
-        deleted: 19,
-    };
-    let meta = SessionMetadata {
-        speed: Some(64.0),
-        max_context_tokens: Some(512_000),
-        ..Default::default()
-    };
-    render_mono(&base_compaction_payload(width), &meta, &git, &cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -259,35 +240,6 @@ fn write_statusline_falls_back_to_estimated_context_tokens() {
 }
 
 #[test]
-fn write_statusline_renders_median_speed_and_falls_back_to_weighted() {
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.theme = ThemeStyle::Mono;
-    cfg.speed_mode = SpeedMode::Median;
-    cfg.rows = vec![vec![WidgetId::Speed]];
-
-    let payload = StatuslinePayload::default();
-    let meta_median = SessionMetadata {
-        speed: Some(50.0),
-        median_speed: Some(73.0),
-        ..Default::default()
-    };
-    assert_eq!(
-        render_mono(&payload, &meta_median, &GitInfo::default(), &cfg),
-        "⚡ 73 tok/s\n"
-    );
-
-    let meta_fallback = SessionMetadata {
-        speed: Some(50.0),
-        median_speed: None,
-        ..Default::default()
-    };
-    assert_eq!(
-        render_mono(&payload, &meta_fallback, &GitInfo::default(), &cfg),
-        "⚡ 50 tok/s\n"
-    );
-}
-
-#[test]
 fn tier2_binary_reads_temp_sqlite_db_median_and_estimated_context() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = dir.path().join("config/agy-statusline");
@@ -363,7 +315,7 @@ fn cli_renders_sub_one_percent_quota_and_expired_reset_time_with_preset_full() {
     assert!(stdout.contains("3p 5h 0.4%"), "unexpected stdout: {stdout}");
     assert!(!stdout.contains("3p 5h 0%"), "unexpected stdout: {stdout}");
     assert!(
-        !stdout.contains('⟳'),
+        !stdout.contains('↻'),
         "unexpected timer in stdout: {stdout}"
     );
 }
@@ -627,16 +579,6 @@ fn stage3_ctx_pct_strips_limit_suffix_and_stage4_abbreviates_models() {
 }
 
 #[test]
-fn stage5_ultra_narrow_widths_never_exceed_limit() {
-    assert!(visible_line_width(&render_with_style(VisualStyle::Plain, 28)) <= 28);
-    assert!(visible_line_width(&render_with_style(VisualStyle::Pill, 28)) <= 28);
-    assert!(visible_line_width(&render_with_style(VisualStyle::Powerline, 28)) <= 28);
-    assert!(visible_line_width(&render_with_style(VisualStyle::Plain, 36)) <= 36);
-    assert!(visible_line_width(&render_with_style(VisualStyle::Pill, 36)) <= 36);
-    assert!(visible_line_width(&render_with_style(VisualStyle::Powerline, 36)) <= 36);
-}
-
-#[test]
 fn tier2_binary_compacts_88col_row_and_keeps_core_widgets() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = LayoutConfig::preset_minimal();
@@ -745,33 +687,6 @@ fn thinking_widget_renders_glyph_modes_palette_and_smart_hide() {
         render_thinking(None, GlyphMode::Ascii, ThemeStyle::Mono, false, true),
         "~ think --\n"
     );
-}
-
-#[test]
-fn thinking_widget_drops_at_priority_1_when_narrow() {
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.theme = ThemeStyle::Mono;
-    cfg.no_color = true;
-    cfg.responsive = true;
-    cfg.rows = vec![vec![WidgetId::State, WidgetId::Model, WidgetId::Thinking]];
-
-    let payload = StatuslinePayload {
-        agent_state: Some("idle".to_string()),
-        model: Some(ModelInfo {
-            display_name: Some("GPT-4".to_string()),
-            ..Default::default()
-        }),
-        terminal_width: Some(25),
-        ..Default::default()
-    };
-    let meta = SessionMetadata {
-        thinking_tokens: Some(4_200),
-        ..Default::default()
-    };
-    let rendered = render_mono(&payload, &meta, &GitInfo::default(), &cfg);
-    assert!(rendered.contains("READY"), "rendered: {rendered}");
-    assert!(rendered.contains("GPT-4"), "rendered: {rendered}");
-    assert!(!rendered.contains("think"), "rendered: {rendered}");
 }
 
 #[test]

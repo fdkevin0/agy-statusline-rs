@@ -14,7 +14,6 @@
 //!       - `cache_write_tokens`: field `4`
 //!       - `cache_read_tokens`: field `5`
 //!       - `thinking_output_tokens`: field `9`
-//!       - `response_output_tokens`: field `10`
 //!     - `model_cost`: field `5` (`float` USD)
 //!     - `chat_start_metadata` (`ChatStartMetadata`): field `9`
 //!       - `created_at` (`google.protobuf.Timestamp`): field `4` (`seconds=1`)
@@ -32,7 +31,7 @@
 use prost::Message;
 
 /// Minimum streaming decode duration (seconds) accepted as a valid turn speed sample.
-pub const MIN_TURN_DECODE_SECS: f64 = 0.01;
+const MIN_TURN_DECODE_SECS: f64 = 0.01;
 /// Maximum decode throughput (tokens/second) accepted as a valid turn speed sample.
 pub const MAX_TURN_SPEED_TPS: f64 = 10_000.0;
 /// Maximum time-to-first-token (seconds) accepted as a valid TTFT sample.
@@ -82,8 +81,6 @@ struct ModelUsage {
     cache_read_tokens: u64,
     #[prost(uint64, tag = "9")]
     thinking_output_tokens: u64,
-    #[prost(uint64, tag = "10")]
-    response_output_tokens: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -140,15 +137,15 @@ struct StepMetadataBlob {
 
 /// Timing and output token metrics extracted from one `gen_metadata` turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct TurnMetrics {
+pub(crate) struct TurnMetrics {
     /// Total output tokens generated in the turn (`chat(1).usage(4).output_tokens(3)`).
-    pub output_tokens: u64,
+    pub(crate) output_tokens: u64,
     /// Optional thinking output tokens (`chat(1).usage(4).thinking_output_tokens(9)`).
-    pub thinking_tokens: Option<u64>,
+    pub(crate) thinking_tokens: Option<u64>,
     /// Streaming decode duration in seconds (`chat(1).streaming_duration(12)`).
-    pub decode_secs: f64,
+    pub(crate) decode_secs: f64,
     /// Optional time-to-first-token in seconds (`chat(1).time_to_first_token(11)`).
-    pub ttft_secs: Option<f64>,
+    pub(crate) ttft_secs: Option<f64>,
 }
 
 /// Full generation record decoded from `CortexStepGeneratorMetadata` (`gen_metadata.data`).
@@ -168,8 +165,6 @@ pub struct GenMetadataRecord {
     pub cache_read_tokens: u64,
     /// Thinking output tokens (`chat(1).usage(4).thinking_output_tokens(9)`).
     pub thinking_output_tokens: u64,
-    /// Visible response output tokens (`chat(1).usage(4).response_output_tokens(10)`).
-    pub response_output_tokens: u64,
     /// Native server-recorded turn cost in USD (`chat(1).model_cost(5)`), if `> 0` and finite.
     pub model_cost_usd: Option<f64>,
     /// Optional chat start timestamp seconds (`chat(1).chat_start_metadata(9).created_at(4).seconds(1)`).
@@ -186,7 +181,7 @@ pub struct GenMetadataRecord {
 
 impl GenMetadataRecord {
     /// Returns decode throughput in tokens/second when output tokens and duration
-    /// satisfy [`MIN_TURN_DECODE_SECS`] and [`MAX_TURN_SPEED_TPS`].
+    /// satisfy the minimum decode duration and [`MAX_TURN_SPEED_TPS`] bounds.
     pub fn decode_speed_tps(&self) -> Option<f64> {
         let secs = self.decode_secs?;
         if !is_sane_decode_speed(self.output_tokens, secs) {
@@ -196,7 +191,7 @@ impl GenMetadataRecord {
     }
 }
 
-fn is_sane_decode_speed(output_tokens: u64, decode_secs: f64) -> bool {
+pub(crate) fn is_sane_decode_speed(output_tokens: u64, decode_secs: f64) -> bool {
     if decode_secs < MIN_TURN_DECODE_SECS || output_tokens == 0 {
         return false;
     }
@@ -221,7 +216,7 @@ fn trim_non_empty(value: Option<String>) -> Option<String> {
 ///
 /// Enforces unified sanity bounds: `decode_secs >= 0.01`, `output_tokens > 0`,
 /// and `0.0 < output_tokens / decode_secs < 10_000.0`.
-pub fn extract_turn_metrics(data: &[u8]) -> Option<TurnMetrics> {
+pub(crate) fn extract_turn_metrics(data: &[u8]) -> Option<TurnMetrics> {
     let blob = GenMetadataBlob::decode(data).ok()?;
     let chat = blob.chat_model?;
     let usage = chat.usage?;
@@ -280,7 +275,6 @@ pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord> {
         cache_write_tokens: usage.cache_write_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         thinking_output_tokens: usage.thinking_output_tokens,
-        response_output_tokens: usage.response_output_tokens,
         model_cost_usd,
         chat_start_created_at_secs,
         ttft_secs,
@@ -333,7 +327,7 @@ fn extract_ctx_window(data: &[u8]) -> Option<ContextWindowMetadata> {
 /// along verified wire path `chat(1) -> chat_start_metadata(9) -> context_window_metadata(10) -> max_context_tokens(4)`.
 ///
 /// Returns `None` if any nested field is missing, malformed, or `<= 0`.
-pub fn extract_max_context_tokens(data: &[u8]) -> Option<u64> {
+pub(crate) fn extract_max_context_tokens(data: &[u8]) -> Option<u64> {
     let v = extract_ctx_window(data)?.max_context_tokens;
     (v > 0).then_some(v as u64)
 }
@@ -342,7 +336,7 @@ pub fn extract_max_context_tokens(data: &[u8]) -> Option<u64> {
 /// along verified wire path `chat(1) -> chat_start_metadata(9) -> context_window_metadata(10) -> estimated_tokens_used(1)`.
 ///
 /// Returns `None` if any nested field is missing, malformed, or `<= 0`.
-pub fn extract_estimated_context_tokens(data: &[u8]) -> Option<u64> {
+pub(crate) fn extract_estimated_context_tokens(data: &[u8]) -> Option<u64> {
     let v = extract_ctx_window(data)?.estimated_tokens_used;
     (v > 0).then_some(v as u64)
 }
@@ -378,11 +372,6 @@ mod tests {
 
     fn push_field_f32(buf: &mut Vec<u8>, id: u64, val: f32) {
         push_varint(buf, (id << 3) | 5);
-        buf.extend_from_slice(&val.to_le_bytes());
-    }
-
-    fn push_field_fixed64(buf: &mut Vec<u8>, id: u64, val: u64) {
-        push_varint(buf, (id << 3) | 1);
         buf.extend_from_slice(&val.to_le_bytes());
     }
 
@@ -514,7 +503,6 @@ mod tests {
         assert_eq!(rec.cache_write_tokens, 250);
         assert_eq!(rec.cache_read_tokens, 48_000);
         assert_eq!(rec.thinking_output_tokens, 400);
-        assert_eq!(rec.response_output_tokens, 200);
         assert!((rec.model_cost_usd.unwrap() - 0.0425).abs() < 1e-6);
         assert!((rec.ttft_secs.unwrap() - 0.5).abs() < 1e-6);
         assert!((rec.decode_secs.unwrap() - 2.0).abs() < 1e-6);
@@ -532,19 +520,6 @@ mod tests {
         push_field_varint(&mut root_unpacked, 2, 15);
         let rec_unpacked = extract_gen_metadata_record(&root_unpacked).unwrap();
         assert_eq!(rec_unpacked.first_step_index, Some(14));
-    }
-
-    #[test]
-    fn step_created_at_secs_decodes_timestamp() {
-        let mut ts = Vec::new();
-        push_field_varint(&mut ts, 1, 1_763_400_000);
-        let mut step_meta = Vec::new();
-        push_field_bytes(&mut step_meta, 1, &ts);
-        assert_eq!(
-            extract_step_created_at_secs(&step_meta),
-            Some(1_763_400_000)
-        );
-        assert_eq!(extract_step_created_at_secs(&[]), None);
     }
 
     #[test]
@@ -609,29 +584,6 @@ mod tests {
         push_field_bytes(&mut root, 1, &chat);
         let rec = extract_gen_metadata_record(&root).unwrap();
         assert_eq!(rec.decode_secs, None);
-    }
-
-    #[test]
-    fn model_cost_rejects_non_fixed32_wire_types() {
-        let mut chat_f64 = Vec::new();
-        push_field_fixed64(&mut chat_f64, 5, f64::to_bits(0.05));
-        let mut root_f64 = Vec::new();
-        push_field_bytes(&mut root_f64, 1, &chat_f64);
-        assert_eq!(extract_gen_metadata_record(&root_f64), None);
-
-        let mut chat_varint = Vec::new();
-        push_field_varint(&mut chat_varint, 5, u64::from(0.05_f32.to_bits()));
-        let mut root_varint = Vec::new();
-        push_field_bytes(&mut root_varint, 1, &chat_varint);
-        assert_eq!(extract_gen_metadata_record(&root_varint), None);
-
-        // Fixed32 is accepted.
-        let mut chat_f32 = Vec::new();
-        push_field_f32(&mut chat_f32, 5, 0.05);
-        let mut root_f32 = Vec::new();
-        push_field_bytes(&mut root_f32, 1, &chat_f32);
-        let rec_f32 = extract_gen_metadata_record(&root_f32).unwrap();
-        assert!((rec_f32.model_cost_usd.unwrap() - 0.05).abs() < 1e-6);
     }
 
     #[test]

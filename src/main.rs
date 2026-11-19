@@ -5,7 +5,8 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 use agy_statusline::apply::{
     resolve_invoked_binary_path, run_apply_command, set_statusline_enabled,
@@ -23,88 +24,155 @@ use agy_statusline::tui::run_tui_config;
 
 const MAX_STDIN_BYTES: u64 = 1024 * 1024;
 
-fn print_help() {
-    println!(
-        "Usage:\n  \
-         agy-statusline [--full|--preset <name>]      Render statusline from stdin JSON (respects NO_COLOR)\n  \
-         agy-statusline config                        Launch 3-pane interactive TUI editor\n  \
-         agy-statusline config --preset <name>        Apply preset (full|powerline|minimal|addon)\n  \
-         agy-statusline config --show                 Print current XDG layout config\n  \
-         agy-statusline config --reset                Remove XDG layout config (restore defaults)\n  \
-         agy-statusline apply [--yes|-y] [--stack|--replace|--disable]\n                                               Register or disable statusLine in AGY settings.json\n  \
-         agy-statusline doctor                        Check configuration, AGY hook, and sample preview\n  \
-         agy-statusline stats [--days <N>] [--json] [--ascii]\n                                               Show local token usage, estimated API cost, and speed stats\n  \
-         agy-statusline pricing [status|sync]         Show or force-refresh cached models.dev pricing (24h TTL)\n  \
-         agy-statusline version | --version | -V      Print version information"
-    );
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PresetArg {
+    Full,
+    Powerline,
+    Minimal,
+    Addon,
 }
 
-fn print_version() {
-    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-}
-
-fn parse_preset(name: &str) -> io::Result<LayoutConfig> {
-    Preset::from_name(name).map(Preset::to_layout).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unknown preset '{name}' (expected full|powerline|minimal|addon)"),
-        )
-    })
-}
-
-fn parse_days_value(val: &str) -> io::Result<u32> {
-    let parsed = val.parse::<u32>().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid --days value '{val}' (expected positive integer)"),
-        )
-    })?;
-    if parsed == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--days must be >= 1",
-        ));
+impl PresetArg {
+    const fn to_preset(self) -> Preset {
+        match self {
+            Self::Full => Preset::Full,
+            Self::Powerline => Preset::Powerline,
+            Self::Minimal => Preset::Minimal,
+            Self::Addon => Preset::Addon,
+        }
     }
-    Ok(parsed)
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "agy-statusline",
+    version,
+    about = "Safe Rust statusline for Antigravity CLI (agy)",
+    args_conflicts_with_subcommands = true
+)]
+struct Cli {
+    /// Render with the built-in full preset (overrides saved config)
+    #[arg(long, conflicts_with = "preset")]
+    full: bool,
+
+    /// Render with a built-in preset (overrides saved config)
+    #[arg(long, value_enum, value_name = "NAME")]
+    preset: Option<PresetArg>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Configure statusline layout (launches 3-pane interactive TUI when no flag is given)
+    Config(ConfigArgs),
+
+    /// Register or disable statusLine in AGY settings.json
+    Apply {
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+
+        /// Stack statusline below AGY's built-in bar
+        #[arg(long, conflicts_with = "replace")]
+        stack: bool,
+
+        /// Replace AGY's built-in statusline
+        #[arg(long, conflicts_with = "stack")]
+        replace: bool,
+
+        /// Disable statusLine in settings.json while retaining hook configuration
+        #[arg(long)]
+        disable: bool,
+    },
+
+    /// Check configuration, AGY hook, and render a live sample preview
+    Doctor,
+
+    /// Show local token usage, estimated API cost, and speed stats
+    Stats {
+        /// Restrict summary to the last N days (>= 1)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        days: Option<u32>,
+
+        /// Output machine-readable JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Use pure 7-bit ASCII characters
+        #[arg(long)]
+        ascii: bool,
+    },
+
+    /// Show or force-refresh cached models.dev pricing (24h TTL)
+    Pricing {
+        #[command(subcommand)]
+        action: Option<PricingCommand>,
+    },
+
+    /// Print version information
+    Version,
+}
+
+#[derive(Debug, Args)]
+#[group(multiple = false)]
+struct ConfigArgs {
+    /// Print current XDG layout config
+    #[arg(long)]
+    show: bool,
+
+    /// Remove XDG layout config (restore defaults)
+    #[arg(long)]
+    reset: bool,
+
+    /// Apply a built-in preset non-interactively
+    #[arg(long, value_enum, value_name = "NAME")]
+    preset: Option<PresetArg>,
+}
+
+#[derive(Debug, Subcommand)]
+enum PricingCommand {
+    /// Show current pricing cache status (default)
+    Status,
+
+    /// Force-refresh cached models.dev pricing
+    Sync {
+        /// Only refresh if the cache is missing or past its 24h TTL
+        #[arg(long)]
+        if_stale: bool,
+    },
+}
+
+fn unix_now_secs() -> u64 {
+    jiff::Timestamp::now().as_second().max(0) as u64
 }
 
 fn main() -> io::Result<()> {
-    let mut args = env::args().skip(1);
-    let mut preset_override: Option<LayoutConfig> = env::var_os("AGY_STATUSLINE_FULL")
-        .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .map(|_| LayoutConfig::preset_full());
+    let cli = Cli::parse();
     let no_color = env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
 
-    if let Some(first) = args.next() {
-        match first.as_str() {
-            "apply" => {
-                let mut assume_yes = false;
-                let mut disable = false;
-                let mut stack_override: Option<bool> = None;
-                for arg in args {
-                    match arg.as_str() {
-                        "--yes" | "-y" => assume_yes = true,
-                        "--stack" => stack_override = Some(true),
-                        "--replace" => stack_override = Some(false),
-                        "--disable" => disable = true,
-                        "--help" | "-h" => {
-                            println!("Usage: agy-statusline apply [--yes|-y] [--stack|--replace|--disable]");
-                            return Ok(());
-                        }
-                        other => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                format!("unknown option for apply: {other}"),
-                            ));
-                        }
-                    }
-                }
+    if let Some(command) = cli.command {
+        match command {
+            Command::Apply {
+                yes,
+                stack,
+                replace,
+                disable,
+            } => {
                 let settings_path = agy_settings_path()?;
                 if disable {
                     set_statusline_enabled(&settings_path, false)?;
                     println!("Disabled statusLine in {}", settings_path.display());
                     return Ok(());
                 }
+                let stack_override = if stack {
+                    Some(true)
+                } else if replace {
+                    Some(false)
+                } else {
+                    None
+                };
                 let stack_with_default = stack_override.unwrap_or_else(|| {
                     xdg_config_dir()
                         .map(|d| load_layout_config(&d.join("config.json")).stack_with_default)
@@ -114,7 +182,7 @@ fn main() -> io::Result<()> {
                 let mut stdin = io::stdin().lock();
                 let mut stdout = io::stdout().lock();
                 return run_apply_command(
-                    assume_yes,
+                    yes,
                     stack_with_default,
                     &settings_path,
                     &command_path,
@@ -122,54 +190,13 @@ fn main() -> io::Result<()> {
                     &mut stdout,
                 );
             }
-            "doctor" => {
-                if let Some(flag) = args.next() {
-                    if matches!(flag.as_str(), "--help" | "-h") {
-                        println!("Usage: agy-statusline doctor");
-                        return Ok(());
-                    }
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("unknown option for doctor: {flag}"),
-                    ));
-                }
+            Command::Doctor => {
                 let config_path = xdg_config_dir()?.join("config.json");
                 let settings_path = agy_settings_path()?;
                 let mut stdout = io::stdout().lock();
                 return run_doctor(&config_path, &settings_path, no_color, &mut stdout);
             }
-            "stats" => {
-                let mut days: Option<u32> = None;
-                let mut json = false;
-                let mut ascii = false;
-                while let Some(arg) = args.next() {
-                    match arg.as_str() {
-                        "--json" => json = true,
-                        "--ascii" => ascii = true,
-                        "--days" => {
-                            let val = args.next().ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "missing value for --days",
-                                )
-                            })?;
-                            days = Some(parse_days_value(&val)?);
-                        }
-                        s if s.starts_with("--days=") => {
-                            days = Some(parse_days_value(&s["--days=".len()..])?);
-                        }
-                        "--help" | "-h" => {
-                            println!("Usage: agy-statusline stats [--days <N>] [--json] [--ascii]");
-                            return Ok(());
-                        }
-                        other => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                format!("unknown option for stats: {other}"),
-                            ));
-                        }
-                    }
-                }
+            Command::Stats { days, json, ascii } => {
                 let home = resolve_home_dir();
                 if home.is_none() && resolve_agy_cli_dir().is_none() {
                     return Err(io::Error::new(
@@ -177,9 +204,6 @@ fn main() -> io::Result<()> {
                         "neither HOME, USERPROFILE, ANTIGRAVITY_CLI_HOME, nor AGY_HOME environment variable is set",
                     ));
                 }
-                let now_unix_secs = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
                 let mut stdout = io::stdout().lock();
                 return run_stats_command(
                     home.as_deref().unwrap_or_else(|| Path::new("")),
@@ -187,126 +211,63 @@ fn main() -> io::Result<()> {
                     json,
                     no_color,
                     ascii,
-                    now_unix_secs,
+                    unix_now_secs(),
                     &mut stdout,
                 );
             }
-            "config" => {
+            Command::Config(args) => {
                 let config_path = xdg_config_dir()?.join("config.json");
-                if let Some(flag) = args.next() {
-                    match flag.as_str() {
-                        "--show" => {
-                            let cfg = load_layout_config(&config_path);
-                            let json = serde_json::to_string_pretty(&cfg)
-                                .map_err(|e| io::Error::other(e.to_string()))?;
-                            println!("{json}");
-                            return Ok(());
-                        }
-                        "--reset" => {
-                            if config_path.exists() {
-                                fs::remove_file(&config_path)?;
-                                println!("Removed {}", config_path.display());
-                            } else {
-                                println!("No config file at {}", config_path.display());
-                            }
-                            return Ok(());
-                        }
-                        "--preset" => {
-                            let name = args.next().ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "missing preset name (full|powerline|minimal|addon)",
-                                )
-                            })?;
-                            let cfg = parse_preset(&name)?;
-                            save_layout_config(&config_path, &cfg)?;
-                            println!("Applied preset '{name}' to {}", config_path.display());
-                            return Ok(());
-                        }
-                        "--help" | "-h" => {
-                            println!(
-                                "Usage: agy-statusline config [--show|--reset|--preset <full|powerline|minimal|addon>]"
-                            );
-                            return Ok(());
-                        }
-                        other => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                format!("unknown option for config: {other}"),
-                            ));
-                        }
+                if args.show {
+                    let cfg = load_layout_config(&config_path);
+                    let json = serde_json::to_string_pretty(&cfg)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    println!("{json}");
+                    return Ok(());
+                }
+                if args.reset {
+                    if config_path.exists() {
+                        fs::remove_file(&config_path)?;
+                        println!("Removed {}", config_path.display());
+                    } else {
+                        println!("No config file at {}", config_path.display());
                     }
+                    return Ok(());
+                }
+                if let Some(preset_arg) = args.preset {
+                    let preset = preset_arg.to_preset();
+                    save_layout_config(&config_path, &preset.to_layout())?;
+                    println!(
+                        "Applied preset '{}' to {}",
+                        preset.name(),
+                        config_path.display()
+                    );
+                    return Ok(());
                 }
                 return run_tui_config(&config_path);
             }
-            "--full" => preset_override = Some(LayoutConfig::preset_full()),
-            "--preset" => {
-                let name = args.next().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "missing preset name (full|powerline|minimal|addon)",
-                    )
-                })?;
-                preset_override = Some(parse_preset(&name)?);
-            }
-            "pricing" => {
-                let mut sync = false;
-                let mut if_stale = false;
-                for arg in args {
-                    match arg.as_str() {
-                        "sync" => sync = true,
-                        "status" => {}
-                        "--if-stale" => if_stale = true,
-                        "--help" | "-h" => {
-                            println!("Usage: agy-statusline pricing [status|sync [--if-stale]]");
-                            return Ok(());
-                        }
-                        other => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                format!("unknown option for pricing: {other}"),
-                            ));
-                        }
-                    }
-                }
-                if if_stale && !sync {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "--if-stale requires 'pricing sync'",
-                    ));
-                }
+            Command::Pricing { action } => {
+                let (sync, if_stale) = match action {
+                    None | Some(PricingCommand::Status) => (false, false),
+                    Some(PricingCommand::Sync { if_stale }) => (true, if_stale),
+                };
                 let mut stdout = io::stdout().lock();
                 return run_pricing_command(sync, if_stale, &mut stdout);
             }
-            "version" | "--version" | "-V" => {
-                if let Some(flag) = args.next() {
-                    if matches!(flag.as_str(), "--help" | "-h") {
-                        println!("Usage: agy-statusline version");
-                        return Ok(());
-                    }
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("unknown option for version: {flag}"),
-                    ));
-                }
-                print_version();
+            Command::Version => {
+                println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
                 return Ok(());
-            }
-            "--help" | "-h" => {
-                print_help();
-                return Ok(());
-            }
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown argument: {other}"),
-                ));
             }
         }
     }
 
+    let preset_override: Option<LayoutConfig> = if cli.full {
+        Some(LayoutConfig::preset_full())
+    } else {
+        cli.preset.map(|p| p.to_preset().to_layout())
+    };
+
     if preset_override.is_none() && io::stdin().is_terminal() {
-        print_help();
+        Cli::command().print_help()?;
         return Ok(());
     }
 
@@ -326,17 +287,63 @@ fn main() -> io::Result<()> {
     let git_probe = SystemGitProbe::with_default_cache();
     let calibration_dir = xdg_cache_dir();
     let agy_cli_dir = resolve_agy_cli_dir();
-    let now_unix_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
     let runtime = StatuslineRuntime {
         reader: &reader,
         git_probe: &git_probe,
         calibration_dir: calibration_dir.as_deref(),
         agy_cli_dir: agy_cli_dir.as_deref(),
         pricing: PricingSource::Effective(SyncMode::SpawnIfStale),
-        now_unix_secs,
+        now_unix_secs: unix_now_secs(),
     };
     let mut stdout = io::stdout().lock();
     process_statusline(&input, &runtime, &cfg, &mut stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses_presets_subcommands_and_rejects_invalid_combinations() {
+        let top_eq = Cli::try_parse_from(["agy-statusline", "--preset=minimal"]).unwrap();
+        assert_eq!(top_eq.preset, Some(PresetArg::Minimal));
+        assert!(!top_eq.full);
+        assert!(top_eq.command.is_none());
+
+        let cfg_eq =
+            Cli::try_parse_from(["agy-statusline", "config", "--preset=powerline"]).unwrap();
+        assert!(matches!(
+            cfg_eq.command,
+            Some(Command::Config(ConfigArgs {
+                show: false,
+                reset: false,
+                preset: Some(PresetArg::Powerline),
+            }))
+        ));
+
+        let pricing_default = Cli::try_parse_from(["agy-statusline", "pricing"]).unwrap();
+        assert!(matches!(
+            pricing_default.command,
+            Some(Command::Pricing { action: None })
+        ));
+
+        let pricing_sync =
+            Cli::try_parse_from(["agy-statusline", "pricing", "sync", "--if-stale"]).unwrap();
+        assert!(matches!(
+            pricing_sync.command,
+            Some(Command::Pricing {
+                action: Some(PricingCommand::Sync { if_stale: true }),
+            })
+        ));
+
+        assert!(Cli::try_parse_from(["agy-statusline", "--full", "--preset", "minimal"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "--full", "doctor"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "--preset=minimal", "extra"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "config", "--show", "--reset"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "config", "--show", "extra"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "apply", "--stack", "--replace"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "stats", "--days", "0"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "pricing", "--if-stale"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "pricing", "status", "--if-stale"]).is_err());
+    }
 }

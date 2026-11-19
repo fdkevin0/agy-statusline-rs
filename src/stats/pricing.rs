@@ -12,19 +12,19 @@ use serde_json::Value;
 
 use crate::fsutil::atomic_write;
 use crate::paths::{xdg_cache_dir, xdg_config_dir};
-use crate::timeutil::unix_now_secs;
+use crate::timeutil::{unix_now_secs, SECS_PER_DAY};
 
 /// Default cache TTL for auto-fetched `models.dev` pricing data (24 hours).
-pub const DEFAULT_PRICING_TTL_SECS: u64 = 86_400;
+pub(super) const DEFAULT_PRICING_TTL_SECS: u64 = SECS_PER_DAY as u64;
 /// Cooldown after a failed network fetch before retrying automatically (5 minutes).
 const PRICING_RETRY_COOLDOWN_SECS: u64 = 300;
 /// Public unauthenticated `models.dev` API endpoint.
-pub const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
+const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
 const MODELS_DEV_CACHE_FILE: &str = "models_dev_pricing.json";
 const MODELS_DEV_ERR_FILE: &str = "models_dev_pricing.err";
 const MAX_PRICING_JSON_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Controls how [`PricingCatalog::load_effective`] handles missing or expired cache.
+/// Controls how [`PricingCatalog`] cache loading handles missing or expired pricing data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     /// Never perform network I/O or spawn background sync; read local files only.
@@ -37,19 +37,19 @@ pub enum SyncMode {
 
 /// Per-million-token pricing rates supplied by user-configured `pricing.json` or `models.dev`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ModelPricingRate {
+struct ModelPricingRate {
     /// USD per 1M uncached input tokens.
     #[serde(default)]
-    pub input_per_mtok: f64,
+    input_per_mtok: f64,
     /// USD per 1M prompt cache read tokens.
     #[serde(default)]
-    pub cache_read_per_mtok: f64,
+    cache_read_per_mtok: f64,
     /// USD per 1M prompt cache write tokens.
     #[serde(default)]
-    pub cache_write_per_mtok: f64,
+    cache_write_per_mtok: f64,
     /// USD per 1M output tokens.
     #[serde(default)]
-    pub output_per_mtok: f64,
+    output_per_mtok: f64,
 }
 
 /// Persisted `models.dev` cache envelope stored in `$XDG_CACHE_HOME/agy-statusline/models_dev_pricing.json`.
@@ -62,19 +62,19 @@ struct CachedPricingFile {
 
 /// Diagnostic summary of the local pricing cache and user override file.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PricingCacheStatus {
+struct PricingCacheStatus {
     /// Path to `models_dev_pricing.json`.
-    pub cache_path: PathBuf,
+    cache_path: PathBuf,
     /// Path to user override `pricing.json`.
-    pub override_path: Option<PathBuf>,
+    override_path: Option<PathBuf>,
     /// Number of cached `models.dev` entries (`0` if missing).
-    pub cached_models: usize,
+    cached_models: usize,
     /// Unix timestamp when cache was last fetched, if present.
-    pub fetched_at: Option<u64>,
+    fetched_at: Option<u64>,
     /// Whether the cache exists and is within `ttl_secs` at `now_secs`.
-    pub fresh: bool,
+    fresh: bool,
     /// Configured TTL in seconds.
-    pub ttl_secs: u64,
+    ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,7 +115,7 @@ impl From<RawPricingCatalog> for PricingCatalog {
 
 impl PricingCatalog {
     /// Builds a pre-indexed [`PricingCatalog`] from a map of model patterns to rates.
-    pub fn from_models(models: BTreeMap<String, ModelPricingRate>) -> Self {
+    fn from_models(models: BTreeMap<String, ModelPricingRate>) -> Self {
         Self::from_layers(BTreeMap::new(), models)
     }
 
@@ -191,23 +191,8 @@ impl PricingCatalog {
         }
     }
 
-    /// Returns a read-only view of the model pricing map.
-    pub fn models(&self) -> &BTreeMap<String, ModelPricingRate> {
-        &self.models
-    }
-
-    /// Returns `true` when the catalog contains no model entries.
-    pub fn is_empty(&self) -> bool {
-        self.models.is_empty()
-    }
-
-    /// Returns the number of model entries in the catalog.
-    pub fn len(&self) -> usize {
-        self.models.len()
-    }
-
     /// Loads a [`PricingCatalog`] from `path`, returning an empty catalog if missing or invalid.
-    pub fn load_from_file(path: &Path) -> Self {
+    pub(super) fn load_from_file(path: &Path) -> Self {
         let Ok(raw) = fs::read_to_string(path) else {
             return Self::default();
         };
@@ -215,7 +200,7 @@ impl PricingCatalog {
     }
 
     /// Loads effective pricing (`models.dev` cache + user `pricing.json` overrides).
-    pub fn load_effective(mode: SyncMode, now_secs: u64) -> Self {
+    pub(crate) fn load_effective(mode: SyncMode, now_secs: u64) -> Self {
         let cache_dir = xdg_cache_dir();
         let override_path = xdg_config_dir().ok().map(|d| d.join("pricing.json"));
         Self::load_effective_with(
@@ -229,7 +214,7 @@ impl PricingCatalog {
     }
 
     /// Loads effective pricing with explicit paths, TTL, and fetcher boundary for deterministic tests.
-    pub fn load_effective_with<F>(
+    pub(super) fn load_effective_with<F>(
         cache_dir: Option<&Path>,
         override_path: Option<&Path>,
         mode: SyncMode,
@@ -290,7 +275,7 @@ impl PricingCatalog {
     }
 
     /// Estimates USD cost for one turn if any candidate model string matches a valid entry.
-    pub fn estimate_cost(
+    pub(crate) fn estimate_cost(
         &self,
         candidates: &[&str],
         input_tokens: u64,
@@ -465,7 +450,7 @@ fn spawn_background_pricing_sync() {
 }
 
 /// Fetches `url` using `curl` with bounded connect/total timeouts and response size limit.
-pub fn fetch_models_dev_via_curl(url: &str) -> io::Result<String> {
+pub(super) fn fetch_models_dev_via_curl(url: &str) -> io::Result<String> {
     let mut child = Command::new("curl")
         .args(["-fsSL", "--connect-timeout", "5", "--max-time", "15", url])
         .stdin(Stdio::null())
@@ -549,7 +534,7 @@ fn extract_rate_from_cost(cost_obj: &serde_json::Map<String, Value>) -> Option<M
 ///
 /// Canonical direct providers (`google`, `anthropic`, `openai`, etc.) take precedence over
 /// aggregator/cloud-reseller providers when identical model IDs appear under multiple providers.
-pub fn parse_models_dev_json(raw: &str) -> io::Result<BTreeMap<String, ModelPricingRate>> {
+fn parse_models_dev_json(raw: &str) -> io::Result<BTreeMap<String, ModelPricingRate>> {
     let root: Value = serde_json::from_str(raw)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid JSON: {e}")))?;
     let Some(providers) = root.as_object() else {
@@ -628,7 +613,7 @@ where
 }
 
 /// Syncs `models.dev` pricing into the cache directory, returning `(status, did_fetch)`.
-pub fn sync_models_dev_pricing_with<F>(
+fn sync_models_dev_pricing_with<F>(
     cache_dir: &Path,
     override_path: Option<&Path>,
     if_stale_only: bool,
@@ -673,7 +658,7 @@ where
 }
 
 /// Inspects the current local pricing cache status without performing network I/O.
-pub fn pricing_cache_status(now_secs: u64) -> Option<PricingCacheStatus> {
+fn pricing_cache_status(now_secs: u64) -> Option<PricingCacheStatus> {
     let dir = xdg_cache_dir()?;
     let cache_path = dir.join(MODELS_DEV_CACHE_FILE);
     let cached = load_cached_file(&cache_path);
@@ -870,7 +855,7 @@ mod tests {
         );
         assert_eq!(fetch_calls, 1);
         // Canonical provider (`google`) takes precedence over `reseller`.
-        assert_eq!(cat1.models()["gemini-4-hydrogen"].input_per_mtok, 1.5);
+        assert_eq!(cat1.models["gemini-4-hydrogen"].input_per_mtok, 1.5);
 
         // Separator-normalized matching (`Claude Opus 5.5` -> `claude-opus-5-5`, `Gemini 4 Carbon (High)` -> `gemini-4-carbon`).
         let (_, opus_usd) = cat1
@@ -931,7 +916,7 @@ mod tests {
             DEFAULT_PRICING_TTL_SECS,
             |_| unreachable!(),
         );
-        assert_eq!(cat3.models()["gemini-4-hydrogen"].input_per_mtok, 9.0);
+        assert_eq!(cat3.models["gemini-4-hydrogen"].input_per_mtok, 9.0);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
@@ -22,13 +22,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::ansi::ansi_to_ratatui_lines;
 use crate::apply::{apply_statusline_config, resolve_invoked_binary_path};
-use crate::db::SessionMetadata;
 use crate::editor::{ActivePane, ExitOutcome, SettingField, TuiEditorState};
-use crate::git::GitInfo;
 use crate::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
 use crate::paths::agy_settings_path;
 use crate::render::write_statusline;
-use crate::statusline::sample_preview_payload;
+use crate::statusline::{sample_preview_git, sample_preview_metadata, sample_preview_payload};
 
 type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
 
@@ -154,22 +152,8 @@ pub fn run_tui_config(config_path: &Path) -> io::Result<()> {
 fn build_preview_lines(state: &TuiEditorState, box_inner: u16) -> (Vec<Line<'static>>, usize) {
     let width = state.preview_width.resolve(box_inner);
     let sample = sample_preview_payload(width);
-    let meta = SessionMetadata {
-        speed: Some(64.0),
-        median_speed: Some(68.0),
-        last_turn_speed: Some(72.0),
-        e2e_speed: Some(46.0),
-        ttft_secs: Some(1.4),
-        thinking_tokens: Some(4_200),
-        max_context_tokens: Some(512_000),
-        ..Default::default()
-    };
-    let git = GitInfo {
-        branch: Some("main".to_string()),
-        worktree: Some("feat-wt".to_string()),
-        added: 42,
-        deleted: 11,
-    };
+    let meta = sample_preview_metadata();
+    let git = sample_preview_git();
     let mut buf = Vec::new();
     let _ = write_statusline(&sample, &meta, &git, &state.config, &mut buf);
     let raw = String::from_utf8_lossy(&buf);
@@ -196,17 +180,14 @@ fn pane_block(title: String, active: bool, grabbed: bool) -> Block<'static> {
         ))
 }
 
-fn in_rect(rect: Rect, col: u16, row: u16) -> bool {
-    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
-}
-
 fn handle_mouse(state: &mut TuiEditorState, mouse: MouseEvent, map: &UiHitMap) {
     let (col, row) = (mouse.column, mouse.row);
+    let pos = Position::new(col, row);
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if in_rect(map.preview, col, row) {
+            if map.preview.contains(pos) {
                 state.preview_width = state.preview_width.next();
-            } else if in_rect(map.canvas, col, row) {
+            } else if map.canvas.contains(pos) {
                 if let Some(hit) = map
                     .canvas_pills
                     .iter()
@@ -223,14 +204,14 @@ fn handle_mouse(state: &mut TuiEditorState, mouse: MouseEvent, map: &UiHitMap) {
                 } else {
                     state.active_pane = ActivePane::Canvas;
                 }
-            } else if in_rect(map.catalog, col, row) {
+            } else if map.catalog.contains(pos) {
                 let inner_y = row.saturating_sub(map.catalog.y + 1) as usize;
                 if row > map.catalog.y && row + 1 < map.catalog.y + map.catalog.height {
                     state.click_catalog(map.catalog_offset + inner_y);
                 } else {
                     state.active_pane = ActivePane::Catalog;
                 }
-            } else if in_rect(map.settings, col, row) {
+            } else if map.settings.contains(pos) {
                 let inner_y = row.saturating_sub(map.settings.y + 1) as usize;
                 if row > map.settings.y && row + 1 < map.settings.y + map.settings.height {
                     state.adjust_setting_at(map.settings_offset + inner_y, 1);
@@ -241,7 +222,7 @@ fn handle_mouse(state: &mut TuiEditorState, mouse: MouseEvent, map: &UiHitMap) {
             }
         }
         MouseEventKind::Down(MouseButton::Right) => {
-            if in_rect(map.canvas, col, row) {
+            if map.canvas.contains(pos) {
                 if let Some(hit) = map
                     .canvas_pills
                     .iter()
@@ -249,7 +230,7 @@ fn handle_mouse(state: &mut TuiEditorState, mouse: MouseEvent, map: &UiHitMap) {
                 {
                     state.remove_canvas_pill(hit.row, hit.col);
                 }
-            } else if in_rect(map.settings, col, row) {
+            } else if map.settings.contains(pos) {
                 let inner_y = row.saturating_sub(map.settings.y + 1) as usize;
                 if row > map.settings.y && row + 1 < map.settings.y + map.settings.height {
                     state.adjust_setting_at(map.settings_offset + inner_y, -1);
@@ -258,20 +239,20 @@ fn handle_mouse(state: &mut TuiEditorState, mouse: MouseEvent, map: &UiHitMap) {
             }
         }
         MouseEventKind::ScrollUp => {
-            if in_rect(map.catalog, col, row) {
+            if map.catalog.contains(pos) {
                 state.scroll_catalog(-1);
-            } else if in_rect(map.settings, col, row) {
+            } else if map.settings.contains(pos) {
                 state.scroll_settings(-1);
-            } else if in_rect(map.canvas, col, row) {
+            } else if map.canvas.contains(pos) {
                 state.click_canvas(state.canvas_row.saturating_sub(1), None);
             }
         }
         MouseEventKind::ScrollDown => {
-            if in_rect(map.catalog, col, row) {
+            if map.catalog.contains(pos) {
                 state.scroll_catalog(1);
-            } else if in_rect(map.settings, col, row) {
+            } else if map.settings.contains(pos) {
                 state.scroll_settings(1);
-            } else if in_rect(map.canvas, col, row) {
+            } else if map.canvas.contains(pos) {
                 state.click_canvas((state.canvas_row + 1).min(MAX_ROWS - 1), None);
             }
         }
