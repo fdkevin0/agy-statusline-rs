@@ -21,6 +21,7 @@ use crate::statusline::StatuslinePayload;
 
 const SCHEMA_VERSION: u32 = 2;
 const CACHE_FILENAME: &str = "quota_cal.json";
+const LOCK_FILENAME: &str = "quota_cal.lock";
 
 const MIN_TTL_SECS: u64 = 7 * 86_400;
 
@@ -63,7 +64,7 @@ pub struct BucketCalibration {
     pub last_reset_at_secs: Option<u64>,
     /// True when external consumption or anomalous drift invalidated calibration for this cycle.
     pub external_divergence_in_cycle: bool,
-    /// Unix epoch seconds of the most recent observation.
+    /// Unix epoch seconds of the most recent calibration state change.
     pub updated_at_secs: u64,
 }
 
@@ -109,9 +110,25 @@ pub fn load_calibration_store(cache_dir: &Path) -> CalibrationStore {
     store
 }
 
-/// Persists `store` atomically into `cache_dir/quota_cal.json` via temporary file + `rename`.
-pub fn save_calibration_store(cache_dir: &Path, store: &CalibrationStore) -> io::Result<()> {
+fn try_lock_calibration(cache_dir: &Path) -> io::Result<fs::File> {
     fs::create_dir_all(cache_dir)?;
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(cache_dir.join(LOCK_FILENAME))?;
+    lock.try_lock().map_err(io::Error::from)?;
+    Ok(lock)
+}
+
+/// Replaces `cache_dir/quota_cal.json` atomically under the calibration lock.
+/// Returns an error if another writer holds the lock.
+pub fn save_calibration_store(cache_dir: &Path, store: &CalibrationStore) -> io::Result<()> {
+    let _lock = try_lock_calibration(cache_dir)?;
+    write_calibration_store(cache_dir, store)
+}
+
+fn write_calibration_store(cache_dir: &Path, store: &CalibrationStore) -> io::Result<()> {
     let target = cache_dir.join(CACHE_FILENAME);
     let tmp = cache_dir.join(format!("{CACHE_FILENAME}.tmp.{}", std::process::id()));
     let mut json = serde_json::to_string_pretty(store)
@@ -144,6 +161,24 @@ fn is_valid_calibrated_total(v: f64) -> bool {
     v.is_finite() && (MIN_CALIBRATED_TOTAL..=MAX_CALIBRATED_TOTAL).contains(&v)
 }
 
+fn valid_calibrated_total(
+    entry: &BucketCalibration,
+    window_secs: u64,
+    now_unix_secs: u64,
+) -> Option<f64> {
+    let ttl_secs = window_secs.saturating_mul(3).max(MIN_TTL_SECS);
+    entry
+        .calibrated_total_tokens
+        .filter(|&total| is_valid_calibrated_total(total))
+        .zip(entry.calibrated_at_secs.filter(|&at| at > 0))
+        .filter(|&(_, at)| now_unix_secs.saturating_sub(at) <= ttl_secs)
+        .map(|(total, _)| total)
+}
+
+fn remaining_tokens(total: f64, remaining_pct: f64) -> u64 {
+    (total * (remaining_pct / 100.0).clamp(0.0, 1.0)).round() as u64
+}
+
 fn calibrate_bucket(
     entry: &mut BucketCalibration,
     mut view: QuotaView,
@@ -153,15 +188,9 @@ fn calibrate_bucket(
     now_unix_secs: u64,
 ) -> QuotaView {
     let frac = (view.remaining_pct / 100.0).clamp(0.0, 1.0);
-    let ttl_secs = view.window_secs.saturating_mul(3).max(MIN_TTL_SECS);
 
     // Expire invalid or TTL-aged prior calibration before evaluating the current sample.
-    let prior_valid = entry
-        .calibrated_total_tokens
-        .filter(|&t| is_valid_calibrated_total(t))
-        .zip(entry.calibrated_at_secs.filter(|&at| at > 0))
-        .filter(|&(_, at)| now_unix_secs.saturating_sub(at) <= ttl_secs);
-    if prior_valid.is_none() {
+    if valid_calibrated_total(entry, view.window_secs, now_unix_secs).is_none() {
         entry.calibrated_total_tokens = None;
         entry.calibrated_at_secs = None;
         entry.sample_count = 0;
@@ -246,15 +275,10 @@ fn calibrate_bucket(
     if reset_at_secs.is_some() {
         entry.last_reset_at_secs = reset_at_secs;
     }
-    entry.updated_at_secs = now_unix_secs;
 
-    view.est_remaining_tokens = entry.calibrated_total_tokens.map(|total| {
-        if frac <= 0.0 {
-            0
-        } else {
-            (total * frac).round().max(0.0) as u64
-        }
-    });
+    view.est_remaining_tokens = entry
+        .calibrated_total_tokens
+        .map(|total| remaining_tokens(total, view.remaining_pct));
     view
 }
 
@@ -281,83 +305,43 @@ fn bucket_state_changed(before: Option<&BucketCalibration>, after: &BucketCalibr
         || prev.external_divergence_in_cycle != after.external_divergence_in_cycle
 }
 
-fn calibrate_slot(
-    store: &mut CalibrationStore,
-    resolved: Option<(QuotaView, Option<u64>)>,
-    conv_id: Option<&str>,
-    session_tokens: Option<u64>,
-    now_unix_secs: u64,
-    dirty_keys: &mut Vec<String>,
-) -> Option<QuotaView> {
-    resolved.map(|(view, reset_at)| {
-        if view.remaining_amount.is_some() {
-            return view;
-        }
-        let prev = store.buckets.get(&view.bucket_key).cloned();
-        let entry = store.buckets.entry(view.bucket_key.clone()).or_default();
-        let out = calibrate_bucket(
-            entry,
-            view,
-            reset_at,
-            conv_id,
-            session_tokens,
-            now_unix_secs,
-        );
-        if bucket_state_changed(prev.as_ref(), entry) && !dirty_keys.contains(&out.bucket_key) {
-            dirty_keys.push(out.bucket_key.clone());
-        }
-        out
-    })
+type ResolvedViews = [Option<(QuotaView, Option<u64>)>; 2];
+
+fn resolve_views(payload: &StatuslinePayload, now_unix_secs: u64) -> ResolvedViews {
+    [
+        resolve_quota_5h_with_reset_at(payload, now_unix_secs),
+        resolve_quota_weekly_with_reset_at(payload, now_unix_secs),
+    ]
 }
 
-fn calibrate_store_with_dirty(
+fn calibrate_resolved(
     store: &mut CalibrationStore,
     payload: &StatuslinePayload,
+    resolved: ResolvedViews,
     now_unix_secs: u64,
-) -> ((Option<QuotaView>, Option<QuotaView>), Vec<String>) {
+) -> ([Option<QuotaView>; 2], bool) {
     let conv_id = payload
         .conversation_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let session_tokens = extract_session_tokens(payload);
-    let mut dirty_keys = Vec::new();
-
-    let q5 = calibrate_slot(
-        store,
-        resolve_quota_5h_with_reset_at(payload, now_unix_secs),
-        conv_id,
-        session_tokens,
-        now_unix_secs,
-        &mut dirty_keys,
-    );
-    let qw = calibrate_slot(
-        store,
-        resolve_quota_weekly_with_reset_at(payload, now_unix_secs),
-        conv_id,
-        session_tokens,
-        now_unix_secs,
-        &mut dirty_keys,
-    );
-
-    ((q5, qw), dirty_keys)
-}
-
-fn persist_dirty_buckets(
-    cache_dir: &Path,
-    updated: &CalibrationStore,
-    dirty_keys: &[String],
-) -> io::Result<()> {
-    if dirty_keys.is_empty() {
-        return Ok(());
-    }
-    let mut merged = load_calibration_store(cache_dir);
-    for key in dirty_keys {
-        if let Some(bucket) = updated.buckets.get(key) {
-            merged.buckets.insert(key.clone(), bucket.clone());
+    let mut changed = false;
+    let views = resolved.map(|slot| {
+        let (view, reset_at) = slot?;
+        if view.remaining_amount.is_some() {
+            return Some(view);
         }
-    }
-    save_calibration_store(cache_dir, &merged)
+        let prev = store.buckets.get(&view.bucket_key).cloned();
+        let entry = store.buckets.entry(view.bucket_key.clone()).or_default();
+        let view = calibrate_bucket(entry, view, reset_at, conv_id, session_tokens, now_unix_secs);
+        if bucket_state_changed(prev.as_ref(), entry) {
+            entry.updated_at_secs = now_unix_secs;
+            changed = true;
+        }
+        Some(view)
+    });
+    (views, changed)
 }
 
 /// Pure calibration step updating `store` in-memory for both `5h` and `weekly` quota buckets.
@@ -366,26 +350,59 @@ pub fn calibrate_store_at(
     payload: &StatuslinePayload,
     now_unix_secs: u64,
 ) -> (Option<QuotaView>, Option<QuotaView>) {
-    calibrate_store_with_dirty(store, payload, now_unix_secs).0
+    let ([short, weekly], _) = calibrate_resolved(
+        store,
+        payload,
+        resolve_views(payload, now_unix_secs),
+        now_unix_secs,
+    );
+    (short, weekly)
 }
 
-/// Loads `cache_dir/quota_cal.json` (if `cache_dir` is `Some`), calibrates `5h` and `weekly`
-/// quota views at `now_unix_secs`, and atomically merges dirty buckets back to disk.
+/// Calibrates fractional quota views under a nonblocking cache lock. If the lock is
+/// unavailable, uses any valid persisted estimates without recording a sample.
 pub fn calibrate_quota_views_at(
     payload: &StatuslinePayload,
     cache_dir: Option<&Path>,
     now_unix_secs: u64,
 ) -> (Option<QuotaView>, Option<QuotaView>) {
-    let Some(dir) = cache_dir else {
-        let mut ephemeral = CalibrationStore::default();
-        return calibrate_store_at(&mut ephemeral, payload, now_unix_secs);
+    let resolved = resolve_views(payload, now_unix_secs);
+    let dir = cache_dir.filter(|_| {
+        resolved
+            .iter()
+            .flatten()
+            .any(|(view, _)| view.remaining_amount.is_none())
+    });
+
+    let [short, weekly] = if let Some(dir) = dir {
+        // Lock the sibling file so replacing the JSON cannot invalidate the lock.
+        let lock = try_lock_calibration(dir);
+        let mut store = load_calibration_store(dir);
+        if let Ok(_lock) = lock {
+            let (views, changed) = calibrate_resolved(&mut store, payload, resolved, now_unix_secs);
+            if changed {
+                let _ = write_calibration_store(dir, &store);
+            }
+            views
+        } else {
+            resolved.map(|slot| {
+                let (mut view, _) = slot?;
+                if view.remaining_amount.is_none() {
+                    view.est_remaining_tokens = store
+                        .buckets
+                        .get(&view.bucket_key)
+                        .and_then(|entry| {
+                            valid_calibrated_total(entry, view.window_secs, now_unix_secs)
+                        })
+                        .map(|total| remaining_tokens(total, view.remaining_pct));
+                }
+                Some(view)
+            })
+        }
+    } else {
+        resolved.map(|slot| slot.map(|(view, _)| view))
     };
-    let mut store = load_calibration_store(dir);
-    let (views, dirty_keys) = calibrate_store_with_dirty(&mut store, payload, now_unix_secs);
-    if !dirty_keys.is_empty() {
-        let _ = persist_dirty_buckets(dir, &store, &dirty_keys);
-    }
-    views
+    (short, weekly)
 }
 
 #[cfg(test)]
@@ -583,86 +600,6 @@ mod tests {
         assert_eq!(after_raw, before_raw);
         let reloaded = load_calibration_store(&dir);
         assert_eq!(reloaded.buckets["acme-5h"].updated_at_secs, t0);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn concurrent_bucket_updates_merge_dirty_keys_without_clobbering_siblings() {
-        let dir = temp_cache_dir("merge_siblings");
-        let t0 = 1_795_000_000;
-
-        // Seed initial on-disk store with both acme-5h and acme-weekly.
-        let p1 = make_payload("conv-a", 10_000, 0, 0.90, 14_000, 0.98, 500_000);
-        calibrate_quota_views_at(&p1, Some(&dir), t0);
-
-        // Terminal A loads store before Terminal B updates sibling bucket acme-weekly.
-        let mut store_a = load_calibration_store(&dir);
-
-        // Terminal B writes a calibrated acme-weekly and an unrelated sibling bucket to disk.
-        let mut store_b = load_calibration_store(&dir);
-        store_b.buckets.insert(
-            "acme-weekly".to_string(),
-            BucketCalibration {
-                calibrated_total_tokens: Some(9_500_000.0),
-                calibrated_at_secs: Some(t0 + 50),
-                sample_count: 7,
-                updated_at_secs: t0 + 50,
-                ..Default::default()
-            },
-        );
-        store_b.buckets.insert(
-            "other-5h".to_string(),
-            BucketCalibration {
-                calibrated_total_tokens: Some(1_234_567.0),
-                calibrated_at_secs: Some(t0 + 50),
-                sample_count: 3,
-                updated_at_secs: t0 + 50,
-                ..Default::default()
-            },
-        );
-        save_calibration_store(&dir, &store_b).unwrap();
-
-        // Terminal A only receives acme-5h in its payload and calibrates it.
-        let mut only_5h = BTreeMap::new();
-        only_5h.insert(
-            "acme-5h".to_string(),
-            QuotaBucket {
-                remaining_fraction: Some(0.80),
-                reset_in_seconds: Some(13_900),
-                ..Default::default()
-            },
-        );
-        let p_a = StatuslinePayload {
-            conversation_id: Some("conv-a".to_string()),
-            model: Some(ModelInfo {
-                id: Some("acme-4-base".to_string()),
-                ..Default::default()
-            }),
-            context_window: Some(ContextWindow {
-                total_input_tokens: Some(210_000),
-                total_output_tokens: Some(0),
-                ..Default::default()
-            }),
-            quota: Some(only_5h),
-            ..Default::default()
-        };
-        let (_, dirty_keys) = calibrate_store_with_dirty(&mut store_a, &p_a, t0 + 100);
-        assert_eq!(dirty_keys, vec!["acme-5h".to_string()]);
-        persist_dirty_buckets(&dir, &store_a, &dirty_keys).unwrap();
-
-        let merged = load_calibration_store(&dir);
-        assert_eq!(merged.buckets["acme-5h"].sample_count, 1);
-        assert!(
-            (merged.buckets["acme-5h"].calibrated_total_tokens.unwrap() - 2_000_000.0).abs()
-                < 1e-3
-        );
-        assert_eq!(merged.buckets["acme-weekly"].sample_count, 7);
-        assert_eq!(
-            merged.buckets["acme-weekly"].calibrated_total_tokens,
-            Some(9_500_000.0)
-        );
-        assert_eq!(merged.buckets["other-5h"].sample_count, 3);
 
         let _ = fs::remove_dir_all(&dir);
     }
