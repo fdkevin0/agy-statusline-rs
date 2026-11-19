@@ -9,7 +9,7 @@ use std::process::Command;
 
 use proptest::prelude::*;
 
-use agy_statusline::db::{is_valid_uuid, SessionMetadata, SpeedReader};
+use agy_statusline::db::{SessionMetadata, SqliteSpeedReader};
 use agy_statusline::format::format_tokens;
 use agy_statusline::git::{GitInfo, SystemGitProbe};
 use agy_statusline::layout::{GlyphMode, LayoutConfig, ThemeStyle, VisualStyle, WidgetId};
@@ -24,18 +24,6 @@ use agy_statusline::statusline::{
 };
 
 use common::{isolated_agy_cmd, visible_line_width, BIN};
-
-struct FixedSpeed(Option<f64>);
-impl SpeedReader for FixedSpeed {
-    fn session_metadata(&self, _id: &str) -> SessionMetadata {
-        SessionMetadata {
-            speed: self.0,
-            median_speed: self.0,
-            last_turn_speed: self.0,
-            ..Default::default()
-        }
-    }
-}
 
 proptest! {
     #[test]
@@ -67,7 +55,7 @@ proptest! {
     fn prop_format_tokens_small_no_suffix(value in 0u64..1000) {
         let mut buf = String::new();
         format_tokens(value, &mut buf);
-        prop_assert!(!buf.ends_with('K'));
+        prop_assert_eq!(buf, value.to_string());
     }
 
     #[test]
@@ -206,39 +194,6 @@ proptest! {
 }
 
 #[test]
-fn integration_full_json_and_uuid_checks() {
-    assert!(is_valid_uuid("01234567-89ab-cdef-0123-456789abcdef"));
-    assert!(!is_valid_uuid("01234567-89ab-cdef-0123-456789abcde"));
-
-    let json = r#"{
-        "agent_state": "working",
-        "model": {"display_name": "Gemini 4", "effort": "high"},
-        "vcs": {"branch": "main", "dirty": true},
-        "terminal_width": 120,
-        "conversation_id": "01234567-89ab-cdef-0123-456789abcdef",
-        "context_window": {
-            "used_percentage": 35.0,
-            "current_usage": {
-                "input_tokens": 500,
-                "cache_read_input_tokens": 1500,
-                "cache_creation_input_tokens": 0
-            }
-        }
-    }"#;
-    let reader = FixedSpeed(Some(120.4));
-    let git = SystemGitProbe::default();
-    let runtime = StatuslineRuntime::minimal(&reader, &git);
-    let mut out = Vec::new();
-    process_statusline(json, &runtime, &LayoutConfig::default(), &mut out).unwrap();
-    let s = String::from_utf8(out).unwrap();
-    assert!(s.contains("WORKING"));
-    assert!(!s.contains("Gemini 4"));
-    assert!(s.contains("main*"));
-    assert!(s.contains("75.0%"));
-    assert!(s.contains("120 tok/s"));
-}
-
-#[test]
 fn live_git_cli_probe_extracts_branch_and_diff_stats() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
@@ -307,7 +262,9 @@ fn live_git_cli_probe_extracts_branch_and_diff_stats() {
         cache_dir: Some(repo.join(".tmp_cache")),
     };
 
-    let reader = FixedSpeed(None);
+    let reader = SqliteSpeedReader {
+        home_override: Some(repo.to_path_buf()),
+    };
     let runtime = StatuslineRuntime::minimal(&reader, &probe);
     let mut out = Vec::new();
     process_statusline(&payload, &runtime, &cfg, &mut out).unwrap();

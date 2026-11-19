@@ -46,7 +46,6 @@ pub fn isolated_agy_cmd(dir: &Path) -> Command {
         .env("XDG_CACHE_HOME", xdg_cache)
         .env("ANTIGRAVITY_CLI_HOME", dir.join(".gemini/antigravity-cli"))
         .env_remove("AGY_HOME")
-        .env_remove("AGY_STATUSLINE_FULL")
         .env_remove("NO_COLOR");
     cmd
 }

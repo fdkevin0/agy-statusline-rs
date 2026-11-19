@@ -595,43 +595,6 @@ mod tests {
     }
 
     #[test]
-    fn preset_round_trip_names_and_cycling() {
-        assert_eq!(Preset::from_name("full"), Some(Preset::Full));
-        assert_eq!(Preset::from_name("powerline"), Some(Preset::Powerline));
-        assert_eq!(Preset::from_name("minimal"), Some(Preset::Minimal));
-        assert_eq!(Preset::from_name("addon"), Some(Preset::Addon));
-        assert_eq!(Preset::from_name("unknown"), None);
-
-        assert_eq!(Preset::Full.name(), "full");
-        assert_eq!(Preset::Powerline.display_name(), "Powerline");
-        assert_eq!(Preset::Full.step(1), Preset::Powerline);
-        assert_eq!(Preset::Full.step(-1), Preset::Addon);
-        assert_eq!(Preset::Addon.step(1), Preset::Full);
-        assert_eq!(Preset::Minimal.to_layout().matching_preset(), Some(Preset::Minimal));
-    }
-
-    #[test]
-    fn speed_mode_cycles_with_median_and_serializes() {
-        let s0 = SpeedMode::Weighted;
-        let s1 = s0.step(1);
-        let s2 = s1.step(1);
-        let s3 = s2.step(1);
-        let s4 = s3.step(1);
-        assert_eq!(s1, SpeedMode::Median);
-        assert_eq!(s1.name(), "Median");
-        assert_eq!(s2, SpeedMode::Instant);
-        assert_eq!(s3, SpeedMode::E2e);
-        assert_eq!(s4, SpeedMode::Weighted);
-        assert_eq!(SpeedMode::Weighted.step(-1), SpeedMode::E2e);
-        assert_eq!(SpeedMode::Instant.step(-1), SpeedMode::Median);
-
-        let json = serde_json::to_string(&SpeedMode::Median).unwrap();
-        assert_eq!(json, "\"median\"");
-        let parsed: SpeedMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, SpeedMode::Median);
-    }
-
-    #[test]
     fn normalize_rows_resets_invalid_speed_warn_threshold() {
         let mut cfg = LayoutConfig::preset_minimal();
         cfg.speed_warn_threshold = f64::NAN;

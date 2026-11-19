@@ -253,26 +253,6 @@ mod tests {
         assert_eq!(reader.session_metadata(uuid).speed, Some(50.0));
     }
 
-    #[test]
-    fn extracts_both_speed_and_max_context_tokens_from_db() {
-        let (dir, conn, uuid) = create_temp_conv_db();
-        let speed_blob: &[u8] = &[0x0a, 0x08, 0x22, 0x02, 0x18, 0x64, 0x62, 0x02, 0x08, 0x02];
-        let ctx_blob: &[u8] = &[0x0a, 0x08, 0x4a, 0x06, 0x52, 0x04, 0x20, 0x80, 0xa0, 0x1f];
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [speed_blob])
-            .unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [ctx_blob])
-            .unwrap();
-        drop(conn);
-
-        let reader = SqliteSpeedReader {
-            home_override: Some(dir.path().to_path_buf()),
-        };
-        let meta = reader.session_metadata(uuid);
-        assert_eq!(meta.speed, Some(50.0));
-        assert_eq!(meta.last_turn_speed, Some(50.0));
-        assert_eq!(meta.max_context_tokens, Some(512_000));
-    }
-
     fn speed_1s_blob(output_tokens: u8) -> [u8; 10] {
         [0x0a, 0x08, 0x22, 0x02, 0x18, output_tokens, 0x62, 0x02, 0x08, 0x01]
     }

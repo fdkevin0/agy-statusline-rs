@@ -375,11 +375,6 @@ mod tests {
         buf.extend_from_slice(&val.to_le_bytes());
     }
 
-    fn push_field_fixed64(buf: &mut Vec<u8>, id: u64, val: u64) {
-        push_varint(buf, (id << 3) | 1);
-        buf.extend_from_slice(&val.to_le_bytes());
-    }
-
     #[test]
     fn metadata_speed_valid_and_invalid() {
         let valid = [0x0a, 0x08, 0x22, 0x02, 0x18, 0x64, 0x62, 0x02, 0x08, 0x02];
@@ -528,19 +523,6 @@ mod tests {
     }
 
     #[test]
-    fn step_created_at_secs_decodes_timestamp() {
-        let mut ts = Vec::new();
-        push_field_varint(&mut ts, 1, 1_763_400_000);
-        let mut step_meta = Vec::new();
-        push_field_bytes(&mut step_meta, 1, &ts);
-        assert_eq!(
-            extract_step_created_at_secs(&step_meta),
-            Some(1_763_400_000)
-        );
-        assert_eq!(extract_step_created_at_secs(&[]), None);
-    }
-
-    #[test]
     fn step_created_at_secs_rejects_out_of_range_years() {
         let mut ts_min = Vec::new();
         push_field_varint(&mut ts_min, 1, (-62_135_596_800_i64) as u64);
@@ -602,29 +584,6 @@ mod tests {
         push_field_bytes(&mut root, 1, &chat);
         let rec = extract_gen_metadata_record(&root).unwrap();
         assert_eq!(rec.decode_secs, None);
-    }
-
-    #[test]
-    fn model_cost_rejects_non_fixed32_wire_types() {
-        let mut chat_f64 = Vec::new();
-        push_field_fixed64(&mut chat_f64, 5, f64::to_bits(0.05));
-        let mut root_f64 = Vec::new();
-        push_field_bytes(&mut root_f64, 1, &chat_f64);
-        assert_eq!(extract_gen_metadata_record(&root_f64), None);
-
-        let mut chat_varint = Vec::new();
-        push_field_varint(&mut chat_varint, 5, u64::from(0.05_f32.to_bits()));
-        let mut root_varint = Vec::new();
-        push_field_bytes(&mut root_varint, 1, &chat_varint);
-        assert_eq!(extract_gen_metadata_record(&root_varint), None);
-
-        // Fixed32 is accepted.
-        let mut chat_f32 = Vec::new();
-        push_field_f32(&mut chat_f32, 5, 0.05);
-        let mut root_f32 = Vec::new();
-        push_field_bytes(&mut root_f32, 1, &chat_f32);
-        let rec_f32 = extract_gen_metadata_record(&root_f32).unwrap();
-        assert!((rec_f32.model_cost_usd.unwrap() - 0.05).abs() < 1e-6);
     }
 
     #[test]

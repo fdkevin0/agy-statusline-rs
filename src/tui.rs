@@ -22,13 +22,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::ansi::ansi_to_ratatui_lines;
 use crate::apply::{apply_statusline_config, resolve_invoked_binary_path};
-use crate::db::SessionMetadata;
 use crate::editor::{ActivePane, ExitOutcome, SettingField, TuiEditorState};
-use crate::git::GitInfo;
 use crate::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
 use crate::paths::agy_settings_path;
 use crate::render::write_statusline;
-use crate::statusline::sample_preview_payload;
+use crate::statusline::{sample_preview_git, sample_preview_metadata, sample_preview_payload};
 
 type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
 
@@ -154,22 +152,8 @@ pub fn run_tui_config(config_path: &Path) -> io::Result<()> {
 fn build_preview_lines(state: &TuiEditorState, box_inner: u16) -> (Vec<Line<'static>>, usize) {
     let width = state.preview_width.resolve(box_inner);
     let sample = sample_preview_payload(width);
-    let meta = SessionMetadata {
-        speed: Some(64.0),
-        median_speed: Some(68.0),
-        last_turn_speed: Some(72.0),
-        e2e_speed: Some(46.0),
-        ttft_secs: Some(1.4),
-        thinking_tokens: Some(4_200),
-        max_context_tokens: Some(512_000),
-        ..Default::default()
-    };
-    let git = GitInfo {
-        branch: Some("main".to_string()),
-        worktree: Some("feat-wt".to_string()),
-        added: 42,
-        deleted: 11,
-    };
+    let meta = sample_preview_metadata();
+    let git = sample_preview_git();
     let mut buf = Vec::new();
     let _ = write_statusline(&sample, &meta, &git, &state.config, &mut buf);
     let raw = String::from_utf8_lossy(&buf);

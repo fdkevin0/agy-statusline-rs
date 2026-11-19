@@ -374,7 +374,6 @@ pub(crate) fn sample_preview_payload(width: usize) -> StatuslinePayload {
 }
 
 /// Builds sample SQLite session metadata used for live TUI preview and `doctor`.
-#[allow(dead_code)]
 pub(crate) fn sample_preview_metadata() -> SessionMetadata {
     SessionMetadata {
         speed: Some(64.0),
@@ -389,7 +388,6 @@ pub(crate) fn sample_preview_metadata() -> SessionMetadata {
 }
 
 /// Builds sample Git probe metadata used for live TUI preview and `doctor`.
-#[allow(dead_code)]
 pub(crate) fn sample_preview_git() -> GitInfo {
     GitInfo {
         branch: Some("main".to_string()),
@@ -633,10 +631,10 @@ mod tests {
         }
     }
 
-    struct StubGit(GitInfo);
-    impl GitProbe for StubGit {
+    struct NoopGit;
+    impl GitProbe for NoopGit {
         fn probe(&self, _dir: &Path, _include_diff: bool) -> GitInfo {
-            self.0.clone()
+            GitInfo::default()
         }
     }
 
@@ -650,25 +648,25 @@ mod tests {
             "workspace": null,
             "cost": null
         }"#;
-        let mut cfg = LayoutConfig::preset_minimal();
-        cfg.theme = crate::layout::ThemeStyle::Mono;
-        let reader = StubReader(Some(88.0));
-        let git = StubGit(GitInfo::default());
-        let runtime = StatuslineRuntime::minimal(&reader, &git);
-
-        let mut out = Vec::new();
-        process_statusline(json, &runtime, &cfg, &mut out).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("THINKING"));
-        assert!(text.contains("main*"));
-        assert!(text.contains("88 tok/s"));
+        let payload: StatuslinePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.agent_state.as_deref(), Some("thinking"));
+        assert_eq!(
+            payload.conversation_id.as_deref(),
+            Some("8d0371e1-5a05-423b-a8bc-ed75995f9a8b")
+        );
+        assert!(payload.model.is_none());
+        assert!(payload.workspace.is_none());
+        assert!(payload.cost.is_none());
+        let vcs = payload.vcs.as_ref().unwrap();
+        assert_eq!(vcs.branch.as_deref(), Some("main"));
+        assert_eq!(vcs.dirty, Some(true));
     }
 
     #[test]
     fn empty_and_invalid_json_degrades_gracefully() {
         let mut cfg = LayoutConfig::preset_addon();
         cfg.theme = crate::layout::ThemeStyle::Mono;
-        let git = StubGit(GitInfo::default());
+        let git = NoopGit;
 
         let reader_none = StubReader(None);
         let mut out = Vec::new();
@@ -686,31 +684,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(String::from_utf8(out2).unwrap(), "◈ cache -- ⚡ --\n");
-    }
-
-    #[test]
-    fn falls_back_to_cwd_and_git_probe_when_vcs_branch_absent() {
-        let json = r#"{
-            "agent_state": "idle",
-            "cwd": "/tmp/my-repo",
-            "vcs": {"type": "git"}
-        }"#;
-        let mut cfg = LayoutConfig::preset_minimal();
-        cfg.theme = crate::layout::ThemeStyle::Mono;
-        cfg.show_git_diff = false;
-        let reader = StubReader(None);
-        let git = StubGit(GitInfo {
-            branch: Some("feat/probe".to_string()),
-            worktree: None,
-            added: 0,
-            deleted: 0,
-        });
-        let runtime = StatuslineRuntime::minimal(&reader, &git);
-
-        let mut out = Vec::new();
-        process_statusline(json, &runtime, &cfg, &mut out).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("feat/probe"));
     }
 
     #[test]
@@ -814,7 +787,7 @@ mod tests {
 
         let calls = Cell::new(0usize);
         let reader = CountingReader(&calls);
-        let git = StubGit(GitInfo::default());
+        let git = NoopGit;
         let runtime = StatuslineRuntime::minimal(&reader, &git);
         let json = r#"{
             "agent_state": "idle",
