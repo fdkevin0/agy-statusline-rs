@@ -112,7 +112,7 @@ pub fn run_doctor<W: Write>(
     let sample = sample_preview_payload(100);
     let meta = SessionMetadata {
         speed: Some(64.0),
-        median_speed: Some(66.0),
+        median_speed: Some(68.0),
         last_turn_speed: Some(72.0),
         e2e_speed: Some(46.0),
         ttft_secs: Some(1.4),

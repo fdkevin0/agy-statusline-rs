@@ -81,7 +81,7 @@ impl GitProbe for SystemGitProbe {
 }
 
 /// Resolves the `.git` directory path and optional linked worktree name for `dir`.
-pub fn resolve_git_repo(dir: &Path) -> Option<(PathBuf, Option<String>)> {
+fn resolve_git_repo(dir: &Path) -> Option<(PathBuf, Option<String>)> {
     let mut cur = Some(dir);
     while let Some(d) = cur {
         let dot_git = d.join(".git");
@@ -122,12 +122,13 @@ fn extract_worktree_name(gitdir: &Path) -> Option<String> {
 /// Detects whether `dir` (or an ancestor) is a linked `git worktree` by inspecting `.git`.
 ///
 /// A linked worktree has a `.git` regular file containing `gitdir: .../worktrees/<name>`.
-pub fn detect_worktree_name(dir: &Path) -> Option<String> {
+#[cfg(test)]
+fn detect_worktree_name(dir: &Path) -> Option<String> {
     resolve_git_repo(dir).and_then(|(_, wt)| wt)
 }
 
 /// Reads the current branch or detached `@<short_sha>` directly from `<gitdir>/HEAD`.
-pub fn read_head_branch(gitdir: &Path) -> Option<String> {
+fn read_head_branch(gitdir: &Path) -> Option<String> {
     let raw = fs::read_to_string(gitdir.join("HEAD")).ok()?;
     let head = raw.trim();
     if let Some(rest) = head.strip_prefix("ref:") {
@@ -162,7 +163,7 @@ fn index_mtime_nanos(gitdir: &Path) -> u128 {
 }
 
 /// Reads or refreshes cached diff stats keyed by repo path, `.git/index` mtime, and `ttl_secs`.
-pub fn probe_diff_cached<F>(
+fn probe_diff_cached<F>(
     dir: &Path,
     gitdir: &Path,
     cache_dir: &Path,

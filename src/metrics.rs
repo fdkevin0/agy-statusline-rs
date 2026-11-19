@@ -3,38 +3,37 @@
 use std::collections::BTreeSet;
 
 use crate::statusline::{QuotaBucket, StatuslinePayload};
-pub use crate::timeutil::parse_rfc3339_unix_secs;
-use crate::timeutil::unix_now_secs;
+use crate::timeutil::{parse_rfc3339_unix_secs, SECS_PER_DAY as SECS_PER_DAY_I64};
 
 const SECS_PER_HOUR: u64 = 3_600;
-const SECS_PER_DAY: u64 = 86_400;
-const SECS_PER_WEEK: u64 = 604_800;
+const SECS_PER_DAY: u64 = SECS_PER_DAY_I64 as u64;
+const SECS_PER_WEEK: u64 = 7 * SECS_PER_DAY;
 const PACE_BEHIND_DELTA_PCT: f64 = 15.0;
 const STRUCTURAL_NOISE_TOKENS: &[&str] = &["wtu", "quota", "pool", "limit"];
 
 /// Resolved rate-limit view for `quota_5h` or `quota_weekly` widgets.
 #[derive(Debug, Clone, PartialEq)]
-pub struct QuotaView {
+pub(crate) struct QuotaView {
     /// Dynamic bucket label (e.g. `"5h"`, `"3p 5h"`, `"7d"`, `"3p 7d"`, `"24h"`).
-    pub label: String,
+    pub(crate) label: String,
     /// Raw bucket identifier key from `payload.quota`.
-    pub bucket_key: String,
+    pub(crate) bucket_key: String,
     /// Parsed rolling window duration in seconds.
-    pub window_secs: u64,
+    pub(crate) window_secs: u64,
     /// Remaining quota percentage (`0.0..=100.0`).
-    pub remaining_pct: f64,
+    pub(crate) remaining_pct: f64,
     /// Remaining credit units when `remaining_fraction` is absent and `remaining_amount >= 0`.
-    pub remaining_amount: Option<i64>,
+    pub(crate) remaining_amount: Option<i64>,
     /// Compact countdown until reset (e.g. `"3h10m"`), if positive remaining time is known.
-    pub reset_compact: Option<String>,
+    pub(crate) reset_compact: Option<String>,
     /// True when remaining quota is lagging behind remaining time by `> 15%`.
-    pub pace_behind: bool,
+    pub(crate) pace_behind: bool,
     /// Calibrated estimated remaining tokens for this bucket, when available.
-    pub est_remaining_tokens: Option<u64>,
+    pub(crate) est_remaining_tokens: Option<u64>,
 }
 
 /// Resolved quota view paired with its inferred reset Unix epoch timestamp.
-pub type QuotaResolution = (QuotaView, Option<u64>);
+pub(crate) type QuotaResolution = (QuotaView, Option<u64>);
 
 #[derive(Debug, Clone)]
 struct BucketDescriptor {
@@ -49,7 +48,7 @@ struct BucketDescriptor {
 ///
 /// Includes `cache_creation_input_tokens` (when present) in the denominator so
 /// incremental cache writes are accurately accounted for.
-pub fn valid_cache_usage(payload: &StatuslinePayload) -> Option<(f64, u64)> {
+pub(crate) fn valid_cache_usage(payload: &StatuslinePayload) -> Option<(f64, u64)> {
     let u = payload.context_window.as_ref()?.current_usage?;
     let read = u.cache_read_input_tokens?;
     let input = u.input_tokens.unwrap_or(0);
@@ -62,7 +61,7 @@ pub fn valid_cache_usage(payload: &StatuslinePayload) -> Option<(f64, u64)> {
 }
 
 /// Returns total active context tokens from `current_usage`.
-pub fn current_context_tokens(payload: &StatuslinePayload) -> Option<u64> {
+pub(crate) fn current_context_tokens(payload: &StatuslinePayload) -> Option<u64> {
     let u = payload.context_window.as_ref()?.current_usage?;
     if u.input_tokens.is_none()
         && u.cache_read_input_tokens.is_none()
@@ -77,24 +76,24 @@ pub fn current_context_tokens(payload: &StatuslinePayload) -> Option<u64> {
 }
 
 /// Formats a duration in seconds into a compact human-readable string (`45s`, `12m`, `3h10m`, `5d12h`).
-pub fn format_duration_compact(secs: u64) -> String {
+fn format_duration_compact(secs: u64) -> String {
     if secs < 60 {
         return format!("{secs}s");
     }
-    if secs < 3600 {
+    if secs < SECS_PER_HOUR {
         return format!("{}m", secs / 60);
     }
-    if secs < 86_400 {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
+    if secs < SECS_PER_DAY {
+        let h = secs / SECS_PER_HOUR;
+        let m = (secs % SECS_PER_HOUR) / 60;
         return if m == 0 {
             format!("{h}h")
         } else {
             format!("{h}h{m}m")
         };
     }
-    let d = secs / 86_400;
-    let h = (secs % 86_400) / 3600;
+    let d = secs / SECS_PER_DAY;
+    let h = (secs % SECS_PER_DAY) / SECS_PER_HOUR;
     if h == 0 {
         format!("{d}d")
     } else {
@@ -107,7 +106,7 @@ pub fn format_duration_compact(secs: u64) -> String {
 /// Returns `"0%"` strictly when `remaining_pct <= 0.0` (or non-finite), `"<0.1%"`
 /// when `0.0 < pct < 0.1`, `"{:.1}%"` when `0.1 <= pct < 1.0`, and rounded `"{:.0}%"`
 /// when `pct >= 1.0`.
-pub fn format_quota_pct(remaining_pct: f64) -> String {
+pub(crate) fn format_quota_pct(remaining_pct: f64) -> String {
     if !remaining_pct.is_finite() || remaining_pct <= 0.0 {
         return "0%".to_string();
     }
@@ -386,7 +385,7 @@ fn update_best_candidate(slot: &mut Option<Candidate>, cand: Candidate) {
 
 /// Resolves both the active short-window (`< 24h`) and multi-day (`>= 24h`) quota buckets
 /// and their reset epoch timestamps in a single pass over `payload.quota`.
-pub fn resolve_quota_views_with_reset_at(
+pub(crate) fn resolve_quota_views_with_reset_at(
     payload: &StatuslinePayload,
     now_unix_secs: u64,
 ) -> (Option<QuotaResolution>, Option<QuotaResolution>) {
@@ -454,50 +453,26 @@ pub fn resolve_quota_views_with_reset_at(
     )
 }
 
-/// Resolves the active short-window (`< 24h`) quota bucket and its reset epoch timestamp at `now_unix_secs`.
-pub fn resolve_quota_5h_with_reset_at(
-    payload: &StatuslinePayload,
-    now_unix_secs: u64,
-) -> Option<QuotaResolution> {
-    resolve_quota_views_with_reset_at(payload, now_unix_secs).0
-}
-
-/// Resolves the active multi-day (`>= 24h`) quota bucket and its reset epoch timestamp at `now_unix_secs`.
-pub fn resolve_quota_weekly_with_reset_at(
-    payload: &StatuslinePayload,
-    now_unix_secs: u64,
-) -> Option<QuotaResolution> {
-    resolve_quota_views_with_reset_at(payload, now_unix_secs).1
-}
-
-/// Resolves the active short-window quota bucket at an explicit Unix epoch timestamp.
-pub fn resolve_quota_5h_at(payload: &StatuslinePayload, now_unix_secs: u64) -> Option<QuotaView> {
-    resolve_quota_5h_with_reset_at(payload, now_unix_secs).map(|(v, _)| v)
-}
-
-/// Resolves the active multi-day quota bucket at an explicit Unix epoch timestamp.
-pub fn resolve_quota_weekly_at(
-    payload: &StatuslinePayload,
-    now_unix_secs: u64,
-) -> Option<QuotaView> {
-    resolve_quota_weekly_with_reset_at(payload, now_unix_secs).map(|(v, _)| v)
-}
-
-/// Resolves the active short-window quota bucket dynamically from `payload.quota`.
-pub fn resolve_quota_5h(payload: &StatuslinePayload) -> Option<QuotaView> {
-    resolve_quota_5h_at(payload, unix_now_secs())
-}
-
-/// Resolves the active multi-day quota bucket dynamically from `payload.quota`.
-pub fn resolve_quota_weekly(payload: &StatuslinePayload) -> Option<QuotaView> {
-    resolve_quota_weekly_at(payload, unix_now_secs())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use crate::statusline::{ContextWindow, JsonUsage, ModelInfo};
+    use std::collections::BTreeMap;
+
+    fn resolve_quota_5h_at(payload: &StatuslinePayload, now_unix_secs: u64) -> Option<QuotaView> {
+        resolve_quota_views_with_reset_at(payload, now_unix_secs)
+            .0
+            .map(|(v, _)| v)
+    }
+
+    fn resolve_quota_weekly_at(
+        payload: &StatuslinePayload,
+        now_unix_secs: u64,
+    ) -> Option<QuotaView> {
+        resolve_quota_views_with_reset_at(payload, now_unix_secs)
+            .1
+            .map(|(v, _)| v)
+    }
 
     #[test]
     fn cache_usage_accounts_for_cache_creation_and_missing_field() {
@@ -567,7 +542,7 @@ mod tests {
             quota: Some(quota.clone()),
             ..Default::default()
         };
-        let q5 = resolve_quota_5h(&acme_payload).unwrap();
+        let q5 = resolve_quota_5h_at(&acme_payload, 0).unwrap();
         assert_eq!(q5.label, "5h");
         assert_eq!(q5.bucket_key, "acme-5h");
         assert_eq!(q5.window_secs, 18_000);
@@ -575,7 +550,7 @@ mod tests {
         assert_eq!(q5.reset_compact.as_deref(), Some("4h"));
         assert!(q5.pace_behind);
 
-        let qw = resolve_quota_weekly(&acme_payload).unwrap();
+        let qw = resolve_quota_weekly_at(&acme_payload, 0).unwrap();
         assert_eq!(qw.label, "tier1");
         assert_eq!(qw.bucket_key, "acme-tier1-wtu-weekly");
         assert_eq!(qw.window_secs, 604_800);
@@ -591,7 +566,7 @@ mod tests {
             quota: Some(quota),
             ..Default::default()
         };
-        let q3p = resolve_quota_5h(&third_party_payload).unwrap();
+        let q3p = resolve_quota_5h_at(&third_party_payload, 0).unwrap();
         assert_eq!(q3p.label, "3p 5h");
         assert_eq!(q3p.reset_compact.as_deref(), Some("3h10m"));
         assert!(!q3p.pace_behind);
@@ -623,36 +598,6 @@ mod tests {
         assert_eq!(format_quota_pct(84.4), "84%");
         assert_eq!(format_quota_pct(93.78), "94%");
         assert_eq!(format_quota_pct(100.0), "100%");
-    }
-
-    #[test]
-    fn parses_rfc3339_timestamps_across_offsets_and_rejects_invalid() {
-        assert_eq!(parse_rfc3339_unix_secs("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(
-            parse_rfc3339_unix_secs("2026-11-18T12:00:00Z"),
-            Some(1_795_003_200)
-        );
-        assert_eq!(
-            parse_rfc3339_unix_secs("2026-11-18T12:00:00.456Z"),
-            Some(1_795_003_200)
-        );
-        assert_eq!(
-            parse_rfc3339_unix_secs("2026-11-18T20:00:00+08:00"),
-            Some(1_795_003_200)
-        );
-        assert_eq!(
-            parse_rfc3339_unix_secs("2026-11-18T07:00:00-05:00"),
-            Some(1_795_003_200)
-        );
-        assert_eq!(
-            parse_rfc3339_unix_secs("2024-02-29T23:59:59Z"),
-            Some(1_709_251_199)
-        );
-        assert_eq!(parse_rfc3339_unix_secs("2026-02-29T00:00:00Z"), None);
-        assert_eq!(parse_rfc3339_unix_secs("2026-13-01T00:00:00Z"), None);
-        assert_eq!(parse_rfc3339_unix_secs("2026-11-18T12:00:00"), None);
-        assert_eq!(parse_rfc3339_unix_secs("2026-11-18T12:00:00.Z"), None);
-        assert_eq!(parse_rfc3339_unix_secs("2026-11-18T12:00:00Zextra"), None);
     }
 
     #[test]

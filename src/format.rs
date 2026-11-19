@@ -18,8 +18,9 @@ fn push_tenths_with_suffix(tenths: u64, suffix: char, out: &mut String) {
     out.push(suffix);
 }
 
-/// Formats a non-negative token count into `out` with comma grouping and `K` (`>= 1,000`),
-/// `M` (`>= 1,000,000`), or `B` (`>= 1,000,000,000`) suffix.
+/// Formats a non-negative token count into `out` with comma grouping and `K` (`1,000..999,500`),
+/// `M` (`999,500..999,500,000`), or `B` (`>= 999,500,000`) suffix using symmetric boundary
+/// promotion (`999_500 -> 1M`, `999_500_000 -> 1B`).
 ///
 /// Uses a stack buffer to avoid intermediate heap allocations.
 ///
@@ -106,7 +107,7 @@ pub fn format_tokens(value: u64, out: &mut String) {
 }
 
 /// Formats a token count into a newly allocated compact string.
-pub fn format_tokens_string(value: u64) -> String {
+pub(crate) fn format_tokens_string(value: u64) -> String {
     let mut buf = String::with_capacity(8);
     format_tokens(value, &mut buf);
     buf

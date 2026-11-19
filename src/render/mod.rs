@@ -10,10 +10,11 @@ use crate::db::SessionMetadata;
 use crate::git::GitInfo;
 use crate::layout::{LayoutConfig, SpeedMode, WidgetId};
 use crate::metrics::{
-    current_context_tokens, resolve_quota_5h, resolve_quota_weekly, valid_cache_usage, QuotaView,
+    current_context_tokens, resolve_quota_views_with_reset_at, valid_cache_usage, QuotaView,
 };
 use crate::statusline::StatuslinePayload;
 use crate::theme::{glyphs_for, palette_for, GlyphSet, Palette};
+use crate::timeutil::unix_now_secs;
 
 pub(crate) use fit::truncate_to_width;
 
@@ -222,19 +223,20 @@ pub fn write_statusline<W: IoWrite>(
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
+    let (quota_5h, quota_weekly) = resolve_quota_views_with_reset_at(payload, unix_now_secs());
     write_statusline_with_quotas(
         payload,
         meta,
         git,
-        resolve_quota_5h(payload),
-        resolve_quota_weekly(payload),
+        quota_5h.map(|(v, _)| v),
+        quota_weekly.map(|(v, _)| v),
         cfg,
         out,
     )
 }
 
 /// Renders all non-empty configured rows using pre-resolved (e.g. calibrated) quota views.
-pub fn write_statusline_with_quotas<W: IoWrite>(
+pub(crate) fn write_statusline_with_quotas<W: IoWrite>(
     payload: &StatuslinePayload,
     meta: &SessionMetadata,
     git: &GitInfo,

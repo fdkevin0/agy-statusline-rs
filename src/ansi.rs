@@ -1,4 +1,4 @@
-//! UTF-8 safe ANSI SGR escape parser for rendering true-color live previews in Ratatui.
+//! Converts ANSI-colored text to Ratatui lines via `ansi-to-tui` with a `strip-ansi-escapes` fallback.
 
 use ansi_to_tui::IntoText;
 use ratatui::text::Line;

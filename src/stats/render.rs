@@ -1,15 +1,14 @@
 //! Terminal report and 20-week activity heatmap renderer for `agy-statusline stats`.
 
-use std::collections::HashMap;
 use std::io::{self, Write};
 
+use jiff::civil::Date;
+use jiff::ToSpan;
 use unicode_width::UnicodeWidthStr;
 
-use super::tz::{format_day, parse_civil_date_day};
-use super::{build_weekly_usage, PeriodSummary, StatsReport, WeeklyUsage, ACTIVITY_WEEKS};
+use super::{PeriodSummary, StatsReport, WeeklyUsage, ACTIVITY_WEEKS};
 use crate::format::format_tokens_string as fmt_tok;
 use crate::render::truncate_to_width;
-use crate::timeutil::civil_from_days;
 
 const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTH_NAMES: [&str; 12] = [
@@ -19,7 +18,7 @@ const UNICODE_HEATMAP: [&str; 5] = ["··", "░░", "▒▒", "▓▓", "█�
 const ASCII_HEATMAP: [&str; 5] = ["..", "==", "--", "##", "**"];
 const HEATMAP_ANSI_CODES: [&str; 5] = ["2", "38;5;29", "38;5;36", "38;5;42", "1;38;5;78"];
 
-pub(super) fn fmt_cache_hit(summary: &PeriodSummary) -> String {
+fn fmt_cache_hit(summary: &PeriodSummary) -> String {
     let denom = summary
         .input_tokens
         .saturating_add(summary.cache_read_tokens)
@@ -31,7 +30,7 @@ pub(super) fn fmt_cache_hit(summary: &PeriodSummary) -> String {
     format!("{pct:.1}%")
 }
 
-pub(super) fn fmt_usd(usd: f64, priced_requests: u64, unpriced_requests: u64) -> String {
+fn fmt_usd(usd: f64, priced_requests: u64, unpriced_requests: u64) -> String {
     if priced_requests == 0 {
         return "-".to_string();
     }
@@ -63,41 +62,12 @@ fn heatmap_level(tokens: u64, peak: u64) -> usize {
     }
 }
 
-fn resolve_weekly_usage(report: &StatsReport) -> Vec<WeeklyUsage> {
-    if !report.weekly.is_empty() {
-        return report.weekly.clone();
-    }
-    let ref_date = if report.today_local.is_empty() {
-        &report.today_utc
-    } else {
-        &report.today_local
-    };
-    let Some(today_idx) = parse_civil_date_day(ref_date) else {
-        return Vec::new();
-    };
-    let daily_by_date: HashMap<&str, u64> = if !report.unfiltered_daily_tokens.is_empty() {
-        report
-            .unfiltered_daily_tokens
-            .iter()
-            .map(|(date, tokens)| (date.as_str(), *tokens))
-            .collect()
-    } else {
-        report
-            .daily
-            .iter()
-            .map(|d| (d.date.as_str(), d.total_tokens))
-            .collect()
-    };
-    build_weekly_usage(today_idx, &daily_by_date)
-}
-
 fn build_month_header(weeks: &[WeeklyUsage]) -> String {
     let week_months: Vec<Option<usize>> = weeks
         .iter()
         .map(|w| {
-            let day_idx = parse_civil_date_day(&w.week_start)?;
-            let (_, m, _) = civil_from_days(day_idx);
-            (1..=12).contains(&m).then_some((m - 1) as usize)
+            let date: Date = w.week_start.parse().ok()?;
+            Some((date.month() - 1) as usize)
         })
         .collect();
 
@@ -133,18 +103,17 @@ fn write_weekly_activity<W: Write>(
     no_color: bool,
     ascii: bool,
 ) -> io::Result<()> {
-    let weeks = resolve_weekly_usage(report);
+    let weeks = &report.weekly;
     let mut peak: Option<(String, &'static str, u64)> = None;
 
-    for week in &weeks {
-        let mon_idx = parse_civil_date_day(&week.week_start);
+    for week in weeks {
+        let mon_date: Option<Date> = week.week_start.parse().ok();
         for (wd_idx, maybe_tok) in week.daily_tokens.iter().enumerate() {
             if let Some(tok) = *maybe_tok {
                 if tok > 0 && peak.as_ref().is_none_or(|(_, _, p)| tok > *p) {
-                    let date = mon_idx.map_or_else(
-                        || week.week_start.clone(),
-                        |m| format_day(m + wd_idx as i64),
-                    );
+                    let date = mon_date
+                        .and_then(|m| m.checked_add((wd_idx as i64).days()).ok())
+                        .map_or_else(|| week.week_start.clone(), |d| d.to_string());
                     peak = Some((date, WEEKDAY_NAMES[wd_idx], tok));
                 }
             }
@@ -187,7 +156,7 @@ fn write_weekly_activity<W: Write>(
         return Ok(());
     }
 
-    let month_hdr = build_month_header(&weeks);
+    let month_hdr = build_month_header(weeks);
     if !month_hdr.is_empty() {
         writeln!(
             out,
@@ -265,7 +234,7 @@ fn pad_model_cell(name: &str, width: usize, ascii: bool) -> String {
 }
 
 /// Renders a concise terminal summary of [`StatsReport`], respecting `no_color` and `ascii`.
-pub fn render_stats_report<W: Write>(
+pub(super) fn render_stats_report<W: Write>(
     report: &StatsReport,
     no_color: bool,
     ascii: bool,
@@ -375,26 +344,35 @@ pub fn render_stats_report<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::HashMap;
 
     use super::*;
-    use crate::stats::ModelStats;
+    use crate::stats::{build_weekly_usage, ModelStats};
+    use crate::timeutil::unix_day_from_civil_date;
+
+    fn weekly_for(today: &str, daily: &[(&str, u64)]) -> Vec<WeeklyUsage> {
+        let today_idx = unix_day_from_civil_date(today.parse().unwrap());
+        let map: HashMap<&str, u64> = daily.iter().copied().collect();
+        build_weekly_usage(today_idx, &map)
+    }
 
     #[test]
     fn github_tile_activity_renders_20w_grid_months_and_blanks_future_days() {
-        let mut unfiltered_daily_tokens = BTreeMap::new();
-        unfiltered_daily_tokens.insert("2026-11-03".to_string(), 250_000);
-        unfiltered_daily_tokens.insert("2026-11-15".to_string(), 1_000_000);
-        unfiltered_daily_tokens.insert("2026-11-16".to_string(), 500_000);
-        unfiltered_daily_tokens.insert("2026-11-17".to_string(), 750_000);
-        // Clock-skewed future date after today_local ("2026-11-18" Wed) must stay blank and uncounted.
-        unfiltered_daily_tokens.insert("2026-11-20".to_string(), 9_999_999);
-
         let report = StatsReport {
             today_local: "2026-11-18".to_string(),
             timezone: "UTC+08:00".to_string(),
             today_utc: "2026-11-18".to_string(),
-            unfiltered_daily_tokens,
+            weekly: weekly_for(
+                "2026-11-18",
+                &[
+                    ("2026-11-03", 250_000),
+                    ("2026-11-15", 1_000_000),
+                    ("2026-11-16", 500_000),
+                    ("2026-11-17", 750_000),
+                    // Clock-skewed future date after today_local ("2026-11-18" Wed) must stay blank and uncounted.
+                    ("2026-11-20", 9_999_999),
+                ],
+            ),
             ..Default::default()
         };
 
@@ -423,6 +401,7 @@ mod tests {
             today_local: "2026-11-11".to_string(),
             timezone: "UTC".to_string(),
             today_utc: "2026-11-11".to_string(),
+            weekly: weekly_for("2026-11-11", &[]),
             ..Default::default()
         };
         let mut trailing_out = Vec::new();
@@ -435,6 +414,7 @@ mod tests {
             today_local: "2027-01-06".to_string(),
             timezone: "UTC".to_string(),
             today_utc: "2027-01-06".to_string(),
+            weekly: weekly_for("2027-01-06", &[]),
             ..Default::default()
         };
         let mut rollover_out = Vec::new();

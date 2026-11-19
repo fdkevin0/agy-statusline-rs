@@ -15,12 +15,13 @@ use serde::{Deserialize, Serialize};
 use crate::fsutil::atomic_write;
 use crate::metrics::{resolve_quota_views_with_reset_at, QuotaResolution, QuotaView};
 use crate::statusline::StatuslinePayload;
+use crate::timeutil::SECS_PER_DAY;
 
 const SCHEMA_VERSION: u32 = 2;
 const CACHE_FILENAME: &str = "quota_cal.json";
 const LOCK_FILENAME: &str = "quota_cal.lock";
 
-const MIN_TTL_SECS: u64 = 7 * 86_400;
+const MIN_TTL_SECS: u64 = 7 * (SECS_PER_DAY as u64);
 
 const NEW_CYCLE_FRAC_JUMP: f64 = 0.04;
 const NEW_CYCLE_RESET_SHIFT_SECS: u64 = 600;
@@ -113,7 +114,8 @@ fn try_lock_calibration(cache_dir: &Path) -> io::Result<fs::File> {
 
 /// Replaces `cache_dir/quota_cal.json` atomically under the calibration lock.
 /// Returns an error if another writer holds the lock.
-pub fn save_calibration_store(cache_dir: &Path, store: &CalibrationStore) -> io::Result<()> {
+#[cfg(test)]
+fn save_calibration_store(cache_dir: &Path, store: &CalibrationStore) -> io::Result<()> {
     let _lock = try_lock_calibration(cache_dir)?;
     write_calibration_store(cache_dir, store)
 }
@@ -339,7 +341,8 @@ fn calibrate_resolved(
 }
 
 /// Pure calibration step updating `store` in-memory for both `5h` and `weekly` quota buckets.
-pub fn calibrate_store_at(
+#[cfg(test)]
+fn calibrate_store_at(
     store: &mut CalibrationStore,
     payload: &StatuslinePayload,
     now_unix_secs: u64,
@@ -355,7 +358,7 @@ pub fn calibrate_store_at(
 
 /// Calibrates fractional quota views under a nonblocking cache lock. If the lock is
 /// unavailable, uses any valid persisted estimates without recording a sample.
-pub fn calibrate_quota_views_at(
+pub(crate) fn calibrate_quota_views_at(
     payload: &StatuslinePayload,
     cache_dir: Option<&Path>,
     now_unix_secs: u64,

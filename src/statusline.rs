@@ -110,8 +110,6 @@ pub struct ContextWindow {
     pub context_window_size: Option<u64>,
     /// Percentage of the context window currently consumed (`0.0..=100.0`).
     pub used_percentage: Option<f64>,
-    /// Remaining context window percentage.
-    pub remaining_percentage: Option<f64>,
     /// Cumulative input tokens over the session.
     pub total_input_tokens: Option<u64>,
     /// Cumulative output tokens over the session.
@@ -215,12 +213,12 @@ impl StatuslinePayload {
     ///
     /// For objects containing a string `"status"` field, counts only entries where
     /// `status != "completed"`; entries lacking `"status"` fall back to direct counting.
-    pub fn subagent_count(&self) -> usize {
+    pub(crate) fn subagent_count(&self) -> usize {
         self.active_subagents().count()
     }
 
     /// Returns the role or name of the sole active subagent when `subagent_count() == 1`.
-    pub fn single_active_subagent_label(&self) -> Option<&str> {
+    pub(crate) fn single_active_subagent_label(&self) -> Option<&str> {
         let mut iter = self.active_subagents();
         let first = iter.next()?;
         if iter.next().is_some() {
@@ -255,7 +253,7 @@ impl StatuslinePayload {
 
     /// Returns the raw workspace directory path preferring `workspace.current_dir`,
     /// then `workspace.project_dir`, then top-level `cwd`.
-    pub fn workspace_path(&self) -> Option<&str> {
+    fn workspace_path(&self) -> Option<&str> {
         self.workspace
             .as_ref()
             .and_then(|ws| {
@@ -269,7 +267,7 @@ impl StatuslinePayload {
 
     /// Returns the directory basename preferring `workspace.project_dir`,
     /// then `workspace.current_dir`, then top-level `cwd`.
-    pub fn workspace_basename(&self) -> Option<&str> {
+    pub(crate) fn workspace_basename(&self) -> Option<&str> {
         let raw = self
             .workspace
             .as_ref()
@@ -295,7 +293,7 @@ impl StatuslinePayload {
 }
 
 /// Builds a rich sample payload used for live preview and `doctor`.
-pub fn sample_preview_payload(width: usize) -> StatuslinePayload {
+pub(crate) fn sample_preview_payload(width: usize) -> StatuslinePayload {
     let mut quota = BTreeMap::new();
     quota.insert(
         "gemini-5h".to_string(),
@@ -372,6 +370,32 @@ pub fn sample_preview_payload(width: usize) -> StatuslinePayload {
         quota: Some(quota),
         terminal_width: Some(width),
         ..Default::default()
+    }
+}
+
+/// Builds sample SQLite session metadata used for live TUI preview and `doctor`.
+#[allow(dead_code)]
+pub(crate) fn sample_preview_metadata() -> SessionMetadata {
+    SessionMetadata {
+        speed: Some(64.0),
+        median_speed: Some(68.0),
+        last_turn_speed: Some(72.0),
+        e2e_speed: Some(46.0),
+        ttft_secs: Some(1.4),
+        thinking_tokens: Some(4_200),
+        max_context_tokens: Some(512_000),
+        ..Default::default()
+    }
+}
+
+/// Builds sample Git probe metadata used for live TUI preview and `doctor`.
+#[allow(dead_code)]
+pub(crate) fn sample_preview_git() -> GitInfo {
+    GitInfo {
+        branch: Some("main".to_string()),
+        worktree: Some("feat-wt".to_string()),
+        added: 42,
+        deleted: 11,
     }
 }
 

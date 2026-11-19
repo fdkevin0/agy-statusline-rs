@@ -18,26 +18,20 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use pricing::{
-    fetch_models_dev_via_curl, parse_models_dev_json, pricing_cache_status, run_pricing_command,
-    sync_models_dev_pricing_with, ModelPricingRate, PricingCacheStatus, PricingCatalog, SyncMode,
-    DEFAULT_PRICING_TTL_SECS,
-};
-pub use render::render_stats_report;
-pub use scan::{derive_model_name, estimate_conversation_cost_usd};
-pub use tz::{
-    parse_rfc3339_unix_secs, parse_rfc3339_utc_day, unix_secs_to_utc_date, TimeZoneSpec,
-};
-
-use pricing::round_usd_6;
-use scan::{scan_sqlite_conversations, scan_transcripts, UsageEvent};
-use tz::format_day;
-
-const DAYS_PER_WEEK: i64 = 7;
-const ACTIVITY_WEEKS: usize = 20;
+pub use pricing::{run_pricing_command, PricingCatalog, SyncMode};
+pub(crate) use scan::estimate_conversation_cost_usd;
+pub use tz::unix_secs_to_utc_date;
 
 use crate::db::compute_median;
 use crate::paths::{resolve_agy_cli_dir, xdg_cache_dir, xdg_config_dir};
+use crate::timeutil::civil_date_from_unix_day;
+use pricing::{fetch_models_dev_via_curl, round_usd_6, DEFAULT_PRICING_TTL_SECS};
+use render::render_stats_report;
+use scan::{scan_sqlite_conversations, scan_transcripts, UsageEvent};
+use tz::{format_day, TimeZoneSpec};
+
+const DAYS_PER_WEEK: i64 = 7;
+const ACTIVITY_WEEKS: usize = 20;
 
 /// Aggregated token and optional cost totals for a time window.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -49,7 +43,6 @@ pub struct PeriodSummary {
     /// Prompt cache read tokens.
     pub cache_read_tokens: u64,
     /// Prompt cache write tokens.
-    #[serde(default)]
     pub cache_write_tokens: u64,
     /// Output tokens (includes thinking tokens when reported by AGY).
     pub output_tokens: u64,
@@ -90,7 +83,6 @@ pub struct DailyUsage {
     /// Cache read tokens.
     pub cache_read_tokens: u64,
     /// Cache write tokens.
-    #[serde(default)]
     pub cache_write_tokens: u64,
     /// Output tokens.
     pub output_tokens: u64,
@@ -131,7 +123,6 @@ pub struct ModelStats {
     /// Cache read tokens.
     pub cache_read_tokens: u64,
     /// Cache write tokens.
-    #[serde(default)]
     pub cache_write_tokens: u64,
     /// Output tokens.
     pub output_tokens: u64,
@@ -170,14 +161,12 @@ pub struct SqliteStats {
     pub median_ttft_secs: Option<f64>,
 }
 
-/// Complete report returned by [`collect_stats`] and serialized by `--json`.
+/// Complete usage report computed by `agy-statusline stats` and serialized by `--json`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatsReport {
     /// Reference local calendar date (`YYYY-MM-DD`) derived from `now_unix_secs` and `timezone`.
-    #[serde(default)]
     pub today_local: String,
     /// Active timezone label (e.g., `"UTC+08:00"` or `"UTC"`).
-    #[serde(default)]
     pub timezone: String,
     /// Reference UTC date (`YYYY-MM-DD`) derived from `now_unix_secs`.
     pub today_utc: String,
@@ -192,11 +181,7 @@ pub struct StatsReport {
     /// Daily usage entries sorted chronologically (filtered by `filter_days` when set).
     pub daily: Vec<DailyUsage>,
     /// Unfiltered 20-week Monday-anchored calendar activity (oldest week first, ending with current week).
-    #[serde(default)]
     pub weekly: Vec<WeeklyUsage>,
-    /// Unfiltered per-local-day token totals (`YYYY-MM-DD -> total_tokens`) for the 20-week activity grid.
-    #[serde(skip)]
-    pub unfiltered_daily_tokens: BTreeMap<String, u64>,
     /// Per-model breakdown sorted by `total_tokens` descending.
     pub models: Vec<ModelStats>,
     /// Aggregate statistics from SQLite `conversations/*.db` (`gen_metadata`).
@@ -234,16 +219,15 @@ struct ModelAccumulator {
     ttfts: Vec<f64>,
 }
 
-/// Monday-based weekday index (`0 = Mon .. 6 = Sun`) for days since `1970-01-01` (Thursday).
-fn weekday_mon0(day_idx: i64) -> usize {
-    (day_idx + 3).rem_euclid(DAYS_PER_WEEK) as usize
-}
-
 fn build_weekly_usage(
     today_idx: i64,
     daily_by_date: &HashMap<&str, u64>,
 ) -> Vec<WeeklyUsage> {
-    let today_wd = weekday_mon0(today_idx) as i64;
+    let today_wd = i64::from(
+        civil_date_from_unix_day(today_idx)
+            .weekday()
+            .to_monday_zero_offset(),
+    );
     let curr_monday = today_idx - today_wd;
     let first_monday = curr_monday - ((ACTIVITY_WEEKS as i64 - 1) * DAYS_PER_WEEK);
     let mut weeks = Vec::with_capacity(ACTIVITY_WEEKS);
@@ -275,17 +259,8 @@ fn build_weekly_usage(
     weeks
 }
 
-/// Scans AGY local directories under `home` using the host local timezone and builds a [`StatsReport`].
-///
-/// Reads `$HOME/.config/agy-statusline/pricing.json` if present under `home` without inspecting
-/// process-wide `XDG_CONFIG_HOME` or `ANTIGRAVITY_CLI_HOME`.
-pub fn collect_stats(home: &Path, days: Option<u32>, now_unix_secs: u64) -> StatsReport {
-    let tz = TimeZoneSpec::local();
-    collect_stats_with_tz(home, days, now_unix_secs, &tz)
-}
-
-/// Deterministic [`StatsReport`] collector parameterized by an explicit [`TimeZoneSpec`].
-pub fn collect_stats_with_tz(
+#[cfg(test)]
+fn collect_stats_with_tz(
     home: &Path,
     days: Option<u32>,
     now_unix_secs: u64,
@@ -304,8 +279,7 @@ pub fn collect_stats_with_tz(
     collect_stats_for_roots(&roots, days, now_unix_secs, tz, &pricing)
 }
 
-/// Builds a [`StatsReport`] for explicit `(source_kind, root_path)` directories, timezone, and pricing.
-pub fn collect_stats_for_roots(
+fn collect_stats_for_roots(
     roots: &[(&'static str, PathBuf)],
     days: Option<u32>,
     now_unix_secs: u64,
@@ -451,12 +425,10 @@ pub fn collect_stats_for_roots(
         totals,
         daily,
         weekly,
-        unfiltered_daily_tokens,
         models,
         sqlite,
     }
 }
-
 
 /// Runs the `agy-statusline stats` subcommand against the resolved environment directories.
 pub fn run_stats_command<W: Write>(
@@ -468,29 +440,23 @@ pub fn run_stats_command<W: Write>(
     now_unix_secs: u64,
     out: &mut W,
 ) -> io::Result<()> {
+    let home_dir = (!home.as_os_str().is_empty()).then_some(home);
     let mut roots: Vec<(&'static str, PathBuf)> = Vec::new();
-    if let Some(cli_dir) = resolve_agy_cli_dir().or_else(|| {
-        (!home.as_os_str().is_empty()).then(|| home.join(".gemini").join("antigravity-cli"))
-    }) {
+    if let Some(cli_dir) = resolve_agy_cli_dir()
+        .or_else(|| home_dir.map(|h| h.join(".gemini").join("antigravity-cli")))
+    {
         roots.push(("cli", cli_dir));
     }
-    if !home.as_os_str().is_empty() {
-        roots.push(("desktop", home.join(".gemini").join("antigravity")));
+    if let Some(h) = home_dir {
+        roots.push(("desktop", h.join(".gemini").join("antigravity")));
     }
 
-    let cache_dir = xdg_cache_dir().or_else(|| {
-        (!home.as_os_str().is_empty()).then(|| home.join(".cache").join("agy-statusline"))
-    });
+    let cache_dir =
+        xdg_cache_dir().or_else(|| home_dir.map(|h| h.join(".cache").join("agy-statusline")));
     let pricing_path = xdg_config_dir()
         .ok()
-        .map(|d| d.join("pricing.json"))
-        .or_else(|| {
-            (!home.as_os_str().is_empty()).then(|| {
-                home.join(".config")
-                    .join("agy-statusline")
-                    .join("pricing.json")
-            })
-        });
+        .or_else(|| home_dir.map(|h| h.join(".config").join("agy-statusline")))
+        .map(|d| d.join("pricing.json"));
     let pricing = PricingCatalog::load_effective_with(
         cache_dir.as_deref(),
         pricing_path.as_deref(),
@@ -645,6 +611,7 @@ pub(super) mod test_helpers {
 mod tests {
     use super::test_helpers::{build_gen_blob, build_step_meta_blob, create_full_conv_db};
     use super::*;
+    use crate::timeutil::parse_rfc3339_unix_secs;
     use std::fs;
 
     #[test]

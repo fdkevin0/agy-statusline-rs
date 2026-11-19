@@ -3,7 +3,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn non_empty_path(val: Option<OsString>) -> Option<PathBuf> {
     val.filter(|v| !v.is_empty()).map(PathBuf::from)
@@ -89,7 +89,8 @@ pub fn agy_settings_path() -> io::Result<PathBuf> {
 }
 
 /// Returns `<home>/.gemini/antigravity-cli/settings.json` for a given home directory.
-pub fn agy_settings_path_for_home(home: &Path) -> PathBuf {
+#[cfg(test)]
+pub(crate) fn agy_settings_path_for_home(home: &std::path::Path) -> PathBuf {
     home.join(".gemini")
         .join("antigravity-cli")
         .join("settings.json")
@@ -98,6 +99,7 @@ pub fn agy_settings_path_for_home(home: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn os(s: &str) -> Option<OsString> {
         Some(OsString::from(s))
