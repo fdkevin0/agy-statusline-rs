@@ -134,7 +134,6 @@ pub fn run_doctor<W: Write>(
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
     use crate::apply::apply_statusline_config;
     use crate::paths::agy_settings_path_for_home;
@@ -144,22 +143,11 @@ mod tests {
     #[cfg(not(windows))]
     const FAKE_BIN_NAME: &str = "agy-statusline-fake";
 
-    fn temp_home(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agy_statusline_doctor_{}_{}",
-            tag,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn doctor_reports_config_settings_and_preview() {
-        let home = temp_home("doctor");
-        let cfg_path = home.join("config.json");
-        let settings = agy_settings_path_for_home(&home);
+        let home = tempfile::tempdir().unwrap();
+        let cfg_path = home.path().join("config.json");
+        let settings = agy_settings_path_for_home(home.path());
         apply_statusline_config(&settings, Path::new("/nonexistent/agy-statusline"), false).unwrap();
 
         let mut out = Vec::new();
@@ -170,14 +158,13 @@ mod tests {
         assert!(text.contains("bin_exists=false"));
         assert!(text.contains("Preview:"));
         assert!(!text.contains('\x1b'));
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn command_executable_lookup_handles_args_spaces_and_bare_path_names() {
-        let home = temp_home("cmd_lookup");
-        let bin_dir = home.join("bin");
-        let space_dir = home.join("dir with spaces");
+        let home = tempfile::tempdir().unwrap();
+        let bin_dir = home.path().join("bin");
+        let space_dir = home.path().join("dir with spaces");
         fs::create_dir_all(&bin_dir).unwrap();
         fs::create_dir_all(&space_dir).unwrap();
 
@@ -224,14 +211,12 @@ mod tests {
         ));
 
         // Also verify run_doctor reports bin_exists=true for command-with-args.
-        let cfg_path = home.join("config.json");
-        let settings = agy_settings_path_for_home(&home);
+        let cfg_path = home.path().join("config.json");
+        let settings = agy_settings_path_for_home(home.path());
         apply_statusline_config(&settings, Path::new(&with_args), false).unwrap();
         let mut out = Vec::new();
         run_doctor(&cfg_path, &settings, true, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("bin_exists=true"));
-
-        let _ = fs::remove_dir_all(&home);
     }
 }

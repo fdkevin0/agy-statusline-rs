@@ -454,16 +454,6 @@ pub fn resolve_quota_views_with_reset_at(
     )
 }
 
-/// Resolves both active short-window (`< 24h`) and multi-day (`>= 24h`) quota views
-/// in a single pass at an explicit Unix epoch timestamp.
-pub fn resolve_quota_views_at(
-    payload: &StatuslinePayload,
-    now_unix_secs: u64,
-) -> (Option<QuotaView>, Option<QuotaView>) {
-    let (short, multi) = resolve_quota_views_with_reset_at(payload, now_unix_secs);
-    (short.map(|(v, _)| v), multi.map(|(v, _)| v))
-}
-
 /// Resolves the active short-window (`< 24h`) quota bucket and its reset epoch timestamp at `now_unix_secs`.
 pub fn resolve_quota_5h_with_reset_at(
     payload: &StatuslinePayload,

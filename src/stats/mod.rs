@@ -512,27 +512,12 @@ pub fn run_stats_command<W: Write>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(super) mod test_helpers {
     use rusqlite::Connection;
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use unicode_width::UnicodeWidthStr;
+    use std::path::Path;
 
-    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_home(tag: &str) -> PathBuf {
-        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "agy_statusline_stats_{tag}_{}_{seq}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn push_varint(buf: &mut Vec<u8>, mut val: u64) {
+    pub(super) fn push_varint(buf: &mut Vec<u8>, mut val: u64) {
         loop {
             let mut byte = (val & 0x7f) as u8;
             val >>= 7;
@@ -546,24 +531,24 @@ mod tests {
         }
     }
 
-    fn push_field_varint(buf: &mut Vec<u8>, id: u64, val: u64) {
+    pub(super) fn push_field_varint(buf: &mut Vec<u8>, id: u64, val: u64) {
         push_varint(buf, id << 3);
         push_varint(buf, val);
     }
 
-    fn push_field_bytes(buf: &mut Vec<u8>, id: u64, bytes: &[u8]) {
+    pub(super) fn push_field_bytes(buf: &mut Vec<u8>, id: u64, bytes: &[u8]) {
         push_varint(buf, (id << 3) | 2);
         push_varint(buf, bytes.len() as u64);
         buf.extend_from_slice(bytes);
     }
 
-    fn push_field_f32(buf: &mut Vec<u8>, id: u64, val: f32) {
+    pub(super) fn push_field_f32(buf: &mut Vec<u8>, id: u64, val: f32) {
         push_varint(buf, (id << 3) | 5);
         buf.extend_from_slice(&val.to_le_bytes());
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_gen_blob(
+    pub(super) fn build_gen_blob(
         step_idx: Option<u64>,
         model_enum: u64,
         resp_model: &str,
@@ -614,7 +599,7 @@ mod tests {
         root
     }
 
-    fn build_step_meta_blob(created_at_secs: u64) -> Vec<u8> {
+    pub(super) fn build_step_meta_blob(created_at_secs: u64) -> Vec<u8> {
         let mut ts = Vec::new();
         push_field_varint(&mut ts, 1, created_at_secs);
         let mut step = Vec::new();
@@ -622,7 +607,11 @@ mod tests {
         step
     }
 
-    fn create_full_conv_db(db_path: &Path, steps: &[(i64, Vec<u8>)], gens: &[(i64, Vec<u8>)]) {
+    pub(super) fn create_full_conv_db(
+        db_path: &Path,
+        steps: &[(i64, Vec<u8>)],
+        gens: &[(i64, Vec<u8>)],
+    ) {
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let conn = Connection::open(db_path).unwrap();
         conn.execute(
@@ -650,121 +639,18 @@ mod tests {
             .unwrap();
         }
     }
+}
 
-    fn build_tzif_v2(offset_secs: i32, footer: &str) -> Vec<u8> {
-        let mut out = Vec::new();
-        // v1 header: timecnt=0, typecnt=1, charcnt=4
-        out.extend_from_slice(b"TZif2");
-        out.extend_from_slice(&[0u8; 15]);
-        out.extend_from_slice(&0u32.to_be_bytes());
-        out.extend_from_slice(&0u32.to_be_bytes());
-        out.extend_from_slice(&0u32.to_be_bytes());
-        out.extend_from_slice(&0u32.to_be_bytes());
-        out.extend_from_slice(&1u32.to_be_bytes());
-        out.extend_from_slice(&4u32.to_be_bytes());
-        // v1 ttinfo (6 bytes) + abbr (4 bytes)
-        out.extend_from_slice(&offset_secs.to_be_bytes());
-        out.push(0);
-        out.push(0);
-        out.extend_from_slice(b"CST\0");
-        // v2 header: timecnt=1, typecnt=1, charcnt=4
-        out.extend_from_slice(b"TZif2");
-        out.extend_from_slice(&[0u8; 15]);
-        out.extend_from_slice(&0u32.to_be_bytes());
-        out.extend_from_slice(&0u32.to_be_bytes());
-        out.extend_from_slice(&0u32.to_be_bytes());
-        out.extend_from_slice(&1u32.to_be_bytes());
-        out.extend_from_slice(&1u32.to_be_bytes());
-        out.extend_from_slice(&4u32.to_be_bytes());
-        // v2 transition time (8 bytes), type_idx (1 byte), ttinfo (6 bytes), abbr (4 bytes)
-        out.extend_from_slice(&0i64.to_be_bytes());
-        out.push(0);
-        out.extend_from_slice(&offset_secs.to_be_bytes());
-        out.push(0);
-        out.push(0);
-        out.extend_from_slice(b"CST\0");
-        out.push(b'\n');
-        out.extend_from_slice(footer.as_bytes());
-        out.push(b'\n');
-        out
-    }
-
-    #[test]
-    fn rfc3339_utc_day_handles_z_and_timezone_rollover() {
-        let (d1, s1) = parse_rfc3339_utc_day("2026-11-18T03:05:35Z").unwrap();
-        assert_eq!(s1, "2026-11-18");
-
-        let (d2, s2) = parse_rfc3339_utc_day("2026-11-17T23:30:00-05:00").unwrap();
-        assert_eq!(s2, "2026-11-18");
-        assert_eq!(d1, d2);
-
-        let (d3, s3) = parse_rfc3339_utc_day("2026-11-18T01:00:00+08:00").unwrap();
-        assert_eq!(s3, "2026-11-17");
-        assert_eq!(d3, d1 - 1);
-
-        assert_eq!(parse_rfc3339_utc_day("not-a-timestamp"), None);
-        assert_eq!(parse_rfc3339_utc_day("2026-02-29T00:00:00Z"), None);
-    }
-
-    #[test]
-    fn tzif_and_posix_dst_timezone_bucketing() {
-        let shanghai_bytes = build_tzif_v2(8 * 3_600, "CST-8");
-        let shanghai = TimeZoneSpec::from_tzif(&shanghai_bytes).unwrap();
-        // 2026-11-17T20:00:00Z is 2026-11-18 04:00:00 in UTC+08:00
-        let ts_utc_17 = parse_rfc3339_unix_secs("2026-11-17T20:00:00Z").unwrap();
-        assert_eq!(shanghai.format_offset_at(ts_utc_17), "UTC+08:00");
-        assert_eq!(shanghai.local_day_and_date(ts_utc_17).1, "2026-11-18");
-
-        // US Eastern POSIX rule with DST: EST5EDT,M3.2.0,M11.1.0
-        let ny = TimeZoneSpec::from_tz_env("EST5EDT,M3.2.0,M11.1.0").unwrap();
-        let summer = parse_rfc3339_unix_secs("2026-07-01T12:00:00Z").unwrap();
-        let winter = parse_rfc3339_unix_secs("2026-11-17T12:00:00Z").unwrap();
-        assert_eq!(ny.format_offset_at(summer), "UTC-04:00");
-        assert_eq!(ny.format_offset_at(winter), "UTC-05:00");
-        assert_eq!(TimeZoneSpec::from_tzif(b"bad"), None);
-    }
-
-    #[test]
-    fn derive_model_name_is_dynamic_and_strips_only_effort_suffixes() {
-        assert_eq!(
-            derive_model_name(Some("Model Alpha (Medium)"), Some("model-alpha"), 1526),
-            "Model Alpha"
-        );
-        assert_eq!(
-            derive_model_name(Some("Model Alpha (High)"), Some("model-alpha"), 1525),
-            "Model Alpha"
-        );
-        assert_eq!(
-            derive_model_name(Some("Orchestrator (TierA)"), Some("pro-orchestrator"), 1667),
-            "Orchestrator (TierA)"
-        );
-        assert_eq!(
-            derive_model_name(
-                Some("Orchestrator (TierB)"),
-                Some("pro-orchestrator-b"),
-                1681
-            ),
-            "Orchestrator (TierB)"
-        );
-        assert_eq!(
-            derive_model_name(
-                Some("Worker Alpha (Orchestrator)"),
-                Some("worker-agy"),
-                1669
-            ),
-            "Worker Alpha (Orchestrator)"
-        );
-        assert_eq!(
-            derive_model_name(None, Some("worker-tiered"), 1322),
-            "worker-tiered"
-        );
-        assert_eq!(derive_model_name(None, None, 1999), "model#1999");
-        assert_eq!(derive_model_name(None, None, 0), "unknown");
-    }
+#[cfg(test)]
+mod tests {
+    use super::test_helpers::{build_gen_blob, build_step_meta_blob, create_full_conv_db};
+    use super::*;
+    use std::fs;
 
     #[test]
     fn sqlite_is_primary_and_transcript_fallback_skips_covered_uuids() {
-        let home = temp_home("sqlite_primary");
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
         let uuid = "11111111-1111-4111-8111-111111111111";
         let desk_uuid = "22222222-2222-4222-8222-222222222222";
 
@@ -851,7 +737,7 @@ mod tests {
 
         let tz_plus8 = TimeZoneSpec::fixed_offset(8 * 3_600);
         let now_secs = parse_rfc3339_unix_secs("2026-11-17T22:00:00Z").unwrap() as u64;
-        let report = collect_stats_with_tz(&home, None, now_secs, &tz_plus8);
+        let report = collect_stats_with_tz(home, None, now_secs, &tz_plus8);
 
         assert_eq!(report.today_local, "2026-11-18");
         assert_eq!(report.timezone, "UTC+08:00");
@@ -886,13 +772,12 @@ mod tests {
         assert!(!text.contains("unpriced"));
         assert!(text.contains("Thinking"));
         assert!(text.contains("Cache Hit"));
-
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn optional_pricing_json_and_native_cost_enable_cost_column() {
-        let home = temp_home("pricing");
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
         let uuid = "33333333-3333-4333-8333-333333333333";
         let ts = parse_rfc3339_unix_secs("2026-11-18T10:00:00Z").unwrap() as u64;
 
@@ -944,7 +829,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = collect_stats_with_tz(&home, None, ts, &TimeZoneSpec::utc());
+        let report = collect_stats_with_tz(home, None, ts, &TimeZoneSpec::utc());
         assert_eq!(report.windows.all_time.priced_requests, 2);
         assert!((report.windows.all_time.priced_usd - 10.25).abs() < 1e-6);
 
@@ -953,96 +838,12 @@ mod tests {
         let text = String::from_utf8(rendered).unwrap();
         assert!(text.contains("Est. Cost"));
         assert!(text.contains("~$10.25"));
-
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_cycles_and_duplicate_links_do_not_loop_or_double_count() {
-        let home = temp_home("symlink");
-        let brain = home.join(".gemini/antigravity-cli/brain");
-        let real_log = brain.join("session-a/transcript.jsonl");
-        fs::create_dir_all(real_log.parent().unwrap()).unwrap();
-        let ev = r#"{"created_at":"2026-11-18T10:00:00Z","step_index":0,"chatModel":{"model":"local-model-v1","usage":{"inputTokens":1000,"cacheReadTokens":0,"outputTokens":100,"responseId":"sym-1"}}}"#;
-        fs::write(&real_log, format!("{ev}\n")).unwrap();
-
-        std::os::unix::fs::symlink(&brain, brain.join("cycle")).unwrap();
-        let desk_session = home.join(".gemini/antigravity/brain/session-a");
-        fs::create_dir_all(&desk_session).unwrap();
-        std::os::unix::fs::symlink(&real_log, desk_session.join("transcript.jsonl")).unwrap();
-
-        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
-        let report = collect_stats_with_tz(&home, None, now_secs, &TimeZoneSpec::utc());
-        assert_eq!(report.totals.requests, 1);
-        assert_eq!(report.totals.total_tokens, 1100);
-        assert_eq!(report.models[0].model, "local-model-v1");
-
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn scans_empty_home_and_falls_back_to_db_mtime_when_step_missing() {
-        let home = temp_home("empty_and_mtime");
-        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
-
-        let empty = collect_stats_with_tz(&home, None, now_secs, &TimeZoneSpec::utc());
-        assert_eq!(empty.totals.requests, 0);
-        assert_eq!(empty.sqlite.db_files, 0);
-        let mut empty_out = Vec::new();
-        render_stats_report(&empty, true, true, &mut empty_out).unwrap();
-        let empty_text = String::from_utf8(empty_out).unwrap();
-        assert!(!empty_text.contains('\x1b'));
-        assert!(
-            empty_text.contains("Activity (20w): no activity | Less .. == -- ## ** More"),
-            "unexpected text:\n{empty_text}"
-        );
-        assert!(
-            empty_text.contains("       Jul         Aug            Sep         Oct         Nov")
-        );
-        assert!(empty_text
-            .contains("  Mon  .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .."));
-        assert!(
-            empty_text.contains("  Sun  .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..")
-        );
-        assert!(empty_text.contains("Models: none recorded"));
-
-        // Minimal gen_metadata-only DB without steps table falls back to DB mtime.
-        let conv_dir = home.join(".gemini/antigravity-cli/conversations");
-        fs::create_dir_all(&conv_dir).unwrap();
-        let db_path = conv_dir.join("8d0371e1-5a05-423b-a8bc-ed75995f9a8b.db");
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
-            [],
-        )
-        .unwrap();
-        let blob_50 = build_gen_blob(None, 10, "tiny-model", "", 100, 200, 100, 40, 2, 1000, None);
-        conn.execute(
-            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
-            [blob_50],
-        )
-        .unwrap();
-        drop(conn);
-        fs::write(
-            conv_dir.join("8d0371e1-5a05-423b-a8bc-ed75995f9a8b.db-wal"),
-            b"junk",
-        )
-        .unwrap();
-        fs::write(conv_dir.join("not-a-uuid.db"), b"junk").unwrap();
-
-        let populated = collect_stats_with_tz(&home, None, now_secs, &TimeZoneSpec::utc());
-        assert_eq!(populated.sqlite.db_files, 1);
-        assert_eq!(populated.sqlite.completed_turns, 1);
-        assert_eq!(populated.windows.all_time.requests, 1);
-        assert_eq!(populated.models[0].model, "tiny-model");
-
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn days_filter_preserves_20w_weekly_activity() {
-        let home = temp_home("days_heatmap");
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
         let uuid = "44444444-4444-4444-8444-444444444444";
         let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
         let old_secs = parse_rfc3339_unix_secs("2026-11-03T12:00:00Z").unwrap() as u64;
@@ -1069,7 +870,7 @@ mod tests {
         )];
         create_full_conv_db(&db_path, &steps, &gens);
 
-        let report = collect_stats_with_tz(&home, Some(7), now_secs, &TimeZoneSpec::utc());
+        let report = collect_stats_with_tz(home, Some(7), now_secs, &TimeZoneSpec::utc());
         assert_eq!(report.filter_days, Some(7));
         assert!(report.daily.is_empty());
         assert!(report.models.is_empty());
@@ -1091,430 +892,5 @@ mod tests {
             text.contains("  Tue  .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ** .. .."),
             "missing Tue tile row in:\n{text}"
         );
-
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn github_tile_activity_renders_20w_grid_months_and_blanks_future_days() {
-        let mut unfiltered_daily_tokens = BTreeMap::new();
-        unfiltered_daily_tokens.insert("2026-11-03".to_string(), 250_000);
-        unfiltered_daily_tokens.insert("2026-11-15".to_string(), 1_000_000);
-        unfiltered_daily_tokens.insert("2026-11-16".to_string(), 500_000);
-        unfiltered_daily_tokens.insert("2026-11-17".to_string(), 750_000);
-        // Clock-skewed future date after today_local ("2026-11-18" Wed) must stay blank and uncounted.
-        unfiltered_daily_tokens.insert("2026-11-20".to_string(), 9_999_999);
-
-        let report = StatsReport {
-            today_local: "2026-11-18".to_string(),
-            timezone: "UTC+08:00".to_string(),
-            today_utc: "2026-11-18".to_string(),
-            unfiltered_daily_tokens,
-            ..Default::default()
-        };
-
-        let mut unicode_out = Vec::new();
-        render_stats_report(&report, true, false, &mut unicode_out).unwrap();
-        let unicode_text = String::from_utf8(unicode_out).unwrap();
-        assert!(unicode_text
-            .contains("Activity (20w): peak 1M on 2026-11-15 (Sun) · Less ·· ░░ ▒▒ ▓▓ ██ More"));
-        assert!(
-            unicode_text.contains("       Jul         Aug            Sep         Oct         Nov")
-        );
-        assert!(unicode_text
-            .contains("  Mon  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ▒▒"));
-        assert!(unicode_text
-            .contains("  Tue  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ░░ ·· ▓▓"));
-        assert!(unicode_text
-            .contains("  Wed  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ··"));
-        assert!(unicode_text
-            .contains("  Thu  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ··\n"));
-        assert!(unicode_text
-            .contains("  Sun  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ██\n"));
-
-        // Trailing-month week 0 (2026-11-11 -> w=0 is 2026-06-29 Jun, w=1 is 2026-07-06 Jul) omits Jun collision,
-        // and year-rollover (2027-01-06 -> w=19 is 2027-01-04 Jan) renders Jan cleanly.
-        let trailing = StatsReport {
-            today_local: "2026-11-11".to_string(),
-            timezone: "UTC".to_string(),
-            today_utc: "2026-11-11".to_string(),
-            ..Default::default()
-        };
-        let mut trailing_out = Vec::new();
-        render_stats_report(&trailing, true, true, &mut trailing_out).unwrap();
-        let trailing_text = String::from_utf8(trailing_out).unwrap();
-        assert!(!trailing_text.contains("JunJul"));
-        assert!(trailing_text.contains("          Jul         Aug"));
-
-        let rollover = StatsReport {
-            today_local: "2027-01-06".to_string(),
-            timezone: "UTC".to_string(),
-            today_utc: "2027-01-06".to_string(),
-            ..Default::default()
-        };
-        let mut rollover_out = Vec::new();
-        render_stats_report(&rollover, false, true, &mut rollover_out).unwrap();
-        let rollover_text = String::from_utf8(rollover_out).unwrap();
-        assert!(rollover_text.contains("\x1b["));
-        assert!(rollover_text.contains("Dec         Jan"));
-    }
-
-    #[test]
-    fn pricing_catalog_prefers_exact_specificity_then_longest_deterministic_substring() {
-        let mut models = BTreeMap::new();
-        models.insert(
-            "claude-sonnet".to_string(),
-            ModelPricingRate {
-                input_per_mtok: 1.0,
-                output_per_mtok: 2.0,
-                ..Default::default()
-            },
-        );
-        models.insert(
-            "claude-sonnet-4-6-thinking".to_string(),
-            ModelPricingRate {
-                input_per_mtok: 10.0,
-                output_per_mtok: 20.0,
-                ..Default::default()
-            },
-        );
-        models.insert(
-            "alpha-a".to_string(),
-            ModelPricingRate {
-                input_per_mtok: 3.0,
-                ..Default::default()
-            },
-        );
-        models.insert(
-            "alpha-b".to_string(),
-            ModelPricingRate {
-                input_per_mtok: 9.0,
-                ..Default::default()
-            },
-        );
-        let catalog = PricingCatalog::from_models(models);
-
-        // Exact specificity: response_model ("claude-sonnet-4-6-thinking") beats model_group ("claude-sonnet")
-        // even though "claude-sonnet" < "claude-sonnet-4-6-thinking" in BTreeMap order.
-        let (matched_key, cost) = catalog
-            .estimate_cost(
-                &[
-                    "claude-sonnet-4-6-thinking",
-                    "Claude Sonnet 4.6 (Thinking)",
-                    "claude-sonnet",
-                ],
-                1_000_000,
-                0,
-                0,
-                0,
-            )
-            .unwrap();
-        assert_eq!(matched_key, "claude-sonnet-4-6-thinking");
-        assert!((cost - 10.0).abs() < 1e-6);
-
-        // Substring fallback: longest match wins, and equal-length tie breaks by BTreeMap key order ("alpha-a" < "alpha-b").
-        let (tie_key, tie_cost) = catalog
-            .estimate_cost(&["alpha-b-and-alpha-a-model"], 1_000_000, 0, 0, 0)
-            .unwrap();
-        assert_eq!(tie_key, "alpha-a");
-        assert!((tie_cost - 3.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn empty_or_schemaless_db_falls_back_to_transcript_jsonl() {
-        let home = temp_home("empty_db_fallback");
-        let uuid_empty = "55555555-5555-4555-8555-555555555555";
-        let uuid_schemaless = "66666666-6666-4666-8666-666666666666";
-        let conv_dir = home.join(".gemini/antigravity-cli/conversations");
-        fs::create_dir_all(&conv_dir).unwrap();
-
-        // 0-byte .db file.
-        fs::write(conv_dir.join(format!("{uuid_empty}.db")), b"").unwrap();
-        let t1 = home.join(format!(
-            ".gemini/antigravity-cli/brain/{uuid_empty}/.system_generated/logs/transcript.jsonl"
-        ));
-        fs::create_dir_all(t1.parent().unwrap()).unwrap();
-        fs::write(
-            &t1,
-            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"step_index\":1,\"model\":\"fallback-a\",\"input_tokens\":500,\"output_tokens\":50}\n",
-        )
-        .unwrap();
-
-        // Schema-less SQLite .db missing gen_metadata.
-        let conn = Connection::open(conv_dir.join(format!("{uuid_schemaless}.db"))).unwrap();
-        conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)", [])
-            .unwrap();
-        drop(conn);
-        let t2 = home.join(format!(
-            ".gemini/antigravity-cli/brain/{uuid_schemaless}/.system_generated/logs/transcript.jsonl"
-        ));
-        fs::create_dir_all(t2.parent().unwrap()).unwrap();
-        fs::write(
-            &t2,
-            "{\"created_at\":\"2026-11-18T11:00:00Z\",\"step_index\":1,\"model\":\"fallback-b\",\"input_tokens\":700,\"output_tokens\":100}\n",
-        )
-        .unwrap();
-
-        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
-        let report = collect_stats_with_tz(&home, None, now_secs, &TimeZoneSpec::utc());
-        assert_eq!(report.sqlite.db_files, 0);
-        assert_eq!(report.totals.requests, 2);
-        assert_eq!(report.totals.total_tokens, 1350);
-
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn render_stats_report_aligns_long_and_unicode_model_names() {
-        let report = StatsReport {
-            today_local: "2026-11-18".to_string(),
-            timezone: "UTC".to_string(),
-            today_utc: "2026-11-18".to_string(),
-            models: vec![
-                ModelStats {
-                    model: "extremely-long-model-display-name-45-chars-xy".to_string(),
-                    requests: 3,
-                    total_tokens: 1_500,
-                    output_tokens: 200,
-                    thinking_tokens: 50,
-                    median_tok_per_sec: Some(64.0),
-                    median_ttft_secs: Some(0.5),
-                    ..Default::default()
-                },
-                ModelStats {
-                    model: "模型-α-wide".to_string(),
-                    requests: 1,
-                    total_tokens: 500,
-                    output_tokens: 100,
-                    thinking_tokens: 0,
-                    median_tok_per_sec: Some(32.0),
-                    median_ttft_secs: Some(0.8),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-
-        let mut out = Vec::new();
-        render_stats_report(&report, true, false, &mut out).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        let hdr_idx = lines
-            .iter()
-            .position(|l| l.contains("Model") && l.contains("Turns"))
-            .unwrap();
-        let hdr_col = lines[hdr_idx].find(" Turns").unwrap();
-        let row1_col = lines[hdr_idx + 1].find("     3").unwrap();
-        let row2_col = lines[hdr_idx + 2].find("     1").unwrap();
-        assert_eq!(
-            lines[hdr_idx][..hdr_col].width(),
-            lines[hdr_idx + 1][..row1_col].width()
-        );
-        assert_eq!(
-            lines[hdr_idx][..hdr_col].width(),
-            lines[hdr_idx + 2][..row2_col].width()
-        );
-    }
-
-    #[test]
-    fn models_dev_sync_respects_ttl_overrides_and_normalizes_model_names() {
-        let home = temp_home("models_dev_ttl");
-        let cache_dir = home.join("cache");
-        let override_path = home.join("pricing.json");
-        fs::create_dir_all(&cache_dir).unwrap();
-
-        let sample_api = r#"{
-          "reseller": {
-            "models": {
-              "gemini-4-hydrogen": { "cost": { "input": 99.0, "output": 99.0 } }
-            }
-          },
-          "google": {
-            "models": {
-              "gemini-4-hydrogen": { "cost": { "input": 1.5, "output": 7.5, "cache_read": 0.075 } },
-              "gemini-4-carbon": { "cost": { "input": 2.0, "output": 10.0, "cache_read": 0.1 } },
-              "gemini-4-argon": { "cost": { "input": 2.0, "output": 10.0, "cache_read": 0.1 } }
-            }
-          },
-          "anthropic": {
-            "models": {
-              "claude-opus-5-5": { "cost": { "input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0 } }
-            }
-          }
-        }"#;
-
-        let t0 = 1_700_000_000;
-        let mut fetch_calls = 0usize;
-        let cat1 = PricingCatalog::load_effective_with(
-            Some(&cache_dir),
-            Some(&override_path),
-            SyncMode::BlockingIfStale,
-            t0,
-            DEFAULT_PRICING_TTL_SECS,
-            |_| {
-                fetch_calls += 1;
-                Ok(sample_api.to_string())
-            },
-        );
-        assert_eq!(fetch_calls, 1);
-        // Canonical provider (`google`) takes precedence over `reseller`.
-        assert_eq!(cat1.models()["gemini-4-hydrogen"].input_per_mtok, 1.5);
-
-        // Separator-normalized matching (`Claude Opus 5.5` -> `claude-opus-5-5`, `Gemini 4 Carbon (High)` -> `gemini-4-carbon`).
-        let (_, opus_usd) = cat1
-            .estimate_cost(&["Claude Opus 5.5"], 1_000_000, 0, 0, 0)
-            .unwrap();
-        assert!((opus_usd - 4.0).abs() < 1e-6);
-        let (_, carbon_usd) = cat1
-            .estimate_cost(&["Gemini 4 Carbon (High)"], 1_000_000, 0, 0, 0)
-            .unwrap();
-        assert!((carbon_usd - 2.0).abs() < 1e-6);
-
-        // Orchestrator aliases map to their underlying Carbon/Argon models when no explicit rate exists.
-        let (orch_c_key, orch_c_usd) = cat1
-            .estimate_cost(
-                &["gemini-pro-orchestrator", "Orchestrator (Carbon)"],
-                1_000_000,
-                0,
-                0,
-                0,
-            )
-            .unwrap();
-        assert_eq!(orch_c_key, "gemini-4-carbon");
-        assert!((orch_c_usd - 2.0).abs() < 1e-6);
-
-        let (orch_a_key, orch_a_usd) = cat1
-            .estimate_cost(
-                &["gemini-pro-orchestrator-argon", "Orchestrator (Argon)"],
-                1_000_000,
-                0,
-                0,
-                0,
-            )
-            .unwrap();
-        assert_eq!(orch_a_key, "gemini-4-argon");
-        assert!((orch_a_usd - 2.0).abs() < 1e-6);
-
-        // Within TTL: fetcher must NOT be called.
-        let _cat2 = PricingCatalog::load_effective_with(
-            Some(&cache_dir),
-            Some(&override_path),
-            SyncMode::BlockingIfStale,
-            t0 + 100,
-            DEFAULT_PRICING_TTL_SECS,
-            |_| -> io::Result<String> { panic!("unexpected fetch while cache is fresh") },
-        );
-
-        // User override `pricing.json` overrides cached rate.
-        fs::write(
-            &override_path,
-            r#"{"models":{"gemini-4-hydrogen":{"input_per_mtok":9.0,"output_per_mtok":9.0}}}"#,
-        )
-        .unwrap();
-        let cat3 = PricingCatalog::load_effective_with(
-            Some(&cache_dir),
-            Some(&override_path),
-            SyncMode::Offline,
-            t0 + 100,
-            DEFAULT_PRICING_TTL_SECS,
-            |_| unreachable!(),
-        );
-        assert_eq!(cat3.models()["gemini-4-hydrogen"].input_per_mtok, 9.0);
-
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn user_override_mixed_case_and_separator_variant_beats_models_dev_cache() {
-        let home = temp_home("pricing_override_precedence");
-        let cache_dir = home.join("cache");
-        let override_path = home.join("pricing.json");
-        fs::create_dir_all(&cache_dir).unwrap();
-
-        let sample_api = r#"{
-          "google": {
-            "models": {
-              "gemini-4-hydrogen": { "cost": { "input": 1.5, "output": 7.5 } },
-              "gemini-4-carbon": { "cost": { "input": 2.0, "output": 10.0 } }
-            }
-          }
-        }"#;
-        let t0 = 1_700_000_000;
-        let _ = PricingCatalog::load_effective_with(
-            Some(&cache_dir),
-            None,
-            SyncMode::BlockingIfStale,
-            t0,
-            DEFAULT_PRICING_TTL_SECS,
-            |_| Ok(sample_api.to_string()),
-        );
-
-        // Mixed-case override ("Gemini-4-Hydrogen") beats lowercase cached "gemini-4-hydrogen".
-        fs::write(
-            &override_path,
-            r#"{"models":{"Gemini-4-Hydrogen":{"input_per_mtok":12.0,"output_per_mtok":24.0}}}"#,
-        )
-        .unwrap();
-        let cat_mixed = PricingCatalog::load_effective_with(
-            Some(&cache_dir),
-            Some(&override_path),
-            SyncMode::Offline,
-            t0 + 10,
-            DEFAULT_PRICING_TTL_SECS,
-            |_| unreachable!(),
-        );
-        let (k1, c1) = cat_mixed
-            .estimate_cost(&["gemini-4-hydrogen"], 1_000_000, 0, 0, 0)
-            .unwrap();
-        assert_eq!(k1, "Gemini-4-Hydrogen");
-        assert!((c1 - 12.0).abs() < 1e-6);
-
-        // Space-separated override ("Gemini 4 Hydrogen") also beats cached "gemini-4-hydrogen".
-        fs::write(
-            &override_path,
-            r#"{"models":{"Gemini 4 Hydrogen":{"input_per_mtok":15.0,"output_per_mtok":30.0}}}"#,
-        )
-        .unwrap();
-        let cat_sep = PricingCatalog::load_effective_with(
-            Some(&cache_dir),
-            Some(&override_path),
-            SyncMode::Offline,
-            t0 + 10,
-            DEFAULT_PRICING_TTL_SECS,
-            |_| unreachable!(),
-        );
-        let (k2, c2) = cat_sep
-            .estimate_cost(&["gemini-4-hydrogen"], 1_000_000, 0, 0, 0)
-            .unwrap();
-        assert_eq!(k2, "Gemini 4 Hydrogen");
-        assert!((c2 - 15.0).abs() < 1e-6);
-
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn orchestrator_alias_matches_normalized_user_override() {
-        let mut models = BTreeMap::new();
-        models.insert(
-            "Gemini 4 Carbon".to_string(),
-            ModelPricingRate {
-                input_per_mtok: 7.5,
-                output_per_mtok: 15.0,
-                ..Default::default()
-            },
-        );
-        let catalog = PricingCatalog::from_models(models);
-
-        let (matched_key, usd) = catalog
-            .estimate_cost(
-                &["gemini-pro-orchestrator", "Orchestrator (Carbon)"],
-                1_000_000,
-                0,
-                0,
-                0,
-            )
-            .unwrap();
-        assert_eq!(matched_key, "Gemini 4 Carbon");
-        assert!((usd - 7.5).abs() < 1e-6);
     }
 }

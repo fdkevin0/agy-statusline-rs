@@ -762,3 +762,267 @@ pub(super) fn round_usd_6(v: f64) -> f64 {
         0.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pricing_catalog_prefers_exact_specificity_then_longest_deterministic_substring() {
+        let mut models = BTreeMap::new();
+        models.insert(
+            "claude-sonnet".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 1.0,
+                output_per_mtok: 2.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "claude-sonnet-4-6-thinking".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 10.0,
+                output_per_mtok: 20.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "alpha-a".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 3.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "alpha-b".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 9.0,
+                ..Default::default()
+            },
+        );
+        let catalog = PricingCatalog::from_models(models);
+
+        // Exact specificity: response_model ("claude-sonnet-4-6-thinking") beats model_group ("claude-sonnet")
+        // even though "claude-sonnet" < "claude-sonnet-4-6-thinking" in BTreeMap order.
+        let (matched_key, cost) = catalog
+            .estimate_cost(
+                &[
+                    "claude-sonnet-4-6-thinking",
+                    "Claude Sonnet 4.6 (Thinking)",
+                    "claude-sonnet",
+                ],
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(matched_key, "claude-sonnet-4-6-thinking");
+        assert!((cost - 10.0).abs() < 1e-6);
+
+        // Substring fallback: longest match wins, and equal-length tie breaks by BTreeMap key order ("alpha-a" < "alpha-b").
+        let (tie_key, tie_cost) = catalog
+            .estimate_cost(&["alpha-b-and-alpha-a-model"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(tie_key, "alpha-a");
+        assert!((tie_cost - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn models_dev_sync_respects_ttl_overrides_and_normalizes_model_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let override_path = dir.path().join("pricing.json");
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        let sample_api = r#"{
+          "reseller": {
+            "models": {
+              "gemini-4-hydrogen": { "cost": { "input": 99.0, "output": 99.0 } }
+            }
+          },
+          "google": {
+            "models": {
+              "gemini-4-hydrogen": { "cost": { "input": 1.5, "output": 7.5, "cache_read": 0.075 } },
+              "gemini-4-carbon": { "cost": { "input": 2.0, "output": 10.0, "cache_read": 0.1 } },
+              "gemini-4-argon": { "cost": { "input": 2.0, "output": 10.0, "cache_read": 0.1 } }
+            }
+          },
+          "anthropic": {
+            "models": {
+              "claude-opus-5-5": { "cost": { "input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0 } }
+            }
+          }
+        }"#;
+
+        let t0 = 1_700_000_000;
+        let mut fetch_calls = 0usize;
+        let cat1 = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            Some(&override_path),
+            SyncMode::BlockingIfStale,
+            t0,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| {
+                fetch_calls += 1;
+                Ok(sample_api.to_string())
+            },
+        );
+        assert_eq!(fetch_calls, 1);
+        // Canonical provider (`google`) takes precedence over `reseller`.
+        assert_eq!(cat1.models()["gemini-4-hydrogen"].input_per_mtok, 1.5);
+
+        // Separator-normalized matching (`Claude Opus 5.5` -> `claude-opus-5-5`, `Gemini 4 Carbon (High)` -> `gemini-4-carbon`).
+        let (_, opus_usd) = cat1
+            .estimate_cost(&["Claude Opus 5.5"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert!((opus_usd - 4.0).abs() < 1e-6);
+        let (_, carbon_usd) = cat1
+            .estimate_cost(&["Gemini 4 Carbon (High)"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert!((carbon_usd - 2.0).abs() < 1e-6);
+
+        // Orchestrator aliases map to their underlying Carbon/Argon models when no explicit rate exists.
+        let (orch_c_key, orch_c_usd) = cat1
+            .estimate_cost(
+                &["gemini-pro-orchestrator", "Orchestrator (Carbon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(orch_c_key, "gemini-4-carbon");
+        assert!((orch_c_usd - 2.0).abs() < 1e-6);
+
+        let (orch_a_key, orch_a_usd) = cat1
+            .estimate_cost(
+                &["gemini-pro-orchestrator-argon", "Orchestrator (Argon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(orch_a_key, "gemini-4-argon");
+        assert!((orch_a_usd - 2.0).abs() < 1e-6);
+
+        // Within TTL: fetcher must NOT be called.
+        let _cat2 = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            Some(&override_path),
+            SyncMode::BlockingIfStale,
+            t0 + 100,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| -> io::Result<String> { panic!("unexpected fetch while cache is fresh") },
+        );
+
+        // User override `pricing.json` overrides cached rate.
+        fs::write(
+            &override_path,
+            r#"{"models":{"gemini-4-hydrogen":{"input_per_mtok":9.0,"output_per_mtok":9.0}}}"#,
+        )
+        .unwrap();
+        let cat3 = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            Some(&override_path),
+            SyncMode::Offline,
+            t0 + 100,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| unreachable!(),
+        );
+        assert_eq!(cat3.models()["gemini-4-hydrogen"].input_per_mtok, 9.0);
+    }
+
+    #[test]
+    fn user_override_mixed_case_and_separator_variant_beats_models_dev_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let override_path = dir.path().join("pricing.json");
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        let sample_api = r#"{
+          "google": {
+            "models": {
+              "gemini-4-hydrogen": { "cost": { "input": 1.5, "output": 7.5 } },
+              "gemini-4-carbon": { "cost": { "input": 2.0, "output": 10.0 } }
+            }
+          }
+        }"#;
+        let t0 = 1_700_000_000;
+        let _ = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            None,
+            SyncMode::BlockingIfStale,
+            t0,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| Ok(sample_api.to_string()),
+        );
+
+        // Mixed-case override ("Gemini-4-Hydrogen") beats lowercase cached "gemini-4-hydrogen".
+        fs::write(
+            &override_path,
+            r#"{"models":{"Gemini-4-Hydrogen":{"input_per_mtok":12.0,"output_per_mtok":24.0}}}"#,
+        )
+        .unwrap();
+        let cat_mixed = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            Some(&override_path),
+            SyncMode::Offline,
+            t0 + 10,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| unreachable!(),
+        );
+        let (k1, c1) = cat_mixed
+            .estimate_cost(&["gemini-4-hydrogen"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(k1, "Gemini-4-Hydrogen");
+        assert!((c1 - 12.0).abs() < 1e-6);
+
+        // Space-separated override ("Gemini 4 Hydrogen") also beats cached "gemini-4-hydrogen".
+        fs::write(
+            &override_path,
+            r#"{"models":{"Gemini 4 Hydrogen":{"input_per_mtok":15.0,"output_per_mtok":30.0}}}"#,
+        )
+        .unwrap();
+        let cat_sep = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            Some(&override_path),
+            SyncMode::Offline,
+            t0 + 10,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| unreachable!(),
+        );
+        let (k2, c2) = cat_sep
+            .estimate_cost(&["gemini-4-hydrogen"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(k2, "Gemini 4 Hydrogen");
+        assert!((c2 - 15.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn orchestrator_alias_matches_normalized_user_override() {
+        let mut models = BTreeMap::new();
+        models.insert(
+            "Gemini 4 Carbon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 7.5,
+                output_per_mtok: 15.0,
+                ..Default::default()
+            },
+        );
+        let catalog = PricingCatalog::from_models(models);
+
+        let (matched_key, usd) = catalog
+            .estimate_cost(
+                &["gemini-pro-orchestrator", "Orchestrator (Carbon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(matched_key, "Gemini 4 Carbon");
+        assert!((usd - 7.5).abs() < 1e-6);
+    }
+}

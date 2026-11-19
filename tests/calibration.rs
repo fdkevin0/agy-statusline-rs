@@ -1,63 +1,30 @@
+#![forbid(unsafe_code)]
 //! Tier 2 binary CLI integration tests for quota token calibration.
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 use agy_statusline::calibration::{load_calibration_store, BucketCalibration, CalibrationStore};
 use agy_statusline::layout::{save_layout_config, LayoutConfig, WidgetId};
-use agy_statusline::timeutil::unix_now_secs;
 
-static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+use common::{run_statusline_stdin, unix_now_secs};
 
-fn isolated_temp_dir(tag: &str) -> PathBuf {
-    let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "agy_statusline_cal_cli_{tag}_{}_{seq}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+fn write_quota_layout(base: &Path) {
     let config = LayoutConfig {
         rows: vec![vec![WidgetId::Quota5h, WidgetId::QuotaWeekly]],
         ..LayoutConfig::default()
     };
-    save_layout_config(&dir.join("config/agy-statusline/config.json"), &config).unwrap();
-    dir
-}
-
-fn run_binary_with_stdin(base: &Path, payload: &str) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
-        .env("HOME", base)
-        .env("USERPROFILE", base)
-        .env("XDG_CONFIG_HOME", base.join("config"))
-        .env("XDG_CACHE_HOME", base.join("cache"))
-        .env_remove("ANTIGRAVITY_CLI_HOME")
-        .env_remove("AGY_HOME")
-        .env_remove("AGY_STATUSLINE_FULL")
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(payload.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success());
-    String::from_utf8(out.stdout).unwrap()
+    save_layout_config(&base.join("config/agy-statusline/config.json"), &config).unwrap();
 }
 
 #[test]
 fn cli_calibrates_quota_tokens_across_ticks_and_persists_in_xdg_cache() {
-    let base = isolated_temp_dir("ticks");
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    write_quota_layout(base);
 
     let tick1 = r#"{
         "agent_state": "idle",
@@ -68,7 +35,7 @@ fn cli_calibrates_quota_tokens_across_ticks_and_persists_in_xdg_cache() {
             "gemini-5h": {"remaining_fraction": 0.90, "reset_in_seconds": 14400}
         }
     }"#;
-    let out1 = run_binary_with_stdin(&base, tick1);
+    let out1 = run_statusline_stdin(base, &[], tick1);
     assert!(out1.contains("5h 90%"));
     assert!(!out1.contains("(~"));
     assert!(base.join("cache/agy-statusline/quota_cal.json").is_file());
@@ -83,7 +50,7 @@ fn cli_calibrates_quota_tokens_across_ticks_and_persists_in_xdg_cache() {
             "gemini-5h": {"remaining_fraction": 0.80, "reset_in_seconds": 14300}
         }
     }"#;
-    let out2 = run_binary_with_stdin(&base, tick2);
+    let out2 = run_statusline_stdin(base, &[], tick2);
     assert!(out2.contains("5h 80% (~1.6M) ↻3h58m"));
 
     // Conversation change re-anchors while preserving 2.0M calibration -> 75% = 1.5M.
@@ -96,19 +63,19 @@ fn cli_calibrates_quota_tokens_across_ticks_and_persists_in_xdg_cache() {
             "gemini-5h": {"remaining_fraction": 0.75, "reset_in_seconds": 14200}
         }
     }"#;
-    let out3 = run_binary_with_stdin(&base, tick3);
+    let out3 = run_statusline_stdin(base, &[], tick3);
     assert!(out3.contains("5h 75% (~1.5M)"));
 
     let cal_raw = fs::read_to_string(base.join("cache/agy-statusline/quota_cal.json")).unwrap();
     assert!(cal_raw.contains("\"gemini-5h\""));
     assert!(!cal_raw.contains("\"5h:5h\""));
-
-    let _ = fs::remove_dir_all(&base);
 }
 
 #[test]
 fn cli_uses_unexpired_estimates_while_another_process_holds_the_lock() {
-    let base = isolated_temp_dir("contended");
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    write_quota_layout(base);
     let cache = base.join("cache/agy-statusline");
     let age_eight_days = unix_now_secs() - 8 * 86_400;
     let short = BucketCalibration {
@@ -156,7 +123,7 @@ fn cli_uses_unexpired_estimates_while_another_process_holds_the_lock() {
         .unwrap();
     lock.lock().unwrap();
 
-    let skipped = run_binary_with_stdin(&base, tick);
+    let skipped = run_statusline_stdin(base, &[], tick);
     assert!(skipped.contains("5h 70%"));
     assert!(!skipped.contains("5h 70% (~"));
     assert!(skipped.contains("7d 75% (~7.5M)"), "{skipped}");
@@ -164,7 +131,7 @@ fn cli_uses_unexpired_estimates_while_another_process_holds_the_lock() {
 
     lock.unlock().unwrap();
     drop(lock);
-    let sampled = run_binary_with_stdin(&base, tick);
+    let sampled = run_statusline_stdin(base, &[], tick);
     assert!(sampled.contains("5h 70% (~2.1M)"));
     assert!(sampled.contains("7d 75% (~5.7M)"), "{sampled}");
     let reloaded = load_calibration_store(&cache);
@@ -173,22 +140,20 @@ fn cli_uses_unexpired_estimates_while_another_process_holds_the_lock() {
         Some(510_000)
     );
     assert_eq!(reloaded.buckets["gemini-7d"].sample_count, 2);
-
-    fs::remove_dir_all(base).unwrap();
 }
 
 #[test]
 fn cli_with_credit_only_quota_skips_the_calibration_cache() {
-    let base = isolated_temp_dir("credits");
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    write_quota_layout(base);
     let tick = r#"{
         "model": {"id": "gemini-4-hydrogen"},
         "quota": {"gemini-5h": {"remaining_amount": 42}}
     }"#;
 
-    let output = run_binary_with_stdin(&base, tick);
+    let output = run_statusline_stdin(base, &[], tick);
     assert!(output.contains("5h 42"));
     assert!(!base.join("cache/agy-statusline/quota_cal.lock").exists());
     assert!(!base.join("cache/agy-statusline/quota_cal.json").exists());
-
-    fs::remove_dir_all(base).unwrap();
 }

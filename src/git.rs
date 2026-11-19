@@ -282,16 +282,14 @@ fn run_git_diff_bounded(dir: &Path, timeout: Duration) -> Option<(u64, u64)> {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::env;
 
     #[test]
     fn detects_linked_worktree_from_dot_git_file() {
-        let dir = env::temp_dir().join(format!("agy_wt_test_{}", std::process::id()));
-        let sub = dir.join("nested/sub");
-        let _ = fs::remove_dir_all(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("nested/sub");
         fs::create_dir_all(&sub).unwrap();
         fs::write(
-            dir.join(".git"),
+            dir.path().join(".git"),
             "gitdir: /repo/.git/worktrees/feat-statusline\n",
         )
         .unwrap();
@@ -300,16 +298,13 @@ mod tests {
             detect_worktree_name(&sub),
             Some("feat-statusline".to_string())
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn resolves_relative_worktree_and_head_branch_or_detached_sha() {
-        let dir = env::temp_dir().join(format!("agy_wt_rel_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let wt_gitdir = dir.join("main_repo/.git/worktrees/wt-rel");
-        let wt_dir = dir.join("wt_checkout");
+        let dir = tempfile::tempdir().unwrap();
+        let wt_gitdir = dir.path().join("main_repo/.git/worktrees/wt-rel");
+        let wt_dir = dir.path().join("wt_checkout");
         fs::create_dir_all(&wt_gitdir).unwrap();
         fs::create_dir_all(&wt_dir).unwrap();
         fs::write(
@@ -329,32 +324,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_head_branch(&resolved).as_deref(), Some("@0123456"));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn main_worktree_dot_git_dir_returns_none() {
-        let dir = env::temp_dir().join(format!("agy_wt_main_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join(".git")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
 
-        assert_eq!(detect_worktree_name(&dir), None);
-
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(detect_worktree_name(dir.path()), None);
     }
 
     #[test]
     fn probe_diff_cached_respects_ttl_and_index_mtime() {
-        let root = env::temp_dir().join(format!("agy_diff_cache_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
         let gitdir = root.join(".git");
         let cache_dir = root.join("cache");
         fs::create_dir_all(&gitdir).unwrap();
         fs::write(gitdir.join("index"), b"v1").unwrap();
 
         let calls = Cell::new(0usize);
-        let first = probe_diff_cached(&root, &gitdir, &cache_dir, 100, 3, || {
+        let first = probe_diff_cached(root, &gitdir, &cache_dir, 100, 3, || {
             calls.set(calls.get() + 1);
             Some((12, 4))
         });
@@ -362,7 +352,7 @@ mod tests {
         assert_eq!(calls.get(), 1);
 
         // Cache hit within TTL does not invoke runner.
-        let hit = probe_diff_cached(&root, &gitdir, &cache_dir, 102, 3, || {
+        let hit = probe_diff_cached(root, &gitdir, &cache_dir, 102, 3, || {
             calls.set(calls.get() + 1);
             Some((99, 99))
         });
@@ -370,7 +360,7 @@ mod tests {
         assert_eq!(calls.get(), 1);
 
         // TTL expiry refreshes value.
-        let expired = probe_diff_cached(&root, &gitdir, &cache_dir, 103, 3, || {
+        let expired = probe_diff_cached(root, &gitdir, &cache_dir, 103, 3, || {
             calls.set(calls.get() + 1);
             Some((20, 5))
         });
@@ -382,27 +372,25 @@ mod tests {
         idx_file
             .set_modified(UNIX_EPOCH + Duration::from_secs(500))
             .unwrap();
-        let invalidated = probe_diff_cached(&root, &gitdir, &cache_dir, 104, 3, || {
+        let invalidated = probe_diff_cached(root, &gitdir, &cache_dir, 104, 3, || {
             calls.set(calls.get() + 1);
             Some((7, 1))
         });
         assert_eq!(invalidated, (7, 1));
         assert_eq!(calls.get(), 3);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn probe_diff_cached_negative_caches_timeout_within_ttl() {
-        let root = env::temp_dir().join(format!("agy_diff_neg_cache_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
         let gitdir = root.join(".git");
         let cache_dir = root.join("cache");
         fs::create_dir_all(&gitdir).unwrap();
         fs::write(gitdir.join("index"), b"v1").unwrap();
 
         let calls = Cell::new(0usize);
-        let timed_out = probe_diff_cached(&root, &gitdir, &cache_dir, 200, 3, || {
+        let timed_out = probe_diff_cached(root, &gitdir, &cache_dir, 200, 3, || {
             calls.set(calls.get() + 1);
             None
         });
@@ -410,7 +398,7 @@ mod tests {
         assert_eq!(calls.get(), 1);
 
         // Within TTL, cached failure avoids re-running the probe.
-        let cached_fail = probe_diff_cached(&root, &gitdir, &cache_dir, 202, 3, || {
+        let cached_fail = probe_diff_cached(root, &gitdir, &cache_dir, 202, 3, || {
             calls.set(calls.get() + 1);
             Some((50, 10))
         });
@@ -418,13 +406,11 @@ mod tests {
         assert_eq!(calls.get(), 1);
 
         // After TTL expiry, probe runs again and succeeds.
-        let recovered = probe_diff_cached(&root, &gitdir, &cache_dir, 203, 3, || {
+        let recovered = probe_diff_cached(root, &gitdir, &cache_dir, 203, 3, || {
             calls.set(calls.get() + 1);
             Some((50, 10))
         });
         assert_eq!(recovered, (50, 10));
         assert_eq!(calls.get(), 2);
-
-        let _ = fs::remove_dir_all(&root);
     }
 }

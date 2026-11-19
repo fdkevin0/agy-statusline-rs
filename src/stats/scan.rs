@@ -857,3 +857,174 @@ pub fn estimate_conversation_cost_usd(
     }
     (priced_turns > 0 && total_usd.is_finite()).then(|| round_usd_6(total_usd))
 }
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::stats::test_helpers::build_gen_blob;
+    use crate::stats::{collect_stats_with_tz, render_stats_report};
+
+    #[test]
+    fn derive_model_name_is_dynamic_and_strips_only_effort_suffixes() {
+        assert_eq!(
+            derive_model_name(Some("Model Alpha (Medium)"), Some("model-alpha"), 1526),
+            "Model Alpha"
+        );
+        assert_eq!(
+            derive_model_name(Some("Model Alpha (High)"), Some("model-alpha"), 1525),
+            "Model Alpha"
+        );
+        assert_eq!(
+            derive_model_name(Some("Orchestrator (TierA)"), Some("pro-orchestrator"), 1667),
+            "Orchestrator (TierA)"
+        );
+        assert_eq!(
+            derive_model_name(
+                Some("Orchestrator (TierB)"),
+                Some("pro-orchestrator-b"),
+                1681
+            ),
+            "Orchestrator (TierB)"
+        );
+        assert_eq!(
+            derive_model_name(
+                Some("Worker Alpha (Orchestrator)"),
+                Some("worker-agy"),
+                1669
+            ),
+            "Worker Alpha (Orchestrator)"
+        );
+        assert_eq!(
+            derive_model_name(None, Some("worker-tiered"), 1322),
+            "worker-tiered"
+        );
+        assert_eq!(derive_model_name(None, None, 1999), "model#1999");
+        assert_eq!(derive_model_name(None, None, 0), "unknown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cycles_and_duplicate_links_do_not_loop_or_double_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let brain = home.join(".gemini/antigravity-cli/brain");
+        let real_log = brain.join("session-a/transcript.jsonl");
+        fs::create_dir_all(real_log.parent().unwrap()).unwrap();
+        let ev = r#"{"created_at":"2026-11-18T10:00:00Z","step_index":0,"chatModel":{"model":"local-model-v1","usage":{"inputTokens":1000,"cacheReadTokens":0,"outputTokens":100,"responseId":"sym-1"}}}"#;
+        fs::write(&real_log, format!("{ev}\n")).unwrap();
+
+        std::os::unix::fs::symlink(&brain, brain.join("cycle")).unwrap();
+        let desk_session = home.join(".gemini/antigravity/brain/session-a");
+        fs::create_dir_all(&desk_session).unwrap();
+        std::os::unix::fs::symlink(&real_log, desk_session.join("transcript.jsonl")).unwrap();
+
+        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
+        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
+        assert_eq!(report.totals.requests, 1);
+        assert_eq!(report.totals.total_tokens, 1100);
+        assert_eq!(report.models[0].model, "local-model-v1");
+    }
+
+    #[test]
+    fn scans_empty_home_and_falls_back_to_db_mtime_when_step_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
+
+        let empty = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
+        assert_eq!(empty.totals.requests, 0);
+        assert_eq!(empty.sqlite.db_files, 0);
+        let mut empty_out = Vec::new();
+        render_stats_report(&empty, true, true, &mut empty_out).unwrap();
+        let empty_text = String::from_utf8(empty_out).unwrap();
+        assert!(!empty_text.contains('\x1b'));
+        assert!(
+            empty_text.contains("Activity (20w): no activity | Less .. == -- ## ** More"),
+            "unexpected text:\n{empty_text}"
+        );
+        assert!(
+            empty_text.contains("       Jul         Aug            Sep         Oct         Nov")
+        );
+        assert!(empty_text
+            .contains("  Mon  .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .."));
+        assert!(
+            empty_text.contains("  Sun  .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..")
+        );
+        assert!(empty_text.contains("Models: none recorded"));
+
+        // Minimal gen_metadata-only DB without steps table falls back to DB mtime.
+        let conv_dir = home.join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+        let db_path = conv_dir.join("8d0371e1-5a05-423b-a8bc-ed75995f9a8b.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+            [],
+        )
+        .unwrap();
+        let blob_50 = build_gen_blob(None, 10, "tiny-model", "", 100, 200, 100, 40, 2, 1000, None);
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [blob_50],
+        )
+        .unwrap();
+        drop(conn);
+        fs::write(
+            conv_dir.join("8d0371e1-5a05-423b-a8bc-ed75995f9a8b.db-wal"),
+            b"junk",
+        )
+        .unwrap();
+        fs::write(conv_dir.join("not-a-uuid.db"), b"junk").unwrap();
+
+        let populated = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
+        assert_eq!(populated.sqlite.db_files, 1);
+        assert_eq!(populated.sqlite.completed_turns, 1);
+        assert_eq!(populated.windows.all_time.requests, 1);
+        assert_eq!(populated.models[0].model, "tiny-model");
+    }
+
+    #[test]
+    fn empty_or_schemaless_db_falls_back_to_transcript_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let uuid_empty = "55555555-5555-4555-8555-555555555555";
+        let uuid_schemaless = "66666666-6666-4666-8666-666666666666";
+        let conv_dir = home.join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+
+        // 0-byte .db file.
+        fs::write(conv_dir.join(format!("{uuid_empty}.db")), b"").unwrap();
+        let t1 = home.join(format!(
+            ".gemini/antigravity-cli/brain/{uuid_empty}/.system_generated/logs/transcript.jsonl"
+        ));
+        fs::create_dir_all(t1.parent().unwrap()).unwrap();
+        fs::write(
+            &t1,
+            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"step_index\":1,\"model\":\"fallback-a\",\"input_tokens\":500,\"output_tokens\":50}\n",
+        )
+        .unwrap();
+
+        // Schema-less SQLite .db missing gen_metadata.
+        let conn = Connection::open(conv_dir.join(format!("{uuid_schemaless}.db"))).unwrap();
+        conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+        drop(conn);
+        let t2 = home.join(format!(
+            ".gemini/antigravity-cli/brain/{uuid_schemaless}/.system_generated/logs/transcript.jsonl"
+        ));
+        fs::create_dir_all(t2.parent().unwrap()).unwrap();
+        fs::write(
+            &t2,
+            "{\"created_at\":\"2026-11-18T11:00:00Z\",\"step_index\":1,\"model\":\"fallback-b\",\"input_tokens\":700,\"output_tokens\":100}\n",
+        )
+        .unwrap();
+
+        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
+        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
+        assert_eq!(report.sqlite.db_files, 0);
+        assert_eq!(report.totals.requests, 2);
+        assert_eq!(report.totals.total_tokens, 1350);
+    }
+}

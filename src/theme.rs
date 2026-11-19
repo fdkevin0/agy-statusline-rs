@@ -87,13 +87,6 @@ pub const fn palette_for(theme: ThemeStyle) -> &'static Palette {
     }
 }
 
-impl Palette {
-    /// Selects the 256-color palette matching `theme`.
-    pub const fn for_theme(theme: ThemeStyle) -> Self {
-        *palette_for(theme)
-    }
-}
-
 /// Glyph set selected by [`GlyphMode`].
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphSet {
@@ -186,12 +179,5 @@ pub const fn glyphs_for(mode: GlyphMode) -> &'static GlyphSet {
         GlyphMode::Unicode => &GLYPHS_UNICODE,
         GlyphMode::Nerd => &GLYPHS_NERD,
         GlyphMode::Ascii => &GLYPHS_ASCII,
-    }
-}
-
-impl GlyphSet {
-    /// Returns the glyph table for `mode`.
-    pub const fn for_mode(mode: GlyphMode) -> Self {
-        *glyphs_for(mode)
     }
 }

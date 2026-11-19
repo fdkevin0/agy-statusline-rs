@@ -1,115 +1,17 @@
+#![forbid(unsafe_code)]
 //! Tier 2 CLI binary tests for `agy-statusline stats`.
 
+mod common;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 use agy_statusline::stats::{unix_secs_to_utc_date, StatsReport};
 use rusqlite::Connection;
 
-static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn isolated_temp_home(tag: &str) -> PathBuf {
-    let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "agy_statusline_stats_cli_{tag}_{}_{seq}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    // Pre-seed a fresh empty models.dev cache so offline CLI tests stay deterministic and fast.
-    let cache_dir = dir.join(".cache/agy-statusline");
-    fs::create_dir_all(&cache_dir).unwrap();
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    fs::write(
-        cache_dir.join("models_dev_pricing.json"),
-        format!("{{\"fetched_at\":{now_secs},\"models\":{{}}}}"),
-    )
-    .unwrap();
-    dir
-}
-
-fn push_varint(buf: &mut Vec<u8>, mut val: u64) {
-    loop {
-        let mut byte = (val & 0x7f) as u8;
-        val >>= 7;
-        if val != 0 {
-            byte |= 0x80;
-        }
-        buf.push(byte);
-        if val == 0 {
-            break;
-        }
-    }
-}
-
-fn push_field_varint(buf: &mut Vec<u8>, id: u64, val: u64) {
-    push_varint(buf, id << 3);
-    push_varint(buf, val);
-}
-
-fn push_field_bytes(buf: &mut Vec<u8>, id: u64, bytes: &[u8]) {
-    push_varint(buf, (id << 3) | 2);
-    push_varint(buf, bytes.len() as u64);
-    buf.extend_from_slice(bytes);
-}
-
-fn build_step_meta_blob(secs: u64) -> Vec<u8> {
-    let mut ts = Vec::new();
-    push_field_varint(&mut ts, 1, secs);
-    let mut step = Vec::new();
-    push_field_bytes(&mut step, 1, &ts);
-    step
-}
-
-struct TestGenSpec<'a> {
-    step_idx: u64,
-    model_enum: u64,
-    resp_model: &'a str,
-    disp_name: &'a str,
-    input_tok: u64,
-    cache_read_tok: u64,
-    output_tok: u64,
-    thinking_tok: u64,
-    dur_secs: u64,
-    ttft_ms: u64,
-}
-
-fn build_gen_blob(spec: TestGenSpec<'_>) -> Vec<u8> {
-    let mut usage = Vec::new();
-    push_field_varint(&mut usage, 2, spec.input_tok);
-    push_field_varint(&mut usage, 3, spec.output_tok);
-    push_field_varint(&mut usage, 5, spec.cache_read_tok);
-    push_field_varint(&mut usage, 9, spec.thinking_tok);
-
-    let mut ttft = Vec::new();
-    push_field_varint(&mut ttft, 1, spec.ttft_ms / 1_000);
-    push_field_varint(&mut ttft, 2, (spec.ttft_ms % 1_000) * 1_000_000);
-
-    let mut dur = Vec::new();
-    push_field_varint(&mut dur, 1, spec.dur_secs);
-
-    let mut chat = Vec::new();
-    push_field_varint(&mut chat, 3, spec.model_enum);
-    push_field_bytes(&mut chat, 4, &usage);
-    push_field_bytes(&mut chat, 11, &ttft);
-    push_field_bytes(&mut chat, 12, &dur);
-    push_field_bytes(&mut chat, 19, spec.resp_model.as_bytes());
-    push_field_bytes(&mut chat, 21, spec.disp_name.as_bytes());
-
-    let mut packed = Vec::new();
-    push_varint(&mut packed, spec.step_idx);
-
-    let mut root = Vec::new();
-    push_field_bytes(&mut root, 1, &chat);
-    push_field_bytes(&mut root, 2, &packed);
-    root
-}
+use common::{
+    build_gen_blob, build_step_meta_blob, isolated_agy_cmd, unix_now_secs, TestGenSpec,
+};
 
 fn seed_sqlite_fixtures(cli_root: &Path, today_secs: u64, old_secs: u64) {
     let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
@@ -183,23 +85,14 @@ fn seed_sqlite_fixtures(cli_root: &Path, today_secs: u64, old_secs: u64) {
 
 #[test]
 fn cli_stats_renders_text_no_color_and_json_in_isolated_home() {
-    let home = isolated_temp_home("full");
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let now_secs = unix_now_secs();
     let old_secs = now_secs.saturating_sub(15 * 86_400);
     seed_sqlite_fixtures(&home.join(".gemini/antigravity-cli"), now_secs, old_secs);
 
-    let text_out = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_CACHE_HOME", home.join(".cache"))
+    let text_out = isolated_agy_cmd(home)
         .env("TZ", "UTC")
-        .env_remove("ANTIGRAVITY_CLI_HOME")
-        .env_remove("AGY_HOME")
-        .env_remove("AGY_STATUSLINE_FULL")
         .env("NO_COLOR", "1")
         .args(["stats", "--ascii"])
         .output()
@@ -218,15 +111,8 @@ fn cli_stats_renders_text_no_color_and_json_in_isolated_home() {
     assert!(text.contains("Less .. == -- ## ** More"));
     assert!(text.contains("  Mon  "));
 
-    let json_out = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_CACHE_HOME", home.join(".cache"))
+    let json_out = isolated_agy_cmd(home)
         .env("TZ", "UTC")
-        .env_remove("ANTIGRAVITY_CLI_HOME")
-        .env_remove("AGY_HOME")
-        .env_remove("AGY_STATUSLINE_FULL")
         .args(["stats", "--days", "7", "--json"])
         .output()
         .unwrap();
@@ -240,22 +126,17 @@ fn cli_stats_renders_text_no_color_and_json_in_isolated_home() {
     assert_eq!(report.models.len(), 1);
     assert_eq!(report.models[0].model, "Model Alpha");
     assert_eq!(report.sqlite.completed_turns, 2);
-
-    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
 fn cli_stats_supports_agy_home_override_and_optional_pricing_json() {
-    let home = isolated_temp_home("override");
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
     let custom_cli = home.join("custom-agy-cli");
-    let xdg_cfg = home.join("xdg-cfg");
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now_secs = unix_now_secs();
     seed_sqlite_fixtures(&custom_cli, now_secs, now_secs.saturating_sub(15 * 86_400));
 
-    let pricing_file = xdg_cfg.join("agy-statusline/pricing.json");
+    let pricing_file = home.join("config/agy-statusline/pricing.json");
     fs::create_dir_all(pricing_file.parent().unwrap()).unwrap();
     fs::write(
         &pricing_file,
@@ -263,14 +144,8 @@ fn cli_stats_supports_agy_home_override_and_optional_pricing_json() {
     )
     .unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", &xdg_cfg)
-        .env("XDG_CACHE_HOME", home.join(".cache"))
+    let out = isolated_agy_cmd(home)
         .env("ANTIGRAVITY_CLI_HOME", &custom_cli)
-        .env_remove("AGY_HOME")
-        .env_remove("AGY_STATUSLINE_FULL")
         .env("TZ", "CST-8")
         .env("NO_COLOR", "1")
         .args(["stats", "--ascii"])
@@ -280,22 +155,15 @@ fn cli_stats_supports_agy_home_override_and_optional_pricing_json() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("Est. Cost"));
     assert!(text.contains("Model Alpha"));
-
-    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
 fn cli_stats_handles_empty_home_and_help() {
-    let home = isolated_temp_home("empty");
-    let empty_out = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_CACHE_HOME", home.join(".cache"))
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+
+    let empty_out = isolated_agy_cmd(home)
         .env("TZ", "UTC")
-        .env_remove("ANTIGRAVITY_CLI_HOME")
-        .env_remove("AGY_HOME")
-        .env_remove("AGY_STATUSLINE_FULL")
         .env("NO_COLOR", "1")
         .args(["stats", "--json"])
         .output()
@@ -305,20 +173,11 @@ fn cli_stats_handles_empty_home_and_help() {
     assert_eq!(report.totals.requests, 0);
     assert_eq!(report.sqlite.db_files, 0);
 
-    let help_out = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_CACHE_HOME", home.join(".cache"))
-        .env_remove("ANTIGRAVITY_CLI_HOME")
-        .env_remove("AGY_HOME")
-        .env_remove("AGY_STATUSLINE_FULL")
+    let help_out = isolated_agy_cmd(home)
         .args(["stats", "--help"])
         .output()
         .unwrap();
     assert!(help_out.status.success());
     let help_text = String::from_utf8(help_out.stdout).unwrap();
     assert!(help_text.contains("Usage: agy-statusline stats"));
-
-    let _ = fs::remove_dir_all(&home);
 }

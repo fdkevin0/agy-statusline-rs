@@ -372,3 +372,127 @@ pub fn render_stats_report<W: Write>(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::stats::ModelStats;
+
+    #[test]
+    fn github_tile_activity_renders_20w_grid_months_and_blanks_future_days() {
+        let mut unfiltered_daily_tokens = BTreeMap::new();
+        unfiltered_daily_tokens.insert("2026-11-03".to_string(), 250_000);
+        unfiltered_daily_tokens.insert("2026-11-15".to_string(), 1_000_000);
+        unfiltered_daily_tokens.insert("2026-11-16".to_string(), 500_000);
+        unfiltered_daily_tokens.insert("2026-11-17".to_string(), 750_000);
+        // Clock-skewed future date after today_local ("2026-11-18" Wed) must stay blank and uncounted.
+        unfiltered_daily_tokens.insert("2026-11-20".to_string(), 9_999_999);
+
+        let report = StatsReport {
+            today_local: "2026-11-18".to_string(),
+            timezone: "UTC+08:00".to_string(),
+            today_utc: "2026-11-18".to_string(),
+            unfiltered_daily_tokens,
+            ..Default::default()
+        };
+
+        let mut unicode_out = Vec::new();
+        render_stats_report(&report, true, false, &mut unicode_out).unwrap();
+        let unicode_text = String::from_utf8(unicode_out).unwrap();
+        assert!(unicode_text
+            .contains("Activity (20w): peak 1M on 2026-11-15 (Sun) · Less ·· ░░ ▒▒ ▓▓ ██ More"));
+        assert!(
+            unicode_text.contains("       Jul         Aug            Sep         Oct         Nov")
+        );
+        assert!(unicode_text
+            .contains("  Mon  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ▒▒"));
+        assert!(unicode_text
+            .contains("  Tue  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ░░ ·· ▓▓"));
+        assert!(unicode_text
+            .contains("  Wed  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ··"));
+        assert!(unicode_text
+            .contains("  Thu  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ··\n"));
+        assert!(unicode_text
+            .contains("  Sun  ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ·· ██\n"));
+
+        // Trailing-month week 0 (2026-11-11 -> w=0 is 2026-06-29 Jun, w=1 is 2026-07-06 Jul) omits Jun collision,
+        // and year-rollover (2027-01-06 -> w=19 is 2027-01-04 Jan) renders Jan cleanly.
+        let trailing = StatsReport {
+            today_local: "2026-11-11".to_string(),
+            timezone: "UTC".to_string(),
+            today_utc: "2026-11-11".to_string(),
+            ..Default::default()
+        };
+        let mut trailing_out = Vec::new();
+        render_stats_report(&trailing, true, true, &mut trailing_out).unwrap();
+        let trailing_text = String::from_utf8(trailing_out).unwrap();
+        assert!(!trailing_text.contains("JunJul"));
+        assert!(trailing_text.contains("          Jul         Aug"));
+
+        let rollover = StatsReport {
+            today_local: "2027-01-06".to_string(),
+            timezone: "UTC".to_string(),
+            today_utc: "2027-01-06".to_string(),
+            ..Default::default()
+        };
+        let mut rollover_out = Vec::new();
+        render_stats_report(&rollover, false, true, &mut rollover_out).unwrap();
+        let rollover_text = String::from_utf8(rollover_out).unwrap();
+        assert!(rollover_text.contains("\x1b["));
+        assert!(rollover_text.contains("Dec         Jan"));
+    }
+
+    #[test]
+    fn render_stats_report_aligns_long_and_unicode_model_names() {
+        let report = StatsReport {
+            today_local: "2026-11-18".to_string(),
+            timezone: "UTC".to_string(),
+            today_utc: "2026-11-18".to_string(),
+            models: vec![
+                ModelStats {
+                    model: "extremely-long-model-display-name-45-chars-xy".to_string(),
+                    requests: 3,
+                    total_tokens: 1_500,
+                    output_tokens: 200,
+                    thinking_tokens: 50,
+                    median_tok_per_sec: Some(64.0),
+                    median_ttft_secs: Some(0.5),
+                    ..Default::default()
+                },
+                ModelStats {
+                    model: "模型-α-wide".to_string(),
+                    requests: 1,
+                    total_tokens: 500,
+                    output_tokens: 100,
+                    thinking_tokens: 0,
+                    median_tok_per_sec: Some(32.0),
+                    median_ttft_secs: Some(0.8),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        render_stats_report(&report, true, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let hdr_idx = lines
+            .iter()
+            .position(|l| l.contains("Model") && l.contains("Turns"))
+            .unwrap();
+        let hdr_col = lines[hdr_idx].find(" Turns").unwrap();
+        let row1_col = lines[hdr_idx + 1].find("     3").unwrap();
+        let row2_col = lines[hdr_idx + 2].find("     1").unwrap();
+        assert_eq!(
+            lines[hdr_idx][..hdr_col].width(),
+            lines[hdr_idx + 1][..row1_col].width()
+        );
+        assert_eq!(
+            lines[hdr_idx][..hdr_col].width(),
+            lines[hdr_idx + 2][..row2_col].width()
+        );
+    }
+}

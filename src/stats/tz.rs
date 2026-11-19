@@ -157,3 +157,81 @@ pub(super) fn parse_civil_date_day(raw: &str) -> Option<i64> {
     }
     Some(days_from_civil(year, month, day))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_tzif_v2(offset_secs: i32, footer: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        // v1 header: timecnt=0, typecnt=1, charcnt=4
+        out.extend_from_slice(b"TZif2");
+        out.extend_from_slice(&[0u8; 15]);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(&4u32.to_be_bytes());
+        // v1 ttinfo (6 bytes) + abbr (4 bytes)
+        out.extend_from_slice(&offset_secs.to_be_bytes());
+        out.push(0);
+        out.push(0);
+        out.extend_from_slice(b"CST\0");
+        // v2 header: timecnt=1, typecnt=1, charcnt=4
+        out.extend_from_slice(b"TZif2");
+        out.extend_from_slice(&[0u8; 15]);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(&4u32.to_be_bytes());
+        // v2 transition time (8 bytes), type_idx (1 byte), ttinfo (6 bytes), abbr (4 bytes)
+        out.extend_from_slice(&0i64.to_be_bytes());
+        out.push(0);
+        out.extend_from_slice(&offset_secs.to_be_bytes());
+        out.push(0);
+        out.push(0);
+        out.extend_from_slice(b"CST\0");
+        out.push(b'\n');
+        out.extend_from_slice(footer.as_bytes());
+        out.push(b'\n');
+        out
+    }
+
+    #[test]
+    fn rfc3339_utc_day_handles_z_and_timezone_rollover() {
+        let (d1, s1) = parse_rfc3339_utc_day("2026-11-18T03:05:35Z").unwrap();
+        assert_eq!(s1, "2026-11-18");
+
+        let (d2, s2) = parse_rfc3339_utc_day("2026-11-17T23:30:00-05:00").unwrap();
+        assert_eq!(s2, "2026-11-18");
+        assert_eq!(d1, d2);
+
+        let (d3, s3) = parse_rfc3339_utc_day("2026-11-18T01:00:00+08:00").unwrap();
+        assert_eq!(s3, "2026-11-17");
+        assert_eq!(d3, d1 - 1);
+
+        assert_eq!(parse_rfc3339_utc_day("not-a-timestamp"), None);
+        assert_eq!(parse_rfc3339_utc_day("2026-02-29T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn tzif_and_posix_dst_timezone_bucketing() {
+        let shanghai_bytes = build_tzif_v2(8 * 3_600, "CST-8");
+        let shanghai = TimeZoneSpec::from_tzif(&shanghai_bytes).unwrap();
+        // 2026-11-17T20:00:00Z is 2026-11-18 04:00:00 in UTC+08:00
+        let ts_utc_17 = parse_rfc3339_unix_secs("2026-11-17T20:00:00Z").unwrap();
+        assert_eq!(shanghai.format_offset_at(ts_utc_17), "UTC+08:00");
+        assert_eq!(shanghai.local_day_and_date(ts_utc_17).1, "2026-11-18");
+
+        // US Eastern POSIX rule with DST: EST5EDT,M3.2.0,M11.1.0
+        let ny = TimeZoneSpec::from_tz_env("EST5EDT,M3.2.0,M11.1.0").unwrap();
+        let summer = parse_rfc3339_unix_secs("2026-07-01T12:00:00Z").unwrap();
+        let winter = parse_rfc3339_unix_secs("2026-11-17T12:00:00Z").unwrap();
+        assert_eq!(ny.format_offset_at(summer), "UTC-04:00");
+        assert_eq!(ny.format_offset_at(winter), "UTC-05:00");
+        assert_eq!(TimeZoneSpec::from_tzif(b"bad"), None);
+    }
+}

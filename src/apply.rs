@@ -172,21 +172,10 @@ mod tests {
     use crate::paths::agy_settings_path_for_home;
     use std::io::Cursor;
 
-    fn temp_home(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agy_statusline_apply_{}_{}",
-            tag,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn creates_new_settings_with_yes() {
-        let home = temp_home("new");
-        let settings = agy_settings_path_for_home(&home);
+        let home = tempfile::tempdir().unwrap();
+        let settings = agy_settings_path_for_home(home.path());
         let cmd = PathBuf::from("/usr/local/bin/agy-statusline");
         let mut stdin = Cursor::new(b"");
         let mut out = Vec::new();
@@ -201,13 +190,12 @@ mod tests {
         );
         assert_eq!(written["statusLine"]["enabled"], true);
         assert_eq!(written["statusLine"]["stack_with_default"], false);
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn preserves_existing_keys_padding_and_supports_disable() {
-        let home = temp_home("preserve");
-        let settings = agy_settings_path_for_home(&home);
+        let home = tempfile::tempdir().unwrap();
+        let settings = agy_settings_path_for_home(home.path());
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
         fs::write(
             &settings,
@@ -256,19 +244,17 @@ mod tests {
         assert_eq!(after_disable["statusLine"]["enabled"], false);
         assert_eq!(after_disable["statusLine"]["padding"], 1);
         assert_eq!(after_disable["statusLine"]["command"], "/opt/agy-statusline");
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn rejects_invalid_existing_json() {
-        let home = temp_home("invalid");
-        let settings = agy_settings_path_for_home(&home);
+        let home = tempfile::tempdir().unwrap();
+        let settings = agy_settings_path_for_home(home.path());
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
         fs::write(&settings, "{not json").unwrap();
 
         let err =
             apply_statusline_config(&settings, Path::new("/bin/agy-statusline"), false).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        let _ = fs::remove_dir_all(&home);
     }
 }

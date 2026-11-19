@@ -570,7 +570,6 @@ pub fn save_layout_config(path: &Path, config: &LayoutConfig) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     #[test]
     fn partial_config_json_deserializes_with_defaults() {
@@ -595,15 +594,13 @@ mod tests {
 
     #[test]
     fn save_and_load_round_trip() {
-        let dir = env::temp_dir().join(format!("agy_layout_rt_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let path = dir.join("config.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
         let cfg = LayoutConfig::preset_powerline();
         save_layout_config(&path, &cfg).unwrap();
         let loaded = load_layout_config(&path);
         assert_eq!(loaded, cfg);
         assert_eq!(loaded.matching_preset(), Some(Preset::Powerline));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1,13 +1,14 @@
+#![forbid(unsafe_code)]
 //! Property-based (`proptest`) and end-to-end integration tests for `agy-statusline`.
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::process::Command;
 
 use proptest::prelude::*;
-use unicode_width::UnicodeWidthStr;
 
-use agy_statusline::ansi::ansi_to_ratatui_lines;
 use agy_statusline::db::{is_valid_uuid, SessionMetadata, SpeedReader};
 use agy_statusline::format::format_tokens;
 use agy_statusline::git::{GitInfo, SystemGitProbe};
@@ -21,6 +22,8 @@ use agy_statusline::statusline::{
     process_statusline, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket,
     StatuslinePayload, StatuslineRuntime, WorkspaceInfo,
 };
+
+use common::{isolated_agy_cmd, visible_line_width, BIN};
 
 struct FixedSpeed(Option<f64>);
 impl SpeedReader for FixedSpeed {
@@ -189,13 +192,8 @@ proptest! {
         let mut out = Vec::new();
         write_statusline(&payload, &meta, &git, &cfg, &mut out).unwrap();
         let raw = String::from_utf8(out).unwrap();
-        let lines = ansi_to_ratatui_lines(&raw);
-        prop_assert_eq!(lines.len(), 1);
-        let visible_w: usize = lines[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref().width())
-            .sum();
+        prop_assert_eq!(raw.lines().count(), 1);
+        let visible_w = visible_line_width(&raw);
         prop_assert!(
             visible_w <= term_width,
             "visible_w={visible_w} exceeded term_width={term_width} for {:?}/{:?}/{:?}: {:?}",
@@ -242,15 +240,14 @@ fn integration_full_json_and_uuid_checks() {
 
 #[test]
 fn live_git_cli_probe_extracts_branch_and_diff_stats() {
-    let dir = std::env::temp_dir().join(format!("agy_live_git_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
 
     let init_ok = Command::new("git")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .args(["init"])
-        .arg(&dir)
+        .arg(repo)
         .output()
         .unwrap();
     assert!(init_ok.status.success());
@@ -259,18 +256,18 @@ fn live_git_cli_probe_extracts_branch_and_diff_stats() {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .args(["-C"])
-        .arg(&dir)
+        .arg(repo)
         .args(["checkout", "-b", "feat-live"])
         .output()
         .unwrap();
     assert!(branch_ok.status.success());
 
-    fs::write(dir.join("notes.txt"), "line1\nline2\n").unwrap();
+    fs::write(repo.join("notes.txt"), "line1\nline2\n").unwrap();
     let add_ok = Command::new("git")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .args(["-C"])
-        .arg(&dir)
+        .arg(repo)
         .args(["add", "notes.txt"])
         .output()
         .unwrap();
@@ -280,7 +277,7 @@ fn live_git_cli_probe_extracts_branch_and_diff_stats() {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .args(["-C"])
-        .arg(&dir)
+        .arg(repo)
         .args([
             "-c",
             "user.name=Test",
@@ -294,11 +291,11 @@ fn live_git_cli_probe_extracts_branch_and_diff_stats() {
         .unwrap();
     assert!(commit_ok.status.success());
 
-    fs::write(dir.join("notes.txt"), "line1\nchanged\nadded_line\n").unwrap();
+    fs::write(repo.join("notes.txt"), "line1\nchanged\nadded_line\n").unwrap();
 
     let payload = serde_json::json!({
         "agent_state": "idle",
-        "cwd": dir,
+        "cwd": repo,
         "vcs": { "type": "git" }
     })
     .to_string();
@@ -307,7 +304,7 @@ fn live_git_cli_probe_extracts_branch_and_diff_stats() {
     cfg.theme = ThemeStyle::Mono;
     cfg.show_git_diff = true;
     let probe = SystemGitProbe {
-        cache_dir: Some(dir.join(".tmp_cache")),
+        cache_dir: Some(repo.join(".tmp_cache")),
     };
 
     let reader = FixedSpeed(None);
@@ -316,27 +313,19 @@ fn live_git_cli_probe_extracts_branch_and_diff_stats() {
     process_statusline(&payload, &runtime, &cfg, &mut out).unwrap();
     let rendered = String::from_utf8(out).unwrap();
     assert!(rendered.contains("feat-live* +2 -1"));
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn tier2_apply_and_doctor_honor_antigravity_cli_home_and_agy_home() {
-    let base = std::env::temp_dir().join(format!("agy_apply_env_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&base);
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
     let cli_home = base.join("custom_cli_home");
     let agy_home = base.join("custom_agy_home");
-    fs::create_dir_all(&base).unwrap();
 
     // ANTIGRAVITY_CLI_HOME takes precedence over AGY_HOME and HOME.
-    let apply_cli = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
-        .env("HOME", &base)
-        .env("USERPROFILE", &base)
-        .env("XDG_CONFIG_HOME", base.join("cfg"))
-        .env("XDG_CACHE_HOME", base.join("cache"))
+    let apply_cli = isolated_agy_cmd(base)
         .env("ANTIGRAVITY_CLI_HOME", &cli_home)
         .env("AGY_HOME", &agy_home)
-        .env_remove("AGY_STATUSLINE_FULL")
         .env("NO_COLOR", "1")
         .args(["apply", "--yes"])
         .output()
@@ -347,14 +336,9 @@ fn tier2_apply_and_doctor_honor_antigravity_cli_home_and_agy_home() {
     assert!(!base.join(".gemini/antigravity-cli/settings.json").exists());
 
     // AGY_HOME is used when ANTIGRAVITY_CLI_HOME is unset.
-    let apply_agy = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
-        .env("HOME", &base)
-        .env("USERPROFILE", &base)
-        .env("XDG_CONFIG_HOME", base.join("cfg"))
-        .env("XDG_CACHE_HOME", base.join("cache"))
+    let apply_agy = isolated_agy_cmd(base)
         .env_remove("ANTIGRAVITY_CLI_HOME")
         .env("AGY_HOME", &agy_home)
-        .env_remove("AGY_STATUSLINE_FULL")
         .env("NO_COLOR", "1")
         .args(["apply", "--yes"])
         .output()
@@ -362,14 +346,9 @@ fn tier2_apply_and_doctor_honor_antigravity_cli_home_and_agy_home() {
     assert!(apply_agy.status.success());
     assert!(agy_home.join("settings.json").is_file());
 
-    let doctor_out = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
-        .env("HOME", &base)
-        .env("USERPROFILE", &base)
-        .env("XDG_CONFIG_HOME", base.join("cfg"))
-        .env("XDG_CACHE_HOME", base.join("cache"))
+    let doctor_out = isolated_agy_cmd(base)
         .env_remove("ANTIGRAVITY_CLI_HOME")
         .env("AGY_HOME", &agy_home)
-        .env_remove("AGY_STATUSLINE_FULL")
         .env("NO_COLOR", "1")
         .args(["doctor"])
         .output()
@@ -381,32 +360,21 @@ fn tier2_apply_and_doctor_honor_antigravity_cli_home_and_agy_home() {
         "doctor stdout: {doctor_text}"
     );
     assert!(doctor_text.contains("enabled=true"));
-
-    let _ = fs::remove_dir_all(&base);
 }
 
 #[test]
 fn cli_version_command_and_flags() {
     let expected = format!("{} {}\n", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
-    let out_cmd = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
-        .arg("version")
-        .output()
-        .unwrap();
+    let out_cmd = Command::new(BIN).arg("version").output().unwrap();
     assert!(out_cmd.status.success());
     assert_eq!(String::from_utf8(out_cmd.stdout).unwrap(), expected);
 
-    let out_long = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
-        .arg("--version")
-        .output()
-        .unwrap();
+    let out_long = Command::new(BIN).arg("--version").output().unwrap();
     assert!(out_long.status.success());
     assert_eq!(String::from_utf8(out_long.stdout).unwrap(), expected);
 
-    let out_short = Command::new(env!("CARGO_BIN_EXE_agy-statusline"))
-        .arg("-V")
-        .output()
-        .unwrap();
+    let out_short = Command::new(BIN).arg("-V").output().unwrap();
     assert!(out_short.status.success());
     assert_eq!(String::from_utf8(out_short.stdout).unwrap(), expected);
 }
