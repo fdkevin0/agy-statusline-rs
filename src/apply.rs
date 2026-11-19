@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{self, Path, PathBuf};
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 use crate::fsutil::atomic_write_preserving_mode;
 
@@ -38,14 +38,21 @@ pub fn resolve_invoked_binary_path() -> io::Result<PathBuf> {
     Ok(resolved.unwrap_or(exe))
 }
 
-/// Builds the `statusLine` JSON object pointing to `command_path`.
-fn build_statusline_entry(command_path: &Path, stack_with_default: bool) -> Value {
-    json!({
-        "type": "command",
-        "command": command_path.to_string_lossy(),
-        "enabled": true,
-        "stack_with_default": stack_with_default
-    })
+fn set_statusline_fields(
+    map: &mut Map<String, Value>,
+    command_path: &Path,
+    stack_with_default: bool,
+) {
+    map.insert("type".to_string(), Value::String("command".to_string()));
+    map.insert(
+        "command".to_string(),
+        Value::String(command_path.to_string_lossy().into_owned()),
+    );
+    map.insert("enabled".to_string(), Value::Bool(true));
+    map.insert(
+        "stack_with_default".to_string(),
+        Value::Bool(stack_with_default),
+    );
 }
 
 pub(crate) fn read_settings_object(
@@ -97,20 +104,11 @@ pub(crate) fn apply_statusline_config(
     stack_with_default: bool,
 ) -> io::Result<()> {
     let mut root = read_settings_object(settings_path, true)?;
-    let mut sl_map = match root.get("statusLine") {
-        Some(Value::Object(existing)) => existing.clone(),
+    let mut sl_map = match root.remove("statusLine") {
+        Some(Value::Object(existing)) => existing,
         _ => Map::new(),
     };
-    sl_map.insert("type".to_string(), Value::String("command".to_string()));
-    sl_map.insert(
-        "command".to_string(),
-        Value::String(command_path.to_string_lossy().into_owned()),
-    );
-    sl_map.insert("enabled".to_string(), Value::Bool(true));
-    sl_map.insert(
-        "stack_with_default".to_string(),
-        Value::Bool(stack_with_default),
-    );
+    set_statusline_fields(&mut sl_map, command_path, stack_with_default);
     root.insert("statusLine".to_string(), Value::Object(sl_map));
 
     write_settings_object(settings_path, root)
@@ -139,11 +137,11 @@ pub fn run_apply_command<R: BufRead, W: Write>(
     stdin: &mut R,
     out: &mut W,
 ) -> io::Result<()> {
-    let entry = build_statusline_entry(command_path, stack_with_default);
-    let preview = serde_json::to_string_pretty(&entry)
-        .map_err(|e| io::Error::other(format!("failed to format preview: {e}")))?;
-
     if !assume_yes {
+        let mut preview_map = Map::new();
+        set_statusline_fields(&mut preview_map, command_path, stack_with_default);
+        let preview = serde_json::to_string_pretty(&Value::Object(preview_map))
+            .map_err(|e| io::Error::other(format!("failed to format preview: {e}")))?;
         writeln!(out, "Target: {}", settings_path.display())?;
         writeln!(out, "\"statusLine\": {preview}")?;
         write!(out, "Apply this configuration? [y/N] ")?;

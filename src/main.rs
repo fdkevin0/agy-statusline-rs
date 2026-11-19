@@ -4,9 +4,8 @@
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
-use std::path::Path;
 
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use agy_statusline::apply::{
     resolve_invoked_binary_path, run_apply_command, set_statusline_enabled,
@@ -24,25 +23,6 @@ use agy_statusline::tui::run_tui_config;
 
 const MAX_STDIN_BYTES: u64 = 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum PresetArg {
-    Full,
-    Powerline,
-    Minimal,
-    Addon,
-}
-
-impl PresetArg {
-    const fn to_preset(self) -> Preset {
-        match self {
-            Self::Full => Preset::Full,
-            Self::Powerline => Preset::Powerline,
-            Self::Minimal => Preset::Minimal,
-            Self::Addon => Preset::Addon,
-        }
-    }
-}
-
 #[derive(Debug, Parser)]
 #[command(
     name = "agy-statusline",
@@ -57,7 +37,7 @@ struct Cli {
 
     /// Render with a built-in preset (overrides saved config)
     #[arg(long, value_enum, value_name = "NAME")]
-    preset: Option<PresetArg>,
+    preset: Option<Preset>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -83,7 +63,7 @@ enum Command {
         replace: bool,
 
         /// Disable statusLine in settings.json while retaining hook configuration
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["yes", "stack", "replace"])]
         disable: bool,
     },
 
@@ -128,7 +108,7 @@ struct ConfigArgs {
 
     /// Apply a built-in preset non-interactively
     #[arg(long, value_enum, value_name = "NAME")]
-    preset: Option<PresetArg>,
+    preset: Option<Preset>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -206,7 +186,7 @@ fn main() -> io::Result<()> {
                 }
                 let mut stdout = io::stdout().lock();
                 return run_stats_command(
-                    home.as_deref().unwrap_or_else(|| Path::new("")),
+                    home.as_deref(),
                     days,
                     json,
                     no_color,
@@ -233,8 +213,7 @@ fn main() -> io::Result<()> {
                     }
                     return Ok(());
                 }
-                if let Some(preset_arg) = args.preset {
-                    let preset = preset_arg.to_preset();
+                if let Some(preset) = args.preset {
                     save_layout_config(&config_path, &preset.to_layout())?;
                     println!(
                         "Applied preset '{}' to {}",
@@ -263,7 +242,7 @@ fn main() -> io::Result<()> {
     let preset_override: Option<LayoutConfig> = if cli.full {
         Some(LayoutConfig::preset_full())
     } else {
-        cli.preset.map(|p| p.to_preset().to_layout())
+        cli.preset.map(Preset::to_layout)
     };
 
     if preset_override.is_none() && io::stdin().is_terminal() {
@@ -306,7 +285,7 @@ mod tests {
     #[test]
     fn cli_parses_presets_subcommands_and_rejects_invalid_combinations() {
         let top_eq = Cli::try_parse_from(["agy-statusline", "--preset=minimal"]).unwrap();
-        assert_eq!(top_eq.preset, Some(PresetArg::Minimal));
+        assert_eq!(top_eq.preset, Some(Preset::Minimal));
         assert!(!top_eq.full);
         assert!(top_eq.command.is_none());
 
@@ -317,7 +296,7 @@ mod tests {
             Some(Command::Config(ConfigArgs {
                 show: false,
                 reset: false,
-                preset: Some(PresetArg::Powerline),
+                preset: Some(Preset::Powerline),
             }))
         ));
 
@@ -342,6 +321,11 @@ mod tests {
         assert!(Cli::try_parse_from(["agy-statusline", "config", "--show", "--reset"]).is_err());
         assert!(Cli::try_parse_from(["agy-statusline", "config", "--show", "extra"]).is_err());
         assert!(Cli::try_parse_from(["agy-statusline", "apply", "--stack", "--replace"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "apply", "--disable", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "apply", "--disable", "--stack"]).is_err());
+        assert!(
+            Cli::try_parse_from(["agy-statusline", "apply", "--disable", "--replace"]).is_err()
+        );
         assert!(Cli::try_parse_from(["agy-statusline", "stats", "--days", "0"]).is_err());
         assert!(Cli::try_parse_from(["agy-statusline", "pricing", "--if-stale"]).is_err());
         assert!(Cli::try_parse_from(["agy-statusline", "pricing", "status", "--if-stale"]).is_err());

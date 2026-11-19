@@ -1,7 +1,5 @@
 //! Shared `jiff`-backed time, civil date, and RFC3339 timestamp utilities.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use jiff::civil::{self, Date};
 use jiff::tz::TimeZone;
 use jiff::Timestamp;
@@ -10,9 +8,7 @@ pub(crate) const SECS_PER_DAY: i64 = 86_400;
 
 /// Returns the current Unix epoch timestamp in seconds (`0` if system clock is before 1970).
 pub(crate) fn unix_now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+    Timestamp::now().as_second().max(0) as u64
 }
 
 /// Parses an RFC3339 / ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SS[.fff](Z|+HH:MM|-HH:MM)`)
@@ -27,8 +23,10 @@ pub(crate) fn parse_rfc3339_unix_secs(raw: &str) -> Option<i64> {
 /// Formats a Unix epoch timestamp (seconds) as a UTC `YYYY-MM-DD` date string.
 pub(crate) fn unix_secs_to_utc_date(secs: i64) -> String {
     Timestamp::from_second(secs)
-        .map(|ts| ts.to_zoned(TimeZone::UTC).date().to_string())
-        .unwrap_or_else(|_| civil_date_from_unix_day(secs.div_euclid(SECS_PER_DAY)).to_string())
+        .unwrap_or(Timestamp::UNIX_EPOCH)
+        .to_zoned(TimeZone::UTC)
+        .date()
+        .to_string()
 }
 
 /// Converts days since `1970-01-01` into a proleptic Gregorian [`jiff::civil::Date`].

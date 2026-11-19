@@ -250,7 +250,7 @@ impl StatuslinePayload {
             })
     }
 
-    /// Returns the raw workspace directory path preferring `workspace.current_dir`,
+    /// Returns the trimmed workspace directory path preferring `workspace.current_dir`,
     /// then `workspace.project_dir`, then top-level `cwd`.
     fn workspace_path(&self) -> Option<&str> {
         self.workspace
@@ -258,10 +258,24 @@ impl StatuslinePayload {
             .and_then(|ws| {
                 ws.current_dir
                     .as_deref()
+                    .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .or_else(|| ws.project_dir.as_deref().filter(|s| !s.is_empty()))
+                    .or_else(|| {
+                        ws.project_dir
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    })
             })
-            .or_else(|| self.cwd.as_deref().filter(|s| !s.is_empty()))
+            .or_else(|| self.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+    }
+
+    /// Returns a validated non-negative finite `cost.total_usd`, if present.
+    pub(crate) fn valid_cost_usd(&self) -> Option<f64> {
+        self.cost
+            .as_ref()?
+            .total_usd
+            .filter(|v| v.is_finite() && *v >= 0.0)
     }
 
     /// Returns the directory basename preferring `workspace.project_dir`,
@@ -587,7 +601,7 @@ pub fn process_statusline<W: Write>(
     let (mut meta, git_info) =
         probe_session_and_git(&payload, runtime.reader, runtime.git_probe, cfg);
     let needs_cost = cfg.rows.iter().flatten().any(|w| matches!(w, WidgetId::Cost))
-        && payload.cost.as_ref().and_then(|c| c.total_usd).is_none();
+        && payload.valid_cost_usd().is_none();
     let mut coverage = CostCoverage::Session;
     if needs_cost {
         let mut estimate_with = |pricing: &PricingCatalog| -> (Option<f64>, Option<f64>) {
@@ -839,5 +853,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p3.workspace_basename(), None);
+    }
+
+    #[test]
+    fn workspace_path_trims_whitespace_only_candidates() {
+        let p1: StatuslinePayload = serde_json::from_str(
+            r#"{
+                "workspace": {"current_dir": "   ", "project_dir": " /tmp/proj-dir "},
+                "cwd": "/tmp/fallback-cwd"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(p1.workspace_path(), Some("/tmp/proj-dir"));
+
+        let p2: StatuslinePayload = serde_json::from_str(
+            r#"{
+                "workspace": {"current_dir": "\t ", "project_dir": "   "},
+                "cwd": " /tmp/fallback-cwd "
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(p2.workspace_path(), Some("/tmp/fallback-cwd"));
+
+        let p3: StatuslinePayload = serde_json::from_str(
+            r#"{"workspace": {"current_dir": "  "}, "cwd": "  "}"#,
+        )
+        .unwrap();
+        assert_eq!(p3.workspace_path(), None);
+    }
+
+    #[test]
+    fn negative_payload_cost_triggers_fallback_estimation() {
+        let dir = tempfile::tempdir().unwrap();
+        let conv_dir = dir.path().join("conversations");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
+        let conn = rusqlite::Connection::open(conv_dir.join(format!("{uuid}.db"))).unwrap();
+        conn.execute(
+            "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+            [],
+        )
+        .unwrap();
+        // chat(1) -> { usage(4) -> { output(3)=100 }, model_cost(5)=0.25f32 }
+        let blob: &[u8] = &[0x0a, 0x09, 0x22, 0x02, 0x18, 0x64, 0x2d, 0x00, 0x00, 0x80, 0x3e];
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [blob])
+            .unwrap();
+        drop(conn);
+
+        let reader = StubReader(None);
+        let git = NoopGit;
+        let pricing = PricingCatalog::default();
+        let runtime = StatuslineRuntime {
+            reader: &reader,
+            git_probe: &git,
+            calibration_dir: None,
+            agy_cli_dir: Some(dir.path()),
+            pricing: PricingSource::Catalog(&pricing),
+            now_unix_secs: 0,
+        };
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = crate::layout::ThemeStyle::Mono;
+        cfg.rows = vec![vec![WidgetId::Cost]];
+
+        let json = format!(
+            r#"{{"conversation_id":"{uuid}","cost":{{"total_usd":-1.0,"estimated":false}}}}"#
+        );
+        let mut out = Vec::new();
+        process_statusline(&json, &runtime, &cfg, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "~$0.25\n");
     }
 }

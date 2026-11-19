@@ -120,7 +120,7 @@ impl PricingCatalog {
         let mut exact_raw: HashMap<String, usize> = HashMap::with_capacity(models.len());
         let mut exact_norm: HashMap<String, usize> = HashMap::with_capacity(models.len());
 
-        for (pattern, rate) in models {
+        for (pattern, mut rate) in models {
             if !is_valid_rate(&rate) {
                 continue;
             }
@@ -128,6 +128,9 @@ impl PricingCatalog {
             if pat_lower.is_empty() {
                 continue;
             }
+            rate.context_tiers.retain(is_valid_tier_rate);
+            rate.context_tiers
+                .sort_by_key(|tier| tier.min_context_tokens);
             let pat_norm = normalize_model_key(&pat_lower);
             let idx = entries.len();
             entries.push(IndexedEntry {
@@ -318,7 +321,6 @@ impl PricingCatalog {
             matched = best.map(|(_, _, e)| e);
         }
 
-        // Orchestrator alias fallback.
         let entry = matched.or_else(|| self.resolve_orchestrator_alias(&lowered_candidates))?;
         let prompt_context_tokens = input_tokens
             .saturating_add(cache_read_tokens)
@@ -329,10 +331,7 @@ impl PricingCatalog {
                     .rate
                     .context_tiers
                     .iter()
-                    .filter(|tier| {
-                        is_valid_tier_rate(tier) && prompt_context_tokens > tier.min_context_tokens
-                    })
-                    .max_by_key(|tier| tier.min_context_tokens)
+                    .rfind(|tier| prompt_context_tokens > tier.min_context_tokens)
             })
             .flatten();
         let (input_rate, cache_read_rate, cache_write_rate, output_rate) = match active_tier {
@@ -354,7 +353,7 @@ impl PricingCatalog {
             + (cache_write_tokens as f64) * cache_write_rate
             + (output_tokens as f64) * output_rate)
             / 1_000_000.0;
-        if !cost.is_finite() || cost < 0.0 {
+        if !cost.is_finite() {
             return None;
         }
         Some((entry.key.clone(), round_usd_6(cost)))
@@ -460,10 +459,6 @@ fn record_retry_cooldown(cache_dir: &Path, now_secs: u64) {
             format!("{now_secs}\n"),
         );
     }
-}
-
-fn clear_retry_cooldown(cache_dir: &Path) {
-    let _ = fs::remove_file(cache_dir.join(MODELS_DEV_ERR_FILE));
 }
 
 fn spawn_background_pricing_sync() {
@@ -712,7 +707,7 @@ where
     let encoded = serde_json::to_string(&cached)
         .map_err(|e| io::Error::other(format!("serialize pricing cache: {e}")))?;
     atomic_write(&target, encoded.as_bytes())?;
-    clear_retry_cooldown(cache_dir);
+    let _ = fs::remove_file(cache_dir.join(MODELS_DEV_ERR_FILE));
     Ok(cached)
 }
 
@@ -759,19 +754,18 @@ where
 }
 
 /// Inspects the current local pricing cache status without performing network I/O.
-fn pricing_cache_status(now_secs: u64) -> Option<PricingCacheStatus> {
-    let dir = xdg_cache_dir()?;
-    let cache_path = dir.join(MODELS_DEV_CACHE_FILE);
+fn pricing_cache_status(cache_dir: &Path, now_secs: u64) -> PricingCacheStatus {
+    let cache_path = cache_dir.join(MODELS_DEV_CACHE_FILE);
     let cached = load_cached_file(&cache_path);
     let fetched_at = cached.as_ref().map(|c| c.fetched_at);
     let fresh = fetched_at.is_some_and(|t| now_secs.saturating_sub(t) < DEFAULT_PRICING_TTL_SECS);
-    Some(PricingCacheStatus {
+    PricingCacheStatus {
         cache_path,
         cached_models: cached.map_or(0, |c| c.models.len()),
         fetched_at,
         fresh,
         ttl_secs: DEFAULT_PRICING_TTL_SECS,
-    })
+    }
 }
 
 /// Runs the `agy-statusline pricing` subcommand (`status` or `sync [--if-stale]`).
@@ -815,12 +809,7 @@ pub fn run_pricing_command<W: io::Write>(
         return Ok(());
     }
 
-    let status = pricing_cache_status(now_secs).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "unable to resolve pricing cache status",
-        )
-    })?;
+    let status = pricing_cache_status(&cache_dir, now_secs);
     let age_desc = match status.fetched_at {
         Some(ts) => {
             let age = now_secs.saturating_sub(ts);
@@ -835,11 +824,7 @@ pub fn run_pricing_command<W: io::Write>(
 }
 
 pub(super) fn round_usd_6(v: f64) -> f64 {
-    if v.is_finite() {
-        (v * 1_000_000.0).round() / 1_000_000.0
-    } else {
-        0.0
-    }
+    (v * 1_000_000.0).round() / 1_000_000.0
 }
 
 #[cfg(test)]

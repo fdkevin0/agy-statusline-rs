@@ -5,13 +5,16 @@ use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
 use crate::format::{format_tokens, format_tokens_string as format_tok_str};
-use crate::layout::{GlyphMode, WidgetId, DEFAULT_SPEED_WARN_THRESHOLD};
+use crate::layout::{GlyphMode, WidgetId};
 use crate::metrics::QuotaView;
 use crate::statusline::StatuslinePayload;
 use crate::theme::Palette;
 
 use super::fit::truncate_to_width;
-use super::{build_progress_bar_with_chars, CompactStage, CostCoverage, RenderContext, Renderer, Segment};
+use super::{
+    build_progress_bar_with_chars, CompactStage, CostCoverage, RenderContext, Renderer,
+    ResolvedCost, Segment,
+};
 
 impl Renderer<'_> {
     pub(super) fn render_widget(
@@ -386,13 +389,12 @@ impl Renderer<'_> {
 
         match widget {
             WidgetId::CtxBar => {
-                let (bar, _) = build_progress_bar_with_chars(
+                let bar = build_progress_bar_with_chars(
                     ctx.used_pct,
                     self.cfg.bar_length,
                     glyphs.bar_chars,
                 );
-                let (tag, disp_pct, raw_pct) =
-                    ctx_display_metrics(ctx.used_pct, self.cfg.ctx_remaining);
+                let (tag, disp_pct) = ctx_display_metrics(ctx.used_pct, self.cfg.ctx_remaining);
                 let compact_pct = format!("{tag} {disp_pct:.1}%");
                 let without_limit = format!("{tag} {bar} {disp_pct:.1}%");
                 let full = match (ctx.cur_ctx, ctx.eff_limit) {
@@ -411,7 +413,12 @@ impl Renderer<'_> {
                     (None, Some(lim)) => format!("{without_limit} ({})", format_tok_str(lim)),
                     (_, None) => without_limit.clone(),
                 };
-                let mut seg = Segment::plain(widget, full, ctx_color(raw_pct, pal), raw_pct >= 85.0);
+                let mut seg = Segment::plain(
+                    widget,
+                    full,
+                    ctx_color(ctx.used_pct, pal),
+                    ctx.used_pct >= 85.0,
+                );
                 if ctx.eff_limit.is_some() {
                     seg.push_fallback(CompactStage::CtxDropLimit, without_limit);
                 }
@@ -419,14 +426,13 @@ impl Renderer<'_> {
                 Some(seg)
             }
             WidgetId::CtxPct => {
-                let (tag, disp_pct, raw_pct) =
-                    ctx_display_metrics(ctx.used_pct, self.cfg.ctx_remaining);
+                let (tag, disp_pct) = ctx_display_metrics(ctx.used_pct, self.cfg.ctx_remaining);
                 let without_limit = format!("{tag} {disp_pct:.1}%");
                 let full = match ctx.eff_limit {
                     Some(lim) => format!("{without_limit} ({})", format_tok_str(lim)),
                     None => without_limit.clone(),
                 };
-                let mut seg = Segment::plain(widget, full, ctx_color(raw_pct, pal), false);
+                let mut seg = Segment::plain(widget, full, ctx_color(ctx.used_pct, pal), false);
                 if ctx.eff_limit.is_some() {
                     seg.push_fallback(CompactStage::CtxDropLimit, without_limit);
                 }
@@ -478,20 +484,12 @@ impl Renderer<'_> {
                 Segment::plain(widget, buf, pal.cache, false)
             }),
             WidgetId::Speed => {
-                let speed = ctx.speed.filter(|s| s.is_finite() && *s >= 0.0);
-                let warn_threshold = if self.cfg.speed_warn_threshold.is_finite()
-                    && self.cfg.speed_warn_threshold >= 0.0
-                {
-                    self.cfg.speed_warn_threshold
-                } else {
-                    DEFAULT_SPEED_WARN_THRESHOLD
-                };
-                let slow = speed.is_some_and(|s| s < warn_threshold);
-                let text = speed.map_or_else(
+                let slow = ctx.speed.is_some_and(|s| s < ctx.speed_warn_threshold);
+                let text = ctx.speed.map_or_else(
                     || format!("{} --", glyphs.speed),
                     |s| format!("{} {s:.0} tok/s", glyphs.speed),
                 );
-                let fg = match speed {
+                let fg = match ctx.speed {
                     Some(_) if slow => pal.speed_slow,
                     Some(_) => pal.speed_ok,
                     None => pal.muted,
@@ -506,7 +504,7 @@ impl Renderer<'_> {
                     fallbacks: Vec::new(),
                 })
             }
-            WidgetId::Ttft => match ctx.ttft_secs.filter(|t| t.is_finite() && *t >= 0.0) {
+            WidgetId::Ttft => match ctx.ttft_secs {
                 Some(t) if t < 1.0 => Some(Segment::plain(
                     widget,
                     format!("{} {:.0}ms", glyphs.ttft, t * 1000.0),
@@ -527,7 +525,7 @@ impl Renderer<'_> {
                     false,
                 )),
             },
-            WidgetId::Thinking => match ctx.thinking_tokens.filter(|&t| t > 0) {
+            WidgetId::Thinking => match ctx.thinking_tokens {
                 Some(tok) => Some(Segment::plain(
                     widget,
                     format!("{} think {}", glyphs.thinking, format_tok_str(tok)),
@@ -543,37 +541,37 @@ impl Renderer<'_> {
                 )),
             },
             WidgetId::Cost => {
-                if let Some(cost) = payload.cost.as_ref() {
-                    if let Some(usd) = cost.total_usd.filter(|v| v.is_finite() && *v >= 0.0) {
-                        let prefix = if cost.estimated == Some(true) {
-                            "~$"
-                        } else {
-                            "$"
-                        };
-                        let mut text = format!("{prefix}{usd:.2}");
-                        if let Some(sub) = cost
-                            .subagent_usd
-                            .filter(|&s| s.is_finite() && s >= 0.01)
-                        {
-                            text.push_str(&format!(" (sub ${sub:.2})"));
+                let text = match ctx.cost? {
+                    ResolvedCost::Payload {
+                        total_usd,
+                        subagent_usd,
+                        estimated,
+                    } => {
+                        let prefix = if estimated { "~$" } else { "$" };
+                        match subagent_usd {
+                            Some(sub) => format!("{prefix}{total_usd:.2} (sub ${sub:.2})"),
+                            None => format!("{prefix}{total_usd:.2}"),
                         }
-                        return Some(Segment::plain(widget, text, pal.cost, false));
                     }
-                }
-                let usd = ctx
-                    .estimated_cost_usd
-                    .filter(|v| v.is_finite() && *v >= 0.0)?;
-                let sub = ctx
-                    .estimated_subagent_cost_usd
-                    .filter(|&s| s.is_finite() && s >= 0.01);
-                let text = match (ctx.cost_coverage, sub) {
-                    (CostCoverage::Session, None) => format!("~${usd:.2}"),
-                    (CostCoverage::Session, Some(s)) => format!("~${usd:.2} (sub ${s:.2})"),
-                    (CostCoverage::Partial(n), None) => format!("~${usd:.2} ({n} unpriced)"),
-                    (CostCoverage::Partial(n), Some(s)) => {
-                        format!("~${usd:.2} (sub ${s:.2}, {n} unpriced)")
-                    }
-                    (CostCoverage::LatestTurn, _) => format!("~${usd:.2} (latest turn)"),
+                    ResolvedCost::Estimated {
+                        total_usd,
+                        subagent_usd,
+                        coverage,
+                    } => match (coverage, subagent_usd) {
+                        (CostCoverage::Session, None) => format!("~${total_usd:.2}"),
+                        (CostCoverage::Session, Some(sub)) => {
+                            format!("~${total_usd:.2} (sub ${sub:.2})")
+                        }
+                        (CostCoverage::Partial(n), None) => {
+                            format!("~${total_usd:.2} ({n} unpriced)")
+                        }
+                        (CostCoverage::Partial(n), Some(sub)) => {
+                            format!("~${total_usd:.2} (sub ${sub:.2}, {n} unpriced)")
+                        }
+                        (CostCoverage::LatestTurn, _) => {
+                            format!("~${total_usd:.2} (latest turn)")
+                        }
+                    },
                 };
                 Some(Segment::plain(widget, text, pal.cost, false))
             }
@@ -595,12 +593,10 @@ impl Renderer<'_> {
                 Segment::plain(widget, format!("{fallback_label} --"), pal.muted, false)
             });
         };
-        let label = sanitize_inline_text(&q.label);
+        let label = &q.label;
         let (core, mut full, fg, bold) = if let Some(amt) = q.remaining_amount {
             let (fg, bold) = if amt <= 0 {
                 (pal.ctx_crit, true)
-            } else if q.pace_behind {
-                (pal.ctx_warn, false)
             } else {
                 (pal.ctx_ok, false)
             };
@@ -794,16 +790,11 @@ fn ctx_color(pct: f64, pal: &Palette) -> u8 {
     }
 }
 
-fn ctx_display_metrics(used_pct: f64, ctx_remaining: bool) -> (&'static str, f64, f64) {
-    let raw_pct = if used_pct.is_finite() {
-        used_pct.max(0.0)
-    } else {
-        0.0
-    };
+fn ctx_display_metrics(used_pct: f64, ctx_remaining: bool) -> (&'static str, f64) {
     if ctx_remaining {
-        ("rem", (100.0 - raw_pct).max(0.0), raw_pct)
+        ("rem", (100.0 - used_pct).max(0.0))
     } else {
-        ("ctx", raw_pct, raw_pct)
+        ("ctx", used_pct)
     }
 }
 

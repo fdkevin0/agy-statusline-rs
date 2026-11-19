@@ -209,7 +209,7 @@ fn calibrate_bucket(
             session_tokens,
         ) {
             let minor_upward_jitter =
-                frac > anchor_f && (frac - anchor_f) < NEW_CYCLE_FRAC_JUMP && !reset_shifted_forward;
+                frac > anchor_f && (frac - anchor_f) < NEW_CYCLE_FRAC_JUMP;
             if cur_tok < anchor_tok || minor_upward_jitter {
                 entry.anchor_fraction = Some(frac);
                 entry.anchor_session_tokens = Some(cur_tok);
