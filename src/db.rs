@@ -200,6 +200,7 @@ fn query_session_metadata_from_db(db_path: &Path) -> SessionMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protobuf::{encode_gen_blob, encode_speed_1s_blob, GenBlobSpec};
 
     #[test]
     fn uuid_validation() {
@@ -213,7 +214,11 @@ mod tests {
     #[test]
     fn query_real_sqlite_db_in_temp_dir() {
         let (dir, conn, uuid) = create_temp_conv_db();
-        let blob: &[u8] = &[0x0a, 0x08, 0x22, 0x02, 0x18, 0x64, 0x62, 0x02, 0x08, 0x02];
+        let blob = encode_gen_blob(GenBlobSpec {
+            output_tok: 100,
+            dur_secs: 2,
+            ..Default::default()
+        });
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [blob])
             .unwrap();
         drop(conn);
@@ -228,7 +233,11 @@ mod tests {
     #[test]
     fn falls_back_when_newest_row_is_incomplete() {
         let (dir, conn, uuid) = create_temp_conv_db();
-        let valid: &[u8] = &[0x0a, 0x08, 0x22, 0x02, 0x18, 0x64, 0x62, 0x02, 0x08, 0x02];
+        let valid = encode_gen_blob(GenBlobSpec {
+            output_tok: 100,
+            dur_secs: 2,
+            ..Default::default()
+        });
         let incomplete: &[u8] = &[0x12, 0x00];
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [valid])
             .unwrap();
@@ -243,10 +252,6 @@ mod tests {
             home_override: Some(dir.path().to_path_buf()),
         };
         assert_eq!(reader.session_metadata(uuid).speed, Some(50.0));
-    }
-
-    fn speed_1s_blob(output_tokens: u8) -> [u8; 10] {
-        [0x0a, 0x08, 0x22, 0x02, 0x18, output_tokens, 0x62, 0x02, 0x08, 0x01]
     }
 
     fn create_temp_conv_db() -> (tempfile::TempDir, Connection, &'static str) {
@@ -267,16 +272,16 @@ mod tests {
     #[test]
     fn median_speed_odd_nine_turns_and_weighted_five_turns() {
         let (dir, conn, uuid) = create_temp_conv_db();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (0, ?1)", [speed_1s_blob(5)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [speed_1s_blob(10)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [speed_1s_blob(20)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (3, ?1)", [speed_1s_blob(30)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (4, ?1)", [speed_1s_blob(40)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (5, ?1)", [speed_1s_blob(80)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (6, ?1)", [speed_1s_blob(90)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (7, ?1)", [speed_1s_blob(100)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (8, ?1)", [speed_1s_blob(110)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (9, ?1)", [speed_1s_blob(120)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (0, ?1)", [encode_speed_1s_blob(5)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [encode_speed_1s_blob(10)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [encode_speed_1s_blob(20)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (3, ?1)", [encode_speed_1s_blob(30)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (4, ?1)", [encode_speed_1s_blob(40)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (5, ?1)", [encode_speed_1s_blob(80)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (6, ?1)", [encode_speed_1s_blob(90)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (7, ?1)", [encode_speed_1s_blob(100)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (8, ?1)", [encode_speed_1s_blob(110)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (9, ?1)", [encode_speed_1s_blob(120)]).unwrap();
         drop(conn);
 
         let reader = SqliteSpeedReader {
@@ -291,10 +296,10 @@ mod tests {
     #[test]
     fn median_speed_even_turns_averages_middle_two() {
         let (dir, conn, uuid) = create_temp_conv_db();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [speed_1s_blob(100)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [speed_1s_blob(20)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (3, ?1)", [speed_1s_blob(60)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (4, ?1)", [speed_1s_blob(40)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [encode_speed_1s_blob(100)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [encode_speed_1s_blob(20)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (3, ?1)", [encode_speed_1s_blob(60)]).unwrap();
+        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (4, ?1)", [encode_speed_1s_blob(40)]).unwrap();
         drop(conn);
 
         let reader = SqliteSpeedReader {
@@ -308,14 +313,17 @@ mod tests {
     #[test]
     fn populates_estimated_context_and_thinking_tokens() {
         let (dir, conn, uuid) = create_temp_conv_db();
-        // idx 1: output=100, thinking=250, dur=2s
-        let turn_with_thinking: &[u8] = &[
-            0x0a, 0x0b, 0x22, 0x05, 0x18, 0x64, 0x48, 0xfa, 0x01, 0x62, 0x02, 0x08, 0x02,
-        ];
-        // idx 2: estimated_tokens_used=64_000, max_context_tokens=512_000 (no usage/duration yet)
-        let ctx_start: &[u8] = &[
-            0x0a, 0x0c, 0x4a, 0x0a, 0x52, 0x08, 0x08, 0x80, 0xf4, 0x03, 0x20, 0x80, 0xa0, 0x1f,
-        ];
+        let turn_with_thinking = encode_gen_blob(GenBlobSpec {
+            output_tok: 100,
+            thinking_tok: 250,
+            dur_secs: 2,
+            ..Default::default()
+        });
+        let ctx_start = encode_gen_blob(GenBlobSpec {
+            estimated_context_tokens: 64_000,
+            max_context_tokens: 512_000,
+            ..Default::default()
+        });
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [turn_with_thinking])
             .unwrap();
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [ctx_start])

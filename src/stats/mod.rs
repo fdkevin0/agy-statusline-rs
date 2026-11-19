@@ -470,39 +470,7 @@ pub fn run_stats_command<W: Write>(
 
 #[cfg(test)]
 pub(super) mod test_helpers {
-    use rusqlite::Connection;
-    use std::fs;
-    use std::path::Path;
-
-    pub(super) fn push_varint(buf: &mut Vec<u8>, mut val: u64) {
-        loop {
-            let mut byte = (val & 0x7f) as u8;
-            val >>= 7;
-            if val != 0 {
-                byte |= 0x80;
-            }
-            buf.push(byte);
-            if val == 0 {
-                break;
-            }
-        }
-    }
-
-    pub(super) fn push_field_varint(buf: &mut Vec<u8>, id: u64, val: u64) {
-        push_varint(buf, id << 3);
-        push_varint(buf, val);
-    }
-
-    pub(super) fn push_field_bytes(buf: &mut Vec<u8>, id: u64, bytes: &[u8]) {
-        push_varint(buf, (id << 3) | 2);
-        push_varint(buf, bytes.len() as u64);
-        buf.extend_from_slice(bytes);
-    }
-
-    pub(super) fn push_field_f32(buf: &mut Vec<u8>, id: u64, val: f32) {
-        push_varint(buf, (id << 3) | 5);
-        buf.extend_from_slice(&val.to_le_bytes());
-    }
+    use crate::protobuf::{encode_gen_blob, GenBlobSpec};
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_gen_blob(
@@ -518,57 +486,34 @@ pub(super) mod test_helpers {
         ttft_ms: u64,
         model_cost: Option<f32>,
     ) -> Vec<u8> {
-        let mut usage = Vec::new();
-        push_field_varint(&mut usage, 2, input_tok);
-        push_field_varint(&mut usage, 3, output_tok);
-        push_field_varint(&mut usage, 5, cache_read_tok);
-        push_field_varint(&mut usage, 9, thinking_tok);
-
-        let mut ttft = Vec::new();
-        push_field_varint(&mut ttft, 1, ttft_ms / 1_000);
-        push_field_varint(&mut ttft, 2, (ttft_ms % 1_000) * 1_000_000);
-
-        let mut dur = Vec::new();
-        push_field_varint(&mut dur, 1, dur_secs);
-
-        let mut chat = Vec::new();
-        push_field_varint(&mut chat, 3, model_enum);
-        push_field_bytes(&mut chat, 4, &usage);
-        if let Some(c) = model_cost {
-            push_field_f32(&mut chat, 5, c);
-        }
-        push_field_bytes(&mut chat, 11, &ttft);
-        push_field_bytes(&mut chat, 12, &dur);
-        if !resp_model.is_empty() {
-            push_field_bytes(&mut chat, 19, resp_model.as_bytes());
-        }
-        if !disp_name.is_empty() {
-            push_field_bytes(&mut chat, 21, disp_name.as_bytes());
-        }
-
-        let mut root = Vec::new();
-        push_field_bytes(&mut root, 1, &chat);
-        if let Some(s) = step_idx {
-            let mut packed = Vec::new();
-            push_varint(&mut packed, s);
-            push_field_bytes(&mut root, 2, &packed);
-        }
-        root
+        encode_gen_blob(GenBlobSpec {
+            step_indices: step_idx.into_iter().collect(),
+            model_enum,
+            resp_model: Some(resp_model).filter(|s| !s.is_empty()),
+            disp_name: Some(disp_name).filter(|s| !s.is_empty()),
+            model_cost,
+            input_tok,
+            output_tok,
+            cache_read_tok,
+            thinking_tok,
+            ttft_secs: (ttft_ms / 1_000) as i64,
+            ttft_nanos: ((ttft_ms % 1_000) * 1_000_000) as i64,
+            dur_secs: dur_secs as i64,
+            ..Default::default()
+        })
     }
+}
 
-    pub(super) fn build_step_meta_blob(created_at_secs: u64) -> Vec<u8> {
-        let mut ts = Vec::new();
-        push_field_varint(&mut ts, 1, created_at_secs);
-        let mut step = Vec::new();
-        push_field_bytes(&mut step, 1, &ts);
-        step
-    }
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+    use std::fs;
 
-    pub(super) fn create_full_conv_db(
-        db_path: &Path,
-        steps: &[(i64, Vec<u8>)],
-        gens: &[(i64, Vec<u8>)],
-    ) {
+    use super::*;
+    use crate::protobuf::{encode_gen_blob, encode_step_meta_blob, GenBlobSpec};
+    use crate::timeutil::parse_rfc3339_unix_secs;
+
+    fn create_conv_db_tables(db_path: &Path) -> Connection {
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let conn = Connection::open(db_path).unwrap();
         conn.execute(
@@ -581,29 +526,24 @@ pub(super) mod test_helpers {
             [],
         )
         .unwrap();
-        for (idx, meta) in steps {
-            conn.execute(
-                "INSERT INTO steps (idx, metadata) VALUES (?1, ?2)",
-                rusqlite::params![idx, meta],
-            )
-            .unwrap();
-        }
-        for (idx, data) in gens {
-            conn.execute(
-                "INSERT INTO gen_metadata (idx, data) VALUES (?1, ?2)",
-                rusqlite::params![idx, data],
-            )
-            .unwrap();
-        }
+        conn
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::test_helpers::{build_gen_blob, build_step_meta_blob, create_full_conv_db};
-    use super::*;
-    use crate::timeutil::parse_rfc3339_unix_secs;
-    use std::fs;
+    fn insert_step(conn: &Connection, idx: i64, created_at_secs: i64) {
+        conn.execute(
+            "INSERT INTO steps (idx, metadata) VALUES (?1, ?2)",
+            rusqlite::params![idx, encode_step_meta_blob(created_at_secs)],
+        )
+        .unwrap();
+    }
+
+    fn insert_gen(conn: &Connection, idx: i64, spec: GenBlobSpec<'_>) {
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (?1, ?2)",
+            rusqlite::params![idx, encode_gen_blob(spec)],
+        )
+        .unwrap();
+    }
 
     #[test]
     fn sqlite_is_primary_and_transcript_fallback_skips_covered_uuids() {
@@ -614,68 +554,65 @@ mod tests {
 
         // CLI DB has 2 turns on 2026-11-17T20:00:00Z (= 2026-11-18T04:00:00+08:00)
         // and 1 turn on 2026-11-10T10:00:00Z (= 2026-11-10T18:00:00+08:00).
-        let ts_today_utc17 = parse_rfc3339_unix_secs("2026-11-17T20:00:00Z").unwrap() as u64;
-        let ts_old = parse_rfc3339_unix_secs("2026-11-10T10:00:00Z").unwrap() as u64;
+        let ts_today_utc17 = parse_rfc3339_unix_secs("2026-11-17T20:00:00Z").unwrap();
+        let ts_old = parse_rfc3339_unix_secs("2026-11-10T10:00:00Z").unwrap();
 
         let db_path = home
             .join(".gemini/antigravity-cli/conversations")
             .join(format!("{uuid}.db"));
-        let steps = vec![
-            (1, build_step_meta_blob(ts_today_utc17)),
-            (2, build_step_meta_blob(ts_today_utc17)),
-            (3, build_step_meta_blob(ts_old)),
-        ];
-        let gens = vec![
-            (
-                1,
-                build_gen_blob(
-                    Some(1),
-                    1526,
-                    "model-alpha",
-                    "Model Alpha (Medium)",
-                    1000,
-                    9000,
-                    200,
-                    150,
-                    2,
-                    400,
-                    None,
-                ),
-            ),
-            (
-                2,
-                build_gen_blob(
-                    Some(2),
-                    1525,
-                    "model-alpha",
-                    "Model Alpha (High)",
-                    2000,
-                    0,
-                    400,
-                    300,
-                    2,
-                    600,
-                    None,
-                ),
-            ),
-            (
-                3,
-                build_gen_blob(
-                    Some(3),
-                    1322,
-                    "worker-tiered",
-                    "",
-                    500,
-                    0,
-                    100,
-                    50,
-                    1,
-                    250,
-                    None,
-                ),
-            ),
-        ];
-        create_full_conv_db(&db_path, &steps, &gens);
+        let conn = create_conv_db_tables(&db_path);
+        insert_step(&conn, 1, ts_today_utc17);
+        insert_step(&conn, 2, ts_today_utc17);
+        insert_step(&conn, 3, ts_old);
+        insert_gen(
+            &conn,
+            1,
+            GenBlobSpec {
+                step_indices: vec![1],
+                model_enum: 1526,
+                resp_model: Some("model-alpha"),
+                disp_name: Some("Model Alpha (Medium)"),
+                input_tok: 1000,
+                cache_read_tok: 9000,
+                output_tok: 200,
+                thinking_tok: 150,
+                dur_secs: 2,
+                ttft_nanos: 400_000_000,
+                ..Default::default()
+            },
+        );
+        insert_gen(
+            &conn,
+            2,
+            GenBlobSpec {
+                step_indices: vec![2],
+                model_enum: 1525,
+                resp_model: Some("model-alpha"),
+                disp_name: Some("Model Alpha (High)"),
+                input_tok: 2000,
+                output_tok: 400,
+                thinking_tok: 300,
+                dur_secs: 2,
+                ttft_nanos: 600_000_000,
+                ..Default::default()
+            },
+        );
+        insert_gen(
+            &conn,
+            3,
+            GenBlobSpec {
+                step_indices: vec![3],
+                model_enum: 1322,
+                resp_model: Some("worker-tiered"),
+                input_tok: 500,
+                output_tok: 100,
+                thinking_tok: 50,
+                dur_secs: 1,
+                ttft_nanos: 250_000_000,
+                ..Default::default()
+            },
+        );
+        drop(conn);
 
         // Matching CLI transcript for the SAME uuid MUST be ignored (no double counting).
         let cli_transcript = home.join(format!(
@@ -737,47 +674,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         let uuid = "33333333-3333-4333-8333-333333333333";
-        let ts = parse_rfc3339_unix_secs("2026-11-18T10:00:00Z").unwrap() as u64;
+        let ts = parse_rfc3339_unix_secs("2026-11-18T10:00:00Z").unwrap();
 
         let db_path = home
             .join(".gemini/antigravity-cli/conversations")
             .join(format!("{uuid}.db"));
-        let steps = vec![(1, build_step_meta_blob(ts)), (2, build_step_meta_blob(ts))];
-        let gens = vec![
-            (
-                1,
-                build_gen_blob(
-                    Some(1),
-                    100,
-                    "custom-pro",
-                    "Custom Pro (High)",
-                    1_000_000,
-                    0,
-                    1_000_000,
-                    0,
-                    10,
-                    500,
-                    None,
-                ),
-            ),
-            (
-                2,
-                build_gen_blob(
-                    Some(2),
-                    101,
-                    "native-billed",
-                    "Native Billed",
-                    1_000,
-                    0,
-                    100,
-                    0,
-                    1,
-                    200,
-                    Some(0.25),
-                ),
-            ),
-        ];
-        create_full_conv_db(&db_path, &steps, &gens);
+        let conn = create_conv_db_tables(&db_path);
+        insert_step(&conn, 1, ts);
+        insert_step(&conn, 2, ts);
+        insert_gen(
+            &conn,
+            1,
+            GenBlobSpec {
+                step_indices: vec![1],
+                model_enum: 100,
+                resp_model: Some("custom-pro"),
+                disp_name: Some("Custom Pro (High)"),
+                input_tok: 1_000_000,
+                output_tok: 1_000_000,
+                dur_secs: 10,
+                ttft_nanos: 500_000_000,
+                ..Default::default()
+            },
+        );
+        insert_gen(
+            &conn,
+            2,
+            GenBlobSpec {
+                step_indices: vec![2],
+                model_enum: 101,
+                resp_model: Some("native-billed"),
+                disp_name: Some("Native Billed"),
+                model_cost: Some(0.25),
+                input_tok: 1_000,
+                output_tok: 100,
+                dur_secs: 1,
+                ttft_nanos: 200_000_000,
+                ..Default::default()
+            },
+        );
+        drop(conn);
 
         let pricing_path = home.join(".cache/agy-statusline/models_dev_pricing.json");
         fs::create_dir_all(pricing_path.parent().unwrap()).unwrap();
@@ -787,7 +723,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = collect_stats_with_tz(home, None, ts, &TimeZoneSpec::utc());
+        let report = collect_stats_with_tz(home, None, ts as u64, &TimeZoneSpec::utc());
         assert_eq!(report.windows.all_time.priced_requests, 2);
         assert!((report.windows.all_time.priced_usd - 10.25).abs() < 1e-6);
 
@@ -804,29 +740,29 @@ mod tests {
         let home = dir.path();
         let uuid = "44444444-4444-4444-8444-444444444444";
         let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
-        let old_secs = parse_rfc3339_unix_secs("2026-11-03T12:00:00Z").unwrap() as u64;
+        let old_secs = parse_rfc3339_unix_secs("2026-11-03T12:00:00Z").unwrap();
 
         let db_path = home
             .join(".gemini/antigravity-cli/conversations")
             .join(format!("{uuid}.db"));
-        let steps = vec![(1, build_step_meta_blob(old_secs))];
-        let gens = vec![(
+        let conn = create_conv_db_tables(&db_path);
+        insert_step(&conn, 1, old_secs);
+        insert_gen(
+            &conn,
             1,
-            build_gen_blob(
-                Some(1),
-                1526,
-                "model-alpha",
-                "Model Alpha",
-                2_500,
-                0,
-                500,
-                0,
-                2,
-                300,
-                None,
-            ),
-        )];
-        create_full_conv_db(&db_path, &steps, &gens);
+            GenBlobSpec {
+                step_indices: vec![1],
+                model_enum: 1526,
+                resp_model: Some("model-alpha"),
+                disp_name: Some("Model Alpha"),
+                input_tok: 2_500,
+                output_tok: 500,
+                dur_secs: 2,
+                ttft_nanos: 300_000_000,
+                ..Default::default()
+            },
+        );
+        drop(conn);
 
         let report = collect_stats_with_tz(home, Some(7), now_secs, &TimeZoneSpec::utc());
         assert_eq!(report.filter_days, Some(7));

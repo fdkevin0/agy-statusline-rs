@@ -4,28 +4,14 @@
 mod common;
 
 use std::fs;
-use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 #[cfg(unix)]
 use serde_json::Value;
 
-use common::{isolated_agy_cmd, seed_offline_pricing, BIN};
-
-fn isolated_program(program: impl AsRef<Path>, root: &Path) -> Command {
-    let cache_dir = root.join("cache");
-    seed_offline_pricing(&cache_dir);
-    let mut cmd = Command::new(program.as_ref());
-    cmd.current_dir(root)
-        .env_clear()
-        .env("HOME", root)
-        .env("USERPROFILE", root)
-        .env("ANTIGRAVITY_CLI_HOME", root.join("agy"))
-        .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("XDG_CACHE_HOME", cache_dir)
-        .env("NO_COLOR", "1");
-    cmd
-}
+#[cfg(unix)]
+use common::{isolated_cmd, BIN};
+use common::{isolated_agy_cmd, run_statusline_stdin};
 
 fn stdout(output: Output) -> String {
     assert!(output.status.success(), "{:?}", output);
@@ -71,17 +57,20 @@ fn tier2_apply_preserves_path_and_explicit_relative_launchers() {
     use std::os::unix::process::CommandExt;
 
     let root = tempfile::tempdir().unwrap();
+    let agy = root.path().join("agy");
     let bin = root.path().canonicalize().unwrap().join("bin");
     fs::create_dir(&bin).unwrap();
     let path_launcher = bin.join("agy-statusline");
     let relative_launcher = bin.join("statusline");
     symlink(BIN, &path_launcher).unwrap();
     symlink(BIN, &relative_launcher).unwrap();
-    let settings = root.path().join("agy/settings.json");
+    let settings = agy.join("settings.json");
     let read = || serde_json::from_slice::<Value>(&fs::read(&settings).unwrap()).unwrap();
 
     stdout(
-        isolated_program(&path_launcher, root.path())
+        isolated_cmd(&path_launcher, root.path())
+            .env("ANTIGRAVITY_CLI_HOME", &agy)
+            .env("NO_COLOR", "1")
             .arg0("agy-statusline")
             .env("PATH", "missing:bin")
             .args(["apply", "--yes"])
@@ -94,7 +83,9 @@ fn tier2_apply_preserves_path_and_explicit_relative_launchers() {
     );
 
     stdout(
-        isolated_program(&relative_launcher, root.path())
+        isolated_cmd(&relative_launcher, root.path())
+            .env("ANTIGRAVITY_CLI_HOME", &agy)
+            .env("NO_COLOR", "1")
             .arg0("./bin/statusline")
             .args(["apply", "--yes"])
             .output()
@@ -115,12 +106,17 @@ fn tier2_tui_save_preserves_launcher_across_upgrade() {
 
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().canonicalize().unwrap();
+    let agy = dir.join("agy");
     let old = dir.join("v1");
     let launcher = dir.join("launcher");
     fs::copy(BIN, &old).unwrap();
     symlink(&old, &launcher).unwrap();
 
-    let mut tui = isolated_program("script", &dir)
+    let mut tui = isolated_cmd("script", &dir)
+        .env("ANTIGRAVITY_CLI_HOME", &agy)
+        .env("NO_COLOR", "1")
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("TERM", "xterm-256color")
         .env("SHELL", "/bin/sh")
         .args([
             "-qec",
@@ -141,7 +137,7 @@ fn tier2_tui_save_preserves_launcher_across_upgrade() {
     let output = tui.wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");
     let settings: Value =
-        serde_json::from_slice(&fs::read(dir.join("agy/settings.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(agy.join("settings.json")).unwrap()).unwrap();
     assert_eq!(
         settings["statusLine"]["command"],
         launcher.to_str().unwrap()
@@ -161,17 +157,7 @@ fn tier2_doctor_reports_config_states_and_render_uses_defaults_on_error() {
                 .unwrap(),
         )
     };
-    let input = root.path().join("payload.json");
-    fs::write(&input, r#"{"cost":{"total_usd":1.0}}"#).unwrap();
-    let render = || {
-        stdout(
-            isolated_agy_cmd(root.path())
-                .env("NO_COLOR", "1")
-                .stdin(fs::File::open(&input).unwrap())
-                .output()
-                .unwrap(),
-        )
-    };
+    let render = || run_statusline_stdin(root.path(), &[], r#"{"cost":{"total_usd":1.0}}"#);
 
     assert!(doctor().contains("[not found (using built-in defaults)]"));
     let default_render = render();
@@ -194,4 +180,53 @@ fn tier2_doctor_reports_config_states_and_render_uses_defaults_on_error() {
     let valid = doctor();
     assert!(valid.contains("[custom file]"));
     assert!(valid.contains("stack=true"));
+}
+
+#[test]
+fn tier2_apply_and_doctor_honor_antigravity_cli_home_and_agy_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    let cli_home = base.join("custom_cli_home");
+    let agy_home = base.join("custom_agy_home");
+
+    // ANTIGRAVITY_CLI_HOME takes precedence over AGY_HOME and HOME.
+    stdout(
+        isolated_agy_cmd(base)
+            .env("ANTIGRAVITY_CLI_HOME", &cli_home)
+            .env("AGY_HOME", &agy_home)
+            .env("NO_COLOR", "1")
+            .args(["apply", "--yes"])
+            .output()
+            .unwrap(),
+    );
+    assert!(cli_home.join("settings.json").is_file());
+    assert!(!agy_home.join("settings.json").exists());
+    assert!(!base.join(".gemini/antigravity-cli/settings.json").exists());
+
+    // AGY_HOME is used when ANTIGRAVITY_CLI_HOME is unset.
+    stdout(
+        isolated_agy_cmd(base)
+            .env_remove("ANTIGRAVITY_CLI_HOME")
+            .env("AGY_HOME", &agy_home)
+            .env("NO_COLOR", "1")
+            .args(["apply", "--yes"])
+            .output()
+            .unwrap(),
+    );
+    assert!(agy_home.join("settings.json").is_file());
+
+    let doctor_text = stdout(
+        isolated_agy_cmd(base)
+            .env_remove("ANTIGRAVITY_CLI_HOME")
+            .env("AGY_HOME", &agy_home)
+            .env("NO_COLOR", "1")
+            .args(["doctor"])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        doctor_text.contains(&agy_home.join("settings.json").display().to_string()),
+        "doctor stdout: {doctor_text}"
+    );
+    assert!(doctor_text.contains("enabled=true"));
 }

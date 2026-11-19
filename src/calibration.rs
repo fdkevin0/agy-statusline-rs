@@ -112,14 +112,6 @@ fn try_lock_calibration(cache_dir: &Path) -> io::Result<fs::File> {
     Ok(lock)
 }
 
-/// Replaces `cache_dir/quota_cal.json` atomically under the calibration lock.
-/// Returns an error if another writer holds the lock.
-#[cfg(test)]
-fn save_calibration_store(cache_dir: &Path, store: &CalibrationStore) -> io::Result<()> {
-    let _lock = try_lock_calibration(cache_dir)?;
-    write_calibration_store(cache_dir, store)
-}
-
 fn write_calibration_store(cache_dir: &Path, store: &CalibrationStore) -> io::Result<()> {
     let target = cache_dir.join(CACHE_FILENAME);
     let mut json = serde_json::to_string_pretty(store)
@@ -584,19 +576,33 @@ mod tests {
     }
 
     #[test]
-    fn save_calibration_store_returns_would_block_when_lock_held() {
+    fn calibrate_quota_views_falls_back_to_read_only_cache_when_lock_held() {
         let dir = tempfile::tempdir().unwrap();
-        let lock = try_lock_calibration(dir.path()).expect("acquire calibration lock");
+        let t0 = 1_795_000_000;
+        let seeded = CalibrationStore {
+            schema_version: SCHEMA_VERSION,
+            buckets: BTreeMap::from([(
+                "acme-5h".to_string(),
+                BucketCalibration {
+                    calibrated_total_tokens: Some(1_000_000.0),
+                    calibrated_at_secs: Some(t0),
+                    sample_count: 1,
+                    updated_at_secs: t0,
+                    ..Default::default()
+                },
+            )]),
+        };
+        write_calibration_store(dir.path(), &seeded).unwrap();
+        let cal_path = dir.path().join(CACHE_FILENAME);
+        let before = fs::read_to_string(&cal_path).unwrap();
 
-        let err = save_calibration_store(dir.path(), &CalibrationStore::default())
-            .expect_err("contended save should fail");
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
-        assert!(!dir.path().join(CACHE_FILENAME).exists());
+        let _lock = try_lock_calibration(dir.path()).expect("acquire calibration lock");
+        let payload = make_payload("conv-contended", 500_000, 0, 0.50, 12_000, 0.90, 400_000);
+        let (q5, q_weekly) = calibrate_quota_views_at(&payload, Some(dir.path()), t0 + 60);
 
-        drop(lock);
-        save_calibration_store(dir.path(), &CalibrationStore::default())
-            .expect("save should succeed after lock release");
-        assert!(dir.path().join(CACHE_FILENAME).is_file());
+        assert_eq!(q5.unwrap().est_remaining_tokens, Some(500_000));
+        assert_eq!(q_weekly.unwrap().est_remaining_tokens, None);
+        assert_eq!(fs::read_to_string(&cal_path).unwrap(), before);
     }
 
     #[test]

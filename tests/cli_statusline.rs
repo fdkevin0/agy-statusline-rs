@@ -1,241 +1,63 @@
 #![forbid(unsafe_code)]
-//! Integration and Tier 2 CLI tests for statusline rendering, quota routing,
-//! responsive compaction, SQLite median speed, thinking tokens, and AGY telemetry widgets.
+//! Tier 2 CLI binary boundary tests for statusline rendering across SQLite,
+//! XDG config/pricing cache, wall-clock quota reset, and live Git CLI boundaries.
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Stdio};
 
 use rusqlite::Connection;
 
-use agy_statusline::db::SessionMetadata;
-use agy_statusline::git::GitInfo;
 use agy_statusline::layout::{
     save_layout_config, GlyphMode, LayoutConfig, ThemeStyle, WidgetId,
 };
-use agy_statusline::render::write_statusline;
-use agy_statusline::statusline::{
-    BattleInfo, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, SandboxInfo,
-    StatuslinePayload, VimInfo, WorkspaceInfo,
+
+use common::{
+    build_gen_blob, isolated_agy_cmd, run_statusline_stdin, unix_now_secs, TestGenSpec,
 };
 
-use common::{isolated_agy_cmd, run_statusline_stdin, speed_1s_blob, visible_line_width};
-
-fn render_mono(
-    payload: &StatuslinePayload,
-    meta: &SessionMetadata,
-    git: &GitInfo,
-    cfg: &LayoutConfig,
-) -> String {
-    let mut out = Vec::new();
-    write_statusline(payload, meta, git, cfg, &mut out).unwrap();
-    String::from_utf8(out).unwrap()
+fn seed_alpha_rate(home: &Path) {
+    let cache_path = home.join("cache/agy-statusline/models_dev_pricing.json");
+    fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+    let cache = serde_json::json!({
+        "fetched_at": unix_now_secs(),
+        "models": {"model-alpha": {"input_per_mtok": 1.0}}
+    });
+    fs::write(cache_path, cache.to_string()).unwrap();
 }
 
-fn render_single(
-    widget: WidgetId,
-    payload: &StatuslinePayload,
-    meta: &SessionMetadata,
-    glyph_mode: GlyphMode,
-    theme: ThemeStyle,
-    smart_hide: bool,
-    no_color: bool,
-) -> String {
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.rows = vec![vec![widget]];
-    cfg.glyph_mode = glyph_mode;
-    cfg.theme = theme;
-    cfg.smart_hide = smart_hide;
-    cfg.no_color = no_color;
-    cfg.responsive = false;
-
-    let mut out = Vec::new();
-    write_statusline(payload, meta, &GitInfo::default(), &cfg, &mut out).unwrap();
-    String::from_utf8(out).unwrap()
+fn seed_conv_turn(cli_root: &Path, uuid: &str, idx: i64, spec: TestGenSpec<'_>) {
+    let db_path = cli_root.join("conversations").join(format!("{uuid}.db"));
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO gen_metadata (idx, data) VALUES (?1, ?2)",
+        rusqlite::params![idx, build_gen_blob(spec)],
+    )
+    .unwrap();
 }
 
-fn base_compaction_payload(width: usize) -> StatuslinePayload {
-    let mut quota = BTreeMap::new();
-    quota.insert(
-        "gemini-5h".to_string(),
-        QuotaBucket {
-            remaining_fraction: Some(0.84),
-            reset_in_seconds: Some(11_400),
-            ..Default::default()
-        },
-    );
-    quota.insert(
-        "gemini-weekly".to_string(),
-        QuotaBucket {
-            remaining_fraction: Some(0.92),
-            reset_in_seconds: Some(432_000),
-            ..Default::default()
-        },
-    );
-    StatuslinePayload {
-        agent_state: Some("thinking".to_string()),
-        cycle_mode: Some("plan".to_string()),
-        model: Some(ModelInfo {
-            id: None,
-            display_name: Some("Gemini 3.1 Pro Preview".to_string()),
-            effort: Some("high".to_string()),
-        }),
-        workspace: Some(WorkspaceInfo {
-            current_dir: Some("/work/agy-statusline".to_string()),
-            project_dir: Some("/work/agy-statusline".to_string()),
-        }),
-        context_window: Some(ContextWindow {
-            current_usage: Some(JsonUsage {
-                input_tokens: Some(56_000),
-                output_tokens: None,
-                cache_read_input_tokens: Some(200_000),
-                cache_creation_input_tokens: Some(0),
-            }),
-            ..Default::default()
-        }),
-        cost: Some(CostInfo {
-            total_usd: Some(0.42),
-            subagent_usd: None,
-            estimated: Some(true),
-        }),
-        quota: Some(quota),
-        terminal_width: Some(width),
-        ..Default::default()
-    }
+fn git_cmd(home: &Path, empty_gitconfig: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", empty_gitconfig);
+    cmd
 }
 
 // ---------------------------------------------------------------------------
-// Token K-formatting, canonical effort matching, and >100% context overflow
+// SQLite gen_metadata boundary: median speed, estimated context, thinking tokens
 // ---------------------------------------------------------------------------
-
-#[test]
-fn cli_renders_minimax_effort_and_context_overflow_with_tenth_k() {
-    let dir = tempfile::tempdir().unwrap();
-    let payload = serde_json::json!({
-        "agent_state": "idle",
-        "model": {
-            "id": "minimax-m2",
-            "display_name": "MiniMax M2",
-            "effort": "max"
-        },
-        "context_window": {
-            "context_window_size": 1500,
-            "current_usage": {
-                "input_tokens": 536,
-                "cache_read_input_tokens": 1000,
-                "cache_creation_input_tokens": 0
-            }
-        }
-    })
-    .to_string();
-
-    let stdout = run_statusline_stdin(dir.path(), &["--preset", "minimal"], &payload);
-    assert!(
-        stdout.contains("MiniMax M2 · max"),
-        "unexpected stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("ctx 102.4% (1.5K)"),
-        "unexpected stdout: {stdout}"
-    );
-}
-
-#[test]
-fn cli_omits_duplicate_xhigh_effort_and_formats_rounded_k_tokens() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.theme = ThemeStyle::Mono;
-    cfg.glyph_mode = GlyphMode::Ascii;
-    cfg.no_color = true;
-    cfg.bar_length = 6;
-    cfg.rows = vec![vec![
-        WidgetId::Model,
-        WidgetId::CtxBar,
-        WidgetId::CtxTokens,
-        WidgetId::CacheRead,
-    ]];
-    save_layout_config(&dir.path().join("config/agy-statusline/config.json"), &cfg).unwrap();
-
-    let payload = serde_json::json!({
-        "agent_state": "thinking",
-        "model": {
-            "id": "gpt-oss-120b",
-            "display_name": "GPT-OSS 120B (Extra High)",
-            "effort": "xhigh"
-        },
-        "context_window": {
-            "context_window_size": 10000,
-            "current_usage": {
-                "input_tokens": 8550,
-                "cache_read_input_tokens": 1950,
-                "cache_creation_input_tokens": 0
-            }
-        }
-    })
-    .to_string();
-
-    let stdout = run_statusline_stdin(dir.path(), &[], &payload);
-    assert_eq!(
-        stdout,
-        "GPT-OSS 120B (Extra High) * ctx ###### 105.0% (11K/10K) * 11K/10K * r: 2K\n"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Protobuf estimated context & SQLite median speed
-// ---------------------------------------------------------------------------
-
-#[test]
-fn write_statusline_falls_back_to_estimated_context_tokens() {
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.theme = ThemeStyle::Mono;
-    cfg.rows = vec![vec![WidgetId::CtxBar, WidgetId::CtxTokens]];
-
-    let payload_no_usage = StatuslinePayload {
-        context_window: Some(ContextWindow {
-            context_window_size: Some(200_000),
-            used_percentage: None,
-            current_usage: None,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let meta_est = SessionMetadata {
-        estimated_context_tokens: Some(128_000),
-        max_context_tokens: Some(512_000),
-        ..Default::default()
-    };
-
-    let rendered_est = render_mono(&payload_no_usage, &meta_est, &GitInfo::default(), &cfg);
-    assert!(rendered_est.contains("25.0% (128K/512K)"));
-    assert!(rendered_est.contains("· 128K/512K"));
-
-    // Actual current_usage takes precedence over estimated_context_tokens.
-    let payload_with_usage = StatuslinePayload {
-        context_window: Some(ContextWindow {
-            current_usage: Some(JsonUsage {
-                input_tokens: Some(56_000),
-                output_tokens: None,
-                cache_read_input_tokens: Some(200_000),
-                cache_creation_input_tokens: Some(0),
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let rendered_actual = render_mono(&payload_with_usage, &meta_est, &GitInfo::default(), &cfg);
-    assert!(rendered_actual.contains("50.0% (256K/512K)"));
-
-    // Zero estimated_context_tokens falls back to showing only the limit in ctx_bar.
-    let meta_zero = SessionMetadata {
-        estimated_context_tokens: Some(0),
-        max_context_tokens: Some(512_000),
-        ..Default::default()
-    };
-    let rendered_zero = render_mono(&payload_no_usage, &meta_zero, &GitInfo::default(), &cfg);
-    assert!(rendered_zero.contains("0.0% (512K)"));
-}
 
 #[test]
 fn tier2_binary_reads_temp_sqlite_db_median_and_estimated_context() {
@@ -261,18 +83,54 @@ fn tier2_binary_reads_temp_sqlite_db_median_and_estimated_context() {
     )
     .unwrap();
     // 6 completed turns: sorted [20, 40, 50, 60, 80, 100] -> median = 55.0; newest 5 weighted = 66.0.
-    conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [speed_1s_blob(20)]).unwrap();
-    conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [speed_1s_blob(40)]).unwrap();
-    conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (3, ?1)", [speed_1s_blob(50)]).unwrap();
-    conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (4, ?1)", [speed_1s_blob(60)]).unwrap();
-    conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (5, ?1)", [speed_1s_blob(80)]).unwrap();
-    conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (6, ?1)", [speed_1s_blob(100)]).unwrap();
+    let speed_blob = |output_tok| {
+        build_gen_blob(TestGenSpec {
+            output_tok,
+            dur_secs: 1,
+            ..Default::default()
+        })
+    };
+    conn.execute(
+        "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+        [speed_blob(20)],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
+        [speed_blob(40)],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO gen_metadata (idx, data) VALUES (3, ?1)",
+        [speed_blob(50)],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO gen_metadata (idx, data) VALUES (4, ?1)",
+        [speed_blob(60)],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO gen_metadata (idx, data) VALUES (5, ?1)",
+        [speed_blob(80)],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO gen_metadata (idx, data) VALUES (6, ?1)",
+        [speed_blob(100)],
+    )
+    .unwrap();
     // Newest turn-start row: estimated_tokens_used=128_000, max_context_tokens=512_000.
-    let ctx_start: &[u8] = &[
-        0x0a, 0x0c, 0x4a, 0x0a, 0x52, 0x08, 0x08, 0x80, 0xe8, 0x07, 0x20, 0x80, 0xa0, 0x1f,
-    ];
-    conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (7, ?1)", [ctx_start])
-        .unwrap();
+    let ctx_start = build_gen_blob(TestGenSpec {
+        estimated_context_tokens: 128_000,
+        max_context_tokens: 512_000,
+        ..Default::default()
+    });
+    conn.execute(
+        "INSERT INTO gen_metadata (idx, data) VALUES (7, ?1)",
+        [ctx_start],
+    )
+    .unwrap();
     drop(conn);
 
     let stdin_json =
@@ -283,8 +141,40 @@ fn tier2_binary_reads_temp_sqlite_db_median_and_estimated_context() {
     assert!(stdout.contains("55 tok/s"), "stdout was: {stdout}");
 }
 
+#[test]
+fn tier2_cli_reads_real_sqlite_gen_metadata_thinking_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = dir.path().join(".gemini/antigravity-cli");
+
+    let mut cfg = LayoutConfig::preset_minimal();
+    cfg.rows = vec![vec![WidgetId::State, WidgetId::Thinking]];
+    cfg.theme = ThemeStyle::Default;
+    cfg.glyph_mode = GlyphMode::Unicode;
+    cfg.smart_hide = true;
+    cfg.responsive = false;
+    save_layout_config(&dir.path().join("config/agy-statusline/config.json"), &cfg).unwrap();
+
+    let uuid = "11223344-5566-7788-99aa-bbccddeeff00";
+    seed_conv_turn(
+        &cli,
+        uuid,
+        1,
+        TestGenSpec {
+            output_tok: 100,
+            thinking_tok: 4_200,
+            dur_secs: 2,
+            ..Default::default()
+        },
+    );
+
+    let stdin_json =
+        format!(r#"{{"conversation_id":"{uuid}","agent_state":"idle","terminal_width":120}}"#);
+    let stdout = run_statusline_stdin(dir.path(), &[], &stdin_json);
+    assert!(stdout.contains("◆ think 4.2K"), "stdout was: {stdout}");
+}
+
 // ---------------------------------------------------------------------------
-// Quota precision, reset_time fallback, and pool routing
+// Quota wall-clock reset, XDG config loading, and end-to-end AGY 1.5.10 payload
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -414,818 +304,294 @@ fn cli_handles_agy_1510_negative_reset_disabled_credits_completed_subagents_and_
 }
 
 // ---------------------------------------------------------------------------
-// Responsive compaction stages
+// Cost estimation boundary: pricing cache, SQLite turns, descendant subagents
 // ---------------------------------------------------------------------------
 
 #[test]
-fn stage1_vcs_strips_diff_stats_then_caps_at_20_cols() {
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.theme = ThemeStyle::Mono;
-    cfg.rows = vec![vec![WidgetId::Vcs, WidgetId::Speed]];
-    let meta = SessionMetadata {
-        speed: Some(64.0),
-        ..Default::default()
-    };
-
-    // Strip diff stats (+120 -45) so branch + Speed both fit at width 28.
-    let git_short = GitInfo {
-        branch: Some("feat-branch".to_string()),
-        added: 120,
-        deleted: 45,
-        ..Default::default()
-    };
-    let s1 = render_mono(&base_compaction_payload(28), &meta, &git_short, &cfg);
-    assert!(s1.contains("feat-branch*"));
-    assert!(!s1.contains("+120"));
-    assert!(s1.contains("64 tok/s"));
-    assert!(visible_line_width(&s1) <= 28);
-
-    // Long branch still overflows after stripping diff stats -> capped at 20 cols with ellipsis.
-    let git_long = GitInfo {
-        branch: Some("feature/extremely-long-branch-name".to_string()),
-        added: 10,
-        deleted: 2,
-        ..Default::default()
-    };
-    let s2 = render_mono(&base_compaction_payload(35), &meta, &git_long, &cfg);
-    assert!(!s2.contains("+10"));
-    assert!(s2.contains('…'));
-    assert!(s2.contains("64 tok/s"));
-    assert!(visible_line_width(&s2) <= 35);
-}
-
-#[test]
-fn stage2_quota_strips_timer_before_dropping_widgets() {
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.theme = ThemeStyle::Mono;
-    cfg.rows = vec![vec![
-        WidgetId::Vcs,
-        WidgetId::Speed,
-        WidgetId::Cost,
-        WidgetId::Quota5h,
-        WidgetId::QuotaWeekly,
-    ]];
-    let git = GitInfo {
-        branch: Some("main".to_string()),
-        ..Default::default()
-    };
-    let meta = SessionMetadata {
-        speed: Some(64.0),
-        ..Default::default()
-    };
-
-    // Uncompacted: "⎇ main · ⚡ 64 tok/s · ~$0.42 · 5h 84% ↻3h10m · 7d 92% ↻5d" (58 cols)
-    // After Stage 2: "⎇ main · ⚡ 64 tok/s · ~$0.42 · 5h 84% · 7d 92%" (47 cols)
-    let out = render_mono(&base_compaction_payload(48), &meta, &git, &cfg);
-    assert!(out.contains("64 tok/s"));
-    assert!(out.contains("~$0.42"));
-    assert!(out.contains("5h 84%"));
-    assert!(out.contains("7d 92%"));
-    assert!(!out.contains("3h10m"));
-    assert!(!out.contains("5d"));
-    assert!(visible_line_width(&out) <= 48);
-}
-
-#[test]
-fn stage3_88col_row_compacts_ctx_bar_instead_of_dropping_speed_cost_vcs() {
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.theme = ThemeStyle::Mono;
-    cfg.rows = vec![vec![
-        WidgetId::State,
-        WidgetId::Model,
-        WidgetId::Vcs,
-        WidgetId::CtxBar,
-        WidgetId::Speed,
-        WidgetId::Cost,
-        WidgetId::Quota5h,
-    ]];
-    let git = GitInfo {
-        branch: Some("feat/ui".to_string()),
-        added: 12,
-        deleted: 3,
-        ..Default::default()
-    };
-    let meta = SessionMetadata {
-        speed: Some(82.0),
-        max_context_tokens: Some(512_000),
-        ..Default::default()
-    };
-
-    // At 90 cols (within 80-95 col window), Stages 1-4 compact Vcs/Quota/CtxBar/Model
-    // so Speed, Cost, Vcs, Quota5h, and ctx 50.0% all survive (uncompacted = 133 cols, compacted = 89 cols).
-    let out = render_mono(&base_compaction_payload(90), &meta, &git, &cfg);
-    assert!(out.contains("feat/ui*"));
-    assert!(out.contains("82 tok/s"));
-    assert!(out.contains("~$0.42"));
-    assert!(out.contains("ctx 50.0%"));
-    assert!(out.contains("5h 84%"));
-    assert!(!out.contains("512K"));
-    assert!(!out.contains('█'));
-    assert!(visible_line_width(&out) <= 90);
-
-    // Remaining mode collapses to "rem 50.0%".
-    let mut rem_cfg = cfg.clone();
-    rem_cfg.ctx_remaining = true;
-    let out_rem = render_mono(&base_compaction_payload(90), &meta, &git, &rem_cfg);
-    assert!(out_rem.contains("rem 50.0%"));
-    assert!(visible_line_width(&out_rem) <= 90);
-}
-
-#[test]
-fn stage3_ctx_pct_strips_limit_suffix_and_stage4_abbreviates_models() {
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.theme = ThemeStyle::Mono;
-    cfg.rows = vec![vec![
-        WidgetId::Model,
-        WidgetId::CtxPct,
-        WidgetId::Speed,
-        WidgetId::Cost,
-    ]];
-    let meta = SessionMetadata {
-        speed: Some(75.0),
-        max_context_tokens: Some(512_000),
-        ..Default::default()
-    };
-
-    // Uncompacted: "Gemini 3.1 Pro Preview · high · ctx 50.0% (512K) · ⚡ 75 tok/s · ~$0.42" (74 cols)
-    // Stage 3 strips (512K) -> 67 cols; Stage 4 abbreviates "Gemini " -> "G" & caps Model at 20 cols -> 55 cols.
-    let out = render_mono(
-        &base_compaction_payload(56),
-        &meta,
-        &GitInfo::default(),
-        &cfg,
-    );
-    assert!(out.contains("G3.1 Pro Preview"));
-    assert!(out.contains("ctx 50.0%"));
-    assert!(!out.contains("(512K)"));
-    assert!(out.contains("75 tok/s"));
-    assert!(out.contains("~$0.42"));
-    assert!(visible_line_width(&out) <= 56);
-
-    // Claude abbreviation check: "Claude Sonnet 4.6 (Thinking)" -> "CSonnet 4.6 (Thin…" (20 cols), total 54 cols.
-    let mut claude_payload = base_compaction_payload(55);
-    claude_payload.model = Some(ModelInfo {
-        id: None,
-        display_name: Some("Claude Sonnet 4.6 (Thinking)".to_string()),
-        effort: None,
-    });
-    let out_claude = render_mono(&claude_payload, &meta, &GitInfo::default(), &cfg);
-    assert!(out_claude.contains("CSonnet 4.6"));
-    assert!(out_claude.contains("75 tok/s"));
-    assert!(out_claude.contains("~$0.42"));
-    assert!(visible_line_width(&out_claude) <= 55);
-}
-
-#[test]
-fn tier2_binary_compacts_88col_row_and_keeps_core_widgets() {
+fn cost_widget_labels_partial_and_latest_turn_estimates() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.theme = ThemeStyle::Mono;
-    cfg.responsive = true;
-    cfg.rows = vec![vec![
-        WidgetId::State,
-        WidgetId::Model,
-        WidgetId::Vcs,
-        WidgetId::CtxBar,
-        WidgetId::Cost,
-        WidgetId::Quota5h,
-    ]];
-    cfg.normalize_rows();
-    save_layout_config(&dir.path().join("config/agy-statusline/config.json"), &cfg).unwrap();
+    let home = dir.path();
+    let cli = home.join(".gemini/antigravity-cli");
+    let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
 
-    let stdin_json = r#"{
-        "agent_state": "working",
-        "model": {"display_name": "Gemini 3.1 Pro Preview", "effort": "high"},
-        "vcs": {"branch": "feat/ui", "dirty": true},
-        "context_window": {
-            "context_window_size": 512000,
-            "current_usage": {"input_tokens": 56000, "cache_read_input_tokens": 200000}
+    seed_alpha_rate(home);
+    seed_conv_turn(
+        &cli,
+        uuid,
+        1,
+        TestGenSpec {
+            step_idx: 1,
+            model_enum: 1526,
+            resp_model: "model-alpha",
+            disp_name: "Model Alpha (Medium)",
+            input_tok: 10_000,
+            cache_read_tok: 20_000,
+            output_tok: 200,
+            thinking_tok: 120,
+            dur_secs: 2,
+            ttft_ms: 400,
+            ..Default::default()
         },
-        "cost": {"total_usd": 0.42, "estimated": true},
-        "quota": {"gemini-5h": {"remaining_fraction": 0.84, "reset_in_seconds": 11400}},
-        "terminal_width": 78
-    }"#;
+    );
+    seed_conv_turn(
+        &cli,
+        uuid,
+        2,
+        TestGenSpec {
+            step_idx: 2,
+            model_enum: 1437,
+            resp_model: "model-beta",
+            disp_name: "Model Beta (High)",
+            input_tok: 5_000,
+            output_tok: 100,
+            thinking_tok: 40,
+            dur_secs: 1,
+            ttft_ms: 800,
+            ..Default::default()
+        },
+    );
 
-    let stdout = run_statusline_stdin(dir.path(), &[], stdin_json);
-    assert!(stdout.contains("G3.1 Pro Preview"), "stdout: {stdout}");
-    assert!(stdout.contains("feat/ui*"), "stdout: {stdout}");
-    assert!(stdout.contains("ctx 50.0%"), "stdout: {stdout}");
-    assert!(stdout.contains("~$0.42"), "stdout: {stdout}");
-    assert!(stdout.contains("5h 84%"), "stdout: {stdout}");
-    assert!(visible_line_width(&stdout) <= 78, "stdout: {stdout}");
-}
+    let mut payload = serde_json::json!({
+        "model": {"id": "model-alpha"},
+        "context_window": {"current_usage": {"input_tokens": 1_000_000}}
+    });
+    let latest_out = run_statusline_stdin(home, &["--full"], &payload.to_string());
+    assert!(
+        latest_out.contains("~$1.00 (latest turn)"),
+        "stdout was: {latest_out}"
+    );
 
-// ---------------------------------------------------------------------------
-// Thinking tokens widget
-// ---------------------------------------------------------------------------
+    payload["conversation_id"] = uuid.into();
+    let partial_out = run_statusline_stdin(home, &["--full"], &payload.to_string());
+    assert!(
+        partial_out.contains("~$0.01 (1 unpriced)"),
+        "stdout was: {partial_out}"
+    );
 
-fn render_thinking(
-    thinking_tokens: Option<u64>,
-    glyph_mode: GlyphMode,
-    theme: ThemeStyle,
-    smart_hide: bool,
-    no_color: bool,
-) -> String {
-    let meta = SessionMetadata {
-        thinking_tokens,
-        ..Default::default()
-    };
-    render_single(
-        WidgetId::Thinking,
-        &StatuslinePayload::default(),
-        &meta,
-        glyph_mode,
-        theme,
-        smart_hide,
-        no_color,
-    )
-}
-
-#[test]
-fn thinking_widget_renders_glyph_modes_palette_and_smart_hide() {
-    assert_eq!(
-        render_thinking(Some(4_200), GlyphMode::Unicode, ThemeStyle::Mono, false, true),
-        "◆ think 4.2K\n"
-    );
-    assert_eq!(
-        render_thinking(Some(4_200), GlyphMode::Nerd, ThemeStyle::Mono, false, true),
-        "\u{f0eb} think 4.2K\n"
-    );
-    assert_eq!(
-        render_thinking(Some(4_200), GlyphMode::Ascii, ThemeStyle::Mono, false, true),
-        "~ think 4.2K\n"
-    );
-    assert_eq!(
-        render_thinking(
-            Some(4_200),
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            false,
-            false
-        ),
-        "\x1b[38;5;220m◆ think 4.2K\x1b[0m\n"
-    );
-    assert_eq!(
-        render_thinking(None, GlyphMode::Unicode, ThemeStyle::Mono, true, true),
-        ""
-    );
-    assert_eq!(
-        render_thinking(Some(0), GlyphMode::Unicode, ThemeStyle::Mono, true, true),
-        ""
-    );
-    assert_eq!(
-        render_thinking(None, GlyphMode::Unicode, ThemeStyle::Default, false, false),
-        "\x1b[38;5;245m◆ think --\x1b[0m\n"
-    );
-    assert_eq!(
-        render_thinking(Some(0), GlyphMode::Nerd, ThemeStyle::Mono, false, true),
-        "\u{f0eb} think --\n"
-    );
-    assert_eq!(
-        render_thinking(None, GlyphMode::Ascii, ThemeStyle::Mono, false, true),
-        "~ think --\n"
-    );
-}
-
-#[test]
-fn tier2_cli_reads_real_sqlite_gen_metadata_thinking_tokens() {
-    let dir = tempfile::tempdir().unwrap();
-    let conv_dir = dir.path().join(".gemini/antigravity-cli/conversations");
-    fs::create_dir_all(&conv_dir).unwrap();
-
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.rows = vec![vec![WidgetId::State, WidgetId::Thinking]];
-    cfg.theme = ThemeStyle::Default;
-    cfg.glyph_mode = GlyphMode::Unicode;
-    cfg.smart_hide = true;
-    cfg.responsive = false;
-    save_layout_config(&dir.path().join("config/agy-statusline/config.json"), &cfg).unwrap();
-
-    let uuid = "11223344-5566-7788-99aa-bbccddeeff00";
-    let conn = Connection::open(conv_dir.join(format!("{uuid}.db"))).unwrap();
-    conn.execute(
-        "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
-        [],
-    )
-    .unwrap();
-    // chat(1) -> { usage(4) -> { output(3)=100, thinking(9)=4200 }, dur(12) -> { sec(1)=2 } }
-    let blob: [u8; 13] = [
-        0x0a, 0x0b, 0x22, 0x05, 0x18, 0x64, 0x48, 0xe8, 0x20, 0x62, 0x02, 0x08, 0x02,
-    ];
-    conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [blob])
+    let conn = Connection::open(cli.join(format!("conversations/{uuid}.db"))).unwrap();
+    conn.execute("DELETE FROM gen_metadata WHERE idx = 1", [])
         .unwrap();
     drop(conn);
 
-    let stdin_json =
-        format!(r#"{{"conversation_id":"{uuid}","agent_state":"idle","terminal_width":120}}"#);
-    let stdout = run_statusline_stdin(dir.path(), &[], &stdin_json);
-    assert!(stdout.contains("◆ think 4.2K"), "stdout was: {stdout}");
-
-    let doctor_out = isolated_agy_cmd(dir.path())
-        .arg("doctor")
-        .env("NO_COLOR", "1")
-        .output()
-        .unwrap();
-    assert!(doctor_out.status.success());
-    let doctor_stdout = String::from_utf8(doctor_out.stdout).unwrap();
+    let unpriced_out = run_statusline_stdin(home, &["--full"], &payload.to_string());
     assert!(
-        doctor_stdout.contains("◆ think 4.2K"),
-        "doctor stdout was: {doctor_stdout}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Telemetry & AGY payload widgets
-// ---------------------------------------------------------------------------
-
-#[test]
-fn state_widget_renders_confirm_alert_on_tool_confirmation_pending() {
-    let empty_meta = SessionMetadata::default();
-    let pending = StatuslinePayload {
-        agent_state: Some("idle".to_string()),
-        tool_confirmation_pending: Some(true),
-        ..Default::default()
-    };
-    assert_eq!(
-        render_single(
-            WidgetId::State,
-            &pending,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            true,
-            false
-        ),
-        "\x1b[1m\x1b[38;5;220m◎ CONFIRM\x1b[0m\n"
-    );
-    assert_eq!(
-        render_single(
-            WidgetId::State,
-            &pending,
-            &empty_meta,
-            GlyphMode::Ascii,
-            ThemeStyle::Mono,
-            true,
-            true
-        ),
-        "@ CONFIRM\n"
-    );
-
-    let not_pending = StatuslinePayload {
-        agent_state: Some("idle".to_string()),
-        tool_confirmation_pending: Some(false),
-        ..Default::default()
-    };
-    assert_eq!(
-        render_single(
-            WidgetId::State,
-            &not_pending,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Mono,
-            true,
-            true
-        ),
-        "● READY\n"
+        !unpriced_out.contains('$'),
+        "unexpected cost in stdout: {unpriced_out}"
     );
 }
 
 #[test]
-fn vim_widget_renders_modes_colors_and_smart_hide() {
-    let empty_meta = SessionMetadata::default();
-    let render_vim = |mode: Option<&str>, smart_hide: bool| {
-        let payload = StatuslinePayload {
-            vim: mode.map(|m| VimInfo {
-                mode: Some(m.to_string()),
-            }),
-            ..Default::default()
-        };
-        render_single(
-            WidgetId::Vim,
-            &payload,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            smart_hide,
-            false,
-        )
-    };
-
-    assert_eq!(render_vim(Some("insert"), true), "\x1b[1m\x1b[38;5;78mvim INSERT\x1b[0m\n");
-    assert_eq!(render_vim(Some("visual"), true), "\x1b[1m\x1b[38;5;183mvim VISUAL\x1b[0m\n");
-    assert_eq!(render_vim(Some("v-line"), true), "\x1b[1m\x1b[38;5;183mvim V-LINE\x1b[0m\n");
-    assert_eq!(render_vim(Some("v-block"), true), "\x1b[1m\x1b[38;5;183mvim V-BLOCK\x1b[0m\n");
-    assert_eq!(render_vim(Some("command"), true), "\x1b[1m\x1b[38;5;220mvim COMMAND\x1b[0m\n");
-    assert_eq!(render_vim(Some("replace"), true), "\x1b[1m\x1b[38;5;220mvim REPLACE\x1b[0m\n");
-    assert_eq!(render_vim(Some(" normal "), true), "\x1b[1m\x1b[38;5;117mvim NORMAL\x1b[0m\n");
-    assert_eq!(render_vim(Some("   "), true), "");
-    assert_eq!(render_vim(None, false), "\x1b[38;5;245mvim off\x1b[0m\n");
-}
-
-#[test]
-fn queue_widget_renders_count_and_smart_hide() {
-    let empty_meta = SessionMetadata::default();
-    let active = StatuslinePayload {
-        pending_input_count: Some(3),
-        ..Default::default()
-    };
-    assert_eq!(
-        render_single(
-            WidgetId::Queue,
-            &active,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            true,
-            false
-        ),
-        "\x1b[1m\x1b[38;5;220mqueue 3\x1b[0m\n"
-    );
-
-    let zero = StatuslinePayload {
-        pending_input_count: Some(0),
-        ..Default::default()
-    };
-    assert_eq!(
-        render_single(
-            WidgetId::Queue,
-            &zero,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            true,
-            false
-        ),
-        ""
-    );
-    assert_eq!(
-        render_single(
-            WidgetId::Queue,
-            &StatuslinePayload::default(),
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            false,
-            false
-        ),
-        "\x1b[38;5;245mqueue 0\x1b[0m\n"
-    );
-}
-
-#[test]
-fn battle_widget_renders_status_arm_and_smart_hide() {
-    let empty_meta = SessionMetadata::default();
-    let with_arm = StatuslinePayload {
-        battle: Some(BattleInfo {
-            status: Some("active".to_string()),
-            focused_arm: Some(2),
-        }),
-        ..Default::default()
-    };
-    assert_eq!(
-        render_single(
-            WidgetId::Battle,
-            &with_arm,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            true,
-            false
-        ),
-        "\x1b[1m\x1b[38;5;141mbattle ACTIVE #2\x1b[0m\n"
-    );
-
-    let no_arm = StatuslinePayload {
-        battle: Some(BattleInfo {
-            status: Some("tie".to_string()),
-            focused_arm: None,
-        }),
-        ..Default::default()
-    };
-    assert_eq!(
-        render_single(
-            WidgetId::Battle,
-            &no_arm,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            true,
-            false
-        ),
-        "\x1b[1m\x1b[38;5;141mbattle TIE\x1b[0m\n"
-    );
-    assert_eq!(
-        render_single(
-            WidgetId::Battle,
-            &StatuslinePayload::default(),
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            true,
-            false
-        ),
-        ""
-    );
-    assert_eq!(
-        render_single(
-            WidgetId::Battle,
-            &StatuslinePayload::default(),
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            false,
-            false
-        ),
-        "\x1b[38;5;245mbattle off\x1b[0m\n"
-    );
-}
-
-#[test]
-fn sandbox_widget_renders_allow_network_states() {
-    let empty_meta = SessionMetadata::default();
-    let on_net = StatuslinePayload {
-        sandbox: Some(SandboxInfo {
-            enabled: Some(true),
-            allow_network: Some(true),
-        }),
-        ..Default::default()
-    };
-    assert_eq!(
-        render_single(
-            WidgetId::Sandbox,
-            &on_net,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Mono,
-            true,
-            true
-        ),
-        "sandbox ON+net\n"
-    );
-
-    let on_no_net = StatuslinePayload {
-        sandbox: Some(SandboxInfo {
-            enabled: Some(true),
-            allow_network: Some(false),
-        }),
-        ..Default::default()
-    };
-    assert_eq!(
-        render_single(
-            WidgetId::Sandbox,
-            &on_no_net,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Mono,
-            true,
-            true
-        ),
-        "sandbox ON\n"
-    );
-
-    let on_none_net = StatuslinePayload {
-        sandbox: Some(SandboxInfo {
-            enabled: Some(true),
-            allow_network: None,
-        }),
-        ..Default::default()
-    };
-    assert_eq!(
-        render_single(
-            WidgetId::Sandbox,
-            &on_none_net,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Mono,
-            true,
-            true
-        ),
-        "sandbox ON\n"
-    );
-
-    let off_with_net = StatuslinePayload {
-        sandbox: Some(SandboxInfo {
-            enabled: Some(false),
-            allow_network: Some(true),
-        }),
-        ..Default::default()
-    };
-    assert_eq!(
-        render_single(
-            WidgetId::Sandbox,
-            &off_with_net,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Mono,
-            true,
-            true
-        ),
-        ""
-    );
-    assert_eq!(
-        render_single(
-            WidgetId::Sandbox,
-            &off_with_net,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Mono,
-            false,
-            true
-        ),
-        "sandbox off\n"
-    );
-}
-
-#[test]
-fn tier2_cli_renders_agy_1510_telemetry_widgets_and_confirm_override() {
+fn cost_widget_attributes_descendant_subagent_dbs_from_conversation_summaries() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.rows = vec![vec![
-        WidgetId::State,
-        WidgetId::Vim,
-        WidgetId::Queue,
-        WidgetId::Battle,
-        WidgetId::Sandbox,
-    ]];
-    cfg.theme = ThemeStyle::Default;
-    cfg.glyph_mode = GlyphMode::Unicode;
-    cfg.smart_hide = true;
-    cfg.responsive = false;
-    save_layout_config(&dir.path().join("config/agy-statusline/config.json"), &cfg).unwrap();
+    let home = dir.path();
+    let cli = home.join(".gemini/antigravity-cli");
+    let parent = "11111111-1111-4111-8111-111111111111";
+    let child = "22222222-2222-4222-8222-222222222222";
+    let grandchild = "33333333-3333-4333-8333-333333333333";
+
+    seed_alpha_rate(home);
+    seed_conv_turn(
+        &cli,
+        parent,
+        1,
+        TestGenSpec {
+            step_idx: 1,
+            model_enum: 1526,
+            resp_model: "model-alpha",
+            disp_name: "Model Alpha",
+            input_tok: 100_000,
+            dur_secs: 1,
+            ttft_ms: 200,
+            ..Default::default()
+        },
+    );
+    seed_conv_turn(
+        &cli,
+        child,
+        1,
+        TestGenSpec {
+            step_idx: 1,
+            model_enum: 1526,
+            resp_model: "model-alpha",
+            disp_name: "Model Alpha",
+            input_tok: 200_000,
+            dur_secs: 1,
+            ttft_ms: 200,
+            ..Default::default()
+        },
+    );
+    seed_conv_turn(
+        &cli,
+        grandchild,
+        1,
+        TestGenSpec {
+            step_idx: 1,
+            model_enum: 1526,
+            resp_model: "model-alpha",
+            disp_name: "Model Alpha",
+            input_tok: 150_000,
+            dur_secs: 1,
+            ttft_ms: 200,
+            ..Default::default()
+        },
+    );
 
     let payload = serde_json::json!({
-        "agent_state": "idle",
-        "tool_confirmation_pending": true,
-        "pending_input_count": 2,
-        "vim": { "mode": "insert" },
-        "battle": { "status": "active", "focused_arm": 1 },
-        "sandbox": { "enabled": true, "allow_network": true },
-        "terminal_width": 120
+        "conversation_id": parent,
+        "terminal_width": 240
     })
     .to_string();
 
-    let stdout = run_statusline_stdin(dir.path(), &[], &payload);
-    assert_eq!(
-        stdout,
-        "◎ CONFIRM · vim INSERT · queue 2 · battle ACTIVE #1 · sandbox ON+net\n"
-    );
-
-    let preset_stdout = run_statusline_stdin(dir.path(), &["--preset", "minimal"], &payload);
+    // Without conversation_summaries.db, only parent spend ($0.10) is shown.
+    let text_parent_only = run_statusline_stdin(home, &["--full"], &payload);
     assert!(
-        preset_stdout.contains("◎ CONFIRM"),
-        "preset stdout: {preset_stdout}"
+        text_parent_only.contains("~$0.10"),
+        "expected ~$0.10 in: {text_parent_only}"
+    );
+    assert!(
+        !text_parent_only.contains("(sub "),
+        "unexpected subagent suffix in: {text_parent_only}"
     );
 
-    let doctor_out = isolated_agy_cmd(dir.path())
-        .arg("doctor")
-        .env("NO_COLOR", "1")
+    // Link parent -> child -> grandchild in conversation_summaries.db.
+    let summaries = Connection::open(cli.join("conversation_summaries.db")).unwrap();
+    summaries
+        .execute(
+            "CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                parent_conversation_id TEXT,
+                nesting_depth INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+    summaries
+        .execute(
+            "INSERT INTO conversation_summaries (conversation_id, parent_conversation_id, nesting_depth) VALUES (?1, ?2, 1)",
+            [child, parent],
+        )
+        .unwrap();
+    summaries
+        .execute(
+            "INSERT INTO conversation_summaries (conversation_id, parent_conversation_id, nesting_depth) VALUES (?1, ?2, 2)",
+            [grandchild, child],
+        )
+        .unwrap();
+    drop(summaries);
+
+    let text_with_subs = run_statusline_stdin(home, &["--full"], &payload);
+    assert!(
+        text_with_subs.contains("~$0.45 (sub $0.35)"),
+        "expected ~$0.45 (sub $0.35) in: {text_with_subs}"
+    );
+
+    // Adding an unpriced turn in the grandchild renders combined sub + unpriced suffix.
+    seed_conv_turn(
+        &cli,
+        grandchild,
+        2,
+        TestGenSpec {
+            step_idx: 2,
+            model_enum: 1437,
+            resp_model: "model-beta",
+            disp_name: "Model Beta",
+            input_tok: 50_000,
+            dur_secs: 1,
+            ttft_ms: 200,
+            ..Default::default()
+        },
+    );
+    let text_partial = run_statusline_stdin(home, &["--full"], &payload);
+    assert!(
+        text_partial.contains("~$0.45 (sub $0.35, 1 unpriced)"),
+        "expected ~$0.45 (sub $0.35, 1 unpriced) in: {text_partial}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Live Git CLI boundary
+// ---------------------------------------------------------------------------
+
+#[test]
+fn live_git_cli_probe_extracts_branch_and_diff_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty_gitconfig = dir.path().join("empty.gitconfig");
+    fs::write(&empty_gitconfig, "").unwrap();
+
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+
+    let init_ok = git_cmd(dir.path(), &empty_gitconfig)
+        .args(["init"])
+        .arg(&repo)
         .output()
         .unwrap();
-    assert!(doctor_out.status.success());
-    let doctor_stdout = String::from_utf8(doctor_out.stdout).unwrap();
+    assert!(init_ok.status.success(), "{init_ok:?}");
+
+    let branch_ok = git_cmd(dir.path(), &empty_gitconfig)
+        .args(["-C"])
+        .arg(&repo)
+        .args(["checkout", "-b", "feat-live"])
+        .output()
+        .unwrap();
+    assert!(branch_ok.status.success(), "{branch_ok:?}");
+
+    fs::write(repo.join("notes.txt"), "line1\nline2\n").unwrap();
+    let add_ok = git_cmd(dir.path(), &empty_gitconfig)
+        .args(["-C"])
+        .arg(&repo)
+        .args(["add", "notes.txt"])
+        .output()
+        .unwrap();
+    assert!(add_ok.status.success(), "{add_ok:?}");
+
+    let commit_ok = git_cmd(dir.path(), &empty_gitconfig)
+        .args(["-C"])
+        .arg(&repo)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .output()
+        .unwrap();
+    assert!(commit_ok.status.success(), "{commit_ok:?}");
+
+    fs::write(repo.join("notes.txt"), "line1\nchanged\nadded_line\n").unwrap();
+
+    let payload = serde_json::json!({
+        "agent_state": "idle",
+        "cwd": repo,
+        "vcs": { "type": "git" }
+    })
+    .to_string();
+
+    let mut child = isolated_agy_cmd(dir.path())
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &empty_gitconfig)
+        .env("NO_COLOR", "1")
+        .args(["--preset", "minimal"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let rendered = String::from_utf8(output.stdout).unwrap();
     assert!(
-        doctor_stdout.contains("vim NORMAL · queue 1"),
-        "doctor stdout: {doctor_stdout}"
+        rendered.contains("feat-live* +2 -1"),
+        "rendered stdout was: {rendered}"
     );
-}
-
-#[test]
-fn version_widget_renders_payload_version_and_handles_missing_or_prefixed() {
-    let empty_meta = SessionMetadata::default();
-    let payload: StatuslinePayload =
-        serde_json::from_str(r#"{"agent_state":"idle","version":"1.5.11"}"#).unwrap();
-    assert_eq!(
-        render_single(
-            WidgetId::Version,
-            &payload,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            true,
-            true
-        )
-        .trim(),
-        "v1.5.11"
-    );
-
-    let payload_prefixed: StatuslinePayload =
-        serde_json::from_str(r#"{"agent_state":"idle","version":" v1.5.11 "}"#).unwrap();
-    assert_eq!(
-        render_single(
-            WidgetId::Version,
-            &payload_prefixed,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            true,
-            true
-        )
-        .trim(),
-        "v1.5.11"
-    );
-
-    let payload_empty: StatuslinePayload =
-        serde_json::from_str(r#"{"agent_state":"idle","version":"  "}"#).unwrap();
-    assert_eq!(
-        render_single(
-            WidgetId::Version,
-            &payload_empty,
-            &empty_meta,
-            GlyphMode::Unicode,
-            ThemeStyle::Default,
-            false,
-            true
-        )
-        .trim(),
-        ""
-    );
-}
-
-#[test]
-fn agy_payload_widgets_render_and_omit_when_absent() {
-    let empty_meta = SessionMetadata::default();
-    let payload: StatuslinePayload = serde_json::from_str(
-        r#"{
-            "session_id": "8d0371e1-5a05-423b-a8bc-ed75995f9a8b",
-            "conversation_title": "Refactor\n  statusline\tpayload   widgets for long title test",
-            "transcript_path": "/home/user/.gemini/logs/transcript.jsonl",
-            "product": "Antigravity",
-            "plan_tier": "Ultra",
-            "email": "alice@example.com",
-            "agent": {"name": "researcher"},
-            "vcs": {"type": "citc", "client": "my-citc-ws", "dirty": true},
-            "subagents": [
-                {"name": "sub-a", "role": "Codebase Researcher", "status": "running"},
-                {"name": "sub-b", "role": "Done Worker", "status": "completed"}
-            ]
-        }"#,
-    )
-    .unwrap();
-
-    let r = |w, p, sh| {
-        render_single(w, p, &empty_meta, GlyphMode::Ascii, ThemeStyle::Default, sh, true)
-            .trim()
-            .to_string()
-    };
-    assert_eq!(r(WidgetId::Plan, &payload, true), "Ultra");
-    assert_eq!(r(WidgetId::Account, &payload, true), "alice@example.com");
-    assert_eq!(
-        r(WidgetId::Title, &payload, true),
-        "Refactor statusline payload wi.."
-    );
-    assert_eq!(r(WidgetId::Agent, &payload, true), "agent researcher");
-    assert_eq!(r(WidgetId::Product, &payload, true), "Antigravity");
-    assert_eq!(r(WidgetId::Session, &payload, true), "sid:8d0371e1");
-    assert_eq!(
-        r(WidgetId::Transcript, &payload, true),
-        "log:transcript.jsonl"
-    );
-    assert_eq!(r(WidgetId::Vcs, &payload, true), "citc: my-citc-ws*");
-    assert_eq!(
-        r(WidgetId::Subagents, &payload, true),
-        "sub 1 (Codebase Researcher)"
-    );
-
-    let blank = StatuslinePayload::default();
-    assert_eq!(r(WidgetId::Plan, &blank, false), "");
-    assert_eq!(r(WidgetId::Account, &blank, false), "");
-    assert_eq!(r(WidgetId::Title, &blank, false), "");
-    assert_eq!(r(WidgetId::Agent, &blank, false), "");
-    assert_eq!(r(WidgetId::Product, &blank, false), "");
-    assert_eq!(r(WidgetId::Session, &blank, false), "");
-    assert_eq!(r(WidgetId::Transcript, &blank, false), "");
-}
-
-#[test]
-fn responsive_compaction_shortens_subagents_account_and_title() {
-    let payload: StatuslinePayload = serde_json::from_str(
-        r#"{
-            "agent_state": "idle",
-            "conversation_title": "Implement full AGY statusline payload widgets",
-            "email": "alice@example.com",
-            "subagents": [{"role": "Reviewer (Rust)", "status": "running"}],
-            "terminal_width": 52
-        }"#,
-    )
-    .unwrap();
-
-    let mut cfg = LayoutConfig::preset_minimal();
-    cfg.rows = vec![vec![
-        WidgetId::State,
-        WidgetId::Title,
-        WidgetId::Account,
-        WidgetId::Subagents,
-    ]];
-    cfg.glyph_mode = GlyphMode::Ascii;
-    cfg.no_color = true;
-    cfg.responsive = true;
-
-    let rendered = render_mono(&payload, &SessionMetadata::default(), &GitInfo::default(), &cfg);
-    assert!(rendered.contains("READY"), "rendered: {rendered}");
-    assert!(rendered.contains("Implement full.."), "rendered: {rendered}");
-    assert!(rendered.contains("alice"), "rendered: {rendered}");
-    assert!(!rendered.contains("@example.com"), "rendered: {rendered}");
-    assert!(rendered.contains("sub 1"), "rendered: {rendered}");
-    assert!(!rendered.contains("Reviewer"), "rendered: {rendered}");
-    assert!(!rendered.contains('('), "unclosed paren in: {rendered}");
 }
