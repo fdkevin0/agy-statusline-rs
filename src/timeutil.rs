@@ -1,7 +1,7 @@
 //! Shared `jiff`-backed time, civil date, and RFC3339 timestamp utilities.
 
 use jiff::civil::{self, Date};
-use jiff::tz::TimeZone;
+use jiff::tz::Offset;
 use jiff::Timestamp;
 
 pub(crate) const SECS_PER_DAY: i64 = 86_400;
@@ -22,11 +22,8 @@ pub(crate) fn parse_rfc3339_unix_secs(raw: &str) -> Option<i64> {
 
 /// Formats a Unix epoch timestamp (seconds) as a UTC `YYYY-MM-DD` date string.
 pub(crate) fn unix_secs_to_utc_date(secs: i64) -> String {
-    Timestamp::from_second(secs)
-        .unwrap_or(Timestamp::UNIX_EPOCH)
-        .to_zoned(TimeZone::UTC)
-        .date()
-        .to_string()
+    let ts = Timestamp::from_second(secs).unwrap_or(Timestamp::UNIX_EPOCH);
+    Offset::UTC.to_datetime(ts).date().to_string()
 }
 
 /// Converts days since `1970-01-01` into a proleptic Gregorian [`jiff::civil::Date`].
@@ -34,14 +31,15 @@ pub(crate) fn civil_date_from_unix_day(day_idx: i64) -> Date {
     day_idx
         .checked_mul(SECS_PER_DAY)
         .and_then(|secs| Timestamp::from_second(secs).ok())
-        .map(|ts| ts.to_zoned(TimeZone::UTC).date())
+        .map(|ts| Offset::UTC.to_datetime(ts).date())
         .unwrap_or_else(|| civil::date(1970, 1, 1))
 }
 
 /// Converts a proleptic Gregorian [`jiff::civil::Date`] into days since `1970-01-01`.
 pub(crate) fn unix_day_from_civil_date(date: Date) -> i64 {
-    date.to_zoned(TimeZone::UTC)
-        .map(|z| z.timestamp().as_second().div_euclid(SECS_PER_DAY))
+    Offset::UTC
+        .to_timestamp(date.at(0, 0, 0, 0))
+        .map(|ts| ts.as_second().div_euclid(SECS_PER_DAY))
         .unwrap_or(0)
 }
 

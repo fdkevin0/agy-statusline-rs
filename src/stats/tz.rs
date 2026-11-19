@@ -77,7 +77,7 @@ impl TimeZoneSpec {
     /// Maps a UTC Unix timestamp (seconds) into `(local_day_index, "YYYY-MM-DD")`.
     pub(super) fn local_day_and_date(&self, unix_secs: i64) -> (i64, String) {
         let date = Timestamp::from_second(unix_secs)
-            .map(|ts| ts.to_zoned(self.inner.clone()).date())
+            .map(|ts| self.inner.to_datetime(ts).date())
             .unwrap_or_else(|_| civil_date_from_unix_day(unix_secs.div_euclid(SECS_PER_DAY)));
         (unix_day_from_civil_date(date), date.to_string())
     }

@@ -18,7 +18,7 @@ bundled = ["rusqlite/bundled"]
 ansi-to-tui = { version = "8.0", default-features = false }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 crossterm = "0.29"
-jiff = "0.2"
+jiff = "1.0"
 prost = "0.14"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rusqlite = { version = "0.43", default-features = false }
