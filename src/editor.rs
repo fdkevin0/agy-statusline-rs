@@ -2,7 +2,57 @@
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::layout::{LayoutConfig, WidgetId, MAX_ROWS};
+use crate::layout::{LayoutConfig, Preset, WidgetId, MAX_ROWS};
+
+/// Ordered entries in the Settings pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingField {
+    /// Built-in preset selector.
+    Preset,
+    /// Visual rendering style (`Plain`, `Pill`, `Powerline`).
+    Style,
+    /// Color theme palette.
+    Theme,
+    /// Widget separator in `Plain` style.
+    Separator,
+    /// Speed calculation method.
+    SpeedMode,
+    /// Context percentage display mode (`Used %` vs `Remaining %`).
+    CtxMode,
+    /// Automatically hide zero/inactive widgets.
+    SmartHide,
+    /// Show working-tree `+ins -del` diff stats alongside `vcs`.
+    GitDiff,
+    /// Context progress bar width in columns.
+    BarWidth,
+    /// AGY statusline integration mode (`Replace Default` vs `Stack Below`).
+    AgyMode,
+    /// Glyph set (`Unicode`, `Nerd Font`, `ASCII`).
+    Glyphs,
+    /// Responsive overflow trimming.
+    Responsive,
+    /// Speed warning threshold in tokens/s.
+    SpeedWarn,
+}
+
+impl SettingField {
+    /// Canonical list of all settings in display order.
+    pub const ALL: &'static [Self] = &[
+        Self::Preset,
+        Self::Style,
+        Self::Theme,
+        Self::Separator,
+        Self::SpeedMode,
+        Self::CtxMode,
+        Self::SmartHide,
+        Self::GitDiff,
+        Self::BarWidth,
+        Self::AgyMode,
+        Self::Glyphs,
+        Self::Responsive,
+        Self::SpeedWarn,
+    ];
+}
 
 /// Currently focused pane inside the 3-pane configurator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,22 +153,19 @@ pub struct TuiEditorState {
     pub grabbed: bool,
     /// Selected index in `WidgetId::ALL` inside `Catalog`.
     pub catalog_idx: usize,
-    /// Selected index (`0..13`) inside `Settings`.
+    /// Selected index in `SettingField::ALL` inside `Settings`.
     pub settings_idx: usize,
-    /// Active preset cursor (`0=Full`, `1=Powerline`, `2=Minimal`, `3=Addon`).
-    pub preset_idx: usize,
+    /// Active preset cursor.
+    pub preset: Preset,
     /// Current Live Preview width simulation mode.
     pub preview_width: PreviewWidth,
 }
 
 impl TuiEditorState {
-    /// Total rows in the Settings pane.
-    pub const SETTINGS_COUNT: usize = 13;
-
     /// Initializes editor state from `config`.
     pub fn new(mut config: LayoutConfig) -> Self {
         config.normalize_rows();
-        let preset_idx = config.matching_preset_index().unwrap_or(0);
+        let preset = config.matching_preset().unwrap_or(Preset::Full);
         Self {
             config,
             active_pane: ActivePane::Canvas,
@@ -127,26 +174,20 @@ impl TuiEditorState {
             grabbed: false,
             catalog_idx: 0,
             settings_idx: 0,
-            preset_idx,
+            preset,
             preview_width: PreviewWidth::Auto,
         }
     }
 
     /// Returns true if `config` has been modified away from all built-in presets.
     pub fn is_custom_preset(&self) -> bool {
-        self.config.matching_preset_index().is_none()
+        self.config.matching_preset().is_none()
     }
 
-    /// Applies one of the 4 built-in presets (`1..=4`).
-    pub fn apply_preset(&mut self, one_based: usize) {
-        self.config = match one_based {
-            1 => LayoutConfig::preset_full(),
-            2 => LayoutConfig::preset_powerline(),
-            3 => LayoutConfig::preset_minimal(),
-            4 => LayoutConfig::preset_addon(),
-            _ => return,
-        };
-        self.preset_idx = one_based - 1;
+    /// Applies one of the built-in presets.
+    pub fn apply_preset(&mut self, preset: Preset) {
+        self.config = preset.to_layout();
+        self.preset = preset;
         self.canvas_row = 0;
         self.canvas_col = 0;
         self.grabbed = false;
@@ -191,7 +232,7 @@ impl TuiEditorState {
 
     /// Adjusts `setting_idx` by `dir` (`-1` or `+1`).
     pub fn adjust_setting_at(&mut self, idx: usize, dir: isize) {
-        if idx < Self::SETTINGS_COUNT {
+        if idx < SettingField::ALL.len() {
             self.settings_idx = idx;
             self.adjust_setting(dir);
         }
@@ -245,7 +286,8 @@ impl TuiEditorState {
     /// Moves `settings_idx` by `delta` (`-1` or `+1`).
     pub fn scroll_settings(&mut self, delta: isize) {
         self.active_pane = ActivePane::Settings;
-        let next = (self.settings_idx as isize + delta).clamp(0, (Self::SETTINGS_COUNT - 1) as isize);
+        let next =
+            (self.settings_idx as isize + delta).clamp(0, (SettingField::ALL.len() - 1) as isize);
         self.settings_idx = next as usize;
     }
 
@@ -274,27 +316,31 @@ impl TuiEditorState {
     }
 
     fn adjust_setting(&mut self, dir: isize) {
-        match self.settings_idx {
-            0 => {
-                let next = ((self.preset_idx as isize + dir).rem_euclid(4)) as usize;
-                self.apply_preset(next + 1);
+        let Some(&field) = SettingField::ALL.get(self.settings_idx) else {
+            return;
+        };
+        match field {
+            SettingField::Preset => self.apply_preset(self.preset.step(dir)),
+            SettingField::Style => self.config.style = self.config.style.step(dir),
+            SettingField::Theme => self.config.theme = self.config.theme.step(dir),
+            SettingField::Separator => self.config.separator = self.config.separator.step(dir),
+            SettingField::SpeedMode => self.config.speed_mode = self.config.speed_mode.step(dir),
+            SettingField::CtxMode => self.config.ctx_remaining = !self.config.ctx_remaining,
+            SettingField::SmartHide => self.config.smart_hide = !self.config.smart_hide,
+            SettingField::GitDiff => self.config.show_git_diff = !self.config.show_git_diff,
+            SettingField::BarWidth => {
+                self.config.bar_length =
+                    (self.config.bar_length as isize + dir).clamp(4, 40) as usize;
             }
-            1 => self.config.style = self.config.style.step(dir),
-            2 => self.config.theme = self.config.theme.step(dir),
-            3 => self.config.separator = self.config.separator.step(dir),
-            4 => self.config.speed_mode = self.config.speed_mode.step(dir),
-            5 => self.config.ctx_remaining = !self.config.ctx_remaining,
-            6 => self.config.smart_hide = !self.config.smart_hide,
-            7 => self.config.show_git_diff = !self.config.show_git_diff,
-            8 => self.config.bar_length = (self.config.bar_length as isize + dir).clamp(4, 40) as usize,
-            9 => self.config.stack_with_default = !self.config.stack_with_default,
-            10 => self.config.glyph_mode = self.config.glyph_mode.step(dir),
-            11 => self.config.responsive = !self.config.responsive,
-            12 => {
+            SettingField::AgyMode => {
+                self.config.stack_with_default = !self.config.stack_with_default;
+            }
+            SettingField::Glyphs => self.config.glyph_mode = self.config.glyph_mode.step(dir),
+            SettingField::Responsive => self.config.responsive = !self.config.responsive,
+            SettingField::SpeedWarn => {
                 self.config.speed_warn_threshold =
                     (self.config.speed_warn_threshold + (dir as f64) * 5.0).clamp(10.0, 200.0);
             }
-            _ => {}
         }
     }
 
@@ -382,7 +428,9 @@ impl TuiEditorState {
             KeyCode::Up | KeyCode::Char('k') if self.settings_idx > 0 => {
                 self.settings_idx -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') if self.settings_idx + 1 < Self::SETTINGS_COUNT => {
+            KeyCode::Down | KeyCode::Char('j')
+                if self.settings_idx + 1 < SettingField::ALL.len() =>
+            {
                 self.settings_idx += 1;
             }
             KeyCode::Left | KeyCode::Char('h') => self.adjust_setting(-1),
@@ -420,7 +468,9 @@ impl TuiEditorState {
                     return ExitOutcome::Continue;
                 }
                 KeyCode::Char(c @ '1'..='4') => {
-                    self.apply_preset((c as u8 - b'0') as usize);
+                    if let Some(&preset) = Preset::ALL.get((c as u8 - b'1') as usize) {
+                        self.apply_preset(preset);
+                    }
                     return ExitOutcome::Continue;
                 }
                 _ => {}
@@ -459,7 +509,7 @@ mod tests {
     #[test]
     fn catalog_adds_to_selected_target_line_and_settings_cycle() {
         let mut ed = TuiEditorState::new(LayoutConfig::preset_minimal());
-        assert_eq!(ed.preset_idx, 2);
+        assert_eq!(ed.preset, Preset::Minimal);
         assert!(!ed.is_custom_preset());
 
         ed.handle_key(KeyCode::Down, KeyModifiers::NONE);

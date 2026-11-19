@@ -12,7 +12,7 @@ use agy_statusline::apply::{
 };
 use agy_statusline::db::SqliteSpeedReader;
 use agy_statusline::git::SystemGitProbe;
-use agy_statusline::layout::{load_layout_config, save_layout_config, LayoutConfig};
+use agy_statusline::layout::{load_layout_config, save_layout_config, LayoutConfig, Preset};
 use agy_statusline::paths::{
     agy_settings_path, resolve_agy_cli_dir, resolve_home_dir, xdg_cache_dir, xdg_config_dir,
 };
@@ -43,16 +43,12 @@ fn print_version() {
 }
 
 fn parse_preset(name: &str) -> io::Result<LayoutConfig> {
-    match name {
-        "full" => Ok(LayoutConfig::preset_full()),
-        "powerline" => Ok(LayoutConfig::preset_powerline()),
-        "minimal" => Ok(LayoutConfig::preset_minimal()),
-        "addon" => Ok(LayoutConfig::preset_addon()),
-        other => Err(io::Error::new(
+    Preset::from_name(name).map(Preset::to_layout).ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unknown preset '{other}' (expected full|powerline|minimal|addon)"),
-        )),
-    }
+            format!("unknown preset '{name}' (expected full|powerline|minimal|addon)"),
+        )
+    })
 }
 
 fn parse_days_value(val: &str) -> io::Result<u32> {

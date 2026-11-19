@@ -18,192 +18,149 @@ pub const MAX_ROWS: usize = 3;
 /// Default speed threshold (tokens/s) below which speed highlights in warning amber.
 pub const DEFAULT_SPEED_WARN_THRESHOLD: f64 = 50.0;
 
-/// All 33 statusline widgets available for placement on any row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WidgetId {
-    /// Agent execution state (`● READY`, `◆ THINKING`, etc.).
-    State,
-    /// Active model display name and reasoning effort.
-    Model,
-    /// Active workspace/project directory basename.
-    Directory,
-    /// Git branch, dirty marker, and optional diff stats.
-    Vcs,
-    /// Linked `git worktree` name (`⎇ wt:feat-x`).
-    Worktree,
-    /// Unicode context usage bar + percentage.
-    CtxBar,
-    /// Context usage/remaining percentage only (`ctx 42.5%`).
-    CtxPct,
-    /// Current/limit or cumulative session tokens.
-    CtxTokens,
-    /// Cache hit percentage (`◈ cache 80.0%`).
-    CacheHit,
-    /// Formatted cache read token count (`↻ 800`).
-    CacheRead,
-    /// Output generation speed (`⚡ 64 tok/s`).
-    Speed,
-    /// Time to first token (`⏱ 1.8s`).
-    Ttft,
-    /// Thinking output tokens (`◆ think 4.2K`).
-    Thinking,
-    /// Estimated session cost (`$0.14`).
-    Cost,
-    /// Active cycle mode (`◇ PLAN`, `◇ AUTO`, etc.) and `>200K` indicator.
-    Mode,
-    /// Rolling 5-hour quota remaining % + reset timer + pace warning.
-    Quota5h,
-    /// Weekly (or multi-day) quota remaining % + reset timer + pace warning.
-    QuotaWeekly,
-    /// Artifact count (`art 2`).
-    Artifacts,
-    /// Active subagent count (`sub 2`).
-    Subagents,
-    /// Background task count (`tasks 3`).
-    Tasks,
-    /// Queued user inputs (`queue 1`).
-    Queue,
-    /// Vim mode (`vim NORMAL`).
-    Vim,
-    /// Battle mode (`battle ACTIVE #1`).
-    Battle,
-    /// Sandbox status (`sandbox ON` / `sandbox ON+net` / `sandbox off`).
-    Sandbox,
-    /// AGY CLI version (`v1.5.11`).
-    Version,
-    /// Account subscription tier (`Pro`, `Ultra`, etc.).
-    Plan,
-    /// Authenticated account email (`alice@example.com`).
-    Account,
-    /// Active conversation title (truncated to fit).
-    Title,
-    /// Active agent name (`agent researcher`).
-    Agent,
-    /// Product name (`Antigravity`).
-    Product,
-    /// Short active session identifier (`sid:8d0371e1`).
-    Session,
-    /// Active transcript filename (`log:transcript.jsonl`).
-    Transcript,
-    /// Elastic left/center/right alignment spacer.
-    Spacer,
+macro_rules! define_widgets {
+    (
+        $(
+            $(#[$meta:meta])*
+            $variant:ident => ($label:literal, $display:literal, $priority:literal)
+        ),+ $(,)?
+    ) => {
+        /// All statusline widgets available for placement on any row.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum WidgetId {
+            $(
+                $(#[$meta])*
+                $variant,
+            )+
+        }
+
+        impl WidgetId {
+            /// Canonical list of all widgets in catalog display order.
+            pub const ALL: &'static [WidgetId] = &[$(Self::$variant),+];
+
+            /// Short machine/pill label.
+            pub const fn label(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label,)+
+                }
+            }
+
+            /// Descriptive display name shown in the widget catalog.
+            pub const fn display_name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $display,)+
+                }
+            }
+
+            /// Responsive fitting priority (`5` = anchor kept last, `1` = auxiliary dropped first).
+            pub const fn priority(self) -> u8 {
+                match self {
+                    $(Self::$variant => $priority,)+
+                }
+            }
+        }
+    };
 }
 
-const WIDGET_META: [(WidgetId, &str, &str); 33] = [
-    (WidgetId::State, "state", "Agent State"),
-    (WidgetId::Model, "model", "Model + Effort"),
-    (WidgetId::Directory, "directory", "Workspace Dir"),
-    (WidgetId::Vcs, "vcs", "Git Branch + Diff"),
-    (WidgetId::Worktree, "worktree", "Git Worktree"),
-    (WidgetId::CtxBar, "ctx_bar", "Context Progress Bar"),
-    (WidgetId::CtxPct, "ctx_pct", "Context % Only"),
-    (WidgetId::CtxTokens, "ctx_tokens", "Session Tokens"),
-    (WidgetId::CacheHit, "cache_hit", "Cache Hit %"),
-    (WidgetId::CacheRead, "cache_read", "Cache Read Tokens"),
-    (WidgetId::Speed, "speed", "Output Speed (tok/s)"),
-    (WidgetId::Ttft, "ttft", "First Token (TTFT)"),
-    (WidgetId::Thinking, "thinking", "Thinking Tokens"),
-    (WidgetId::Cost, "cost", "Session Cost ($)"),
-    (WidgetId::Mode, "mode", "Cycle Mode (Plan/Auto)"),
-    (WidgetId::Quota5h, "quota_5h", "5h Quota + Pace"),
-    (WidgetId::QuotaWeekly, "quota_weekly", "Weekly Quota"),
-    (WidgetId::Artifacts, "artifacts", "Artifact Count"),
-    (WidgetId::Subagents, "subagents", "Active Subagents"),
-    (WidgetId::Tasks, "tasks", "Background Tasks"),
-    (WidgetId::Queue, "queue", "Queued Inputs"),
-    (WidgetId::Vim, "vim", "Vim Mode"),
-    (WidgetId::Battle, "battle", "Battle Mode"),
-    (WidgetId::Sandbox, "sandbox", "Sandbox Status"),
-    (WidgetId::Version, "version", "AGY Version"),
-    (WidgetId::Plan, "plan", "Plan Tier"),
-    (WidgetId::Account, "account", "Account Email"),
-    (WidgetId::Title, "title", "Conversation Title"),
-    (WidgetId::Agent, "agent", "Active Agent"),
-    (WidgetId::Product, "product", "Product Name"),
-    (WidgetId::Session, "session", "Session ID"),
-    (WidgetId::Transcript, "transcript", "Transcript File"),
-    (WidgetId::Spacer, "spacer", "Flex Spacer (L|R)"),
-];
+macro_rules! impl_cycle_enum {
+    ($ty:ident, $all_vis:vis ALL => [$($variant:ident),+ $(,)?]) => {
+        impl $ty {
+            /// All variants in canonical cycle order.
+            $all_vis const ALL: &'static [Self] = &[$(Self::$variant),+];
 
-impl WidgetId {
-    /// Canonical list of all 33 widgets in catalog display order.
-    pub const ALL: [WidgetId; 33] = [
-        Self::State,
-        Self::Model,
-        Self::Directory,
-        Self::Vcs,
-        Self::Worktree,
-        Self::CtxBar,
-        Self::CtxPct,
-        Self::CtxTokens,
-        Self::CacheHit,
-        Self::CacheRead,
-        Self::Speed,
-        Self::Ttft,
-        Self::Thinking,
-        Self::Cost,
-        Self::Mode,
-        Self::Quota5h,
-        Self::QuotaWeekly,
-        Self::Artifacts,
-        Self::Subagents,
-        Self::Tasks,
-        Self::Queue,
-        Self::Vim,
-        Self::Battle,
-        Self::Sandbox,
-        Self::Version,
-        Self::Plan,
-        Self::Account,
-        Self::Title,
-        Self::Agent,
-        Self::Product,
-        Self::Session,
-        Self::Transcript,
-        Self::Spacer,
-    ];
+            /// Cycles forward (`dir = 1`) or backward (`dir = -1`).
+            pub const fn step(self, dir: isize) -> Self {
+                #[allow(dead_code)]
+                enum Order {
+                    $($variant),+
+                }
+                let idx = match self {
+                    $(Self::$variant => Order::$variant as isize,)+
+                };
+                Self::ALL[(idx + dir).rem_euclid(Self::ALL.len() as isize) as usize]
+            }
 
-    /// Short machine/pill label.
-    pub fn label(self) -> &'static str {
-        WIDGET_META.iter().find(|m| m.0 == self).map_or("", |m| m.1)
-    }
+            /// Cycles forward to the next variant.
+            pub const fn next(self) -> Self {
+                self.step(1)
+            }
 
-    /// Descriptive display name shown in the widget catalog.
-    pub fn display_name(self) -> &'static str {
-        WIDGET_META.iter().find(|m| m.0 == self).map_or("", |m| m.2)
-    }
-
-    /// Responsive fitting priority (`5` = anchor kept last, `1` = auxiliary dropped first).
-    pub const fn priority(self) -> u8 {
-        match self {
-            Self::State | Self::Spacer => 5,
-            Self::Model | Self::CtxBar | Self::CtxPct | Self::Quota5h => 4,
-            Self::Mode | Self::Vcs | Self::Speed | Self::Cost | Self::QuotaWeekly => 3,
-            Self::Directory
-            | Self::CacheHit
-            | Self::CtxTokens
-            | Self::Worktree
-            | Self::Vim
-            | Self::Queue
-            | Self::Title
-            | Self::Agent => 2,
-            Self::CacheRead
-            | Self::Ttft
-            | Self::Thinking
-            | Self::Subagents
-            | Self::Tasks
-            | Self::Artifacts
-            | Self::Battle
-            | Self::Sandbox
-            | Self::Version
-            | Self::Plan
-            | Self::Account
-            | Self::Product
-            | Self::Session
-            | Self::Transcript => 1,
+            /// Cycles backward to the previous variant.
+            pub const fn prev(self) -> Self {
+                self.step(-1)
+            }
         }
-    }
+    };
+}
+
+define_widgets! {
+    /// Agent execution state (`● READY`, `◆ THINKING`, etc.).
+    State => ("state", "Agent State", 5),
+    /// Active model display name and reasoning effort.
+    Model => ("model", "Model + Effort", 4),
+    /// Active workspace/project directory basename.
+    Directory => ("directory", "Workspace Dir", 2),
+    /// Git branch, dirty marker, and optional diff stats.
+    Vcs => ("vcs", "Git Branch + Diff", 3),
+    /// Linked `git worktree` name (`⎇ wt:feat-x`).
+    Worktree => ("worktree", "Git Worktree", 2),
+    /// Unicode context usage bar + percentage.
+    CtxBar => ("ctx_bar", "Context Progress Bar", 4),
+    /// Context usage/remaining percentage only (`ctx 42.5%`).
+    CtxPct => ("ctx_pct", "Context % Only", 4),
+    /// Current/limit or cumulative session tokens.
+    CtxTokens => ("ctx_tokens", "Session Tokens", 2),
+    /// Cache hit percentage (`◈ cache 80.0%`).
+    CacheHit => ("cache_hit", "Cache Hit %", 2),
+    /// Formatted cache read token count (`↻ 800`).
+    CacheRead => ("cache_read", "Cache Read Tokens", 1),
+    /// Output generation speed (`⚡ 64 tok/s`).
+    Speed => ("speed", "Output Speed (tok/s)", 3),
+    /// Time to first token (`⏱ 1.8s`).
+    Ttft => ("ttft", "First Token (TTFT)", 1),
+    /// Thinking output tokens (`◆ think 4.2K`).
+    Thinking => ("thinking", "Thinking Tokens", 1),
+    /// Estimated session cost (`$0.14`).
+    Cost => ("cost", "Session Cost ($)", 3),
+    /// Active cycle mode (`◇ PLAN`, `◇ AUTO`, etc.) and `>200K` indicator.
+    Mode => ("mode", "Cycle Mode (Plan/Auto)", 3),
+    /// Rolling 5-hour quota remaining % + reset timer + pace warning.
+    Quota5h => ("quota_5h", "5h Quota + Pace", 4),
+    /// Weekly (or multi-day) quota remaining % + reset timer + pace warning.
+    QuotaWeekly => ("quota_weekly", "Weekly Quota", 3),
+    /// Artifact count (`art 2`).
+    Artifacts => ("artifacts", "Artifact Count", 1),
+    /// Active subagent count (`sub 2`).
+    Subagents => ("subagents", "Active Subagents", 1),
+    /// Background task count (`tasks 3`).
+    Tasks => ("tasks", "Background Tasks", 1),
+    /// Queued user inputs (`queue 1`).
+    Queue => ("queue", "Queued Inputs", 2),
+    /// Vim mode (`vim NORMAL`).
+    Vim => ("vim", "Vim Mode", 2),
+    /// Battle mode (`battle ACTIVE #1`).
+    Battle => ("battle", "Battle Mode", 1),
+    /// Sandbox status (`sandbox ON` / `sandbox ON+net` / `sandbox off`).
+    Sandbox => ("sandbox", "Sandbox Status", 1),
+    /// AGY CLI version (`v1.5.11`).
+    Version => ("version", "AGY Version", 1),
+    /// Account subscription tier (`Pro`, `Ultra`, etc.).
+    Plan => ("plan", "Plan Tier", 1),
+    /// Authenticated account email (`alice@example.com`).
+    Account => ("account", "Account Email", 1),
+    /// Active conversation title (truncated to fit).
+    Title => ("title", "Conversation Title", 2),
+    /// Active agent name (`agent researcher`).
+    Agent => ("agent", "Active Agent", 2),
+    /// Product name (`Antigravity`).
+    Product => ("product", "Product Name", 1),
+    /// Short active session identifier (`sid:8d0371e1`).
+    Session => ("session", "Session ID", 1),
+    /// Active transcript filename (`log:transcript.jsonl`).
+    Transcript => ("transcript", "Transcript File", 1),
+    /// Elastic left/center/right alignment spacer.
+    Spacer => ("spacer", "Flex Spacer (L|R)", 5),
 }
 
 /// Visual rendering style for statusline rows.
@@ -219,28 +176,9 @@ pub enum VisualStyle {
     Powerline,
 }
 
+impl_cycle_enum!(VisualStyle, ALL => [Plain, Pill, Powerline]);
+
 impl VisualStyle {
-    const ALL: [Self; 3] = [Self::Plain, Self::Pill, Self::Powerline];
-
-    /// Cycles forward (`dir = 1`) or backward (`dir = -1`).
-    pub const fn step(self, dir: isize) -> Self {
-        let idx = match self {
-            Self::Plain => 0isize,
-            Self::Pill => 1,
-            Self::Powerline => 2,
-        };
-        Self::ALL[(idx + dir).rem_euclid(3) as usize]
-    }
-
-    /// Cycles forward to the next style.
-    pub const fn next(self) -> Self {
-        self.step(1)
-    }
-    /// Cycles backward to the previous style.
-    pub const fn prev(self) -> Self {
-        self.step(-1)
-    }
-
     /// Human-readable style name.
     pub const fn name(self) -> &'static str {
         match self {
@@ -266,29 +204,9 @@ pub enum SeparatorStyle {
     Space,
 }
 
+impl_cycle_enum!(SeparatorStyle, ALL => [Dot, Pipe, Slash, Space]);
+
 impl SeparatorStyle {
-    const ALL: [Self; 4] = [Self::Dot, Self::Pipe, Self::Slash, Self::Space];
-
-    /// Cycles forward or backward.
-    pub const fn step(self, dir: isize) -> Self {
-        let idx = match self {
-            Self::Dot => 0isize,
-            Self::Pipe => 1,
-            Self::Slash => 2,
-            Self::Space => 3,
-        };
-        Self::ALL[(idx + dir).rem_euclid(4) as usize]
-    }
-
-    /// Cycles forward to the next separator.
-    pub const fn next(self) -> Self {
-        self.step(1)
-    }
-    /// Cycles backward to the previous separator.
-    pub const fn prev(self) -> Self {
-        self.step(-1)
-    }
-
     /// Plain text separator string.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -333,29 +251,9 @@ pub enum GlyphMode {
     Ascii,
 }
 
+impl_cycle_enum!(GlyphMode, ALL => [Unicode, Nerd, Ascii]);
+
 impl GlyphMode {
-    const ALL: [Self; 3] = [Self::Unicode, Self::Nerd, Self::Ascii];
-
-    /// Cycles forward or backward.
-    pub const fn step(self, dir: isize) -> Self {
-        let idx = match self {
-            Self::Unicode => 0isize,
-            Self::Nerd => 1,
-            Self::Ascii => 2,
-        };
-        Self::ALL[(idx + dir).rem_euclid(3) as usize]
-    }
-
-    /// Cycles forward to the next glyph mode.
-    pub const fn next(self) -> Self {
-        self.step(1)
-    }
-
-    /// Cycles backward to the previous glyph mode.
-    pub const fn prev(self) -> Self {
-        self.step(-1)
-    }
-
     /// Human-readable glyph mode label.
     pub const fn name(self) -> &'static str {
         match self {
@@ -387,40 +285,9 @@ pub enum ThemeStyle {
     Mono,
 }
 
+impl_cycle_enum!(ThemeStyle, ALL => [Default, Nord, Catppuccin, TokyoNight, Gruvbox, Light, Mono]);
+
 impl ThemeStyle {
-    const ALL: [Self; 7] = [
-        Self::Default,
-        Self::Nord,
-        Self::Catppuccin,
-        Self::TokyoNight,
-        Self::Gruvbox,
-        Self::Light,
-        Self::Mono,
-    ];
-
-    /// Cycles forward or backward.
-    pub const fn step(self, dir: isize) -> Self {
-        let idx = match self {
-            Self::Default => 0isize,
-            Self::Nord => 1,
-            Self::Catppuccin => 2,
-            Self::TokyoNight => 3,
-            Self::Gruvbox => 4,
-            Self::Light => 5,
-            Self::Mono => 6,
-        };
-        Self::ALL[(idx + dir).rem_euclid(7) as usize]
-    }
-
-    /// Cycles forward to the next theme.
-    pub const fn next(self) -> Self {
-        self.step(1)
-    }
-    /// Cycles backward to the previous theme.
-    pub const fn prev(self) -> Self {
-        self.step(-1)
-    }
-
     /// Human-readable theme name.
     pub const fn name(self) -> &'static str {
         match self {
@@ -450,20 +317,9 @@ pub enum SpeedMode {
     E2e,
 }
 
+impl_cycle_enum!(SpeedMode, ALL => [Weighted, Median, Instant, E2e]);
+
 impl SpeedMode {
-    const ALL: [Self; 4] = [Self::Weighted, Self::Median, Self::Instant, Self::E2e];
-
-    /// Cycles forward or backward.
-    pub const fn step(self, dir: isize) -> Self {
-        let idx = match self {
-            Self::Weighted => 0isize,
-            Self::Median => 1,
-            Self::Instant => 2,
-            Self::E2e => 3,
-        };
-        Self::ALL[(idx + dir).rem_euclid(4) as usize]
-    }
-
     /// Human-readable name.
     pub const fn name(self) -> &'static str {
         match self {
@@ -471,6 +327,58 @@ impl SpeedMode {
             Self::Median => "Median",
             Self::Instant => "Instant",
             Self::E2e => "E2E (+TTFT)",
+        }
+    }
+}
+
+/// Built-in statusline layout presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preset {
+    /// Single-line Full Dashboard (replaces default AGY bar).
+    Full,
+    /// Two-line Powerline Pro with Catppuccin palette.
+    Powerline,
+    /// Minimal single-line statusline.
+    Minimal,
+    /// Metrics Addon bar stacked under AGY's built-in statusline.
+    Addon,
+}
+
+impl_cycle_enum!(Preset, pub ALL => [Full, Powerline, Minimal, Addon]);
+
+impl Preset {
+    /// Canonical CLI preset name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Powerline => "powerline",
+            Self::Minimal => "minimal",
+            Self::Addon => "addon",
+        }
+    }
+
+    /// Human-readable display name shown in the TUI settings pane.
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Full => "Full",
+            Self::Powerline => "Powerline",
+            Self::Minimal => "Minimal",
+            Self::Addon => "Addon",
+        }
+    }
+
+    /// Parses a preset by its canonical CLI name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|p| p.name() == name)
+    }
+
+    /// Builds the [`LayoutConfig`] corresponding to this preset.
+    pub fn to_layout(self) -> LayoutConfig {
+        match self {
+            Self::Full => LayoutConfig::preset_full(),
+            Self::Powerline => LayoutConfig::preset_powerline(),
+            Self::Minimal => LayoutConfig::preset_minimal(),
+            Self::Addon => LayoutConfig::preset_addon(),
         }
     }
 }
@@ -629,18 +537,12 @@ impl LayoutConfig {
         None
     }
 
-    /// Returns the matching built-in preset index (`0..=3`), ignoring runtime `no_color`.
-    pub fn matching_preset_index(&self) -> Option<usize> {
+    /// Returns the matching built-in [`Preset`], ignoring runtime `no_color`.
+    pub fn matching_preset(&self) -> Option<Preset> {
         let mut norm = self.clone();
         norm.normalize_rows();
         norm.no_color = false;
-        let presets = [
-            Self::preset_full(),
-            Self::preset_powerline(),
-            Self::preset_minimal(),
-            Self::preset_addon(),
-        ];
-        presets.iter().position(|p| p == &norm)
+        Preset::ALL.iter().copied().find(|p| p.to_layout() == norm)
     }
 }
 
@@ -700,8 +602,24 @@ mod tests {
         save_layout_config(&path, &cfg).unwrap();
         let loaded = load_layout_config(&path);
         assert_eq!(loaded, cfg);
-        assert_eq!(loaded.matching_preset_index(), Some(1));
+        assert_eq!(loaded.matching_preset(), Some(Preset::Powerline));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preset_round_trip_names_and_cycling() {
+        assert_eq!(Preset::from_name("full"), Some(Preset::Full));
+        assert_eq!(Preset::from_name("powerline"), Some(Preset::Powerline));
+        assert_eq!(Preset::from_name("minimal"), Some(Preset::Minimal));
+        assert_eq!(Preset::from_name("addon"), Some(Preset::Addon));
+        assert_eq!(Preset::from_name("unknown"), None);
+
+        assert_eq!(Preset::Full.name(), "full");
+        assert_eq!(Preset::Powerline.display_name(), "Powerline");
+        assert_eq!(Preset::Full.next(), Preset::Powerline);
+        assert_eq!(Preset::Full.prev(), Preset::Addon);
+        assert_eq!(Preset::Addon.next(), Preset::Full);
+        assert_eq!(Preset::Minimal.to_layout().matching_preset(), Some(Preset::Minimal));
     }
 
     #[test]

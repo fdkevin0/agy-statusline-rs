@@ -77,16 +77,22 @@ fn telemetry_widgets_catalog_metadata_and_presets_unchanged() {
         WidgetId::Battle
     );
 
-    assert_eq!(LayoutConfig::preset_full().matching_preset_index(), Some(0));
     assert_eq!(
-        LayoutConfig::preset_powerline().matching_preset_index(),
-        Some(1)
+        LayoutConfig::preset_full().matching_preset(),
+        Some(agy_statusline::layout::Preset::Full)
     );
     assert_eq!(
-        LayoutConfig::preset_minimal().matching_preset_index(),
-        Some(2)
+        LayoutConfig::preset_powerline().matching_preset(),
+        Some(agy_statusline::layout::Preset::Powerline)
     );
-    assert_eq!(LayoutConfig::preset_addon().matching_preset_index(), Some(3));
+    assert_eq!(
+        LayoutConfig::preset_minimal().matching_preset(),
+        Some(agy_statusline::layout::Preset::Minimal)
+    );
+    assert_eq!(
+        LayoutConfig::preset_addon().matching_preset(),
+        Some(agy_statusline::layout::Preset::Addon)
+    );
 
     let vim_idx = WidgetId::ALL.iter().position(|&w| w == WidgetId::Vim).unwrap();
     let queue_idx = WidgetId::ALL
