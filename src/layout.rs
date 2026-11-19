@@ -447,12 +447,10 @@ impl LayoutConfig {
             WidgetId::Worktree,
             WidgetId::CtxBar,
             WidgetId::CacheHit,
-            WidgetId::CacheRead,
             WidgetId::Speed,
             WidgetId::Ttft,
             WidgetId::Cost,
             WidgetId::Quota5h,
-            WidgetId::Sandbox,
         ]])
     }
 

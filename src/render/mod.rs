@@ -346,7 +346,7 @@ mod tests {
         assert!(pl_text.contains("\u{e0b0}"));
         assert!(pl_text.contains("Gemini 4 · high"));
         assert!(pl_text.contains("~$0.14"));
-        assert!(pl_text.contains("(512K)"));
+        assert!(pl_text.contains("(1K/512K)"));
 
         let mut pill_cfg = LayoutConfig::preset_full();
         pill_cfg.style = VisualStyle::Pill;
@@ -368,7 +368,7 @@ mod tests {
         write_statusline(&payload, &meta, &git, &narrow_cfg, &mut narrow_out).unwrap();
         let narrow_text = String::from_utf8(narrow_out).unwrap();
         assert!(narrow_text.contains("THINKING"));
-        assert!(!narrow_text.contains("sandbox"));
+        assert!(!narrow_text.contains("wt:feat-wt"));
         assert!(!narrow_text.contains("\u{e0b0}"));
         assert!(!narrow_text.contains("\u{e0b6}"));
     }
@@ -690,7 +690,7 @@ mod tests {
         write_statusline(&payload, &meta, &GitInfo::default(), &cfg_used, &mut out_used).unwrap();
         assert_eq!(
             String::from_utf8(out_used).unwrap(),
-            "ctx ████████ 104.7% (512K) · ctx 104.7% (512K)\n"
+            "ctx ████████ 104.7% (536K/512K) · ctx 104.7% (512K)\n"
         );
 
         let mut cfg_rem = LayoutConfig::preset_minimal();
@@ -703,8 +703,34 @@ mod tests {
         let rem_text = String::from_utf8(out_rem).unwrap();
         let crit_code = format!("\x1b[38;5;{}m", palette_for(ThemeStyle::Default).ctx_crit);
         assert!(rem_text.contains(&crit_code));
-        assert!(rem_text.contains("rem ████████ 0.0% (512K)"));
+        assert!(rem_text.contains("rem ████████ 0.0% (0/512K)"));
         assert!(rem_text.contains("rem 0.0% (512K)"));
+
+        // Non-overflow remaining mode renders (remaining/limit) in ctx_bar.
+        let payload_half = StatuslinePayload {
+            context_window: Some(ContextWindow {
+                context_window_size: Some(200_000),
+                current_usage: Some(JsonUsage {
+                    input_tokens: Some(15_000),
+                    output_tokens: None,
+                    cache_read_input_tokens: Some(70_000),
+                    cache_creation_input_tokens: Some(0),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut out_rem_half = Vec::new();
+        write_statusline(
+            &payload_half,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg_rem,
+            &mut out_rem_half,
+        )
+        .unwrap();
+        let rem_half = String::from_utf8(out_rem_half).unwrap();
+        assert!(rem_half.contains("57.5% (115K/200K)"));
     }
 
     #[test]
