@@ -18,9 +18,9 @@
 
 ## Usage Pricing
 
-Native AGY costs take precedence. For estimates, the CLI uses the models.dev catalog cached for 24 hours. `stats` refreshes stale rates before reporting, and the statusline can refresh them in the background. Existing hand-written `pricing.json` files are ignored.
+Native AGY costs take precedence. For estimates, the CLI uses the `models.dev` catalog cached for 24 hours. `stats` refreshes stale rates before reporting, and the statusline can refresh them in the background. Existing hand-written `pricing.json` files are ignored.
 
-Catalog lookup checks exact model names case-insensitively, then names with normalized punctuation and spacing, then the longest matching substring. Within each exact-match stage, the model ID precedes the display name. Carbon and Argon Orchestrator aliases are used when direct matching finds no rate.
+Catalog lookup checks exact model names case-insensitively, then names with normalized punctuation and spacing, then the longest matching substring. Within each exact-match stage, the model ID precedes the display name, and canonical provider rates take precedence over reseller punctuation variants. When prompt context tokens exceed a `models.dev` context-length tier threshold (`tiers` / `context_over_200k`), the corresponding tier rates are applied. Carbon and Argon Orchestrator aliases (including `gemini-flash-worker-agy` -> `gemini-4-hydrogen`) are used when direct matching finds no rate.
 
 ## Interactive TUI Controls
 
@@ -49,7 +49,7 @@ Every widget reads from AGY's `stdin` JSON payload (`StatuslinePayload`), local 
 | `speed` | Output speed | From SQLite `gen_metadata` (`ORDER BY idx DESC LIMIT 9`, valid turns with decode duration `>= 0.01s` and `< 10,000 tok/s`): `Weighted 5t` (`sum(out) / sum(decode_s)`), `Median` (up to 9 turns), `Instant` (latest turn), or `E2E (+TTFT)` (`out / (ttft + decode_s)`) |
 | `ttft` | First token latency | Latest turn time-to-first-token extracted from SQLite `gen_metadata` (`1 -> 11`); hidden when absent if `smart_hide` is enabled |
 | `thinking` | Thinking tokens | Latest turn thinking output tokens extracted from SQLite `gen_metadata` (`1 -> 4 -> 9`); hidden when absent/zero if `smart_hide` is enabled |
-| `cost` | Session cost | Prefers payload `cost.total_usd` (with `(sub $...)` when `cost.subagent_usd >= 0.01`); uses native turn costs or cached `models.dev` rates for SQLite usage, showing a subtotal and unpriced turn count for partial coverage. Without recorded usage it can estimate from session totals or label a current-usage estimate as `latest turn` |
+| `cost` | Session cost | Prefers payload `cost.total_usd` (with `(sub $...)` when `cost.subagent_usd >= 0.01`); otherwise sums native turn costs or cached `models.dev` rates across the active conversation DB and any descendant subagent DBs linked in `conversation_summaries.db`, rendering `(sub $...)` when subagent spend is `>= $0.01`, and `(N unpriced)` / `(sub $..., N unpriced)` for partial coverage. Without recorded usage it can estimate from session totals or label a current-usage estimate as `latest turn` |
 | `mode` | Cycle mode | `cycle_mode` uppercased (`PLAN` / `AUTO` / `EDIT`, etc.), plus `>200K` badge when `exceeds_200k_tokens` is true |
 | `quota_5h` | 5h quota + pace | Selects short-window (`<24h`) non-`disabled` bucket from `quota` via model token-affinity scoring; reads `remaining_fraction` (sub-1% precision: `<0.1%`, `0.1%`–`0.9%`) or `remaining_amount`, countdown from `reset_in_seconds` (or RFC3339 `reset_time` fallback), calibrated `(~tokens)` estimate, and burn-rate pace warning; hidden when absent if `smart_hide` is enabled |
 | `quota_weekly` | Weekly quota | Selects multi-day (`>=24h`) non-`disabled` bucket from `quota` via token-affinity scoring; dynamic qualifier/window labeling, `remaining_fraction` or `remaining_amount`, countdown timer, calibrated `(~tokens)` estimate, and burn-rate pace warning; hidden when absent if `smart_hide` is enabled |

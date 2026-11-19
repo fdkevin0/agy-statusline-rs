@@ -551,10 +551,17 @@ impl Renderer<'_> {
                 let usd = ctx
                     .estimated_cost_usd
                     .filter(|v| v.is_finite() && *v >= 0.0)?;
-                let text = match ctx.cost_coverage {
-                    CostCoverage::Session => format!("~${usd:.2}"),
-                    CostCoverage::Partial(n) => format!("~${usd:.2} ({n} unpriced)"),
-                    CostCoverage::LatestTurn => format!("~${usd:.2} (latest turn)"),
+                let sub = ctx
+                    .estimated_subagent_cost_usd
+                    .filter(|&s| s.is_finite() && s >= 0.01);
+                let text = match (ctx.cost_coverage, sub) {
+                    (CostCoverage::Session, None) => format!("~${usd:.2}"),
+                    (CostCoverage::Session, Some(s)) => format!("~${usd:.2} (sub ${s:.2})"),
+                    (CostCoverage::Partial(n), None) => format!("~${usd:.2} ({n} unpriced)"),
+                    (CostCoverage::Partial(n), Some(s)) => {
+                        format!("~${usd:.2} (sub ${s:.2}, {n} unpriced)")
+                    }
+                    (CostCoverage::LatestTurn, _) => format!("~${usd:.2} (latest turn)"),
                 };
                 Some(Segment::plain(widget, text, pal.cost, false))
             }

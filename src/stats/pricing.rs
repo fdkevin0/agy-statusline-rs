@@ -1,6 +1,6 @@
 //! Model token pricing catalog (TTL-cached `models.dev` rates).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Read};
@@ -35,6 +35,25 @@ pub enum SyncMode {
     SpawnIfStale,
 }
 
+/// Context-length pricing tier overriding base rates above `min_context_tokens`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct ContextPricingTier {
+    /// Strict lower bound (`prompt_context_tokens > min_context_tokens`) for activating this tier.
+    min_context_tokens: u64,
+    /// USD per 1M uncached input tokens in this tier.
+    #[serde(default)]
+    input_per_mtok: f64,
+    /// USD per 1M prompt cache read tokens in this tier.
+    #[serde(default)]
+    cache_read_per_mtok: f64,
+    /// USD per 1M prompt cache write tokens in this tier.
+    #[serde(default)]
+    cache_write_per_mtok: f64,
+    /// USD per 1M output tokens in this tier.
+    #[serde(default)]
+    output_per_mtok: f64,
+}
+
 /// Per-million-token pricing rates supplied by `models.dev`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 struct ModelPricingRate {
@@ -50,6 +69,9 @@ struct ModelPricingRate {
     /// USD per 1M output tokens.
     #[serde(default)]
     output_per_mtok: f64,
+    /// Optional context-length pricing tiers sorted ascending by `min_context_tokens`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    context_tiers: Vec<ContextPricingTier>,
 }
 
 /// Persisted `models.dev` cache envelope stored in `$XDG_CACHE_HOME/agy-statusline/models_dev_pricing.json`.
@@ -228,34 +250,66 @@ impl PricingCatalog {
             })
             .map(|&idx| &self.entries[idx]);
 
-        // Substring fallback prefers the longest match, then key order.
+        // Substring fallback prefers literal raw matches over separator-normalized matches,
+        // then longest match, then key order.
         if matched.is_none() {
-            let mut best: Option<(usize, &IndexedEntry)> = None;
+            let mut best: Option<(bool, usize, &IndexedEntry)> = None;
             for entry in &self.entries {
-                let match_len = if lowered_candidates.iter().any(|(raw, _)| raw.contains(&entry.pat_lower)) {
-                    entry.pat_lower.len()
-                } else if !entry.pat_norm.is_empty()
-                    && lowered_candidates.iter().any(|(_, norm)| norm.contains(&entry.pat_norm))
+                let (is_raw, match_len) = if lowered_candidates
+                    .iter()
+                    .any(|(raw, _)| raw.contains(&entry.pat_lower))
                 {
-                    entry.pat_norm.len()
+                    (true, entry.pat_lower.len())
+                } else if !entry.pat_norm.is_empty()
+                    && lowered_candidates
+                        .iter()
+                        .any(|(_, norm)| norm.contains(&entry.pat_norm))
+                {
+                    (false, entry.pat_norm.len())
                 } else {
                     continue;
                 };
-                if best.is_none_or(|(len, previous)| {
-                    match_len > len || (match_len == len && entry.key < previous.key)
+                if best.is_none_or(|(best_raw, best_len, previous)| {
+                    (is_raw, match_len) > (best_raw, best_len)
+                        || ((is_raw, match_len) == (best_raw, best_len) && entry.key < previous.key)
                 }) {
-                    best = Some((match_len, entry));
+                    best = Some((is_raw, match_len, entry));
                 }
             }
-            matched = best.map(|(_, e)| e);
+            matched = best.map(|(_, _, e)| e);
         }
 
         // Orchestrator alias fallback.
         let entry = matched.or_else(|| self.resolve_orchestrator_alias(&lowered_candidates))?;
-        let cost = ((input_tokens as f64) * entry.rate.input_per_mtok
-            + (cache_read_tokens as f64) * entry.rate.cache_read_per_mtok
-            + (cache_write_tokens as f64) * entry.rate.cache_write_per_mtok
-            + (output_tokens as f64) * entry.rate.output_per_mtok)
+        let prompt_context_tokens = input_tokens
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_write_tokens);
+        let active_tier = entry
+            .rate
+            .context_tiers
+            .iter()
+            .filter(|tier| {
+                is_valid_tier_rate(tier) && prompt_context_tokens > tier.min_context_tokens
+            })
+            .max_by_key(|tier| tier.min_context_tokens);
+        let (input_rate, cache_read_rate, cache_write_rate, output_rate) = match active_tier {
+            Some(tier) => (
+                tier.input_per_mtok,
+                tier.cache_read_per_mtok,
+                tier.cache_write_per_mtok,
+                tier.output_per_mtok,
+            ),
+            None => (
+                entry.rate.input_per_mtok,
+                entry.rate.cache_read_per_mtok,
+                entry.rate.cache_write_per_mtok,
+                entry.rate.output_per_mtok,
+            ),
+        };
+        let cost = ((input_tokens as f64) * input_rate
+            + (cache_read_tokens as f64) * cache_read_rate
+            + (cache_write_tokens as f64) * cache_write_rate
+            + (output_tokens as f64) * output_rate)
             / 1_000_000.0;
         if !cost.is_finite() || cost < 0.0 {
             return None;
@@ -264,12 +318,15 @@ impl PricingCatalog {
     }
 
     fn resolve_orchestrator_alias(&self, candidates: &[(String, String)]) -> Option<&IndexedEntry> {
-        // Resolve the target alias first: explicit Argon/Carbon qualifiers across all candidates
-        // take precedence over the bare `gemini-pro-orchestrator` fallback, and an explicit
-        // qualifier never silently falls back to the other tier when its rate is absent.
+        // Resolve the target alias first: explicit Argon/Carbon/Flash-worker qualifiers across all
+        // candidates take precedence over the bare `gemini-pro-orchestrator` fallback, and an
+        // explicit qualifier never silently falls back to another tier when its rate is absent.
         let (target_raw, target_norm) = candidates
             .iter()
             .find_map(|(_, norm)| {
+                if norm == "gemini flash worker agy" {
+                    return Some(("gemini-4-hydrogen", "gemini 4 hydrogen"));
+                }
                 if !norm.split_whitespace().any(|w| w == "orchestrator") {
                     return None;
                 }
@@ -324,6 +381,18 @@ fn is_valid_rate(rate: &ModelPricingRate) -> bool {
     ]
     .iter()
     .all(|v| v.is_finite() && *v >= 0.0)
+}
+
+fn is_valid_tier_rate(tier: &ContextPricingTier) -> bool {
+    tier.min_context_tokens > 0
+        && [
+            tier.input_per_mtok,
+            tier.cache_read_per_mtok,
+            tier.cache_write_per_mtok,
+            tier.output_per_mtok,
+        ]
+        .iter()
+        .all(|v| v.is_finite() && *v >= 0.0)
 }
 
 fn load_cached_file(path: &Path) -> Option<CachedPricingFile> {
@@ -423,6 +492,33 @@ const CANONICAL_PROVIDERS: &[&str] = &[
     "meta-llama",
 ];
 
+fn extract_context_tier(
+    tier_obj: &serde_json::Map<String, Value>,
+    min_context_tokens: u64,
+    base: &ModelPricingRate,
+) -> Option<ContextPricingTier> {
+    let tier = ContextPricingTier {
+        min_context_tokens,
+        input_per_mtok: tier_obj
+            .get("input")
+            .and_then(Value::as_f64)
+            .unwrap_or(base.input_per_mtok),
+        cache_read_per_mtok: tier_obj
+            .get("cache_read")
+            .and_then(Value::as_f64)
+            .unwrap_or(base.cache_read_per_mtok),
+        cache_write_per_mtok: tier_obj
+            .get("cache_write")
+            .and_then(Value::as_f64)
+            .unwrap_or(base.cache_write_per_mtok),
+        output_per_mtok: tier_obj
+            .get("output")
+            .and_then(Value::as_f64)
+            .unwrap_or(base.output_per_mtok),
+    };
+    is_valid_tier_rate(&tier).then_some(tier)
+}
+
 fn extract_rate_from_cost(cost_obj: &serde_json::Map<String, Value>) -> Option<ModelPricingRate> {
     let input = cost_obj.get("input").and_then(Value::as_f64).unwrap_or(0.0);
     let output = cost_obj.get("output").and_then(Value::as_f64).unwrap_or(0.0);
@@ -435,22 +531,57 @@ fn extract_rate_from_cost(cost_obj: &serde_json::Map<String, Value>) -> Option<M
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
 
-    let rate = ModelPricingRate {
+    let mut rate = ModelPricingRate {
         input_per_mtok: input,
         cache_read_per_mtok: cache_read,
         cache_write_per_mtok: cache_write,
         output_per_mtok: output,
+        context_tiers: Vec::new(),
     };
     if !is_valid_rate(&rate) || (input == 0.0 && output == 0.0) {
         return None;
     }
+
+    let mut context_tiers = Vec::new();
+    if let Some(tiers) = cost_obj.get("tiers").and_then(Value::as_array) {
+        for tier_val in tiers {
+            let Some(tier_obj) = tier_val.as_object() else {
+                continue;
+            };
+            if tier_obj.get("type").and_then(Value::as_str) != Some("context") {
+                continue;
+            }
+            let Some(size) = tier_obj.get("size").and_then(Value::as_u64) else {
+                continue;
+            };
+            if size == 0 {
+                continue;
+            }
+            if let Some(tier) = extract_context_tier(tier_obj, size, &rate) {
+                context_tiers.push(tier);
+            }
+        }
+    }
+
+    if context_tiers.is_empty() {
+        if let Some(over_200k_obj) = cost_obj.get("context_over_200k").and_then(Value::as_object) {
+            if let Some(tier) = extract_context_tier(over_200k_obj, 200_000, &rate) {
+                context_tiers.push(tier);
+            }
+        }
+    }
+
+    context_tiers.sort_by_key(|tier| tier.min_context_tokens);
+    context_tiers.dedup_by_key(|tier| tier.min_context_tokens);
+    rate.context_tiers = context_tiers;
     Some(rate)
 }
 
 /// Parses `https://models.dev/api.json` payload into a flat `model_id -> ModelPricingRate` map.
 ///
 /// Canonical direct providers (`google`, `anthropic`, `openai`, etc.) take precedence over
-/// aggregator/cloud-reseller providers when identical model IDs appear under multiple providers.
+/// aggregator/cloud-reseller providers when identical or separator-equivalent model IDs appear
+/// under multiple providers.
 fn parse_models_dev_json(raw: &str) -> io::Result<BTreeMap<String, ModelPricingRate>> {
     let root: Value = serde_json::from_str(raw)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid JSON: {e}")))?;
@@ -462,20 +593,21 @@ fn parse_models_dev_json(raw: &str) -> io::Result<BTreeMap<String, ModelPricingR
     };
 
     let mut out = BTreeMap::new();
+    let mut canonical_norm_keys = HashSet::new();
 
     // Pass 1: canonical direct providers take precedence.
     for &prov_id in CANONICAL_PROVIDERS {
         if let Some(prov_obj) = providers.get(prov_id).and_then(Value::as_object) {
-            insert_provider_models(prov_obj, &mut out, true);
+            insert_provider_models(prov_obj, &mut out, &mut canonical_norm_keys, true);
         }
     }
-    // Pass 2: remaining providers fill in any models not already present.
+    // Pass 2: remaining providers fill in any models not already present (including normalized collisions).
     for (prov_id, prov_val) in providers {
         if CANONICAL_PROVIDERS.contains(&prov_id.as_str()) {
             continue;
         }
         if let Some(prov_obj) = prov_val.as_object() {
-            insert_provider_models(prov_obj, &mut out, false);
+            insert_provider_models(prov_obj, &mut out, &mut canonical_norm_keys, false);
         }
     }
 
@@ -485,7 +617,8 @@ fn parse_models_dev_json(raw: &str) -> io::Result<BTreeMap<String, ModelPricingR
 fn insert_provider_models(
     prov_obj: &serde_json::Map<String, Value>,
     out: &mut BTreeMap<String, ModelPricingRate>,
-    overwrite: bool,
+    canonical_norm_keys: &mut HashSet<String>,
+    canonical: bool,
 ) {
     let Some(models_obj) = prov_obj.get("models").and_then(Value::as_object) else {
         return;
@@ -501,7 +634,15 @@ fn insert_provider_models(
         if key.is_empty() {
             continue;
         }
-        if overwrite || !out.contains_key(&key) {
+        let norm_key = normalize_model_key(&key);
+        if canonical {
+            out.insert(key, rate);
+            if !norm_key.is_empty() {
+                canonical_norm_keys.insert(norm_key);
+            }
+        } else if !out.contains_key(&key)
+            && (norm_key.is_empty() || !canonical_norm_keys.contains(&norm_key))
+        {
             out.insert(key, rate);
         }
     }
@@ -881,5 +1022,251 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn flash_worker_alias_maps_to_gemini_4_hydrogen_without_cross_tier_fallback() {
+        let mut models = BTreeMap::new();
+        models.insert(
+            "gemini-4-hydrogen".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 1.5,
+                output_per_mtok: 7.5,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "gemini-4-carbon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 2.0,
+                output_per_mtok: 10.0,
+                ..Default::default()
+            },
+        );
+        let catalog = PricingCatalog::from_models(models);
+
+        let (matched_key, usd) = catalog
+            .estimate_cost(
+                &["gemini-flash-worker-agy", "Gemini Flash"],
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(matched_key, "gemini-4-hydrogen");
+        assert!((usd - 1.5).abs() < 1e-6);
+
+        let (precedence_key, precedence_usd) = catalog
+            .estimate_cost(
+                &["gemini-pro-orchestrator", "gemini-flash-worker-agy"],
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(precedence_key, "gemini-4-hydrogen");
+        assert!((precedence_usd - 1.5).abs() < 1e-6);
+
+        let mut carbon_only = BTreeMap::new();
+        carbon_only.insert(
+            "gemini-4-carbon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 2.0,
+                output_per_mtok: 10.0,
+                ..Default::default()
+            },
+        );
+        let carbon_catalog = PricingCatalog::from_models(carbon_only);
+        assert_eq!(
+            carbon_catalog.estimate_cost(
+                &["gemini-pro-orchestrator", "gemini-flash-worker-agy"],
+                1_000_000,
+                0,
+                0,
+                0,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_models_dev_json_blocks_reseller_punctuation_collisions() {
+        let sample_api = r#"{
+          "google": {
+            "models": {
+              "gemini-3.8-flash": { "cost": { "input": 0.75, "output": 3.0 } }
+            }
+          },
+          "frogbot": {
+            "models": {
+              "gemini-3-8-flash": { "cost": { "input": 1.50, "output": 6.0 } }
+            }
+          },
+          "anthropic": {
+            "models": {
+              "claude-opus-5-5": { "cost": { "input": 4.00, "output": 20.0 } }
+            }
+          },
+          "aigrow": {
+            "models": {
+              "claude-opus-5.5": { "cost": { "input": 1.60, "output": 8.0 } },
+              "reseller-only-model": { "cost": { "input": 0.50, "output": 1.0 } }
+            }
+          }
+        }"#;
+
+        let parsed = parse_models_dev_json(sample_api).unwrap();
+        assert!(parsed.contains_key("gemini-3.8-flash"));
+        assert!(!parsed.contains_key("gemini-3-8-flash"));
+        assert!(parsed.contains_key("claude-opus-5-5"));
+        assert!(!parsed.contains_key("claude-opus-5.5"));
+        assert!(parsed.contains_key("reseller-only-model"));
+
+        let catalog = PricingCatalog::from_models(parsed);
+        let (flash_key, flash_usd) = catalog
+            .estimate_cost(&["gemini-3.8-flash-tiered"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(flash_key, "gemini-3.8-flash");
+        assert!((flash_usd - 0.75).abs() < 1e-6);
+
+        let (opus_key, opus_usd) = catalog
+            .estimate_cost(&["Claude Opus 5.5"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(opus_key, "claude-opus-5-5");
+        assert!((opus_usd - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn substring_fallback_ranks_raw_match_above_normalized_match() {
+        let mut models = BTreeMap::new();
+        models.insert(
+            "gemini-3-8-flash".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 1.50,
+                output_per_mtok: 6.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "gemini-3.8-flash".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 0.75,
+                output_per_mtok: 3.0,
+                ..Default::default()
+            },
+        );
+        let catalog = PricingCatalog::from_models(models);
+
+        let (dot_key, dot_usd) = catalog
+            .estimate_cost(&["gemini-3.8-flash-tiered"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(dot_key, "gemini-3.8-flash");
+        assert!((dot_usd - 0.75).abs() < 1e-6);
+
+        let (dash_key, dash_usd) = catalog
+            .estimate_cost(&["gemini-3-8-flash-tiered"], 1_000_000, 0, 0, 0)
+            .unwrap();
+        assert_eq!(dash_key, "gemini-3-8-flash");
+        assert!((dash_usd - 1.50).abs() < 1e-6);
+    }
+
+    #[test]
+    fn context_tiered_pricing_applies_cost_tiers_and_over_200k_fallback() {
+        let sample_api = r#"{
+          "openai": {
+            "models": {
+              "gpt-5.4": {
+                "cost": {
+                  "input": 2.5,
+                  "output": 15.0,
+                  "cache_read": 0.25,
+                  "cache_write": 3.0,
+                  "tiers": [
+                    { "type": "batch", "size": 1000, "input": 99.0 },
+                    { "type": "context", "size": 272000, "input": 5.0, "output": 22.5, "cache_read": 0.5 }
+                  ]
+                }
+              }
+            }
+          },
+          "anthropic": {
+            "models": {
+              "claude-haiku-next": {
+                "cost": {
+                  "input": 1.0,
+                  "output": 5.0,
+                  "cache_read": 0.1,
+                  "cache_write": 1.25,
+                  "tiers": [
+                    { "type": "context", "size": 200000, "input": 3.0, "output": 15.0 },
+                    { "type": "context", "size": 100000, "input": 2.0, "output": 10.0 }
+                  ],
+                  "context_over_200k": { "input": 99.0, "output": 99.0 }
+                }
+              },
+              "claude-sonnet-legacy": {
+                "cost": {
+                  "input": 3.0,
+                  "output": 15.0,
+                  "cache_read": 0.3,
+                  "cache_write": 3.75,
+                  "context_over_200k": { "input": 6.0, "output": 22.5, "cache_read": 0.6 }
+                }
+              }
+            }
+          }
+        }"#;
+
+        let catalog = PricingCatalog::from_models(parse_models_dev_json(sample_api).unwrap());
+
+        // OpenAI 272K context tier: <= 272_000 uses base rate, > 272_000 uses tier rate (inheriting cache_write).
+        let (_, openai_at_threshold) = catalog
+            .estimate_cost(&["gpt-5.4"], 172_000, 100_000, 0, 100_000)
+            .unwrap();
+        assert!((openai_at_threshold - 1.955).abs() < 1e-6);
+
+        let (_, openai_above_threshold) = catalog
+            .estimate_cost(&["gpt-5.4"], 172_001, 100_000, 0, 100_000)
+            .unwrap();
+        assert!((openai_above_threshold - 3.160005).abs() < 1e-6);
+
+        let (_, openai_inherited_cache_write) = catalog
+            .estimate_cost(&["gpt-5.4"], 200_000, 0, 100_000, 0)
+            .unwrap();
+        assert!((openai_inherited_cache_write - 1.3).abs() < 1e-6);
+
+        // Multi-tier 100K/200K model (`tiers` takes precedence over `context_over_200k`).
+        let (_, haiku_at_100k) = catalog
+            .estimate_cost(&["claude-haiku-next"], 100_000, 0, 0, 0)
+            .unwrap();
+        assert!((haiku_at_100k - 0.1).abs() < 1e-6);
+
+        let (_, haiku_above_100k) = catalog
+            .estimate_cost(&["claude-haiku-next"], 100_001, 0, 0, 0)
+            .unwrap();
+        assert!((haiku_above_100k - 0.200002).abs() < 1e-6);
+
+        let (_, haiku_at_200k) = catalog
+            .estimate_cost(&["claude-haiku-next"], 200_000, 0, 0, 0)
+            .unwrap();
+        assert!((haiku_at_200k - 0.4).abs() < 1e-6);
+
+        let (_, haiku_above_200k) = catalog
+            .estimate_cost(&["claude-haiku-next"], 200_001, 0, 0, 0)
+            .unwrap();
+        assert!((haiku_above_200k - 0.600003).abs() < 1e-6);
+
+        // Legacy `context_over_200k` fallback when `tiers` is absent.
+        let (_, legacy_at_200k) = catalog
+            .estimate_cost(&["claude-sonnet-legacy"], 100_000, 50_000, 50_000, 0)
+            .unwrap();
+        assert!((legacy_at_200k - 0.5025).abs() < 1e-6);
+
+        let (_, legacy_above_200k) = catalog
+            .estimate_cost(&["claude-sonnet-legacy"], 100_001, 50_000, 50_000, 0)
+            .unwrap();
+        assert!((legacy_above_200k - 0.817506).abs() < 1e-6);
     }
 }

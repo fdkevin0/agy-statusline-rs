@@ -590,7 +590,7 @@ pub fn process_statusline<W: Write>(
         && payload.cost.as_ref().and_then(|c| c.total_usd).is_none();
     let mut coverage = CostCoverage::Session;
     if needs_cost {
-        let mut estimate_with = |pricing: &PricingCatalog| {
+        let mut estimate_with = |pricing: &PricingCatalog| -> (Option<f64>, Option<f64>) {
             if let Some(cost) = payload.conversation_id.as_deref().and_then(|cid| {
                 runtime
                     .agy_cli_dir
@@ -599,14 +599,18 @@ pub fn process_statusline<W: Write>(
                 if cost.unpriced_turns > 0 {
                     coverage = CostCoverage::Partial(cost.unpriced_turns);
                 }
-                return cost.usd;
+                return (cost.usd, cost.subagent_usd);
             }
-            let (usd, source) = estimate_payload_cost_usd(&payload, pricing)?;
-            coverage = source;
-            Some(usd)
+            match estimate_payload_cost_usd(&payload, pricing) {
+                Some((usd, source)) => {
+                    coverage = source;
+                    (Some(usd), None)
+                }
+                None => (None, None),
+            }
         };
-        meta.estimated_cost_usd = match runtime.pricing {
-            PricingSource::Disabled => None,
+        (meta.estimated_cost_usd, meta.estimated_subagent_cost_usd) = match runtime.pricing {
+            PricingSource::Disabled => (None, None),
             PricingSource::Catalog(pricing) => estimate_with(pricing),
             PricingSource::Effective(mode) => {
                 let pricing = PricingCatalog::load_effective(mode, runtime.now_unix_secs);
