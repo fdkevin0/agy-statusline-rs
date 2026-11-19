@@ -31,13 +31,23 @@ pub struct ModelInfo {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct VcsInfo {
-    /// VCS type (`"git"`).
+    /// VCS type (`"git"`, `"hg"`, `"citc"`, etc.).
     #[serde(rename = "type")]
     pub vcs_type: Option<String>,
     /// Active branch name.
     pub branch: Option<String>,
+    /// VCS client / workspace name (used by non-Git VCS such as CitC or Perforce).
+    pub client: Option<String>,
     /// Whether the working tree has uncommitted changes.
     pub dirty: Option<bool>,
+}
+
+/// Active agent metadata.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AgentInfo {
+    /// Active agent name.
+    pub name: Option<String>,
 }
 
 /// Sandbox mode status.
@@ -144,14 +154,28 @@ pub struct QuotaBucket {
 pub struct StatuslinePayload {
     /// Agent execution state (`idle`, `thinking`, `working`, `tool_use`, `reviewing`, etc.).
     pub agent_state: Option<String>,
+    /// Active session identifier.
+    pub session_id: Option<String>,
     /// Active conversation UUID.
     pub conversation_id: Option<String>,
+    /// Human-readable title for the active conversation.
+    pub conversation_title: Option<String>,
+    /// Filesystem path to the active conversation transcript (`transcript.jsonl`).
+    pub transcript_path: Option<String>,
+    /// AGY CLI version string (`"1.5.11"`).
+    pub version: Option<String>,
+    /// Product name string (e.g. `"Antigravity"`).
+    pub product: Option<String>,
     /// Top-level current working directory fallback.
     pub cwd: Option<String>,
     /// Active agent cycle mode (`plan`, `auto`, `edit`, etc.).
     pub cycle_mode: Option<String>,
     /// Active account plan tier (`Pro`, `Ultra`, etc.).
     pub plan_tier: Option<String>,
+    /// Authenticated user email address.
+    pub email: Option<String>,
+    /// Active agent metadata.
+    pub agent: Option<AgentInfo>,
     /// Whether context exceeds 200K tokens.
     pub exceeds_200k_tokens: Option<bool>,
     /// Terminal column width.
@@ -192,18 +216,41 @@ impl StatuslinePayload {
     /// For objects containing a string `"status"` field, counts only entries where
     /// `status != "completed"`; entries lacking `"status"` fall back to direct counting.
     pub fn subagent_count(&self) -> usize {
-        match &self.subagents {
-            Some(Value::Array(items)) => items
-                .iter()
-                .filter(|item| {
-                    item.as_object()
-                        .and_then(|obj| obj.get("status"))
-                        .and_then(Value::as_str)
-                        .is_none_or(|status| !status.eq_ignore_ascii_case("completed"))
-                })
-                .count(),
-            _ => 0,
+        self.active_subagents().count()
+    }
+
+    /// Returns the role or name of the sole active subagent when `subagent_count() == 1`.
+    pub fn single_active_subagent_label(&self) -> Option<&str> {
+        let mut iter = self.active_subagents();
+        let first = iter.next()?;
+        if iter.next().is_some() {
+            return None;
         }
+        let obj = first.as_object()?;
+        obj.get("role")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                obj.get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+    }
+
+    fn active_subagents(&self) -> impl Iterator<Item = &Value> {
+        self.subagents
+            .as_ref()
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                item.as_object()
+                    .and_then(|obj| obj.get("status"))
+                    .and_then(Value::as_str)
+                    .is_none_or(|status| !status.eq_ignore_ascii_case("completed"))
+            })
     }
 
     /// Returns the raw workspace directory path preferring `workspace.current_dir`,
@@ -297,12 +344,11 @@ fn probe_session_and_git(
         .iter()
         .flatten()
         .any(|w| matches!(w, WidgetId::Worktree));
-    let payload_has_branch = payload
-        .vcs
-        .as_ref()
-        .and_then(|v| v.branch.as_deref())
-        .is_some_and(|b| !b.trim().is_empty());
-    let needs_git = has_wt || (has_vcs && (cfg.show_git_diff || !payload_has_branch));
+    let payload_has_vcs_ref = payload.vcs.as_ref().is_some_and(|v| {
+        v.branch.as_deref().is_some_and(|b| !b.trim().is_empty())
+            || v.client.as_deref().is_some_and(|c| !c.trim().is_empty())
+    });
+    let needs_git = has_wt || (has_vcs && (cfg.show_git_diff || !payload_has_vcs_ref));
     let git_info = if needs_git {
         payload
             .workspace_path()

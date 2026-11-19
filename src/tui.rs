@@ -28,8 +28,8 @@ use crate::git::GitInfo;
 use crate::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
 use crate::render::write_statusline;
 use crate::statusline::{
-    ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, SandboxInfo, StatuslinePayload,
-    VcsInfo, VimInfo, WorkspaceInfo,
+    AgentInfo, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, SandboxInfo,
+    StatuslinePayload, VcsInfo, VimInfo, WorkspaceInfo,
 };
 
 struct TerminalGuard;
@@ -145,8 +145,17 @@ pub fn sample_preview_payload(width: usize) -> StatuslinePayload {
     );
     StatuslinePayload {
         agent_state: Some("thinking".to_string()),
+        session_id: Some("8d0371e1-5a05-423b-a8bc-ed75995f9a8b".to_string()),
+        conversation_title: Some("Add AGY payload widgets".to_string()),
+        transcript_path: Some("/tmp/agy/logs/transcript.jsonl".to_string()),
+        version: Some("1.5.11".to_string()),
+        product: Some("Antigravity".to_string()),
         cycle_mode: Some("plan".to_string()),
         plan_tier: Some("Pro".to_string()),
+        email: Some("dev@example.com".to_string()),
+        agent: Some(AgentInfo {
+            name: Some("researcher".to_string()),
+        }),
         model: Some(ModelInfo {
             id: None,
             display_name: Some("Gemini 4".to_string()),
@@ -159,6 +168,7 @@ pub fn sample_preview_payload(width: usize) -> StatuslinePayload {
         vcs: Some(VcsInfo {
             vcs_type: Some("git".to_string()),
             branch: Some("main".to_string()),
+            client: None,
             dirty: Some(true),
         }),
         sandbox: Some(SandboxInfo {

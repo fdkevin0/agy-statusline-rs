@@ -1,6 +1,7 @@
 //! Multi-style, theme-aware statusline renderer (`Plain`, `Pill`, `Powerline`).
 
 use std::io::{self, Write as IoWrite};
+use std::path::Path;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -369,17 +370,41 @@ fn render_widget(
         WidgetId::Vcs => {
             let vcs = payload.vcs.as_ref();
             let branch = vcs
-                .and_then(|v| v.branch.as_deref())
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .or_else(|| ctx.git.branch.as_deref().filter(|b| !b.is_empty()))?;
+                .and_then(|v| {
+                    v.branch
+                        .as_deref()
+                        .map(collapse_whitespace)
+                        .filter(|b| !b.is_empty())
+                        .or_else(|| {
+                            v.client
+                                .as_deref()
+                                .map(collapse_whitespace)
+                                .filter(|c| !c.is_empty())
+                        })
+                })
+                .or_else(|| {
+                    ctx.git
+                        .branch
+                        .as_deref()
+                        .map(collapse_whitespace)
+                        .filter(|b| !b.is_empty())
+                })?;
             let dirty = vcs.and_then(|v| v.dirty).unwrap_or(false)
                 || ctx.git.added > 0
                 || ctx.git.deleted > 0;
-            let mut text = if dirty {
-                format!("{} {branch}*", glyphs.branch)
+            let prefix = if cfg.glyph_mode == GlyphMode::Ascii {
+                vcs.and_then(|v| v.vcs_type.as_deref())
+                    .map(collapse_whitespace)
+                    .filter(|t| !t.is_empty())
+                    .map(|t| format!("{t}:"))
+                    .unwrap_or_else(|| glyphs.branch.to_string())
             } else {
-                format!("{} {branch}", glyphs.branch)
+                glyphs.branch.to_string()
+            };
+            let mut text = if dirty {
+                format!("{prefix} {branch}*")
+            } else {
+                format!("{prefix} {branch}")
             };
             if cfg.show_git_diff && (ctx.git.added > 0 || ctx.git.deleted > 0) {
                 text.push_str(&format!(" +{} -{}", ctx.git.added, ctx.git.deleted));
@@ -584,7 +609,15 @@ fn render_widget(
             if cfg.smart_hide && n == 0 {
                 return None;
             }
-            Some(Segment::plain(widget, format!("sub {n}"), pal.muted, false))
+            let text = match payload.single_active_subagent_label() {
+                Some(label) => {
+                    let clean = collapse_whitespace(label);
+                    let short = truncate_to_width(&clean, 20, glyphs.ellipsis);
+                    format!("sub {n} ({short})")
+                }
+                None => format!("sub {n}"),
+            };
+            Some(Segment::plain(widget, text, pal.muted, false))
         }
         WidgetId::Tasks => {
             let n = payload.task_count.unwrap_or(0);
@@ -689,7 +722,108 @@ fn render_widget(
                 on,
             ))
         }
+        WidgetId::Version => {
+            let ver = payload
+                .version
+                .as_deref()
+                .map(collapse_whitespace)
+                .filter(|s| !s.is_empty())?;
+            let text = if ver.starts_with('v') || ver.starts_with('V') {
+                ver
+            } else {
+                format!("v{ver}")
+            };
+            Some(Segment::plain(widget, text, pal.muted, false))
+        }
+        WidgetId::Plan => {
+            let tier = payload
+                .plan_tier
+                .as_deref()
+                .map(collapse_whitespace)
+                .filter(|s| !s.is_empty())?;
+            Some(Segment::plain(widget, tier, pal.model, true))
+        }
+        WidgetId::Account => {
+            let email = payload
+                .email
+                .as_deref()
+                .map(collapse_whitespace)
+                .filter(|s| !s.is_empty())?;
+            Some(Segment::plain(widget, email, pal.muted, false))
+        }
+        WidgetId::Title => {
+            let raw = payload
+                .conversation_title
+                .as_deref()
+                .map(collapse_whitespace)
+                .filter(|s| !s.is_empty())?;
+            let text = truncate_to_width(&raw, 32, glyphs.ellipsis);
+            Some(Segment::plain(widget, text, pal.dir, false))
+        }
+        WidgetId::Agent => {
+            let name = payload
+                .agent
+                .as_ref()
+                .and_then(|a| a.name.as_deref())
+                .map(collapse_whitespace)
+                .filter(|s| !s.is_empty())?;
+            Some(Segment::plain(
+                widget,
+                format!("agent {name}"),
+                pal.tool,
+                true,
+            ))
+        }
+        WidgetId::Product => {
+            let prod = payload
+                .product
+                .as_deref()
+                .map(collapse_whitespace)
+                .filter(|s| !s.is_empty())?;
+            Some(Segment::plain(widget, prod, pal.muted, false))
+        }
+        WidgetId::Session => {
+            let sid = payload
+                .session_id
+                .as_deref()
+                .map(collapse_whitespace)
+                .filter(|s| !s.is_empty())?;
+            let short: String = sid.chars().take(8).collect();
+            Some(Segment::plain(
+                widget,
+                format!("sid:{short}"),
+                pal.muted,
+                false,
+            ))
+        }
+        WidgetId::Transcript => {
+            let raw = payload
+                .transcript_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?;
+            let name = collapse_whitespace(
+                Path::new(raw)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(raw),
+            );
+            if name.is_empty() {
+                return None;
+            }
+            Some(Segment::plain(
+                widget,
+                format!("log:{name}"),
+                pal.muted,
+                false,
+            ))
+        }
     }
+}
+
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn slice_visible_width(segments: &[Segment], geom: StyleGeometry) -> usize {
@@ -905,6 +1039,34 @@ fn fit_row_groups(
     compact_matching_segments(&mut groups, |w| w == WidgetId::Model, |seg| {
         if seg.text.width() > 20 {
             seg.text = truncate_to_width(&seg.text, 20, ellipsis);
+        }
+    });
+    if groups_visible_width(&groups, geom) <= limit {
+        return groups;
+    }
+
+    // Stage 4b: Compact auxiliary text widgets (Subagents label, Account domain, Title width).
+    compact_matching_segments(&mut groups, |w| w == WidgetId::Subagents, |seg| {
+        if let Some((head, _)) = seg.text.split_once(" (") {
+            seg.text = head.to_string();
+        }
+    });
+    if groups_visible_width(&groups, geom) <= limit {
+        return groups;
+    }
+    compact_matching_segments(&mut groups, |w| w == WidgetId::Account, |seg| {
+        if let Some((local, _)) = seg.text.split_once('@') {
+            if !local.is_empty() {
+                seg.text = local.to_string();
+            }
+        }
+    });
+    if groups_visible_width(&groups, geom) <= limit {
+        return groups;
+    }
+    compact_matching_segments(&mut groups, |w| w == WidgetId::Title, |seg| {
+        if seg.text.width() > 16 {
+            seg.text = truncate_to_width(&seg.text, 16, ellipsis);
         }
     });
     if groups_visible_width(&groups, geom) <= limit {
@@ -1196,6 +1358,7 @@ mod tests {
             vcs: Some(VcsInfo {
                 vcs_type: None,
                 branch: Some("main".to_string()),
+                client: None,
                 dirty: Some(true),
             }),
             context_window: Some(ContextWindow {
