@@ -18,6 +18,9 @@ cargo test --locked --all-targets
 cargo test --locked --doc
 ```
 
+On Linux, the TUI integration test uses `script` (util-linux) and `stty`
+(coreutils) to run the editor in a pseudoterminal.
+
 Add regression tests for behavior changes and update relevant documentation.
 Keep code, comments, commit messages, documentation, issues, and pull requests
 in English. Never include credentials, tokens, conversation database contents,

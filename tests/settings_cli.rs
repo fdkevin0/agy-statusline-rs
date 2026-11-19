@@ -64,9 +64,10 @@ fn tier2_apply_preserves_path_and_explicit_relative_launchers() {
     use std::os::unix::process::CommandExt;
 
     let root = tempfile::tempdir().unwrap();
-    fs::create_dir(root.path().join("bin")).unwrap();
-    let path_launcher = root.path().join("bin/agy-statusline");
-    let relative_launcher = root.path().join("bin/statusline");
+    let bin = root.path().canonicalize().unwrap().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let path_launcher = bin.join("agy-statusline");
+    let relative_launcher = bin.join("statusline");
     symlink(BIN, &path_launcher).unwrap();
     symlink(BIN, &relative_launcher).unwrap();
     let settings = root.path().join("agy/settings.json");
@@ -95,6 +96,48 @@ fn tier2_apply_preserves_path_and_explicit_relative_launchers() {
     assert_eq!(
         read()["statusLine"]["command"],
         relative_launcher.to_str().unwrap()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tier2_tui_save_preserves_launcher_across_upgrade() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::symlink;
+    use std::process::Stdio;
+
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().canonicalize().unwrap();
+    let old = dir.join("v1");
+    let launcher = dir.join("launcher");
+    fs::copy(BIN, &old).unwrap();
+    symlink(&old, &launcher).unwrap();
+
+    let mut tui = isolated_command("script", &dir)
+        .env("SHELL", "/bin/sh")
+        .args([
+            "-qec",
+            "stty rows 24 cols 100 && exec ./launcher config",
+            "/dev/null",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The first terminal write signals that the editor has entered raw mode.
+    tui.stdout.as_mut().unwrap().read_exact(&mut [0]).unwrap();
+    let next = dir.join("next");
+    symlink(BIN, &next).unwrap();
+    fs::rename(next, &launcher).unwrap();
+    fs::remove_file(old).unwrap();
+    tui.stdin.as_mut().unwrap().write_all(b"s").unwrap();
+    let output = tui.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let settings: Value =
+        serde_json::from_slice(&fs::read(dir.join("agy/settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        settings["statusLine"]["command"],
+        launcher.to_str().unwrap()
     );
 }
 
