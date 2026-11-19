@@ -277,10 +277,16 @@ impl StatuslinePayload {
             .and_then(|ws| {
                 ws.project_dir
                     .as_deref()
+                    .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .or_else(|| ws.current_dir.as_deref().filter(|s| !s.is_empty()))
+                    .or_else(|| {
+                        ws.current_dir
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    })
             })
-            .or_else(|| self.cwd.as_deref().filter(|s| !s.is_empty()))?;
+            .or_else(|| self.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()))?;
         Path::new(raw)
             .file_name()
             .and_then(|n| n.to_str())
@@ -349,7 +355,14 @@ fn probe_session_and_git(
         v.branch.as_deref().is_some_and(|b| !b.trim().is_empty())
             || v.client.as_deref().is_some_and(|c| !c.trim().is_empty())
     });
-    let needs_git = has_wt || (has_vcs && (cfg.show_git_diff || !payload_has_vcs_ref));
+    let explicit_non_git_vcs = payload
+        .vcs
+        .as_ref()
+        .and_then(|v| v.vcs_type.as_deref())
+        .map(str::trim)
+        .is_some_and(|t| !t.is_empty() && !t.eq_ignore_ascii_case("git"));
+    let needs_git = !explicit_non_git_vcs
+        && (has_wt || (has_vcs && (cfg.show_git_diff || !payload_has_vcs_ref)));
     let git_info = if needs_git {
         payload
             .workspace_path()
@@ -563,5 +576,88 @@ mod tests {
         let legacy: StatuslinePayload =
             serde_json::from_str(r#"{"subagents":[1,2,3]}"#).unwrap();
         assert_eq!(legacy.subagent_count(), 3);
+    }
+
+    #[test]
+    fn skips_git_probe_for_explicit_non_git_vcs() {
+        use std::cell::Cell;
+
+        struct CountingGit<'a>(&'a Cell<usize>);
+        impl GitProbe for CountingGit<'_> {
+            fn probe(&self, _dir: &Path, _include_diff: bool) -> GitInfo {
+                self.0.set(self.0.get() + 1);
+                GitInfo {
+                    branch: Some("unexpected-git".to_string()),
+                    ..Default::default()
+                }
+            }
+        }
+
+        let calls = Cell::new(0usize);
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = crate::layout::ThemeStyle::Mono;
+        cfg.show_git_diff = true;
+        cfg.rows = vec![vec![WidgetId::Vcs, WidgetId::Worktree]];
+
+        let hg_json = r#"{
+            "cwd": "/tmp/hg-repo",
+            "vcs": {"type": "hg", "branch": "default"}
+        }"#;
+        let mut out = Vec::new();
+        process_statusline_with_probes(hg_json, &StubReader(None), &CountingGit(&calls), &cfg, &mut out)
+            .unwrap();
+        assert_eq!(calls.get(), 0);
+
+        let citc_json = r#"{
+            "cwd": "/tmp/citc-ws",
+            "vcs": {"type": "citc", "client": "my-client"}
+        }"#;
+        out.clear();
+        process_statusline_with_probes(
+            citc_json,
+            &StubReader(None),
+            &CountingGit(&calls),
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 0);
+
+        // Explicit "git" still probes.
+        let git_json = r#"{
+            "cwd": "/tmp/git-repo",
+            "vcs": {"type": "git"}
+        }"#;
+        out.clear();
+        process_statusline_with_probes(git_json, &StubReader(None), &CountingGit(&calls), &cfg, &mut out)
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn workspace_basename_trims_whitespace_only_candidates() {
+        let p1: StatuslinePayload = serde_json::from_str(
+            r#"{
+                "workspace": {"project_dir": "   ", "current_dir": " /tmp/active-dir "},
+                "cwd": "/tmp/fallback-cwd"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(p1.workspace_basename(), Some("active-dir"));
+
+        let p2: StatuslinePayload = serde_json::from_str(
+            r#"{
+                "workspace": {"project_dir": "\t ", "current_dir": "   "},
+                "cwd": " /tmp/fallback-cwd "
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(p2.workspace_basename(), Some("fallback-cwd"));
+
+        let p3: StatuslinePayload = serde_json::from_str(
+            r#"{"workspace": {"project_dir": "  "}, "cwd": "  "}"#,
+        )
+        .unwrap();
+        assert_eq!(p3.workspace_basename(), None);
     }
 }

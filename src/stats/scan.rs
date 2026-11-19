@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::pricing::{round_usd_6, PricingCatalog};
 use super::tz::TimeZoneSpec;
 use super::SqliteStats;
-use crate::db::{compute_median, is_valid_uuid, open_readonly_db};
+use crate::db::{compute_median, is_valid_uuid, open_readonly_db, resolve_conversation_db_path};
 use crate::protobuf::{
     extract_gen_metadata_record, extract_step_created_at_secs, MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
     MIN_TURN_DECODE_SECS,
@@ -809,12 +809,7 @@ pub fn estimate_conversation_cost_usd(
     conversation_id: &str,
     pricing: &PricingCatalog,
 ) -> Option<f64> {
-    if !is_valid_uuid(conversation_id) {
-        return None;
-    }
-    let db_path = cli_dir
-        .join("conversations")
-        .join(format!("{}.db", conversation_id.to_ascii_lowercase()));
+    let db_path = resolve_conversation_db_path(cli_dir, conversation_id)?;
     let conn = open_readonly_db(&db_path).ok()?;
     let mut stmt = conn
         .prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL")

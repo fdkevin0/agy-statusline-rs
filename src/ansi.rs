@@ -105,15 +105,23 @@ pub fn ansi_to_ratatui_lines(input: &str) -> Vec<Line<'static>> {
                         ));
                     }
                     let seq_start = pos + rel_esc + 2;
-                    if let Some(rel_end) = line[seq_start..].find(|c: char| c.is_ascii_alphabetic())
-                    {
-                        let cmd = line.as_bytes()[seq_start + rel_end];
-                        if cmd == b'm' {
-                            apply_sgr(&mut style, &line[seq_start..seq_start + rel_end]);
+                    let mut i = seq_start;
+                    while i < bytes.len() && (0x30..=0x3F).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    let params_end = i;
+                    while i < bytes.len() && (0x20..=0x2F).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    let has_intermediates = i > params_end;
+                    if i < bytes.len() && (0x40..=0x7E).contains(&bytes[i]) {
+                        if bytes[i] == b'm' && !has_intermediates {
+                            apply_sgr(&mut style, &line[seq_start..params_end]);
                         }
-                        pos = seq_start + rel_end + 1;
+                        pos = i + 1;
                     } else {
-                        break;
+                        // Malformed or truncated CSI: abort without swallowing subsequent text.
+                        pos = i;
                     }
                 } else {
                     spans.push(Span::styled(line[pos..].to_string(), style));
@@ -158,5 +166,42 @@ mod tests {
         assert_eq!(lines[0].spans[0].content, "Hi");
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::Rgb(12, 34, 56)));
         assert_eq!(lines[0].spans[0].style.bg, Some(Color::Rgb(200, 150, 100)));
+    }
+
+    #[test]
+    fn skips_non_sgr_csi_sequences_cleanly() {
+        let raw = "\x1b[2K\x1b[32mok\x1b[2 q\x1b[0m done";
+        let lines = ansi_to_ratatui_lines(raw);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans.len(), 2);
+        assert_eq!(lines[0].spans[0].content, "ok");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Green));
+        assert_eq!(lines[0].spans[1].content, " done");
+        assert_eq!(lines[0].spans[1].style.fg, None);
+    }
+
+    #[test]
+    fn aborts_malformed_or_truncated_csi_without_swallowing_text() {
+        let lines = ansi_to_ratatui_lines("pre\x1b[31\x1b[32mok\x1b[0m");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans.len(), 2);
+        assert_eq!(lines[0].spans[0].content, "pre");
+        assert_eq!(lines[0].spans[1].content, "ok");
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Green));
+
+        let lines_utf8 = ansi_to_ratatui_lines("\x1b[31● hello");
+        assert_eq!(lines_utf8.len(), 1);
+        assert_eq!(lines_utf8[0].spans.len(), 1);
+        assert_eq!(lines_utf8[0].spans[0].content, "● hello");
+
+        let lines_tab = ansi_to_ratatui_lines("\x1b[31\thello");
+        assert_eq!(lines_tab.len(), 1);
+        assert_eq!(lines_tab[0].spans.len(), 1);
+        assert_eq!(lines_tab[0].spans[0].content, "\thello");
+
+        let lines_trunc = ansi_to_ratatui_lines("hi\x1b[31");
+        assert_eq!(lines_trunc.len(), 1);
+        assert_eq!(lines_trunc[0].spans.len(), 1);
+        assert_eq!(lines_trunc[0].spans[0].content, "hi");
     }
 }

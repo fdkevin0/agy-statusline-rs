@@ -15,6 +15,9 @@ use crate::fsutil::atomic_write;
 /// Maximum number of configurable statusline rows.
 pub const MAX_ROWS: usize = 3;
 
+/// Default speed threshold (tokens/s) below which speed highlights in warning amber.
+pub const DEFAULT_SPEED_WARN_THRESHOLD: f64 = 50.0;
+
 /// All 33 statusline widgets available for placement on any row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -523,7 +526,7 @@ impl LayoutConfig {
             glyph_mode: GlyphMode::Unicode,
             responsive: true,
             bar_length: 12,
-            speed_warn_threshold: 50.0,
+            speed_warn_threshold: DEFAULT_SPEED_WARN_THRESHOLD,
             stack_with_default: false,
             speed_mode: SpeedMode::Weighted,
             ctx_remaining: false,
@@ -603,13 +606,17 @@ impl LayoutConfig {
         cfg
     }
 
-    /// Ensures `rows` always has exactly [`MAX_ROWS`] slots and `bar_length` is clamped.
+    /// Ensures `rows` always has exactly [`MAX_ROWS`] slots, `bar_length` is clamped,
+    /// and `speed_warn_threshold` is finite and non-negative.
     pub fn normalize_rows(&mut self) {
         while self.rows.len() < MAX_ROWS {
             self.rows.push(Vec::new());
         }
         self.rows.truncate(MAX_ROWS);
         self.bar_length = self.bar_length.clamp(4, 40);
+        if !self.speed_warn_threshold.is_finite() || self.speed_warn_threshold < 0.0 {
+            self.speed_warn_threshold = DEFAULT_SPEED_WARN_THRESHOLD;
+        }
     }
 
     /// Finds which row (`0..3`) currently hosts `widget`, if any.
@@ -716,5 +723,33 @@ mod tests {
         assert_eq!(json, "\"median\"");
         let parsed: SpeedMode = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, SpeedMode::Median);
+    }
+
+    #[test]
+    fn normalize_rows_resets_invalid_speed_warn_threshold() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.speed_warn_threshold = f64::NAN;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, DEFAULT_SPEED_WARN_THRESHOLD);
+
+        cfg.speed_warn_threshold = f64::INFINITY;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, DEFAULT_SPEED_WARN_THRESHOLD);
+
+        cfg.speed_warn_threshold = f64::NEG_INFINITY;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, DEFAULT_SPEED_WARN_THRESHOLD);
+
+        cfg.speed_warn_threshold = -1.0;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, DEFAULT_SPEED_WARN_THRESHOLD);
+
+        cfg.speed_warn_threshold = 0.0;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, 0.0);
+
+        cfg.speed_warn_threshold = 35.5;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, 35.5);
     }
 }

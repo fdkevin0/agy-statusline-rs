@@ -55,21 +55,21 @@ proptest! {
     }
 
     #[test]
-    fn prop_format_tokens_k_range_has_k_suffix(value in 1000u64..1_000_000) {
+    fn prop_format_tokens_k_range_has_k_suffix(value in 1000u64..999_500) {
         let mut buf = String::new();
         format_tokens(value, &mut buf);
         prop_assert!(buf.ends_with('K'));
     }
 
     #[test]
-    fn prop_format_tokens_m_range_has_m_suffix(value in 1_000_000u64..1_000_000_000) {
+    fn prop_format_tokens_m_range_has_m_suffix(value in 999_500u64..999_500_000) {
         let mut buf = String::new();
         format_tokens(value, &mut buf);
         prop_assert!(buf.ends_with('M'));
     }
 
     #[test]
-    fn prop_format_tokens_b_range_has_b_suffix(value in 1_000_000_000u64..100_000_000_000) {
+    fn prop_format_tokens_b_range_has_b_suffix(value in 999_500_000u64..100_000_000_000) {
         let mut buf = String::new();
         format_tokens(value, &mut buf);
         prop_assert!(buf.ends_with('B'));

@@ -32,10 +32,95 @@
 /// A decoded Protobuf wire field value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldValue<'a> {
-    /// Varint (wire type 0) or little-endian fixed-width value (wire types 1 and 5).
-    Number(u64),
+    /// Base-128 varint (wire type 0).
+    Varint(u64),
+    /// 32-bit little-endian fixed-width value (wire type 5).
+    Fixed32(u32),
+    /// 64-bit little-endian fixed-width value (wire type 1).
+    Fixed64(u64),
     /// Length-delimited byte slice (wire type 2).
     Bytes(&'a [u8]),
+}
+
+impl FieldValue<'_> {
+    /// Returns the numeric payload as `u64` for `Varint`, `Fixed32`, and `Fixed64` variants.
+    pub const fn as_u64(self) -> Option<u64> {
+        match self {
+            Self::Varint(v) | Self::Fixed64(v) => Some(v),
+            Self::Fixed32(v) => Some(v as u64),
+            Self::Bytes(_) => None,
+        }
+    }
+}
+
+/// Zero-copy iterator over `(field_num, FieldValue)` pairs in a Protobuf wire buffer.
+///
+/// Yields `Err(())` once and terminates if the wire stream is malformed or truncated.
+#[derive(Debug, Clone)]
+pub struct WireIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> WireIter<'a> {
+    /// Creates a new wire-format iterator over `data`.
+    pub const fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn decode_next(&mut self) -> Result<(u32, FieldValue<'a>), ()> {
+        let key = decode_varint(self.data, &mut self.pos).ok_or(())?;
+        let field_id = key >> 3;
+        if field_id == 0 || field_id > u64::from(u32::MAX) {
+            return Err(());
+        }
+        let field_num = field_id as u32;
+        let value = match key & 7 {
+            0 => FieldValue::Varint(decode_varint(self.data, &mut self.pos).ok_or(())?),
+            1 => {
+                let slice = self.data.get(self.pos..self.pos + 8).ok_or(())?;
+                self.pos += 8;
+                let bits = u64::from_le_bytes([
+                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+                ]);
+                FieldValue::Fixed64(bits)
+            }
+            2 => {
+                let size_u64 = decode_varint(self.data, &mut self.pos).ok_or(())?;
+                let remaining = self.data.len() - self.pos;
+                if size_u64 > remaining as u64 {
+                    return Err(());
+                }
+                let size = size_u64 as usize;
+                let slice = &self.data[self.pos..self.pos + size];
+                self.pos += size;
+                FieldValue::Bytes(slice)
+            }
+            5 => {
+                let slice = self.data.get(self.pos..self.pos + 4).ok_or(())?;
+                self.pos += 4;
+                let bits = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
+                FieldValue::Fixed32(bits)
+            }
+            _ => return Err(()),
+        };
+        Ok((field_num, value))
+    }
+}
+
+impl<'a> Iterator for WireIter<'a> {
+    type Item = Result<(u32, FieldValue<'a>), ()>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.data.len() {
+            return None;
+        }
+        let item = self.decode_next();
+        if item.is_err() {
+            self.pos = self.data.len();
+        }
+        Some(item)
+    }
 }
 
 /// Decodes a base-128 varint starting at `*pos`, advancing `*pos` past it.
@@ -83,48 +168,14 @@ pub fn decode_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
 /// use agy_statusline::protobuf::{find_field, FieldValue};
 ///
 /// let msg = [0x08, 0x2a]; // field 1 = 42
-/// assert_eq!(find_field(&msg, 1), Some(FieldValue::Number(42)));
+/// assert_eq!(find_field(&msg, 1), Some(FieldValue::Varint(42)));
 /// assert_eq!(find_field(&msg, 2), None);
 /// ```
 pub fn find_field(data: &[u8], wanted: u64) -> Option<FieldValue<'_>> {
-    let mut pos = 0;
     let mut result = None;
-    while pos < data.len() {
-        let key = decode_varint(data, &mut pos)?;
-        let field_id = key >> 3;
-        if field_id == 0 {
-            return None;
-        }
-        let field = match key & 7 {
-            0 => FieldValue::Number(decode_varint(data, &mut pos)?),
-            2 => {
-                let size_u64 = decode_varint(data, &mut pos)?;
-                let remaining = data.len() - pos;
-                if size_u64 > remaining as u64 {
-                    return None;
-                }
-                let size = size_u64 as usize;
-                let slice = &data[pos..pos + size];
-                pos += size;
-                FieldValue::Bytes(slice)
-            }
-            1 => {
-                let slice = data.get(pos..pos + 8)?;
-                pos += 8;
-                let bits = u64::from_le_bytes([
-                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-                ]);
-                FieldValue::Number(bits)
-            }
-            5 => {
-                let slice = data.get(pos..pos + 4)?;
-                pos += 4;
-                let bits = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
-                FieldValue::Number(u64::from(bits))
-            }
-            _ => return None,
-        };
-        if field_id == wanted {
+    for item in WireIter::new(data) {
+        let (field_id, field) = item.ok()?;
+        if u64::from(field_id) == wanted {
             result = Some(field);
         }
     }
@@ -135,42 +186,41 @@ pub fn find_field(data: &[u8], wanted: u64) -> Option<FieldValue<'_>> {
 pub fn find_bytes(data: &[u8], id: u64) -> Option<&[u8]> {
     match find_field(data, id)? {
         FieldValue::Bytes(bytes) => Some(bytes),
-        FieldValue::Number(_) => None,
+        _ => None,
     }
 }
 
-/// Returns the varint value for numeric field `id`, defaulting to `0` if absent or non-numeric.
+/// Returns the numeric value for field `id`, defaulting to `0` if absent or non-numeric.
 pub fn find_number(data: &[u8], id: u64) -> u64 {
-    match find_field(data, id) {
-        Some(FieldValue::Number(n)) => n,
-        _ => 0,
-    }
+    find_field(data, id)
+        .and_then(FieldValue::as_u64)
+        .unwrap_or(0)
 }
 
-const FIELD_CHAT: u64 = 1;
-const FIELD_STEP_INDICES: u64 = 2;
-const FIELD_CHAT_MODEL_ENUM: u64 = 3;
-const FIELD_CHAT_USAGE: u64 = 4;
-const FIELD_CHAT_MODEL_COST: u64 = 5;
-const FIELD_USAGE_INPUT_TOKENS: u64 = 2;
-const FIELD_USAGE_OUTPUT_TOKENS: u64 = 3;
-const FIELD_USAGE_CACHE_WRITE_TOKENS: u64 = 4;
-const FIELD_USAGE_CACHE_READ_TOKENS: u64 = 5;
-const FIELD_USAGE_THINKING_OUTPUT_TOKENS: u64 = 9;
-const FIELD_USAGE_RESPONSE_OUTPUT_TOKENS: u64 = 10;
-const FIELD_CHAT_START: u64 = 9;
-const FIELD_CHAT_START_CREATED_AT: u64 = 4;
-const FIELD_START_CTX_WINDOW: u64 = 10;
-const FIELD_CTX_ESTIMATED_TOKENS: u64 = 1;
-const FIELD_CTX_MAX_TOKENS: u64 = 4;
-const FIELD_CHAT_TTFT: u64 = 11;
-const FIELD_CHAT_DECODE_DURATION: u64 = 12;
-const FIELD_CHAT_RESPONSE_MODEL: u64 = 19;
-const FIELD_CHAT_MODEL_DISPLAY_NAME: u64 = 21;
-const FIELD_DURATION_SECS: u64 = 1;
-const FIELD_DURATION_NANOS: u64 = 2;
-const FIELD_STEP_CREATED_AT: u64 = 1;
-const FIELD_TIMESTAMP_SECS: u64 = 1;
+const FIELD_CHAT: u32 = 1;
+const FIELD_STEP_INDICES: u32 = 2;
+const FIELD_CHAT_MODEL_ENUM: u32 = 3;
+const FIELD_CHAT_USAGE: u32 = 4;
+const FIELD_CHAT_MODEL_COST: u32 = 5;
+const FIELD_USAGE_INPUT_TOKENS: u32 = 2;
+const FIELD_USAGE_OUTPUT_TOKENS: u32 = 3;
+const FIELD_USAGE_CACHE_WRITE_TOKENS: u32 = 4;
+const FIELD_USAGE_CACHE_READ_TOKENS: u32 = 5;
+const FIELD_USAGE_THINKING_OUTPUT_TOKENS: u32 = 9;
+const FIELD_USAGE_RESPONSE_OUTPUT_TOKENS: u32 = 10;
+const FIELD_CHAT_START: u32 = 9;
+const FIELD_CHAT_START_CREATED_AT: u32 = 4;
+const FIELD_START_CTX_WINDOW: u32 = 10;
+const FIELD_CTX_ESTIMATED_TOKENS: u32 = 1;
+const FIELD_CTX_MAX_TOKENS: u32 = 4;
+const FIELD_CHAT_TTFT: u32 = 11;
+const FIELD_CHAT_DECODE_DURATION: u32 = 12;
+const FIELD_CHAT_RESPONSE_MODEL: u32 = 19;
+const FIELD_CHAT_MODEL_DISPLAY_NAME: u32 = 21;
+const FIELD_DURATION_SECS: u32 = 1;
+const FIELD_DURATION_NANOS: u32 = 2;
+const FIELD_STEP_CREATED_AT: u32 = 1;
+const FIELD_TIMESTAMP_SECS: u32 = 1;
 
 /// Minimum streaming decode duration (seconds) accepted as a valid turn speed sample.
 pub const MIN_TURN_DECODE_SECS: f64 = 0.01;
@@ -237,74 +287,41 @@ impl GenMetadataRecord<'_> {
     }
 }
 
-fn find_nonzero_number(data: &[u8], id: u64) -> Option<u64> {
-    match find_field(data, id)? {
-        FieldValue::Number(val) if val > 0 => Some(val),
-        _ => None,
-    }
+fn find_nonzero_number(data: &[u8], id: u32) -> Option<u64> {
+    find_field(data, u64::from(id))?
+        .as_u64()
+        .filter(|&val| val > 0)
 }
 
-fn find_utf8_str(data: &[u8], id: u64) -> Option<&str> {
-    let bytes = find_bytes(data, id)?;
+fn parse_utf8_trimmed(bytes: &[u8]) -> Option<&str> {
     std::str::from_utf8(bytes)
         .ok()
         .map(str::trim)
         .filter(|s| !s.is_empty())
 }
 
-fn find_first_repeated_varint(data: &[u8], wanted: u64) -> Option<u64> {
-    let mut pos = 0;
-    while pos < data.len() {
-        let key = decode_varint(data, &mut pos)?;
-        let field_id = key >> 3;
-        if field_id == 0 {
-            return None;
-        }
-        match key & 7 {
-            0 => {
-                let value = decode_varint(data, &mut pos)?;
-                if field_id == wanted {
-                    return Some(value);
-                }
-            }
-            2 => {
-                let size_u64 = decode_varint(data, &mut pos)?;
-                let remaining = data.len() - pos;
-                if size_u64 > remaining as u64 {
-                    return None;
-                }
-                let size = size_u64 as usize;
-                let slice = &data[pos..pos + size];
-                pos += size;
-                if field_id == wanted && !slice.is_empty() {
-                    let mut p = 0;
-                    return decode_varint(slice, &mut p);
-                }
-            }
-            1 => {
-                if data.len() - pos < 8 {
-                    return None;
-                }
-                pos += 8;
-            }
-            5 => {
-                if data.len() - pos < 4 {
-                    return None;
-                }
-                pos += 4;
-            }
-            _ => return None,
+fn decode_duration_secs(msg: &[u8]) -> Option<f64> {
+    let mut secs: i64 = 0;
+    let mut nanos: i64 = 0;
+    for item in WireIter::new(msg) {
+        let (field_num, value) = item.ok()?;
+        match (field_num, value) {
+            (FIELD_DURATION_SECS, FieldValue::Varint(bits)) => secs = bits as i64,
+            (FIELD_DURATION_NANOS, FieldValue::Varint(bits)) => nanos = bits as i64,
+            _ => {}
         }
     }
-    None
-}
-
-fn decode_duration_secs(msg: &[u8]) -> Option<f64> {
-    let nanos = find_number(msg, FIELD_DURATION_NANOS);
-    if nanos >= 1_000_000_000 {
+    if secs < 0 || !(0..1_000_000_000).contains(&nanos) {
         return None;
     }
-    Some((find_number(msg, FIELD_DURATION_SECS) as f64) + (nanos as f64) / 1e9)
+    Some((secs as f64) + (nanos as f64) / 1e9)
+}
+
+fn decode_timestamp_secs(ts: &[u8]) -> Option<i64> {
+    let secs = find_nonzero_number(ts, FIELD_TIMESTAMP_SECS)? as i64;
+    (MIN_TIMESTAMP_SECS..=MAX_TIMESTAMP_SECS)
+        .contains(&secs)
+        .then_some(secs)
 }
 
 fn is_sane_decode_speed(output_tokens: u64, decode_secs: f64) -> bool {
@@ -321,16 +338,16 @@ fn is_sane_decode_speed(output_tokens: u64, decode_secs: f64) -> bool {
 /// Enforces unified sanity bounds: `decode_secs >= 0.01`, `output_tokens > 0`,
 /// and `0.0 < output_tokens / decode_secs < 10_000.0`.
 pub fn extract_turn_metrics(data: &[u8]) -> Option<TurnMetrics> {
-    let chat = find_bytes(data, FIELD_CHAT)?;
-    let usage = find_bytes(chat, FIELD_CHAT_USAGE)?;
-    let duration = find_bytes(chat, FIELD_CHAT_DECODE_DURATION)?;
+    let chat = find_bytes(data, u64::from(FIELD_CHAT))?;
+    let usage = find_bytes(chat, u64::from(FIELD_CHAT_USAGE))?;
+    let duration = find_bytes(chat, u64::from(FIELD_CHAT_DECODE_DURATION))?;
     let decode_secs = decode_duration_secs(duration)?;
-    let output_tokens = find_number(usage, FIELD_USAGE_OUTPUT_TOKENS);
+    let output_tokens = find_number(usage, u64::from(FIELD_USAGE_OUTPUT_TOKENS));
     if !is_sane_decode_speed(output_tokens, decode_secs) {
         return None;
     }
     let thinking_tokens = find_nonzero_number(usage, FIELD_USAGE_THINKING_OUTPUT_TOKENS);
-    let ttft_secs = find_bytes(chat, FIELD_CHAT_TTFT)
+    let ttft_secs = find_bytes(chat, u64::from(FIELD_CHAT_TTFT))
         .and_then(decode_duration_secs)
         .filter(|&t| t > 0.0 && t < MAX_TTFT_SECS);
     Some(TurnMetrics {
@@ -345,51 +362,140 @@ pub fn extract_turn_metrics(data: &[u8]) -> Option<TurnMetrics> {
 ///
 /// Returns `None` if `chat_model` (field `1`) is missing or malformed.
 pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord<'_>> {
-    let chat = find_bytes(data, FIELD_CHAT)?;
-    let first_step_index = find_first_repeated_varint(data, FIELD_STEP_INDICES);
-    let model_enum = find_number(chat, FIELD_CHAT_MODEL_ENUM);
+    let mut chat: Option<&[u8]> = None;
+    let mut first_step_index: Option<u64> = None;
 
-    let (
-        input_tokens,
-        output_tokens,
-        cache_write_tokens,
-        cache_read_tokens,
-        thinking_output_tokens,
-        response_output_tokens,
-    ) = match find_bytes(chat, FIELD_CHAT_USAGE) {
-        Some(usage) => (
-            find_number(usage, FIELD_USAGE_INPUT_TOKENS),
-            find_number(usage, FIELD_USAGE_OUTPUT_TOKENS),
-            find_number(usage, FIELD_USAGE_CACHE_WRITE_TOKENS),
-            find_number(usage, FIELD_USAGE_CACHE_READ_TOKENS),
-            find_number(usage, FIELD_USAGE_THINKING_OUTPUT_TOKENS),
-            find_number(usage, FIELD_USAGE_RESPONSE_OUTPUT_TOKENS),
-        ),
-        None => (0, 0, 0, 0, 0, 0),
-    };
-
-    let model_cost_usd = match find_field(chat, FIELD_CHAT_MODEL_COST) {
-        Some(FieldValue::Number(bits)) => {
-            let cost = f64::from(f32::from_bits(bits as u32));
-            (cost.is_finite() && cost > 0.0).then_some(cost)
+    for item in WireIter::new(data) {
+        let (field_num, value) = item.ok()?;
+        match field_num {
+            FIELD_CHAT => {
+                chat = match value {
+                    FieldValue::Bytes(bytes) => Some(bytes),
+                    _ => None,
+                };
+            }
+            FIELD_STEP_INDICES if first_step_index.is_none() => match value {
+                FieldValue::Varint(v) => first_step_index = Some(v),
+                FieldValue::Bytes(slice) if !slice.is_empty() => {
+                    let mut p = 0;
+                    first_step_index = decode_varint(slice, &mut p);
+                }
+                _ => {}
+            },
+            _ => {}
         }
-        _ => None,
-    };
+    }
 
-    let chat_start_created_at_secs = find_bytes(chat, FIELD_CHAT_START)
-        .and_then(|start| find_bytes(start, FIELD_CHAT_START_CREATED_AT))
-        .and_then(|ts| find_nonzero_number(ts, FIELD_TIMESTAMP_SECS))
-        .map(|s| s as i64);
+    let chat = chat?;
+    let mut model_enum: u64 = 0;
+    let mut usage_bytes: Option<&[u8]> = None;
+    let mut model_cost_usd: Option<f64> = None;
+    let mut chat_start_bytes: Option<&[u8]> = None;
+    let mut ttft_bytes: Option<&[u8]> = None;
+    let mut decode_dur_bytes: Option<&[u8]> = None;
+    let mut response_model: Option<&str> = None;
+    let mut model_display_name: Option<&str> = None;
 
-    let ttft_secs = find_bytes(chat, FIELD_CHAT_TTFT)
+    for item in WireIter::new(chat) {
+        let (field_num, value) = item.ok()?;
+        match field_num {
+            FIELD_CHAT_MODEL_ENUM => {
+                model_enum = value.as_u64().unwrap_or(0);
+            }
+            FIELD_CHAT_USAGE => {
+                usage_bytes = match value {
+                    FieldValue::Bytes(b) => Some(b),
+                    _ => None,
+                };
+            }
+            FIELD_CHAT_MODEL_COST => {
+                model_cost_usd = match value {
+                    FieldValue::Fixed32(bits) => {
+                        let cost = f64::from(f32::from_bits(bits));
+                        (cost.is_finite() && cost > 0.0).then_some(cost)
+                    }
+                    _ => None,
+                };
+            }
+            FIELD_CHAT_START => {
+                chat_start_bytes = match value {
+                    FieldValue::Bytes(b) => Some(b),
+                    _ => None,
+                };
+            }
+            FIELD_CHAT_TTFT => {
+                ttft_bytes = match value {
+                    FieldValue::Bytes(b) => Some(b),
+                    _ => None,
+                };
+            }
+            FIELD_CHAT_DECODE_DURATION => {
+                decode_dur_bytes = match value {
+                    FieldValue::Bytes(b) => Some(b),
+                    _ => None,
+                };
+            }
+            FIELD_CHAT_RESPONSE_MODEL => {
+                response_model = match value {
+                    FieldValue::Bytes(b) => parse_utf8_trimmed(b),
+                    _ => None,
+                };
+            }
+            FIELD_CHAT_MODEL_DISPLAY_NAME => {
+                model_display_name = match value {
+                    FieldValue::Bytes(b) => parse_utf8_trimmed(b),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut cache_write_tokens = 0u64;
+    let mut cache_read_tokens = 0u64;
+    let mut thinking_output_tokens = 0u64;
+    let mut response_output_tokens = 0u64;
+
+    if let Some(usage) = usage_bytes {
+        let mut usage_ok = true;
+        for item in WireIter::new(usage) {
+            let Ok((field_num, value)) = item else {
+                usage_ok = false;
+                break;
+            };
+            let v = value.as_u64().unwrap_or(0);
+            match field_num {
+                FIELD_USAGE_INPUT_TOKENS => input_tokens = v,
+                FIELD_USAGE_OUTPUT_TOKENS => output_tokens = v,
+                FIELD_USAGE_CACHE_WRITE_TOKENS => cache_write_tokens = v,
+                FIELD_USAGE_CACHE_READ_TOKENS => cache_read_tokens = v,
+                FIELD_USAGE_THINKING_OUTPUT_TOKENS => thinking_output_tokens = v,
+                FIELD_USAGE_RESPONSE_OUTPUT_TOKENS => response_output_tokens = v,
+                _ => {}
+            }
+        }
+        if !usage_ok {
+            input_tokens = 0;
+            output_tokens = 0;
+            cache_write_tokens = 0;
+            cache_read_tokens = 0;
+            thinking_output_tokens = 0;
+            response_output_tokens = 0;
+        }
+    }
+
+    let chat_start_created_at_secs = chat_start_bytes
+        .and_then(|start| find_bytes(start, u64::from(FIELD_CHAT_START_CREATED_AT)))
+        .and_then(decode_timestamp_secs);
+
+    let ttft_secs = ttft_bytes
         .and_then(decode_duration_secs)
         .filter(|&t| t > 0.0 && t < MAX_TTFT_SECS);
-    let decode_secs = find_bytes(chat, FIELD_CHAT_DECODE_DURATION)
+    let decode_secs = decode_dur_bytes
         .and_then(decode_duration_secs)
         .filter(|&d| d.is_finite() && d > 0.0);
-
-    let response_model = find_utf8_str(chat, FIELD_CHAT_RESPONSE_MODEL);
-    let model_display_name = find_utf8_str(chat, FIELD_CHAT_MODEL_DISPLAY_NAME);
 
     Some(GenMetadataRecord {
         first_step_index,
@@ -420,11 +526,8 @@ const MAX_TIMESTAMP_SECS: i64 = 253_402_300_799;
 /// Rejects timestamps outside proleptic UTC years `0001..=9999`
 /// (`-62_135_596_800..=253_402_300_799`).
 pub fn extract_step_created_at_secs(data: &[u8]) -> Option<i64> {
-    let ts = find_bytes(data, FIELD_STEP_CREATED_AT)?;
-    let secs = find_nonzero_number(ts, FIELD_TIMESTAMP_SECS)? as i64;
-    (MIN_TIMESTAMP_SECS..=MAX_TIMESTAMP_SECS)
-        .contains(&secs)
-        .then_some(secs)
+    let ts = find_bytes(data, u64::from(FIELD_STEP_CREATED_AT))?;
+    decode_timestamp_secs(ts)
 }
 
 /// Extracts output generation speed (tokens/second) from a `gen_metadata` Protobuf blob.
@@ -446,10 +549,10 @@ pub fn extract_metadata_speed(data: &[u8]) -> Option<f64> {
     Some((metrics.output_tokens as f64) / metrics.decode_secs)
 }
 
-fn extract_ctx_window_field(data: &[u8], field_id: u64) -> Option<u64> {
-    let chat = find_bytes(data, FIELD_CHAT)?;
-    let chat_start = find_bytes(chat, FIELD_CHAT_START)?;
-    let ctx_window = find_bytes(chat_start, FIELD_START_CTX_WINDOW)?;
+fn extract_ctx_window_field(data: &[u8], field_id: u32) -> Option<u64> {
+    let chat = find_bytes(data, u64::from(FIELD_CHAT))?;
+    let chat_start = find_bytes(chat, u64::from(FIELD_CHAT_START))?;
+    let ctx_window = find_bytes(chat_start, u64::from(FIELD_START_CTX_WINDOW))?;
     find_nonzero_number(ctx_window, field_id)
 }
 
@@ -727,5 +830,81 @@ mod tests {
         let mut meta_too_high = Vec::new();
         push_field_bytes(&mut meta_too_high, 1, &ts_too_high);
         assert_eq!(extract_step_created_at_secs(&meta_too_high), None);
+    }
+
+    fn push_field_fixed64(buf: &mut Vec<u8>, id: u64, val: u64) {
+        push_varint(buf, (id << 3) | 1);
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+
+    #[test]
+    fn duration_rejects_negative_seconds_and_invalid_nanos() {
+        let mut neg_secs = Vec::new();
+        push_field_varint(&mut neg_secs, 1, (-1_i64) as u64);
+        assert_eq!(decode_duration_secs(&neg_secs), None);
+
+        let mut neg_nanos = Vec::new();
+        push_field_varint(&mut neg_nanos, 1, 1);
+        push_field_varint(&mut neg_nanos, 2, (-1_i64) as u64);
+        assert_eq!(decode_duration_secs(&neg_nanos), None);
+
+        let mut huge_nanos = Vec::new();
+        push_field_varint(&mut huge_nanos, 1, 1);
+        push_field_varint(&mut huge_nanos, 2, 1_000_000_000);
+        assert_eq!(decode_duration_secs(&huge_nanos), None);
+
+        // Verify extract_gen_metadata_record also rejects negative duration.
+        let mut chat = Vec::new();
+        push_field_bytes(&mut chat, 12, &neg_secs);
+        let mut root = Vec::new();
+        push_field_bytes(&mut root, 1, &chat);
+        let rec = extract_gen_metadata_record(&root).unwrap();
+        assert_eq!(rec.decode_secs, None);
+    }
+
+    #[test]
+    fn model_cost_rejects_non_fixed32_wire_types() {
+        let mut chat_f64 = Vec::new();
+        push_field_fixed64(&mut chat_f64, 5, f64::to_bits(0.05));
+        let mut root_f64 = Vec::new();
+        push_field_bytes(&mut root_f64, 1, &chat_f64);
+        let rec_f64 = extract_gen_metadata_record(&root_f64).unwrap();
+        assert_eq!(rec_f64.model_cost_usd, None);
+
+        let mut chat_varint = Vec::new();
+        push_field_varint(&mut chat_varint, 5, u64::from(0.05_f32.to_bits()));
+        let mut root_varint = Vec::new();
+        push_field_bytes(&mut root_varint, 1, &chat_varint);
+        let rec_varint = extract_gen_metadata_record(&root_varint).unwrap();
+        assert_eq!(rec_varint.model_cost_usd, None);
+
+        // Fixed32 is accepted.
+        let mut chat_f32 = Vec::new();
+        push_field_f32(&mut chat_f32, 5, 0.05);
+        let mut root_f32 = Vec::new();
+        push_field_bytes(&mut root_f32, 1, &chat_f32);
+        let rec_f32 = extract_gen_metadata_record(&root_f32).unwrap();
+        assert!((rec_f32.model_cost_usd.unwrap() - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chat_start_created_at_rejects_out_of_range_timestamps() {
+        let decode_chat_start = |secs: u64| -> Option<i64> {
+            let mut ts = Vec::new();
+            push_field_varint(&mut ts, 1, secs);
+            let mut start = Vec::new();
+            push_field_bytes(&mut start, 4, &ts);
+            let mut chat = Vec::new();
+            push_field_bytes(&mut chat, 9, &start);
+            let mut root = Vec::new();
+            push_field_bytes(&mut root, 1, &chat);
+            extract_gen_metadata_record(&root)
+                .unwrap()
+                .chat_start_created_at_secs
+        };
+
+        assert_eq!(decode_chat_start(1_763_400_000), Some(1_763_400_000));
+        assert_eq!(decode_chat_start((-62_135_596_801_i64) as u64), None);
+        assert_eq!(decode_chat_start(253_402_300_800), None);
     }
 }

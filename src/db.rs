@@ -69,17 +69,35 @@ impl SpeedReader for SqliteSpeedReader {
         if let Some(home) = &self.home_override {
             return query_session_metadata(home, conversation_id);
         }
-        if !is_valid_uuid(conversation_id) {
-            return SessionMetadata::default();
-        }
         let Some(cli_dir) = resolve_agy_cli_dir() else {
             return SessionMetadata::default();
         };
-        let db_path = cli_dir
-            .join("conversations")
-            .join(format!("{conversation_id}.db"));
+        let Some(db_path) = resolve_conversation_db_path(&cli_dir, conversation_id) else {
+            return SessionMetadata::default();
+        };
         query_session_metadata_from_db(&db_path)
     }
+}
+
+/// Resolves `<cli_dir>/conversations/<conversation_id>.db`, falling back to lowercase
+/// `<conversation_id_lower>.db` on case-sensitive filesystems.
+pub fn resolve_conversation_db_path(cli_dir: &Path, conversation_id: &str) -> Option<PathBuf> {
+    if !is_valid_uuid(conversation_id) {
+        return None;
+    }
+    let conv_dir = cli_dir.join("conversations");
+    let exact = conv_dir.join(format!("{conversation_id}.db"));
+    if exact.is_file() {
+        return Some(exact);
+    }
+    let lower = conversation_id.to_ascii_lowercase();
+    if lower != conversation_id {
+        let lower_path = conv_dir.join(format!("{lower}.db"));
+        if lower_path.is_file() {
+            return Some(lower_path);
+        }
+    }
+    None
 }
 
 /// Validates canonical `8-4-4-4-12` lowercase/uppercase hexadecimal UUID strings.
@@ -143,14 +161,10 @@ pub fn query_last_speed(home: &Path, conversation_id: &str) -> Option<f64> {
 /// Queries `<home>/.gemini/antigravity-cli/conversations/<conversation_id>.db`
 /// in read-only mode for both generation speed and `max_context_tokens`.
 pub fn query_session_metadata(home: &Path, conversation_id: &str) -> SessionMetadata {
-    if !is_valid_uuid(conversation_id) {
+    let cli_dir = home.join(".gemini").join("antigravity-cli");
+    let Some(db_path) = resolve_conversation_db_path(&cli_dir, conversation_id) else {
         return SessionMetadata::default();
-    }
-    let db_path = home
-        .join(".gemini")
-        .join("antigravity-cli")
-        .join("conversations")
-        .join(format!("{conversation_id}.db"));
+    };
     query_session_metadata_from_db(&db_path)
 }
 
@@ -197,7 +211,11 @@ pub fn query_session_metadata_from_db(db_path: &Path) -> SessionMetadata {
             .map(|t| (first.output_tokens as f64) / (t + first.decode_secs));
         meta.thinking_tokens = first.thinking_tokens;
 
-        let total_tokens: u64 = turns.iter().take(5).map(|t| t.output_tokens).sum();
+        let total_tokens: u64 = turns
+            .iter()
+            .take(5)
+            .map(|t| t.output_tokens)
+            .fold(0u64, u64::saturating_add);
         let total_secs: f64 = turns.iter().take(5).map(|t| t.decode_secs).sum();
         if total_secs > 0.0 {
             meta.speed = Some((total_tokens as f64) / total_secs);
@@ -420,5 +438,20 @@ mod tests {
             compute_median(&[40.0, f64::NAN, 10.0, 20.0, f64::NEG_INFINITY, 30.0]),
             Some(25.0)
         );
+    }
+
+    #[test]
+    fn resolve_conversation_db_path_falls_back_to_lowercase_uuid() {
+        let (dir, conn, uuid) = create_temp_conv_db("uuid_case");
+        drop(conn);
+        let cli_dir = dir.join(".gemini/antigravity-cli");
+        let upper = uuid.to_ascii_uppercase();
+
+        let exact = resolve_conversation_db_path(&cli_dir, uuid).unwrap();
+        let via_upper = resolve_conversation_db_path(&cli_dir, &upper).unwrap();
+        assert_eq!(exact, via_upper);
+        assert!(resolve_conversation_db_path(&cli_dir, "not-a-uuid").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

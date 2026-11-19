@@ -168,6 +168,39 @@ pub fn run_apply_command<R: BufRead, W: Write>(
     Ok(())
 }
 
+fn command_executable_exists(cmd: &str) -> bool {
+    command_executable_exists_in_path(cmd, env::var_os("PATH").as_deref())
+}
+
+fn command_executable_exists_in_path(cmd: &str, path_env: Option<&std::ffi::OsStr>) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if Path::new(trimmed).is_file() {
+        return true;
+    }
+    let Some(exe) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    let exe_path = Path::new(exe);
+    if exe_path.components().count() > 1 {
+        return exe_path.is_file();
+    }
+    let Some(paths) = path_env else {
+        return false;
+    };
+    env::split_paths(paths).any(|dir| {
+        let candidate = dir.join(exe);
+        if candidate.is_file() {
+            return true;
+        }
+        cfg!(windows)
+            && candidate.extension().is_none()
+            && candidate.with_extension("exe").is_file()
+    })
+}
+
 /// Inspects XDG config, AGY `settings.json` wiring, and prints a live sample preview.
 pub fn run_doctor<W: Write>(
     config_path: &Path,
@@ -209,10 +242,8 @@ pub fn run_doctor<W: Write>(
     match read_settings_object(settings_path, false) {
         Ok(root) => match root.get("statusLine").and_then(Value::as_object) {
             Some(sl) => {
-                let cmd = sl
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<missing>");
+                let cmd_opt = sl.get("command").and_then(Value::as_str);
+                let cmd = cmd_opt.unwrap_or("<missing>");
                 let enabled = sl
                     .get("enabled")
                     .and_then(Value::as_bool)
@@ -221,7 +252,7 @@ pub fn run_doctor<W: Write>(
                     .get("stack_with_default")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let cmd_exists = Path::new(cmd).exists();
+                let cmd_exists = cmd_opt.is_some_and(command_executable_exists);
                 writeln!(
                     out,
                     "AGY Hook: {} [enabled={enabled}, stack={stack}, bin_exists={cmd_exists}]",
@@ -385,6 +416,63 @@ mod tests {
         assert!(text.contains("bin_exists=false"));
         assert!(text.contains("Preview:"));
         assert!(!text.contains('\x1b'));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn command_executable_lookup_handles_args_spaces_and_bare_path_names() {
+        let home = temp_home("cmd_lookup");
+        let bin_dir = home.join("bin");
+        let space_dir = home.join("dir with spaces");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&space_dir).unwrap();
+
+        let bin_path = bin_dir.join("agy-statusline-fake");
+        let spaced_path = space_dir.join("agy-statusline-spaced");
+        fs::write(&bin_path, b"").unwrap();
+        fs::write(&spaced_path, b"").unwrap();
+
+        let path_env = env::join_paths([&bin_dir]).unwrap();
+
+        // Explicit path with CLI arguments.
+        let with_args = format!("{} --no-color --style minimal", bin_path.display());
+        assert!(command_executable_exists_in_path(&with_args, None));
+
+        // Direct path containing spaces.
+        assert!(command_executable_exists_in_path(
+            &spaced_path.to_string_lossy(),
+            None
+        ));
+
+        // Bare command resolved via PATH (with and without args).
+        assert!(command_executable_exists_in_path(
+            "agy-statusline-fake",
+            Some(path_env.as_os_str())
+        ));
+        assert!(command_executable_exists_in_path(
+            "agy-statusline-fake --no-color",
+            Some(path_env.as_os_str())
+        ));
+
+        // Missing bare command and missing explicit path.
+        assert!(!command_executable_exists_in_path(
+            "definitely-nonexistent-bin",
+            Some(path_env.as_os_str())
+        ));
+        assert!(!command_executable_exists_in_path(
+            "/nonexistent/agy-statusline --no-color",
+            Some(path_env.as_os_str())
+        ));
+
+        // Also verify run_doctor reports bin_exists=true for command-with-args.
+        let cfg_path = home.join("config.json");
+        let settings = agy_settings_path_for_home(&home);
+        apply_statusline_config(&settings, Path::new(&with_args), false).unwrap();
+        let mut out = Vec::new();
+        run_doctor(&cfg_path, &settings, true, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("bin_exists=true"));
+
         let _ = fs::remove_dir_all(&home);
     }
 }
