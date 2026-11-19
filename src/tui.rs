@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal};
 use std::path::Path;
+use std::sync::Arc;
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEvent,
@@ -21,23 +22,53 @@ use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthStr;
 
 use crate::ansi::ansi_to_ratatui_lines;
-use crate::apply::{apply_statusline_config, resolve_invoked_binary_path, default_settings_path};
+use crate::apply::{apply_statusline_config, resolve_invoked_binary_path};
 use crate::db::SessionMetadata;
 use crate::editor::{ActivePane, ExitOutcome, TuiEditorState};
 use crate::git::GitInfo;
 use crate::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
+use crate::paths::agy_settings_path;
 use crate::render::write_statusline;
 use crate::statusline::{
     AgentInfo, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, SandboxInfo,
     StatuslinePayload, VcsInfo, VimInfo, WorkspaceInfo,
 };
 
-struct TerminalGuard;
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+}
+
+struct TerminalGuard {
+    prev_hook: Option<Arc<PanicHook>>,
+}
+
+impl TerminalGuard {
+    fn enter() -> Self {
+        let prev = Arc::new(std::panic::take_hook());
+        let hook_prev = Arc::clone(&prev);
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            hook_prev(info);
+        }));
+        Self {
+            prev_hook: Some(prev),
+        }
+    }
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        restore_terminal();
+        if let Some(prev) = self.prev_hook.take() {
+            let _ = std::panic::take_hook();
+            match Arc::try_unwrap(prev) {
+                Ok(original) => std::panic::set_hook(original),
+                Err(shared) => std::panic::set_hook(Box::new(move |info| shared(info))),
+            }
+        }
     }
 }
 
@@ -76,10 +107,10 @@ pub fn run_tui_config(config_path: &Path) -> io::Result<()> {
     let initial = load_layout_config(config_path);
     let mut state = TuiEditorState::new(initial);
 
+    let _guard = TerminalGuard::enter();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -108,7 +139,7 @@ pub fn run_tui_config(config_path: &Path) -> io::Result<()> {
         }
         ExitOutcome::SaveAndApply => {
             save_layout_config(config_path, &state.config)?;
-            let settings_path = default_settings_path()?;
+            let settings_path = agy_settings_path()?;
             apply_statusline_config(&settings_path, &launcher?, state.config.stack_with_default)?;
             println!("Saved layout config to {}", config_path.display());
             println!(

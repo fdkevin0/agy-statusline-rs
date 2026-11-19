@@ -7,35 +7,12 @@ use std::path::{self, Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use crate::db::{resolve_agy_cli_dir, SessionMetadata};
+use crate::db::SessionMetadata;
+use crate::fsutil::atomic_write_preserving_mode;
 use crate::git::GitInfo;
 use crate::layout::try_load_layout_config;
 use crate::render::write_statusline;
 use crate::tui::sample_preview_payload;
-
-fn settings_path_from_cli_dir(cli_dir: Option<PathBuf>) -> io::Result<PathBuf> {
-    let dir = cli_dir.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "neither ANTIGRAVITY_CLI_HOME, AGY_HOME, HOME, nor USERPROFILE environment variable is set",
-        )
-    })?;
-    Ok(dir.join("settings.json"))
-}
-
-/// Returns the default AGY settings path (`<agy_cli_dir>/settings.json`).
-///
-/// Honors `ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, or `<home>/.gemini/antigravity-cli`.
-pub fn default_settings_path() -> io::Result<PathBuf> {
-    settings_path_from_cli_dir(resolve_agy_cli_dir())
-}
-
-/// Returns `<home>/.gemini/antigravity-cli/settings.json` for a given home directory.
-pub fn settings_path_for_home(home: &Path) -> PathBuf {
-    home.join(".gemini")
-        .join("antigravity-cli")
-        .join("settings.json")
-}
 
 /// Resolves the preferred binary path to register in AGY `settings.json`.
 ///
@@ -101,25 +78,10 @@ fn read_settings_object(settings_path: &Path, allow_missing: bool) -> io::Result
 }
 
 fn write_settings_object(settings_path: &Path, root: Map<String, Value>) -> io::Result<()> {
-    let parent = settings_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
     let mut formatted = serde_json::to_string_pretty(&Value::Object(root))
         .map_err(|e| io::Error::other(format!("failed to serialize settings: {e}")))?;
     formatted.push('\n');
-
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(formatted.as_bytes())?;
-    match fs::metadata(settings_path) {
-        Ok(metadata) => tmp.as_file().set_permissions(metadata.permissions())?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    tmp.as_file().sync_all()?;
-    tmp.persist(settings_path).map_err(|e| e.error)?;
-    Ok(())
+    atomic_write_preserving_mode(settings_path, formatted.as_bytes())
 }
 
 /// Updates `settings_path` in-place (preserving existing top-level keys and custom
@@ -206,6 +168,28 @@ pub fn run_apply_command<R: BufRead, W: Write>(
     Ok(())
 }
 
+fn command_executable_exists(cmd: &str) -> bool {
+    command_executable_exists_in_path(cmd, env::var_os("PATH").as_deref())
+}
+
+fn command_executable_exists_in_path(cmd: &str, path_env: Option<&std::ffi::OsStr>) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if Path::new(trimmed).is_file() {
+        return true;
+    }
+    let Some(exe) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    let exe_path = Path::new(exe);
+    if exe_path.components().count() > 1 {
+        return exe_path.is_file();
+    }
+    path_env.is_some_and(|paths| which::which_in(exe, Some(paths), ".").is_ok())
+}
+
 /// Inspects XDG config, AGY `settings.json` wiring, and prints a live sample preview.
 pub fn run_doctor<W: Write>(
     config_path: &Path,
@@ -247,10 +231,8 @@ pub fn run_doctor<W: Write>(
     match read_settings_object(settings_path, false) {
         Ok(root) => match root.get("statusLine").and_then(Value::as_object) {
             Some(sl) => {
-                let cmd = sl
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<missing>");
+                let cmd_opt = sl.get("command").and_then(Value::as_str);
+                let cmd = cmd_opt.unwrap_or("<missing>");
                 let enabled = sl
                     .get("enabled")
                     .and_then(Value::as_bool)
@@ -259,7 +241,7 @@ pub fn run_doctor<W: Write>(
                     .get("stack_with_default")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let cmd_exists = Path::new(cmd).exists();
+                let cmd_exists = cmd_opt.is_some_and(command_executable_exists);
                 writeln!(
                     out,
                     "AGY Hook: {} [enabled={enabled}, stack={stack}, bin_exists={cmd_exists}]",
@@ -305,6 +287,7 @@ pub fn run_doctor<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::agy_settings_path_for_home;
     use std::io::Cursor;
 
     fn temp_home(tag: &str) -> PathBuf {
@@ -321,7 +304,7 @@ mod tests {
     #[test]
     fn creates_new_settings_with_yes() {
         let home = temp_home("new");
-        let settings = settings_path_for_home(&home);
+        let settings = agy_settings_path_for_home(&home);
         let cmd = PathBuf::from("/usr/local/bin/agy-statusline");
         let mut stdin = Cursor::new(b"");
         let mut out = Vec::new();
@@ -342,7 +325,7 @@ mod tests {
     #[test]
     fn preserves_existing_keys_padding_and_supports_disable() {
         let home = temp_home("preserve");
-        let settings = settings_path_for_home(&home);
+        let settings = agy_settings_path_for_home(&home);
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
         fs::write(
             &settings,
@@ -397,7 +380,7 @@ mod tests {
     #[test]
     fn rejects_invalid_existing_json() {
         let home = temp_home("invalid");
-        let settings = settings_path_for_home(&home);
+        let settings = agy_settings_path_for_home(&home);
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
         fs::write(&settings, "{not json").unwrap();
 
@@ -411,7 +394,7 @@ mod tests {
     fn doctor_reports_config_settings_and_preview() {
         let home = temp_home("doctor");
         let cfg_path = home.join("config.json");
-        let settings = settings_path_for_home(&home);
+        let settings = agy_settings_path_for_home(&home);
         apply_statusline_config(&settings, Path::new("/nonexistent/agy-statusline"), false).unwrap();
 
         let mut out = Vec::new();
@@ -426,13 +409,69 @@ mod tests {
     }
 
     #[test]
-    fn settings_path_from_cli_dir_resolves_or_errors_not_found() {
-        let dir = PathBuf::from("/tmp/custom-agy-cli");
-        assert_eq!(
-            settings_path_from_cli_dir(Some(dir.clone())).unwrap(),
-            dir.join("settings.json")
-        );
-        let err = settings_path_from_cli_dir(None).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    fn command_executable_lookup_handles_args_spaces_and_bare_path_names() {
+        let home = temp_home("cmd_lookup");
+        let bin_dir = home.join("bin");
+        let space_dir = home.join("dir with spaces");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&space_dir).unwrap();
+
+        let bin_name = if cfg!(windows) {
+            "agy-statusline-fake.exe"
+        } else {
+            "agy-statusline-fake"
+        };
+        let bin_path = bin_dir.join(bin_name);
+        let spaced_path = space_dir.join("agy-statusline-spaced");
+        fs::write(&bin_path, b"").unwrap();
+        fs::write(&spaced_path, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let path_env = env::join_paths([&bin_dir]).unwrap();
+
+        // Explicit path with CLI arguments.
+        let with_args = format!("{} --no-color --style minimal", bin_path.display());
+        assert!(command_executable_exists_in_path(&with_args, None));
+
+        // Direct path containing spaces.
+        assert!(command_executable_exists_in_path(
+            &spaced_path.to_string_lossy(),
+            None
+        ));
+
+        // Bare command resolved via PATH (with and without args).
+        assert!(command_executable_exists_in_path(
+            "agy-statusline-fake",
+            Some(path_env.as_os_str())
+        ));
+        assert!(command_executable_exists_in_path(
+            "agy-statusline-fake --no-color",
+            Some(path_env.as_os_str())
+        ));
+
+        // Missing bare command and missing explicit path.
+        assert!(!command_executable_exists_in_path(
+            "definitely-nonexistent-bin",
+            Some(path_env.as_os_str())
+        ));
+        assert!(!command_executable_exists_in_path(
+            "/nonexistent/agy-statusline --no-color",
+            Some(path_env.as_os_str())
+        ));
+
+        // Also verify run_doctor reports bin_exists=true for command-with-args.
+        let cfg_path = home.join("config.json");
+        let settings = agy_settings_path_for_home(&home);
+        apply_statusline_config(&settings, Path::new(&with_args), false).unwrap();
+        let mut out = Vec::new();
+        run_doctor(&cfg_path, &settings, true, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("bin_exists=true"));
+
+        let _ = fs::remove_dir_all(&home);
     }
 }

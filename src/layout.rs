@@ -4,17 +4,19 @@
 //! `$XDG_CONFIG_HOME/agy-statusline/config.json` (defaulting to
 //! `~/.config/agy-statusline/config.json`).
 
-use std::env;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::db::resolve_home_dir;
+use crate::fsutil::atomic_write;
 
 /// Maximum number of configurable statusline rows.
 pub const MAX_ROWS: usize = 3;
+
+/// Default speed threshold (tokens/s) below which speed highlights in warning amber.
+pub const DEFAULT_SPEED_WARN_THRESHOLD: f64 = 50.0;
 
 /// All 33 statusline widgets available for placement on any row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -524,7 +526,7 @@ impl LayoutConfig {
             glyph_mode: GlyphMode::Unicode,
             responsive: true,
             bar_length: 12,
-            speed_warn_threshold: 50.0,
+            speed_warn_threshold: DEFAULT_SPEED_WARN_THRESHOLD,
             stack_with_default: false,
             speed_mode: SpeedMode::Weighted,
             ctx_remaining: false,
@@ -604,13 +606,17 @@ impl LayoutConfig {
         cfg
     }
 
-    /// Ensures `rows` always has exactly [`MAX_ROWS`] slots and `bar_length` is clamped.
+    /// Ensures `rows` always has exactly [`MAX_ROWS`] slots, `bar_length` is clamped,
+    /// and `speed_warn_threshold` is finite and non-negative.
     pub fn normalize_rows(&mut self) {
         while self.rows.len() < MAX_ROWS {
             self.rows.push(Vec::new());
         }
         self.rows.truncate(MAX_ROWS);
         self.bar_length = self.bar_length.clamp(4, 40);
+        if !self.speed_warn_threshold.is_finite() || self.speed_warn_threshold < 0.0 {
+            self.speed_warn_threshold = DEFAULT_SPEED_WARN_THRESHOLD;
+        }
     }
 
     /// Finds which row (`0..3`) currently hosts `widget`, if any.
@@ -638,20 +644,6 @@ impl LayoutConfig {
     }
 }
 
-/// Resolves `$XDG_CONFIG_HOME/agy-statusline/config.json` or `<HOME>/.config/agy-statusline/config.json`.
-pub fn default_config_path() -> io::Result<PathBuf> {
-    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(xdg).join("agy-statusline").join("config.json"));
-    }
-    let home = resolve_home_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "neither XDG_CONFIG_HOME nor HOME/USERPROFILE is set",
-        )
-    })?;
-    Ok(home.join(".config").join("agy-statusline").join("config.json"))
-}
-
 /// Loads [`LayoutConfig`] from `path`, falling back to [`LayoutConfig::default`] if absent or invalid.
 pub fn load_layout_config(path: &Path) -> LayoutConfig {
     try_load_layout_config(path).unwrap_or_default()
@@ -667,21 +659,16 @@ pub(crate) fn try_load_layout_config(path: &Path) -> io::Result<LayoutConfig> {
 
 /// Atomically writes `config` to `path` as pretty-printed JSON.
 pub fn save_layout_config(path: &Path, config: &LayoutConfig) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let mut json = serde_json::to_string_pretty(config)
         .map_err(|e| io::Error::other(format!("failed to serialize layout config: {e}")))?;
     json.push('\n');
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json.as_bytes())?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    atomic_write(path, json.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     #[test]
     fn partial_config_json_deserializes_with_defaults() {
@@ -736,5 +723,33 @@ mod tests {
         assert_eq!(json, "\"median\"");
         let parsed: SpeedMode = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, SpeedMode::Median);
+    }
+
+    #[test]
+    fn normalize_rows_resets_invalid_speed_warn_threshold() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.speed_warn_threshold = f64::NAN;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, DEFAULT_SPEED_WARN_THRESHOLD);
+
+        cfg.speed_warn_threshold = f64::INFINITY;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, DEFAULT_SPEED_WARN_THRESHOLD);
+
+        cfg.speed_warn_threshold = f64::NEG_INFINITY;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, DEFAULT_SPEED_WARN_THRESHOLD);
+
+        cfg.speed_warn_threshold = -1.0;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, DEFAULT_SPEED_WARN_THRESHOLD);
+
+        cfg.speed_warn_threshold = 0.0;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, 0.0);
+
+        cfg.speed_warn_threshold = 35.5;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, 35.5);
     }
 }

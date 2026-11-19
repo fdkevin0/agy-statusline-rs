@@ -19,8 +19,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use pricing::{
-    default_pricing_cache_dir, default_pricing_path, fetch_models_dev_via_curl,
-    parse_models_dev_json, pricing_cache_status, run_pricing_command,
+    fetch_models_dev_via_curl, parse_models_dev_json, pricing_cache_status, run_pricing_command,
     sync_models_dev_pricing_with, ModelPricingRate, PricingCacheStatus, PricingCatalog, SyncMode,
     DEFAULT_PRICING_TTL_SECS,
 };
@@ -35,7 +34,8 @@ use render::build_weekly_usage;
 use scan::{scan_sqlite_conversations, scan_transcripts, UsageEvent};
 use tz::format_day;
 
-use crate::db::resolve_agy_cli_dir;
+use crate::db::compute_median;
+use crate::paths::{resolve_agy_cli_dir, xdg_cache_dir, xdg_config_dir};
 
 /// Aggregated token and optional cost totals for a time window.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -199,20 +199,6 @@ pub struct StatsReport {
     pub models: Vec<ModelStats>,
     /// Aggregate statistics from SQLite `conversations/*.db` (`gen_metadata`).
     pub sqlite: SqliteStats,
-}
-
-pub(super) fn compute_median(values: &mut Vec<f64>) -> Option<f64> {
-    values.retain(|v| v.is_finite());
-    if values.is_empty() {
-        return None;
-    }
-    values.sort_by(f64::total_cmp);
-    let mid = values.len() / 2;
-    if values.len() % 2 == 1 {
-        Some(values[mid])
-    } else {
-        Some((values[mid - 1] + values[mid]) / 2.0)
-    }
 }
 
 fn accumulate_period(summary: &mut PeriodSummary, ev: &UsageEvent) {
@@ -408,7 +394,7 @@ pub fn collect_stats_for_roots(
 
     let mut models: Vec<ModelStats> = model_map
         .into_iter()
-        .map(|(model, mut acc)| {
+        .map(|(model, acc)| {
             let speed_samples = acc.speeds.len();
             let ttft_samples = acc.ttfts.len();
             ModelStats {
@@ -424,9 +410,9 @@ pub fn collect_stats_for_roots(
                 priced_usd: round_usd_6(acc.priced_usd),
                 unpriced_requests: acc.unpriced_requests,
                 speed_samples,
-                median_tok_per_sec: compute_median(&mut acc.speeds),
+                median_tok_per_sec: compute_median(&acc.speeds),
                 ttft_samples,
-                median_ttft_secs: compute_median(&mut acc.ttfts),
+                median_ttft_secs: compute_median(&acc.ttfts),
             }
         })
         .collect();
@@ -480,16 +466,19 @@ pub fn run_stats_command<W: Write>(
         roots.push(("desktop", home.join(".gemini").join("antigravity")));
     }
 
-    let cache_dir = default_pricing_cache_dir().or_else(|| {
+    let cache_dir = xdg_cache_dir().or_else(|| {
         (!home.as_os_str().is_empty()).then(|| home.join(".cache").join("agy-statusline"))
     });
-    let pricing_path = default_pricing_path().or_else(|| {
-        (!home.as_os_str().is_empty()).then(|| {
-            home.join(".config")
-                .join("agy-statusline")
-                .join("pricing.json")
-        })
-    });
+    let pricing_path = xdg_config_dir()
+        .ok()
+        .map(|d| d.join("pricing.json"))
+        .or_else(|| {
+            (!home.as_os_str().is_empty()).then(|| {
+                home.join(".config")
+                    .join("agy-statusline")
+                    .join("pricing.json")
+            })
+        });
     let pricing = PricingCatalog::load_effective_with(
         cache_dir.as_deref(),
         pricing_path.as_deref(),

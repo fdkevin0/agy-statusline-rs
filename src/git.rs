@@ -1,13 +1,14 @@
 //! Pure-Rust Git branch/worktree probing and bounded, cached diff statistics.
 
-use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crate::fsutil::atomic_write;
+use crate::paths::xdg_cache_dir;
 use crate::timeutil::unix_now_secs;
 
 const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -42,12 +43,8 @@ pub struct SystemGitProbe {
 impl SystemGitProbe {
     /// Creates a probe configured with the default per-user diff cache directory.
     pub fn with_default_cache() -> Self {
-        let base = env::var_os("XDG_CACHE_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(env::temp_dir);
         Self {
-            cache_dir: Some(base.join("agy-statusline")),
+            cache_dir: xdg_cache_dir(),
         }
     }
 }
@@ -182,28 +179,32 @@ where
 
     if let Ok(cached) = fs::read_to_string(&cache_path) {
         let mut parts = cached.split_whitespace();
-        if let (Some(m), Some(t), Some(a), Some(d)) = (
+        if let (Some(m), Some(t), Some(first_val)) = (
             parts.next().and_then(|s| s.parse::<u128>().ok()),
             parts.next().and_then(|s| s.parse::<u64>().ok()),
-            parts.next().and_then(|s| s.parse::<u64>().ok()),
-            parts.next().and_then(|s| s.parse::<u64>().ok()),
+            parts.next(),
         ) {
             if m == idx_mtime && now_secs.saturating_sub(t) < ttl_secs {
-                return (a, d);
+                if first_val == "timeout" {
+                    return (0, 0);
+                }
+                if let (Ok(a), Some(d)) = (
+                    first_val.parse::<u64>(),
+                    parts.next().and_then(|s| s.parse::<u64>().ok()),
+                ) {
+                    return (a, d);
+                }
             }
         }
     }
 
     let Some((added, deleted)) = runner() else {
+        let payload = format!("{idx_mtime} {now_secs} timeout\n");
+        let _ = atomic_write(&cache_path, payload.as_bytes());
         return (0, 0);
     };
-    if fs::create_dir_all(cache_dir).is_ok() {
-        let tmp = cache_dir.join(format!("diff_{hash:016x}.{}.tmp", std::process::id()));
-        let payload = format!("{idx_mtime} {now_secs} {added} {deleted}\n");
-        if fs::write(&tmp, payload.as_bytes()).is_ok() {
-            let _ = fs::rename(&tmp, &cache_path);
-        }
-    }
+    let payload = format!("{idx_mtime} {now_secs} {added} {deleted}\n");
+    let _ = atomic_write(&cache_path, payload.as_bytes());
     (added, deleted)
 }
 
@@ -221,7 +222,30 @@ fn parse_numstat(bytes: &[u8]) -> (u64, u64) {
     (added, deleted)
 }
 
+fn wait_child_bounded(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 fn run_git_diff_bounded(dir: &Path, timeout: Duration) -> Option<(u64, u64)> {
+    let deadline = Instant::now() + timeout;
     let mut child = Command::new("git")
         .args(["--no-optional-locks", "-C"])
         .arg(dir)
@@ -240,9 +264,10 @@ fn run_git_diff_bounded(dir: &Path, timeout: Duration) -> Option<(u64, u64)> {
         let _ = tx.send(res);
     });
 
-    match rx.recv_timeout(timeout) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(remaining) {
         Ok(Ok(bytes)) => {
-            let status = child.wait().ok()?;
+            let status = wait_child_bounded(&mut child, deadline)?;
             status.success().then(|| parse_numstat(&bytes))
         }
         _ => {
@@ -257,6 +282,7 @@ fn run_git_diff_bounded(dir: &Path, timeout: Duration) -> Option<(u64, u64)> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::env;
 
     #[test]
     fn detects_linked_worktree_from_dot_git_file() {
@@ -362,6 +388,42 @@ mod tests {
         });
         assert_eq!(invalidated, (7, 1));
         assert_eq!(calls.get(), 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn probe_diff_cached_negative_caches_timeout_within_ttl() {
+        let root = env::temp_dir().join(format!("agy_diff_neg_cache_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let gitdir = root.join(".git");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("index"), b"v1").unwrap();
+
+        let calls = Cell::new(0usize);
+        let timed_out = probe_diff_cached(&root, &gitdir, &cache_dir, 200, 3, || {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert_eq!(timed_out, (0, 0));
+        assert_eq!(calls.get(), 1);
+
+        // Within TTL, cached failure avoids re-running the probe.
+        let cached_fail = probe_diff_cached(&root, &gitdir, &cache_dir, 202, 3, || {
+            calls.set(calls.get() + 1);
+            Some((50, 10))
+        });
+        assert_eq!(cached_fail, (0, 0));
+        assert_eq!(calls.get(), 1);
+
+        // After TTL expiry, probe runs again and succeeds.
+        let recovered = probe_diff_cached(&root, &gitdir, &cache_dir, 203, 3, || {
+            calls.set(calls.get() + 1);
+            Some((50, 10))
+        });
+        assert_eq!(recovered, (50, 10));
+        assert_eq!(calls.get(), 2);
 
         let _ = fs::remove_dir_all(&root);
     }

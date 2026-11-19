@@ -13,7 +13,8 @@ use agy_statusline::format::format_tokens;
 use agy_statusline::git::{GitInfo, SystemGitProbe};
 use agy_statusline::layout::{GlyphMode, LayoutConfig, ThemeStyle, VisualStyle, WidgetId};
 use agy_statusline::protobuf::{
-    decode_varint, extract_metadata_speed, find_field, MAX_TURN_SPEED_TPS,
+    extract_gen_metadata_record, extract_metadata_speed, extract_step_created_at_secs,
+    MAX_TIMESTAMP_SECS, MAX_TTFT_SECS, MAX_TURN_SPEED_TPS, MIN_TIMESTAMP_SECS,
 };
 use agy_statusline::render::{build_progress_bar, write_statusline};
 use agy_statusline::statusline::{
@@ -30,15 +31,22 @@ impl SpeedReader for FixedSpeed {
 
 proptest! {
     #[test]
-    fn prop_decode_varint_never_panics(data in prop::collection::vec(any::<u8>(), 0..64)) {
-        let mut pos = 0;
-        let res = decode_varint(&data, &mut pos);
-        prop_assert!(res.is_none() || (pos >= 1 && pos <= data.len().min(10)));
+    fn prop_extract_gen_metadata_record_never_panics(data in prop::collection::vec(any::<u8>(), 0..128)) {
+        let rec = extract_gen_metadata_record(&data);
+        let valid = rec.as_ref().is_none_or(|r| {
+            r.decode_secs.is_none_or(|s| s.is_finite() && s >= 0.0)
+                && r.ttft_secs.is_none_or(|t| t > 0.0 && t < MAX_TTFT_SECS)
+                && r.model_cost_usd.is_none_or(|c| c.is_finite() && c > 0.0)
+                && r.chat_start_created_at_secs
+                    .is_none_or(|ts| (MIN_TIMESTAMP_SECS..=MAX_TIMESTAMP_SECS).contains(&ts))
+        });
+        prop_assert!(valid);
     }
 
     #[test]
-    fn prop_find_field_never_panics(data in prop::collection::vec(any::<u8>(), 0..128), field_id in 0u64..16) {
-        let _ = find_field(&data, field_id);
+    fn prop_extract_step_created_at_secs_bounds(data in prop::collection::vec(any::<u8>(), 0..128)) {
+        let ts = extract_step_created_at_secs(&data);
+        prop_assert!(ts.is_none_or(|t| (MIN_TIMESTAMP_SECS..=MAX_TIMESTAMP_SECS).contains(&t)));
     }
 
     #[test]
@@ -55,21 +63,21 @@ proptest! {
     }
 
     #[test]
-    fn prop_format_tokens_k_range_has_k_suffix(value in 1000u64..1_000_000) {
+    fn prop_format_tokens_k_range_has_k_suffix(value in 1000u64..999_500) {
         let mut buf = String::new();
         format_tokens(value, &mut buf);
         prop_assert!(buf.ends_with('K'));
     }
 
     #[test]
-    fn prop_format_tokens_m_range_has_m_suffix(value in 1_000_000u64..1_000_000_000) {
+    fn prop_format_tokens_m_range_has_m_suffix(value in 999_500u64..999_500_000) {
         let mut buf = String::new();
         format_tokens(value, &mut buf);
         prop_assert!(buf.ends_with('M'));
     }
 
     #[test]
-    fn prop_format_tokens_b_range_has_b_suffix(value in 1_000_000_000u64..100_000_000_000) {
+    fn prop_format_tokens_b_range_has_b_suffix(value in 999_500_000u64..100_000_000_000) {
         let mut buf = String::new();
         format_tokens(value, &mut buf);
         prop_assert!(buf.ends_with('B'));

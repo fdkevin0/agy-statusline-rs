@@ -8,7 +8,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::db::SessionMetadata;
 use crate::format::{format_tokens, format_tokens_string as format_tok_str};
 use crate::git::GitInfo;
-use crate::layout::{GlyphMode, LayoutConfig, SpeedMode, ThemeStyle, VisualStyle, WidgetId};
+use crate::layout::{
+    GlyphMode, LayoutConfig, SpeedMode, ThemeStyle, VisualStyle, WidgetId,
+    DEFAULT_SPEED_WARN_THRESHOLD,
+};
 use crate::metrics::{
     current_context_tokens, resolve_quota_5h, resolve_quota_weekly, valid_cache_usage, QuotaView,
 };
@@ -183,6 +186,7 @@ fn render_quota(
             Segment::plain(widget, format!("{fallback_label} --"), pal.muted, false)
         });
     };
+    let label = sanitize_inline_text(&q.label);
     let (mut text, fg, bold) = if let Some(amt) = q.remaining_amount {
         let (fg, bold) = if amt <= 0 {
             (pal.ctx_crit, true)
@@ -191,11 +195,10 @@ fn render_quota(
         } else {
             (pal.ctx_ok, false)
         };
-        (format!("{} {amt}", q.label), fg, bold)
+        (format!("{label} {amt}"), fg, bold)
     } else {
         let mut text = format!(
-            "{} {}",
-            q.label,
+            "{label} {}",
             crate::metrics::format_quota_pct(q.remaining_pct)
         );
         if let Some(tok) = q.est_remaining_tokens {
@@ -312,7 +315,12 @@ fn render_widget(
                     is_spacer: false,
                 });
             }
-            let state = payload.agent_state.as_deref().unwrap_or("idle");
+            let state_owned = payload
+                .agent_state
+                .as_deref()
+                .map(sanitize_inline_text)
+                .filter(|s| !s.is_empty());
+            let state = state_owned.as_deref().unwrap_or("idle");
             let (text, fg) = match state {
                 "idle" => (format!("{} READY", glyphs.ready), pal.ready),
                 "thinking" => (format!("{} THINKING", glyphs.thinking), pal.thinking),
@@ -339,7 +347,7 @@ fn render_widget(
         }
         WidgetId::Model => {
             let model = payload.model.as_ref()?;
-            let name = model.display_name.as_deref()?.trim();
+            let name = sanitize_inline_text(model.display_name.as_deref()?);
             if name.is_empty() {
                 return None;
             }
@@ -351,34 +359,40 @@ fn render_widget(
             let text = match model
                 .effort
                 .as_deref()
-                .map(str::trim)
+                .map(sanitize_inline_text)
                 .filter(|e| !e.is_empty())
             {
-                Some(effort) if !display_includes_effort(name, effort) => {
+                Some(effort) if !display_includes_effort(&name, &effort) => {
                     format!("{name}{joiner}{effort}")
                 }
-                _ => name.to_string(),
+                _ => name,
             };
             Some(Segment::plain(widget, text, pal.model, true))
         }
-        WidgetId::Directory => Some(Segment::plain(
-            widget,
-            format!("{} {}", glyphs.dir, payload.workspace_basename()?),
-            pal.dir,
-            false,
-        )),
+        WidgetId::Directory => {
+            let dir = sanitize_inline_text(payload.workspace_basename()?);
+            if dir.is_empty() {
+                return None;
+            }
+            Some(Segment::plain(
+                widget,
+                format!("{} {dir}", glyphs.dir),
+                pal.dir,
+                false,
+            ))
+        }
         WidgetId::Vcs => {
             let vcs = payload.vcs.as_ref();
             let branch = vcs
                 .and_then(|v| {
                     v.branch
                         .as_deref()
-                        .map(collapse_whitespace)
+                        .map(sanitize_inline_text)
                         .filter(|b| !b.is_empty())
                         .or_else(|| {
                             v.client
                                 .as_deref()
-                                .map(collapse_whitespace)
+                                .map(sanitize_inline_text)
                                 .filter(|c| !c.is_empty())
                         })
                 })
@@ -386,7 +400,7 @@ fn render_widget(
                     ctx.git
                         .branch
                         .as_deref()
-                        .map(collapse_whitespace)
+                        .map(sanitize_inline_text)
                         .filter(|b| !b.is_empty())
                 })?;
             let dirty = vcs.and_then(|v| v.dirty).unwrap_or(false)
@@ -394,7 +408,7 @@ fn render_widget(
                 || ctx.git.deleted > 0;
             let prefix = if cfg.glyph_mode == GlyphMode::Ascii {
                 vcs.and_then(|v| v.vcs_type.as_deref())
-                    .map(collapse_whitespace)
+                    .map(sanitize_inline_text)
                     .filter(|t| !t.is_empty())
                     .map(|t| format!("{t}:"))
                     .unwrap_or_else(|| glyphs.branch.to_string())
@@ -416,7 +430,13 @@ fn render_widget(
                 dirty,
             ))
         }
-        WidgetId::Worktree => match &ctx.git.worktree {
+        WidgetId::Worktree => match ctx
+            .git
+            .worktree
+            .as_deref()
+            .map(sanitize_inline_text)
+            .filter(|s| !s.is_empty())
+        {
             Some(wt) => {
                 let text = if cfg.glyph_mode == GlyphMode::Ascii {
                     format!("wt:{wt}")
@@ -505,7 +525,14 @@ fn render_widget(
             Segment::plain(widget, buf, pal.cache, false)
         }),
         WidgetId::Speed => {
-            let slow = speed.is_some_and(|s| s < cfg.speed_warn_threshold);
+            let speed = speed.filter(|s| s.is_finite() && *s >= 0.0);
+            let warn_threshold =
+                if cfg.speed_warn_threshold.is_finite() && cfg.speed_warn_threshold >= 0.0 {
+                    cfg.speed_warn_threshold
+                } else {
+                    DEFAULT_SPEED_WARN_THRESHOLD
+                };
+            let slow = speed.is_some_and(|s| s < warn_threshold);
             let text = speed.map_or_else(
                 || format!("{} --", glyphs.speed),
                 |s| format!("{} {s:.0} tok/s", glyphs.speed),
@@ -524,7 +551,7 @@ fn render_widget(
                 is_spacer: false,
             })
         }
-        WidgetId::Ttft => match ctx.ttft_secs {
+        WidgetId::Ttft => match ctx.ttft_secs.filter(|t| t.is_finite() && *t >= 0.0) {
             Some(t) if t < 1.0 => Some(Segment::plain(
                 widget,
                 format!("{} {:.0}ms", glyphs.ttft, t * 1000.0),
@@ -562,27 +589,32 @@ fn render_widget(
         },
         WidgetId::Cost => {
             if let Some(cost) = payload.cost.as_ref() {
-                if let Some(usd) = cost.total_usd {
+                if let Some(usd) = cost.total_usd.filter(|v| v.is_finite() && *v >= 0.0) {
                     let prefix = if cost.estimated == Some(true) {
                         "~$"
                     } else {
                         "$"
                     };
                     let mut text = format!("{prefix}{usd:.2}");
-                    if let Some(sub) = cost.subagent_usd.filter(|&s| s >= 0.01) {
+                    if let Some(sub) = cost
+                        .subagent_usd
+                        .filter(|&s| s.is_finite() && s >= 0.01)
+                    {
                         text.push_str(&format!(" (sub ${sub:.2})"));
                     }
                     return Some(Segment::plain(widget, text, pal.cost, false));
                 }
             }
-            let usd = ctx.estimated_cost_usd?;
+            let usd = ctx
+                .estimated_cost_usd
+                .filter(|v| v.is_finite() && *v >= 0.0)?;
             Some(Segment::plain(widget, format!("~${usd:.2}"), pal.cost, false))
         }
         WidgetId::Mode => {
             let mode = payload
                 .cycle_mode
                 .as_deref()
-                .map(str::trim)
+                .map(sanitize_inline_text)
                 .filter(|s| !s.is_empty())?;
             let mut text = format!("{} {}", glyphs.mode, mode.to_ascii_uppercase());
             if payload.exceeds_200k_tokens == Some(true) {
@@ -609,9 +641,12 @@ fn render_widget(
             if cfg.smart_hide && n == 0 {
                 return None;
             }
-            let text = match payload.single_active_subagent_label() {
-                Some(label) => {
-                    let clean = collapse_whitespace(label);
+            let text = match payload
+                .single_active_subagent_label()
+                .map(sanitize_inline_text)
+                .filter(|s| !s.is_empty())
+            {
+                Some(clean) => {
                     let short = truncate_to_width(&clean, 20, glyphs.ellipsis);
                     format!("sub {n} ({short})")
                 }
@@ -656,7 +691,7 @@ fn render_widget(
                 .vim
                 .as_ref()
                 .and_then(|v| v.mode.as_deref())
-                .map(str::trim)
+                .map(sanitize_inline_text)
                 .filter(|s| !s.is_empty());
             match mode {
                 Some(m) => {
@@ -682,7 +717,7 @@ fn render_widget(
             let battle = payload.battle.as_ref();
             let status = battle
                 .and_then(|b| b.status.as_deref())
-                .map(str::trim)
+                .map(sanitize_inline_text)
                 .filter(|s| !s.is_empty());
             match status {
                 Some(st) => {
@@ -726,7 +761,7 @@ fn render_widget(
             let ver = payload
                 .version
                 .as_deref()
-                .map(collapse_whitespace)
+                .map(sanitize_inline_text)
                 .filter(|s| !s.is_empty())?;
             let text = if ver.starts_with('v') || ver.starts_with('V') {
                 ver
@@ -739,7 +774,7 @@ fn render_widget(
             let tier = payload
                 .plan_tier
                 .as_deref()
-                .map(collapse_whitespace)
+                .map(sanitize_inline_text)
                 .filter(|s| !s.is_empty())?;
             Some(Segment::plain(widget, tier, pal.model, true))
         }
@@ -747,7 +782,7 @@ fn render_widget(
             let email = payload
                 .email
                 .as_deref()
-                .map(collapse_whitespace)
+                .map(sanitize_inline_text)
                 .filter(|s| !s.is_empty())?;
             Some(Segment::plain(widget, email, pal.muted, false))
         }
@@ -755,7 +790,7 @@ fn render_widget(
             let raw = payload
                 .conversation_title
                 .as_deref()
-                .map(collapse_whitespace)
+                .map(sanitize_inline_text)
                 .filter(|s| !s.is_empty())?;
             let text = truncate_to_width(&raw, 32, glyphs.ellipsis);
             Some(Segment::plain(widget, text, pal.dir, false))
@@ -765,7 +800,7 @@ fn render_widget(
                 .agent
                 .as_ref()
                 .and_then(|a| a.name.as_deref())
-                .map(collapse_whitespace)
+                .map(sanitize_inline_text)
                 .filter(|s| !s.is_empty())?;
             Some(Segment::plain(
                 widget,
@@ -778,7 +813,7 @@ fn render_widget(
             let prod = payload
                 .product
                 .as_deref()
-                .map(collapse_whitespace)
+                .map(sanitize_inline_text)
                 .filter(|s| !s.is_empty())?;
             Some(Segment::plain(widget, prod, pal.muted, false))
         }
@@ -786,7 +821,7 @@ fn render_widget(
             let sid = payload
                 .session_id
                 .as_deref()
-                .map(collapse_whitespace)
+                .map(sanitize_inline_text)
                 .filter(|s| !s.is_empty())?;
             let short: String = sid.chars().take(8).collect();
             Some(Segment::plain(
@@ -802,7 +837,7 @@ fn render_widget(
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())?;
-            let name = collapse_whitespace(
+            let name = sanitize_inline_text(
                 Path::new(raw)
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -822,8 +857,38 @@ fn render_widget(
     }
 }
 
-fn collapse_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+fn sanitize_inline_text(raw: &str) -> String {
+    // Normalize non-CR/LF whitespace (such as `\t` and NEL) before `strip_ansi_escapes`,
+    // whose VTE parser drops C0/C1 control characters other than `\n` and `\r`.
+    let normalized: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_whitespace() && !matches!(ch, ' ' | '\n' | '\r') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let stripped = strip_ansi_escapes::strip_str(&normalized);
+    let mut out = String::with_capacity(stripped.len());
+    let mut pending_space = false;
+
+    for ch in stripped.chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() {
+                pending_space = true;
+            }
+        } else if !ch.is_control() {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+
+    out
 }
 
 fn slice_visible_width(segments: &[Segment], geom: StyleGeometry) -> usize {
@@ -1868,5 +1933,148 @@ mod tests {
         write_statusline(&payload, &meta, &GitInfo::default(), &cfg, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text, "~$1.23\n");
+    }
+
+    #[test]
+    fn sanitize_inline_text_strips_ansi_and_controls_and_collapses_whitespace() {
+        assert_eq!(sanitize_inline_text("\x1b[31mhello\x1b[0m"), "hello");
+        assert_eq!(
+            sanitize_inline_text("  \x1b]0;title\x07foo\n\tbar\r\nbaz \x07 "),
+            "foo bar baz"
+        );
+        assert_eq!(
+            sanitize_inline_text("\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\"),
+            "link"
+        );
+        assert_eq!(sanitize_inline_text("a\x00\u{0085}b\x7fc"), "a bc");
+        assert_eq!(sanitize_inline_text("   \x1b[0m\n\t  "), "");
+    }
+
+    #[test]
+    fn render_widgets_strip_escape_sequences_and_newlines_from_untrusted_fields() {
+        use crate::statusline::{AgentInfo, BattleInfo, VimInfo};
+
+        let payload = StatuslinePayload {
+            agent_state: Some("\x1b[31mcustom\nstate\x1b[0m".to_string()),
+            model: Some(ModelInfo {
+                id: None,
+                display_name: Some("Gemini\n4\x1b[31m".to_string()),
+                effort: Some("\x1b[1mhigh\tmode\x1b[0m".to_string()),
+            }),
+            workspace: Some(WorkspaceInfo {
+                current_dir: Some("/tmp/my\x1b[32mdir\nname".to_string()),
+                project_dir: None,
+            }),
+            vcs: Some(VcsInfo {
+                vcs_type: Some("git\x1b[0m".to_string()),
+                branch: Some("feat/\x1b[31mbar\nbaz".to_string()),
+                client: None,
+                dirty: Some(false),
+            }),
+            cycle_mode: Some("plan\x1b[33m\n".to_string()),
+            vim: Some(VimInfo {
+                mode: Some("\x1b[31minsert\n".to_string()),
+            }),
+            battle: Some(BattleInfo {
+                status: Some("active\x1b[0m\tnow".to_string()),
+                focused_arm: Some(1),
+            }),
+            conversation_title: Some("\x1b]0;evil\x07Hello\nWorld".to_string()),
+            agent: Some(AgentInfo {
+                name: Some("rev\x1b[2Kiewer\n".to_string()),
+            }),
+            ..Default::default()
+        };
+        let git = GitInfo {
+            worktree: Some("wt\x1b[31m\n1".to_string()),
+            ..Default::default()
+        };
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.glyph_mode = GlyphMode::Ascii;
+        cfg.responsive = false;
+        cfg.rows = vec![vec![
+            WidgetId::State,
+            WidgetId::Model,
+            WidgetId::Directory,
+            WidgetId::Vcs,
+            WidgetId::Worktree,
+            WidgetId::Mode,
+            WidgetId::Vim,
+            WidgetId::Battle,
+            WidgetId::Title,
+            WidgetId::Agent,
+        ]];
+
+        let mut out = Vec::new();
+        write_statusline(&payload, &SessionMetadata::default(), &git, &cfg, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains('\x1b'), "ESC leaked: {text:?}");
+        assert_eq!(text.lines().count(), 1, "newline leaked: {text:?}");
+        assert!(text.contains("CUSTOM STATE"), "text: {text}");
+        assert!(text.contains("Gemini 4 / high mode"), "text: {text}");
+        assert!(text.contains("mydir name"), "text: {text}");
+        assert!(text.contains("git: feat/bar baz"), "text: {text}");
+        assert!(text.contains("wt:wt 1"), "text: {text}");
+        assert!(text.contains("mode: PLAN"), "text: {text}");
+        assert!(text.contains("vim INSERT"), "text: {text}");
+        assert!(text.contains("battle ACTIVE NOW #1"), "text: {text}");
+        assert!(text.contains("Hello World"), "text: {text}");
+        assert!(text.contains("agent reviewer"), "text: {text}");
+    }
+
+    #[test]
+    fn non_finite_and_negative_floats_fail_closed_in_cost_speed_and_ttft() {
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.glyph_mode = GlyphMode::Ascii;
+        cfg.smart_hide = false;
+        cfg.rows = vec![vec![WidgetId::Speed, WidgetId::Ttft, WidgetId::Cost]];
+
+        // NaN, Inf, and negative values should never format as NaN/inf/negative.
+        let bad_payload = StatuslinePayload {
+            cost: Some(CostInfo {
+                total_usd: Some(f64::INFINITY),
+                subagent_usd: Some(f64::NAN),
+                estimated: Some(false),
+            }),
+            ..Default::default()
+        };
+        let bad_meta = SessionMetadata {
+            speed: Some(f64::NAN),
+            ttft_secs: Some(-0.5),
+            estimated_cost_usd: Some(-2.0),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        write_statusline(&bad_payload, &bad_meta, &GitInfo::default(), &cfg, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "spd -- * ttft --\n");
+
+        // Negative speed and +Inf ttft also fail closed; valid total_usd drops NaN/Inf subagent_usd.
+        let partial_payload = StatuslinePayload {
+            cost: Some(CostInfo {
+                total_usd: Some(1.50),
+                subagent_usd: Some(f64::INFINITY),
+                estimated: Some(false),
+            }),
+            ..Default::default()
+        };
+        let partial_meta = SessionMetadata {
+            speed: Some(-10.0),
+            ttft_secs: Some(f64::INFINITY),
+            ..Default::default()
+        };
+        let mut out2 = Vec::new();
+        write_statusline(
+            &partial_payload,
+            &partial_meta,
+            &GitInfo::default(),
+            &cfg,
+            &mut out2,
+        )
+        .unwrap();
+        let text2 = String::from_utf8(out2).unwrap();
+        assert_eq!(text2, "spd -- * ttft -- * $1.50\n");
     }
 }

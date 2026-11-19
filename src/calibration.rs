@@ -6,14 +6,13 @@
 //! cycles, and stale calibrations.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::db::resolve_home_dir;
+use crate::fsutil::atomic_write;
 use crate::metrics::{
     resolve_quota_5h_with_reset_at, resolve_quota_weekly_with_reset_at, QuotaView,
 };
@@ -87,14 +86,6 @@ impl Default for CalibrationStore {
     }
 }
 
-/// Resolves the default cache directory (`$XDG_CACHE_HOME/agy-statusline` or `~/.cache/agy-statusline`).
-pub fn default_calibration_cache_dir() -> Option<PathBuf> {
-    if let Some(xdg) = env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(xdg).join("agy-statusline"));
-    }
-    resolve_home_dir().map(|home| home.join(".cache").join("agy-statusline"))
-}
-
 /// Loads [`CalibrationStore`] from `cache_dir/quota_cal.json`, falling back to default on missing/invalid data.
 pub fn load_calibration_store(cache_dir: &Path) -> CalibrationStore {
     let path = cache_dir.join(CACHE_FILENAME);
@@ -106,6 +97,7 @@ pub fn load_calibration_store(cache_dir: &Path) -> CalibrationStore {
     };
     if store.schema_version != SCHEMA_VERSION {
         store.schema_version = SCHEMA_VERSION;
+        store.buckets.clear();
     }
     store
 }
@@ -130,19 +122,10 @@ pub fn save_calibration_store(cache_dir: &Path, store: &CalibrationStore) -> io:
 
 fn write_calibration_store(cache_dir: &Path, store: &CalibrationStore) -> io::Result<()> {
     let target = cache_dir.join(CACHE_FILENAME);
-    let tmp = cache_dir.join(format!("{CACHE_FILENAME}.tmp.{}", std::process::id()));
     let mut json = serde_json::to_string_pretty(store)
         .map_err(|e| io::Error::other(format!("failed to serialize calibration store: {e}")))?;
     json.push('\n');
-    if let Err(e) = fs::write(&tmp, json.as_bytes()) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = fs::rename(&tmp, &target) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    atomic_write(&target, json.as_bytes())
 }
 
 fn extract_session_tokens(payload: &StatuslinePayload) -> Option<u64> {
@@ -290,6 +273,14 @@ fn opt_f64_differs(a: Option<f64>, b: Option<f64>) -> bool {
     }
 }
 
+fn opt_reset_at_differs(a: Option<u64>, b: Option<u64>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x.abs_diff(y) > 2,
+        (None, None) => false,
+        _ => true,
+    }
+}
+
 fn bucket_state_changed(before: Option<&BucketCalibration>, after: &BucketCalibration) -> bool {
     let Some(prev) = before else {
         return true;
@@ -301,7 +292,7 @@ fn bucket_state_changed(before: Option<&BucketCalibration>, after: &BucketCalibr
         || opt_f64_differs(prev.anchor_fraction, after.anchor_fraction)
         || opt_f64_differs(prev.last_fraction, after.last_fraction)
         || prev.anchor_session_tokens != after.anchor_session_tokens
-        || prev.last_reset_at_secs != after.last_reset_at_secs
+        || opt_reset_at_differs(prev.last_reset_at_secs, after.last_reset_at_secs)
         || prev.external_divergence_in_cycle != after.external_divergence_in_cycle
 }
 
@@ -416,6 +407,7 @@ pub fn calibrate_quota_views_at(
 mod tests {
     use super::*;
     use crate::statusline::{ContextWindow, ModelInfo, QuotaBucket};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -625,6 +617,53 @@ mod tests {
         save_calibration_store(&dir, &CalibrationStore::default())
             .expect("save should succeed after lock release");
         assert!(dir.join(CACHE_FILENAME).is_file());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schema_version_mismatch_clears_stale_buckets() {
+        let dir = temp_cache_dir("schema_mismatch");
+        let stale = CalibrationStore {
+            schema_version: SCHEMA_VERSION - 1,
+            buckets: BTreeMap::from([(
+                "acme-5h".to_string(),
+                BucketCalibration {
+                    calibrated_total_tokens: Some(1_000_000.0),
+                    calibrated_at_secs: Some(1_795_000_000),
+                    sample_count: 3,
+                    ..Default::default()
+                },
+            )]),
+        };
+        write_calibration_store(&dir, &stale).unwrap();
+
+        let loaded = load_calibration_store(&dir);
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
+        assert!(loaded.buckets.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_at_jitter_within_two_seconds_does_not_rewrite_disk() {
+        let dir = temp_cache_dir("reset_jitter");
+        let t0 = 1_795_000_000;
+
+        let p1 = make_payload("conv-jitter", 10_000, 0, 0.90, 14_000, 0.98, 500_000);
+        calibrate_quota_views_at(&p1, Some(&dir), t0);
+        let cal_path = dir.join(CACHE_FILENAME);
+        let before_raw = fs::read_to_string(&cal_path).unwrap();
+
+        // +1s jitter in computed reset_at (t0 + 10 + 13_991 = t0 + 14_001 vs t0 + 14_000)
+        let p_jitter_plus1 = make_payload("conv-jitter", 10_000, 0, 0.90, 13_991, 0.98, 499_989);
+        calibrate_quota_views_at(&p_jitter_plus1, Some(&dir), t0 + 10);
+        assert_eq!(fs::read_to_string(&cal_path).unwrap(), before_raw);
+
+        // -1s jitter in computed reset_at
+        let p_jitter_minus1 = make_payload("conv-jitter", 10_000, 0, 0.90, 13_979, 0.98, 499_981);
+        calibrate_quota_views_at(&p_jitter_minus1, Some(&dir), t0 + 20);
+        assert_eq!(fs::read_to_string(&cal_path).unwrap(), before_raw);
 
         let _ = fs::remove_dir_all(&dir);
     }
