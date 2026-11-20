@@ -21,6 +21,8 @@ use crate::paths::{resolve_agy_cli_dir, xdg_cache_dir};
 use crate::timeutil::civil_date_from_unix_day;
 
 pub(super) const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+/// Upper bound on calendar gap-fill span to prevent pathological allocations on huge `--days` or outlier timestamps.
+const MAX_GAP_FILL_DAYS: i64 = 1096;
 
 pub(super) fn weekday_name(day_idx: i64) -> &'static str {
     let idx = civil_date_from_unix_day(day_idx)
@@ -659,12 +661,9 @@ impl StatsDataset {
 
         let mut peak_day: Option<(String, &'static str, MetricValue)> = None;
         let mut daily_rows: Vec<DailyRow> = if query.fill_empty_days {
-            let start_day = match query.range {
-                RangePreset::Days(n) => Some(self.today_day_idx - i64::from(n - 1)),
-                RangePreset::All => day_map.keys().next().copied(),
-            };
-            start_day
-                .map(|start| {
+            cutoff
+                .or_else(|| day_map.keys().next().copied())
+                .map(|raw_start| {
                     let end = self.today_day_idx.max(
                         day_map
                             .keys()
@@ -672,6 +671,7 @@ impl StatsDataset {
                             .copied()
                             .unwrap_or(self.today_day_idx),
                     );
+                    let start = raw_start.max(end.saturating_sub(MAX_GAP_FILL_DAYS - 1));
                     (start..=end)
                         .map(|d| finish_day_row(d, day_map.remove(&d), query.metric, &mut peak_day))
                         .collect()
@@ -889,5 +889,15 @@ mod tests {
         assert_eq!(v_fill.active_days, 3);
         assert_eq!(v_fill.daily_rows[0].date, "2026-11-20");
         assert_eq!(v_fill.daily_rows[6].date, "2026-11-14");
+
+        // Huge range with fill_empty_days is bounded to MAX_GAP_FILL_DAYS.
+        let q_huge = StatsQuery {
+            range: RangePreset::Days(1_000_000),
+            fill_empty_days: true,
+            ..Default::default()
+        };
+        let v_huge = ds.compute_view(&q_huge, None);
+        assert_eq!(v_huge.daily_rows.len(), MAX_GAP_FILL_DAYS as usize);
+        assert_eq!(v_huge.active_days, 3);
     }
 }

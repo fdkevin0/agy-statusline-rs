@@ -81,7 +81,7 @@ enum Command {
         days: Option<u32>,
 
         /// Primary aggregation metric (total, cost, io, input, output, cache, cache_read, cache_write, thinking, turns, or '+' combos like input+output)
-        #[arg(long, value_name = "METRIC")]
+        #[arg(long, value_name = "METRIC", conflicts_with = "json")]
         metric: Option<StatsMetric>,
 
         /// Force interactive TUI (requires a TTY)
@@ -373,6 +373,7 @@ mod tests {
         assert!(Cli::try_parse_from(["agy-statusline", "stats", "--tui", "--plain"]).is_err());
         assert!(Cli::try_parse_from(["agy-statusline", "stats", "--tui", "--json"]).is_err());
         assert!(Cli::try_parse_from(["agy-statusline", "stats", "--plain", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "stats", "--metric", "cost", "--json"]).is_err());
         assert!(Cli::try_parse_from(["agy-statusline", "stats", "--metric", "bogus"]).is_err());
         let stats_custom = Cli::try_parse_from([
             "agy-statusline",

@@ -245,9 +245,9 @@ fn cli_stats_tui_persists_selected_metric_in_config_across_runs() {
 
     let bin = common::BIN;
     let cmd_str = format!("stty rows 36 cols 120 && exec '{bin}' stats --ascii");
-    let mut tui = common::isolated_cmd("script", &home)
+    let mut tui = common::isolated_cmd("/usr/bin/script", &home)
         .env("NO_COLOR", "1")
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PATH", "/usr/bin:/bin")
         .env("TERM", "xterm-256color")
         .env("SHELL", "/bin/sh")
         .args(["-qec", &cmd_str, "/dev/null"])

@@ -7,12 +7,11 @@ use jiff::ToSpan;
 use unicode_width::UnicodeWidthStr;
 
 use super::metric::{format_usd_full, heatmap_level_f64, MetricValue, StatsMetric};
-use super::query::HeatmapWeek;
+use super::query::{HeatmapWeek, WEEKDAY_NAMES};
 use super::{DailyUsage, PeriodSummary, StatsReport, ACTIVITY_WEEKS};
 use crate::format::format_tokens_string as fmt_tok;
 use crate::render::truncate_to_width;
 
-const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MONTH_NAMES: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];

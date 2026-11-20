@@ -765,7 +765,8 @@ fn draw_heatmap_pane(
     let title = format!(" Activity (20w {sep} {}) ", metric.label());
 
     let inner_w = usize::from(area.width.saturating_sub(2));
-    let max_weeks = inner_w.saturating_sub(7).div_ceil(3).min(view.heatmap_weeks.len());
+    // k weeks occupy 7 ("  Mon  ") + 3*k - 1 = 6 + 3*k columns.
+    let max_weeks = (inner_w.saturating_sub(6) / 3).min(view.heatmap_weeks.len());
     let visible_weeks: &[HeatmapWeek] = &view.heatmap_weeks[view.heatmap_weeks.len().saturating_sub(max_weeks)..];
     let glyphs = if pal.ascii { &ASCII_HEATMAP } else { &UNICODE_HEATMAP };
     let peak_mag = view.heatmap_peak.as_ref().map_or(0.0, |(_, _, v)| v.magnitude());
@@ -792,6 +793,8 @@ fn draw_heatmap_pane(
 
     let base_y = area.y + 3;
     let base_x = area.x + 8;
+    let max_y = area.y + area.height.saturating_sub(1);
+    let max_x = area.x + area.width.saturating_sub(1);
     for (wd_idx, wd_name) in WEEKDAY_NAMES.iter().enumerate() {
         let mut row_spans = vec![Span::styled(format!("  {wd_name}  "), pal.dim())];
         let y = base_y + wd_idx as u16;
@@ -802,12 +805,17 @@ fn draw_heatmap_pane(
                     let lvl = heatmap_level_f64(val.magnitude(), peak_mag);
                     let is_sel = state.selected_date.as_deref() == Some(date.as_str());
                     row_spans.push(Span::styled(glyphs[lvl], pal.heatmap(lvl, is_sel)));
-                    hit_map.heatmap_cells.push(RectHit {
-                        value: date.clone(),
-                        y,
-                        x0,
-                        x1: x0 + 2,
-                    });
+                    if y < max_y
+                        && x0 + 2 <= max_x
+                        && (val.is_positive() || state.query.fill_empty_days)
+                    {
+                        hit_map.heatmap_cells.push(RectHit {
+                            value: date.clone(),
+                            y,
+                            x0,
+                            x1: x0 + 2,
+                        });
+                    }
                 }
                 None => row_spans.push(Span::raw("  ")),
             }
@@ -898,7 +906,7 @@ fn draw_daily_pane(
             .saturating_add(view.summary.cache_write_tokens);
         let foot = has_footer.then(|| {
             Row::new([
-                Cell::from(format!("Total({}d)", view.active_days)),
+                Cell::from("Total"),
                 Cell::from(""),
                 right_cell(view.summary.requests.to_string(), val_style),
                 right_cell(fmt_tok(view.summary.input_tokens), val_style),
@@ -928,7 +936,7 @@ fn draw_daily_pane(
         ];
         let foot = has_footer.then(|| {
             Row::new([
-                Cell::from(format!("Total({}d)", view.active_days)),
+                Cell::from("Total"),
                 Cell::from(""),
                 right_cell(metric.format_display(view.total_value, true), val_style),
                 right_cell(if total_mag > 0.0 { "100%" } else { "-" }, val_style),
@@ -951,7 +959,7 @@ fn draw_daily_pane(
         ];
         let foot = has_footer.then(|| {
             Row::new([
-                Cell::from(format!("Total({})", view.active_days)),
+                Cell::from("Total"),
                 right_cell(metric.format_display(view.total_value, true), val_style),
                 Cell::from(""),
             ])
@@ -1220,6 +1228,8 @@ fn draw_models_pane(
         .row_highlight_style(pal.selected_row(active))
         .highlight_symbol(if pal.ascii { "> " } else { "▸ " });
 
+    // Clamp stale scroll offset before rendering so shrinking model lists never strand the viewport when unfocused.
+    *table_state.offset_mut() = table_state.offset().min(state.model_idx);
     table_state.select(active.then_some(state.model_idx));
     frame.render_stateful_widget(table, area, table_state);
 
@@ -1380,5 +1390,42 @@ mod tests {
         assert!(text.contains("2026-11-19"));
         assert!(text.contains("24K"));
         assert!(text.contains("6K"));
+    }
+
+    #[test]
+    fn heatmap_hit_map_stays_inside_borders_and_unfocused_models_offset_recovers() {
+        let ds = test_dataset();
+        let mut st = StatsTuiState::new(None, StatsMetric::Cost);
+        st.loading = false;
+        st.show_heatmap = Some(true);
+        let view = ds.compute_view(&st.query, None);
+        st.sync_with_view(&view);
+
+        // 96x20 forces heatmap onto a short terminal (inner_w = 56, height < 11) and tests exact width/height bounds.
+        let mut tables = TableStates::default();
+        *tables.models.offset_mut() = 10;
+        let pal = Palette {
+            no_color: true,
+            ascii: true,
+        };
+        let backend = TestBackend::new(96, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hit_map = StatsHitMap::default();
+        terminal
+            .draw(|frame| {
+                hit_map = draw_stats_ui(frame, &st, &mut tables, Some(&ds), Some(&view), &pal);
+            })
+            .unwrap();
+
+        // Only active tiles inside the heatmap inner bounds are registered; zero bleed into daily_pane.
+        assert!(hit_map
+            .heatmap_cells
+            .iter()
+            .all(|h| h.x1 <= 95 && h.y < hit_map.daily_pane.y));
+        assert!(hit_map.heatmap_cells.len() <= 2);
+
+        // Unfocused models table recovers from stale offset = 10 back to 0.
+        assert_eq!(tables.models.offset(), 0);
+        assert_eq!(hit_map.models_offset, 0);
     }
 }
