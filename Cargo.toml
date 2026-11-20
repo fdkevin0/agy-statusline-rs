@@ -16,6 +16,7 @@ bundled = ["rusqlite/bundled"]
 
 [dependencies]
 ansi-to-tui = { version = "8.0", default-features = false }
+bitflags = "2"
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 crossterm = "0.29"
 jiff = "1.0"

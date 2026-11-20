@@ -179,9 +179,11 @@ impl TuiEditorState {
         }
     }
 
-    /// Applies one of the built-in presets.
+    /// Applies one of the built-in presets while preserving non-layout preferences.
     pub fn apply_preset(&mut self, preset: Preset) {
+        let saved_metric = self.config.stats_metric;
         self.config = preset.to_layout();
+        self.config.stats_metric = saved_metric;
         self.preset = preset;
         self.canvas_row = 0;
         self.canvas_col = 0;

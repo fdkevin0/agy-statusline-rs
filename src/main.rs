@@ -13,11 +13,15 @@ use agy_statusline::apply::{
 use agy_statusline::db::SqliteSpeedReader;
 use agy_statusline::doctor::run_doctor;
 use agy_statusline::git::SystemGitProbe;
-use agy_statusline::layout::{load_layout_config, save_layout_config, LayoutConfig, Preset};
+use agy_statusline::layout::{
+    load_layout_config, load_saved_stats_metric, save_layout_config, LayoutConfig, Preset,
+};
 use agy_statusline::paths::{
     agy_settings_path, resolve_agy_cli_dir, resolve_home_dir, xdg_cache_dir, xdg_config_dir,
 };
-use agy_statusline::stats::{run_pricing_command, run_stats_command, SyncMode};
+use agy_statusline::stats::{
+    run_pricing_command, run_stats_command_with_metric, run_stats_tui, StatsMetric, SyncMode,
+};
 use agy_statusline::statusline::{process_statusline, PricingSource, StatuslineRuntime};
 use agy_statusline::tui::run_tui_config;
 
@@ -70,14 +74,26 @@ enum Command {
     /// Check configuration, AGY hook, and render a live sample preview
     Doctor,
 
-    /// Show local token usage, estimated API cost, and speed stats
+    /// Show local daily & model token usage, estimated API cost, and speed stats (launches interactive TUI on a TTY)
     Stats {
-        /// Restrict summary to the last N days (>= 1)
+        /// Restrict summary and daily usage to the last N days (>= 1)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         days: Option<u32>,
 
+        /// Primary aggregation metric (total, cost, io, input, output, cache, cache_read, cache_write, thinking, turns, or '+' combos like input+output)
+        #[arg(long, value_name = "METRIC", conflicts_with = "json")]
+        metric: Option<StatsMetric>,
+
+        /// Force interactive TUI (requires a TTY)
+        #[arg(long, conflicts_with_all = ["plain", "json"])]
+        tui: bool,
+
+        /// Print static terminal report instead of launching interactive TUI
+        #[arg(long, conflicts_with_all = ["tui", "json"])]
+        plain: bool,
+
         /// Output machine-readable JSON
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["tui", "plain"])]
         json: bool,
 
         /// Use pure 7-bit ASCII characters
@@ -176,7 +192,14 @@ fn main() -> io::Result<()> {
                 let mut stdout = io::stdout().lock();
                 return run_doctor(&config_path, &settings_path, no_color, &mut stdout);
             }
-            Command::Stats { days, json, ascii } => {
+            Command::Stats {
+                days,
+                metric,
+                tui,
+                plain,
+                json,
+                ascii,
+            } => {
                 let home = resolve_home_dir();
                 if home.is_none() && resolve_agy_cli_dir().is_none() {
                     return Err(io::Error::new(
@@ -184,10 +207,28 @@ fn main() -> io::Result<()> {
                         "neither HOME, USERPROFILE, ANTIGRAVITY_CLI_HOME, nor AGY_HOME environment variable is set",
                     ));
                 }
+                let config_path = xdg_config_dir().ok().map(|d| d.join("config.json"));
+                let effective_metric = metric
+                    .or_else(|| config_path.as_deref().and_then(load_saved_stats_metric))
+                    .unwrap_or_default();
+                let interactive =
+                    tui || (!plain && !json && io::stdin().is_terminal() && io::stdout().is_terminal());
+                if interactive {
+                    return run_stats_tui(
+                        home.as_deref(),
+                        config_path.as_deref(),
+                        days,
+                        effective_metric,
+                        no_color,
+                        ascii,
+                        unix_now_secs(),
+                    );
+                }
                 let mut stdout = io::stdout().lock();
-                return run_stats_command(
+                return run_stats_command_with_metric(
                     home.as_deref(),
                     days,
+                    effective_metric,
                     json,
                     no_color,
                     ascii,
@@ -214,7 +255,9 @@ fn main() -> io::Result<()> {
                     return Ok(());
                 }
                 if let Some(preset) = args.preset {
-                    save_layout_config(&config_path, &preset.to_layout())?;
+                    let mut layout = preset.to_layout();
+                    layout.stats_metric = load_saved_stats_metric(&config_path);
+                    save_layout_config(&config_path, &layout)?;
                     println!(
                         "Applied preset '{}' to {}",
                         preset.name(),
@@ -327,6 +370,32 @@ mod tests {
             Cli::try_parse_from(["agy-statusline", "apply", "--disable", "--replace"]).is_err()
         );
         assert!(Cli::try_parse_from(["agy-statusline", "stats", "--days", "0"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "stats", "--tui", "--plain"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "stats", "--tui", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "stats", "--plain", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "stats", "--metric", "cost", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "stats", "--metric", "bogus"]).is_err());
+        let stats_custom = Cli::try_parse_from([
+            "agy-statusline",
+            "stats",
+            "--days",
+            "14",
+            "--metric",
+            "input+output",
+            "--plain",
+        ])
+        .unwrap();
+        assert!(matches!(
+            stats_custom.command,
+            Some(Command::Stats {
+                days: Some(14),
+                metric: Some(StatsMetric::InputOutput),
+                tui: false,
+                plain: true,
+                json: false,
+                ascii: false,
+            })
+        ));
         assert!(Cli::try_parse_from(["agy-statusline", "pricing", "--if-stale"]).is_err());
         assert!(Cli::try_parse_from(["agy-statusline", "pricing", "status", "--if-stale"]).is_err());
     }

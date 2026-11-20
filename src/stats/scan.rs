@@ -193,8 +193,26 @@ fn extract_canonical_event_key(
     format!("{source}:{cascade}#{step_idx}")
 }
 
+/// Origin of a scanned usage event (`antigravity-cli` vs desktop `antigravity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageSource {
+    Cli,
+    Desktop,
+}
+
+impl UsageSource {
+    fn from_root_label(label: &str) -> Self {
+        if label == "desktop" {
+            Self::Desktop
+        } else {
+            Self::Cli
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct UsageEvent {
+    pub(super) source: UsageSource,
     pub(super) local_day: i64,
     pub(super) local_date: String,
     pub(super) model_group: String,
@@ -464,6 +482,7 @@ fn parse_transcript_line(
     Some((
         event_key,
         UsageEvent {
+            source: UsageSource::from_root_label(job.source),
             local_day,
             local_date,
             model_group,
@@ -667,6 +686,7 @@ fn scan_single_sqlite_db(
         );
 
         out.events.push(UsageEvent {
+            source: UsageSource::from_root_label(target.source),
             local_day,
             local_date,
             model_group,

@@ -35,12 +35,12 @@ fn restore_terminal() {
     let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
 }
 
-struct TerminalGuard {
+pub(crate) struct TerminalGuard {
     prev_hook: Option<Arc<PanicHook>>,
 }
 
 impl TerminalGuard {
-    fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         let prev = Arc::new(std::panic::take_hook());
         let hook_prev = Arc::clone(&prev);
         std::panic::set_hook(Box::new(move |info| {
