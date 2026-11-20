@@ -36,10 +36,11 @@ agy-statusline apply --yes
 agy-statusline doctor
 ```
 
-4. Inspect local CLI & desktop token usage, per-model speed, TTFT, and estimated API cost (native `model_cost` or cached `models.dev` rates with a 24h TTL):
+4. Inspect local CLI & desktop daily/model token usage, speed, TTFT, and estimated API cost interactively (with selectable/composable metrics, or `--plain` / `--json` for static output):
 
 ```sh
-agy-statusline stats --days 30
+agy-statusline stats
+agy-statusline stats --plain --metric cost --days 30
 ```
 
 > Press `s` inside `agy-statusline config` to save and apply in one step.

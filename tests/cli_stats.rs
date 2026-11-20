@@ -181,3 +181,102 @@ fn cli_stats_handles_empty_home() {
     assert_eq!(report.totals.requests, 0);
     assert_eq!(report.sqlite.db_files, 0);
 }
+
+#[test]
+fn cli_stats_plain_lists_daily_usage_switches_metrics_and_rejects_tui_without_tty() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let now_secs = unix_now_secs();
+    let old_secs = now_secs.saturating_sub(3 * 86_400);
+    seed_sqlite_fixtures(&home.join(".gemini/antigravity-cli"), now_secs, old_secs);
+    seed_alpha_rate(home);
+
+    let today_date = unix_secs_to_utc_date(now_secs);
+    let old_date = unix_secs_to_utc_date(old_secs);
+
+    let io_out = isolated_agy_cmd(home)
+        .env("NO_COLOR", "1")
+        .args(["stats", "--plain", "--ascii", "--metric", "io"])
+        .output()
+        .unwrap();
+    assert!(io_out.status.success(), "{io_out:?}");
+    let io_text = String::from_utf8(io_out.stdout).unwrap();
+    assert!(io_text.contains("Metric In+Out"), "{io_text}");
+    assert!(io_text.contains("Activity (20w | In+Out):"), "{io_text}");
+    assert!(io_text.contains("Daily (2d | In+Out):"), "{io_text}");
+    assert!(io_text.contains(&today_date), "{io_text}");
+    assert!(io_text.contains(&old_date), "{io_text}");
+
+    let cost_out = isolated_agy_cmd(home)
+        .env("NO_COLOR", "1")
+        .args(["stats", "--plain", "--ascii", "--metric", "cost"])
+        .output()
+        .unwrap();
+    assert!(cost_out.status.success(), "{cost_out:?}");
+    let cost_text = String::from_utf8(cost_out.stdout).unwrap();
+    assert!(cost_text.contains("Daily (2d | Cost ($)):"), "{cost_text}");
+    assert!(cost_text.contains("~$0.01"), "{cost_text}");
+
+    let tui_err = isolated_agy_cmd(home)
+        .env("NO_COLOR", "1")
+        .args(["stats", "--tui"])
+        .output()
+        .unwrap();
+    assert!(!tui_err.status.success());
+    let stderr = String::from_utf8_lossy(&tui_err.stderr);
+    assert!(stderr.contains("requires a TTY"), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_stats_tui_persists_selected_metric_in_config_across_runs() {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let now_secs = unix_now_secs();
+    seed_sqlite_fixtures(
+        &home.join(".gemini/antigravity-cli"),
+        now_secs,
+        now_secs.saturating_sub(2 * 86_400),
+    );
+    seed_alpha_rate(&home);
+
+    let bin = common::BIN;
+    let cmd_str = format!("stty rows 36 cols 120 && exec '{bin}' stats --ascii");
+    let mut tui = common::isolated_cmd("script", &home)
+        .env("NO_COLOR", "1")
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("TERM", "xterm-256color")
+        .env("SHELL", "/bin/sh")
+        .args(["-qec", &cmd_str, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // First byte confirms alternate-screen raw mode started; '2' selects Cost ($), 'q' exits.
+    tui.stdout.as_mut().unwrap().read_exact(&mut [0]).unwrap();
+    tui.stdin.as_mut().unwrap().write_all(b"2q").unwrap();
+    let output = tui.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let cfg_path = home.join("config/agy-statusline/config.json");
+    let cfg_raw = fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        cfg_raw.contains("\"stats_metric\": \"cost\""),
+        "expected persisted stats_metric in config.json, got:\n{cfg_raw}"
+    );
+
+    // Subsequent `stats --plain` without `--metric` remembers the saved `cost` metric.
+    let next_out = isolated_agy_cmd(&home)
+        .env("NO_COLOR", "1")
+        .args(["stats", "--plain", "--ascii"])
+        .output()
+        .unwrap();
+    assert!(next_out.status.success(), "{next_out:?}");
+    let next_text = String::from_utf8(next_out.stdout).unwrap();
+    assert!(next_text.contains("Metric Cost ($)"), "{next_text}");
+    assert!(next_text.contains("Daily (2d | Cost ($)):"), "{next_text}");
+}

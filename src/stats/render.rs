@@ -6,7 +6,9 @@ use jiff::civil::Date;
 use jiff::ToSpan;
 use unicode_width::UnicodeWidthStr;
 
-use super::{PeriodSummary, StatsReport, ACTIVITY_WEEKS};
+use super::metric::{format_usd_full, heatmap_level_f64, MetricValue, StatsMetric};
+use super::query::HeatmapWeek;
+use super::{DailyUsage, PeriodSummary, StatsReport, ACTIVITY_WEEKS};
 use crate::format::format_tokens_string as fmt_tok;
 use crate::render::truncate_to_width;
 
@@ -14,55 +16,35 @@ const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun
 const MONTH_NAMES: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
-const UNICODE_HEATMAP: [&str; 5] = ["··", "░░", "▒▒", "▓▓", "██"];
-const ASCII_HEATMAP: [&str; 5] = ["..", "==", "--", "##", "**"];
+pub(super) const UNICODE_HEATMAP: [&str; 5] = ["··", "░░", "▒▒", "▓▓", "██"];
+pub(super) const ASCII_HEATMAP: [&str; 5] = ["..", "==", "--", "##", "**"];
 const HEATMAP_ANSI_CODES: [&str; 5] = ["2", "38;5;29", "38;5;36", "38;5;42", "1;38;5;78"];
+const DEFAULT_STATIC_DAILY_LIMIT: usize = 14;
 
-fn fmt_cache_hit(summary: &PeriodSummary) -> String {
-    let denom = summary
-        .input_tokens
-        .saturating_add(summary.cache_read_tokens)
-        .saturating_add(summary.cache_write_tokens);
+pub(super) fn fmt_cache_hit(summary: &PeriodSummary) -> String {
+    fmt_cache_hit_parts(
+        summary.input_tokens,
+        summary.cache_read_tokens,
+        summary.cache_write_tokens,
+    )
+}
+
+fn fmt_cache_hit_parts(input: u64, cache_read: u64, cache_write: u64) -> String {
+    let denom = input
+        .saturating_add(cache_read)
+        .saturating_add(cache_write);
     if denom == 0 {
         return "-".to_string();
     }
-    let pct = (summary.cache_read_tokens as f64) * 100.0 / (denom as f64);
+    let pct = (cache_read as f64) * 100.0 / (denom as f64);
     format!("{pct:.1}%")
 }
 
 fn fmt_usd(usd: f64, priced_requests: u64, unpriced_requests: u64) -> String {
-    if priced_requests == 0 {
-        return "-".to_string();
-    }
-    let base = if usd > 0.0 && usd < 0.01 {
-        format!("~${usd:.4}")
-    } else {
-        format!("~${usd:.2}")
-    };
-    if unpriced_requests > 0 {
-        format!("{base} (+{unpriced_requests})")
-    } else {
-        base
-    }
+    format_usd_full(usd, priced_requests, unpriced_requests)
 }
 
-fn heatmap_level(tokens: u64, peak: u64) -> usize {
-    if tokens == 0 || peak == 0 {
-        return 0;
-    }
-    let pct = (tokens as f64) / (peak as f64);
-    if pct <= 0.25 {
-        1
-    } else if pct <= 0.50 {
-        2
-    } else if pct <= 0.75 {
-        3
-    } else {
-        4
-    }
-}
-
-fn build_month_header(week_dates: &[Option<Date>]) -> String {
+pub(super) fn build_month_header(week_dates: &[Option<Date>]) -> String {
     let week_months: Vec<Option<usize>> = week_dates
         .iter()
         .map(|d| d.map(|date| (date.month() - 1) as usize))
@@ -94,94 +76,27 @@ fn build_month_header(week_dates: &[Option<Date>]) -> String {
     out
 }
 
-fn write_weekly_activity<W: Write>(
-    out: &mut W,
-    report: &StatsReport,
-    no_color: bool,
-    ascii: bool,
-) -> io::Result<()> {
-    let weeks = &report.weekly;
-    let week_dates: Vec<Option<Date>> = weeks.iter().map(|w| w.week_start.parse().ok()).collect();
-    let mut peak: Option<(String, &'static str, u64)> = None;
-
-    for (week, &mon_date) in weeks.iter().zip(&week_dates) {
-        for (wd_idx, maybe_tok) in week.daily_tokens.iter().enumerate() {
-            if let Some(tok) = *maybe_tok {
-                if tok > 0 && peak.as_ref().is_none_or(|(_, _, p)| tok > *p) {
+fn weekly_usage_to_heatmap(report: &StatsReport) -> Vec<HeatmapWeek> {
+    report
+        .weekly
+        .iter()
+        .map(|week| {
+            let mon_date: Option<Date> = week.week_start.parse().ok();
+            let daily = std::array::from_fn(|wd_idx| {
+                week.daily_tokens[wd_idx].map(|tok| {
                     let date = mon_date
                         .and_then(|m| m.checked_add((wd_idx as i64).days()).ok())
                         .map_or_else(|| week.week_start.clone(), |d| d.to_string());
-                    peak = Some((date, WEEKDAY_NAMES[wd_idx], tok));
-                }
+                    (date, MetricValue::Count(tok))
+                })
+            });
+            HeatmapWeek {
+                week_start: week.week_start.clone(),
+                week_end: week.week_end.clone(),
+                daily,
             }
-        }
-    }
-
-    let glyphs = if ascii {
-        &ASCII_HEATMAP
-    } else {
-        &UNICODE_HEATMAP
-    };
-    let peak_tokens = peak.as_ref().map_or(0, |(_, _, p)| *p);
-    let peak_note = match peak {
-        Some((date, wd, tok)) => format!("peak {} on {date} ({wd})", fmt_tok(tok)),
-        None => "no activity".to_string(),
-    };
-    let sep = if ascii { "|" } else { "·" };
-    let legend_tiles: String = (0..5)
-        .map(|lvl| style_wrap(no_color, HEATMAP_ANSI_CODES[lvl], glyphs[lvl]))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let legend = format!(
-        "{} {} {}",
-        style_wrap(no_color, "2", "Less"),
-        legend_tiles,
-        style_wrap(no_color, "2", "More"),
-    );
-    let span_weeks = if weeks.is_empty() {
-        ACTIVITY_WEEKS
-    } else {
-        weeks.len()
-    };
-
-    writeln!(
-        out,
-        "\n{} {peak_note} {sep} {legend}",
-        style_wrap(no_color, "38;5;117", &format!("Activity ({span_weeks}w):")),
-    )?;
-    if weeks.is_empty() {
-        return Ok(());
-    }
-
-    let month_hdr = build_month_header(&week_dates);
-    if !month_hdr.is_empty() {
-        writeln!(
-            out,
-            "{}",
-            style_wrap(no_color, "2", &format!("       {month_hdr}"))
-        )?;
-    }
-
-    for (wd_idx, wd_name) in WEEKDAY_NAMES.iter().enumerate() {
-        let wd_label = style_wrap(no_color, "2", wd_name);
-        if let Some(last_w) = weeks.iter().rposition(|w| w.daily_tokens[wd_idx].is_some()) {
-            let mut row_cells = Vec::with_capacity(last_w + 1);
-            for week in &weeks[..=last_w] {
-                match week.daily_tokens[wd_idx] {
-                    Some(tok) => {
-                        let lvl = heatmap_level(tok, peak_tokens);
-                        row_cells.push(style_wrap(no_color, HEATMAP_ANSI_CODES[lvl], glyphs[lvl]));
-                    }
-                    None => row_cells.push("  ".to_string()),
-                }
-            }
-            writeln!(out, "  {wd_label}  {}", row_cells.join(" "))?;
-        } else {
-            writeln!(out, "  {wd_label}")?;
-        }
-    }
-
-    Ok(())
+        })
+        .collect()
 }
 
 fn style_wrap(no_color: bool, code: &str, text: &str) -> String {
@@ -230,9 +145,226 @@ fn pad_model_cell(name: &str, width: usize, ascii: bool) -> String {
     format!("{truncated}{}", " ".repeat(pad))
 }
 
+fn write_heatmap_grid<W: Write>(
+    out: &mut W,
+    weeks: &[HeatmapWeek],
+    metric: StatsMetric,
+    include_metric_tag: bool,
+    no_color: bool,
+    ascii: bool,
+) -> io::Result<()> {
+    let week_dates: Vec<Option<Date>> = weeks.iter().map(|w| w.week_start.parse().ok()).collect();
+    let mut peak: Option<(String, &'static str, MetricValue)> = None;
+
+    for week in weeks {
+        for (wd_idx, slot) in week.daily.iter().enumerate() {
+            if let Some((date, val)) = slot {
+                if val.is_positive()
+                    && peak
+                        .as_ref()
+                        .is_none_or(|(_, _, p)| val.magnitude() > p.magnitude())
+                {
+                    peak = Some((date.clone(), WEEKDAY_NAMES[wd_idx], *val));
+                }
+            }
+        }
+    }
+
+    let glyphs = if ascii {
+        &ASCII_HEATMAP
+    } else {
+        &UNICODE_HEATMAP
+    };
+    let peak_mag = peak.as_ref().map_or(0.0, |(_, _, v)| v.magnitude());
+    let peak_note = match peak {
+        Some((date, wd, val)) => format!(
+            "peak {} on {date} ({wd})",
+            metric.format_display(val, true)
+        ),
+        None => "no activity".to_string(),
+    };
+    let sep = if ascii { "|" } else { "·" };
+    let legend_tiles: String = (0..5)
+        .map(|lvl| style_wrap(no_color, HEATMAP_ANSI_CODES[lvl], glyphs[lvl]))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let legend = format!(
+        "{} {} {}",
+        style_wrap(no_color, "2", "Less"),
+        legend_tiles,
+        style_wrap(no_color, "2", "More"),
+    );
+    let span_weeks = if weeks.is_empty() {
+        ACTIVITY_WEEKS
+    } else {
+        weeks.len()
+    };
+    let title = if include_metric_tag {
+        format!("Activity ({span_weeks}w {sep} {}):", metric.label())
+    } else {
+        format!("Activity ({span_weeks}w):")
+    };
+
+    writeln!(
+        out,
+        "\n{} {peak_note} {sep} {legend}",
+        style_wrap(no_color, "38;5;117", &title),
+    )?;
+    if weeks.is_empty() {
+        return Ok(());
+    }
+
+    let month_hdr = build_month_header(&week_dates);
+    if !month_hdr.is_empty() {
+        writeln!(
+            out,
+            "{}",
+            style_wrap(no_color, "2", &format!("       {month_hdr}"))
+        )?;
+    }
+
+    for (wd_idx, wd_name) in WEEKDAY_NAMES.iter().enumerate() {
+        let wd_label = style_wrap(no_color, "2", wd_name);
+        if let Some(last_w) = weeks.iter().rposition(|w| w.daily[wd_idx].is_some()) {
+            let mut row_cells = Vec::with_capacity(last_w + 1);
+            for week in &weeks[..=last_w] {
+                match &week.daily[wd_idx] {
+                    Some((_, val)) => {
+                        let lvl = heatmap_level_f64(val.magnitude(), peak_mag);
+                        row_cells.push(style_wrap(no_color, HEATMAP_ANSI_CODES[lvl], glyphs[lvl]));
+                    }
+                    None => row_cells.push("  ".to_string()),
+                }
+            }
+            writeln!(out, "  {wd_label}  {}", row_cells.join(" "))?;
+        } else {
+            writeln!(out, "  {wd_label}")?;
+        }
+    }
+
+    Ok(())
+}
+
+fn static_bar(value: f64, max: f64, width: usize, ascii: bool) -> String {
+    if width == 0 || !value.is_finite() || !max.is_finite() || value <= 0.0 || max <= 0.0 {
+        return String::new();
+    }
+    let filled = ((value / max).clamp(0.0, 1.0) * (width as f64))
+        .round()
+        .max(1.0) as usize;
+    let ch = if ascii { "#" } else { "█" };
+    ch.repeat(filled.min(width))
+}
+
+fn write_daily_table<W: Write>(
+    out: &mut W,
+    report: &StatsReport,
+    metric: StatsMetric,
+    show_cost: bool,
+    no_color: bool,
+    ascii: bool,
+) -> io::Result<()> {
+    if report.daily.is_empty() {
+        return Ok(());
+    }
+
+    // Show newest days first; cap unfiltered all-time static output to 14 active days.
+    let mut rows: Vec<&DailyUsage> = report.daily.iter().rev().collect();
+    let total_days = rows.len();
+    let omitted = if report.filter_days.is_none() && rows.len() > DEFAULT_STATIC_DAILY_LIMIT {
+        rows.truncate(DEFAULT_STATIC_DAILY_LIMIT);
+        total_days - rows.len()
+    } else {
+        0
+    };
+
+    let sep = if ascii { "|" } else { "·" };
+    let section_title = if omitted > 0 {
+        format!(
+            "Daily (latest {} of {total_days}d {sep} {}):",
+            rows.len(),
+            metric.label()
+        )
+    } else {
+        format!("Daily ({total_days}d {sep} {}):", metric.label())
+    };
+    writeln!(out, "\n{}", style_wrap(no_color, "38;5;117", &section_title))?;
+
+    let metric_hdr = metric.label();
+    let cost_extra = show_cost && metric != StatsMetric::Cost;
+    let cost_col_hdr = if cost_extra { "  Est. Cost" } else { "" };
+    let hdr = format!(
+        "  {:<10} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>10}{cost_col_hdr}  Bar",
+        "Date", "Turns", "Input", "Cache", "Output", "Cache Hit", metric_hdr
+    );
+    writeln!(out, "{}", style_wrap(no_color, "2", &hdr))?;
+
+    let max_mag = rows
+        .iter()
+        .map(|d| metric.extract(*d).magnitude())
+        .fold(0.0_f64, f64::max);
+
+    for d in &rows {
+        let cache_tot = d.cache_read_tokens.saturating_add(d.cache_write_tokens);
+        let hit = fmt_cache_hit_parts(d.input_tokens, d.cache_read_tokens, d.cache_write_tokens);
+        let val = metric.extract(*d);
+        let val_str = metric.format_display(val, true);
+        let bar = static_bar(val.magnitude(), max_mag, 10, ascii);
+        write!(
+            out,
+            "  {:<10} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {}",
+            d.date,
+            d.requests,
+            fmt_tok(d.input_tokens),
+            fmt_tok(cache_tot),
+            fmt_tok(d.output_tokens),
+            hit,
+            style_wrap(no_color, "1;38;5;81", &format!("{val_str:>10}")),
+        )?;
+        if cost_extra {
+            let cost_val = StatsMetric::Cost.extract(*d);
+            write!(
+                out,
+                "  {:>9}",
+                StatsMetric::Cost.format_display(cost_val, true)
+            )?;
+        }
+        if !bar.is_empty() {
+            write!(out, "  {}", style_wrap(no_color, "38;5;42", &bar))?;
+        }
+        writeln!(out)?;
+    }
+
+    if omitted > 0 {
+        writeln!(
+            out,
+            "  {}",
+            style_wrap(
+                no_color,
+                "2",
+                &format!("... {omitted} older active days omitted (use --days N or interactive TUI)"),
+            )
+        )?;
+    }
+    Ok(())
+}
+
 /// Renders a concise terminal summary of [`StatsReport`], respecting `no_color` and `ascii`.
+#[cfg(test)]
 pub(super) fn render_stats_report<W: Write>(
     report: &StatsReport,
+    no_color: bool,
+    ascii: bool,
+    out: &mut W,
+) -> io::Result<()> {
+    render_stats_report_with_metric(report, StatsMetric::Total, None, no_color, ascii, out)
+}
+
+/// Renders [`StatsReport`] using `metric` for the daily usage table and optional metric-colored heatmap.
+pub(super) fn render_stats_report_with_metric<W: Write>(
+    report: &StatsReport,
+    metric: StatsMetric,
+    metric_heatmap: Option<&[HeatmapWeek]>,
     no_color: bool,
     ascii: bool,
     out: &mut W,
@@ -243,6 +375,9 @@ pub(super) fn render_stats_report<W: Write>(
     );
     if let Some(d) = report.filter_days {
         header.push_str(&format!(" · Last {d}d"));
+    }
+    if metric != StatsMetric::Total {
+        header.push_str(&format!(" · Metric {}", metric.label()));
     }
     if let Some(first) = &report.first_active_date {
         header.push_str(&format!(" · first {first}"));
@@ -266,7 +401,17 @@ pub(super) fn render_stats_report<W: Write>(
     write_window_row(out, "30d", &report.windows.last_30d, show_cost)?;
     write_window_row(out, "All-Time", &report.windows.all_time, show_cost)?;
 
-    write_weekly_activity(out, report, no_color, ascii)?;
+    match (metric, metric_heatmap) {
+        (m, Some(weeks)) if m != StatsMetric::Total => {
+            write_heatmap_grid(out, weeks, m, true, no_color, ascii)?;
+        }
+        _ => {
+            let fallback = weekly_usage_to_heatmap(report);
+            write_heatmap_grid(out, &fallback, StatsMetric::Total, false, no_color, ascii)?;
+        }
+    }
+
+    write_daily_table(out, report, metric, show_cost, no_color, ascii)?;
 
     if report.models.is_empty() {
         writeln!(out, "\nModels: none recorded")?;

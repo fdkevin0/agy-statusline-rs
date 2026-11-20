@@ -7,28 +7,38 @@
 //! - `brain/**/transcript.jsonl` as a deduplicated fallback ONLY for conversations that
 //!   have no usable SQLite usage records.
 
+mod metric;
 mod pricing;
+mod query;
 mod render;
 mod scan;
+mod state;
+mod tui;
 mod tz;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub use metric::{MetricValue, StatsMetric, TokenComponent, TokenMask};
 pub use pricing::{run_pricing_command, PricingCatalog, SyncMode};
 pub(crate) use scan::estimate_conversation_cost_usd;
+pub use tui::run_stats_tui;
 pub use tz::unix_secs_to_utc_date;
 
-use crate::db::compute_median;
-use crate::paths::{resolve_agy_cli_dir, xdg_cache_dir};
 use crate::timeutil::civil_date_from_unix_day;
-use pricing::{fetch_models_dev_via_curl, round_usd_6, DEFAULT_PRICING_TTL_SECS};
+#[cfg(test)]
+use pricing::DEFAULT_PRICING_TTL_SECS;
+use query::{SourceFilter, StatsDataset};
+use render::render_stats_report_with_metric;
+#[cfg(test)]
 use render::render_stats_report;
-use scan::{scan_sqlite_conversations, scan_transcripts, UsageEvent};
-use tz::{format_day, TimeZoneSpec};
+use scan::UsageEvent;
+use tz::format_day;
+#[cfg(test)]
+use tz::TimeZoneSpec;
 
 const DAYS_PER_WEEK: i64 = 7;
 const ACTIVITY_WEEKS: usize = 20;
@@ -219,44 +229,42 @@ struct ModelAccumulator {
     ttfts: Vec<f64>,
 }
 
-fn build_weekly_usage(
-    today_idx: i64,
-    daily_by_date: &HashMap<&str, u64>,
-) -> Vec<WeeklyUsage> {
+/// Yields the 20 Monday Unix day indices ending with the calendar week containing `today_idx`.
+pub(super) fn activity_week_mondays(today_idx: i64) -> impl Iterator<Item = i64> {
     let today_wd = i64::from(
         civil_date_from_unix_day(today_idx)
             .weekday()
             .to_monday_zero_offset(),
     );
-    let curr_monday = today_idx - today_wd;
-    let first_monday = curr_monday - ((ACTIVITY_WEEKS as i64 - 1) * DAYS_PER_WEEK);
-    let mut weeks = Vec::with_capacity(ACTIVITY_WEEKS);
+    let first_monday = (today_idx - today_wd) - ((ACTIVITY_WEEKS as i64 - 1) * DAYS_PER_WEEK);
+    (0..ACTIVITY_WEEKS).map(move |w| first_monday + (w as i64) * DAYS_PER_WEEK)
+}
 
-    for w in 0..ACTIVITY_WEEKS {
-        let week_mon = first_monday + (w as i64) * DAYS_PER_WEEK;
-        let week_sun = week_mon + (DAYS_PER_WEEK - 1);
-        let mut daily_tokens = [None; 7];
-        let mut total_tokens = 0u64;
-
-        for (d, slot) in daily_tokens.iter_mut().enumerate() {
-            let day_idx = week_mon + (d as i64);
-            if day_idx <= today_idx {
-                let date = format_day(day_idx);
-                let tok = daily_by_date.get(date.as_str()).copied().unwrap_or(0);
-                *slot = Some(tok);
-                total_tokens = total_tokens.saturating_add(tok);
+fn build_weekly_usage(
+    today_idx: i64,
+    daily_by_date: &HashMap<&str, u64>,
+) -> Vec<WeeklyUsage> {
+    activity_week_mondays(today_idx)
+        .map(|week_mon| {
+            let mut daily_tokens = [None; 7];
+            let mut total_tokens = 0u64;
+            for (d, slot) in daily_tokens.iter_mut().enumerate() {
+                let day_idx = week_mon + (d as i64);
+                if day_idx <= today_idx {
+                    let date = format_day(day_idx);
+                    let tok = daily_by_date.get(date.as_str()).copied().unwrap_or(0);
+                    *slot = Some(tok);
+                    total_tokens = total_tokens.saturating_add(tok);
+                }
             }
-        }
-
-        weeks.push(WeeklyUsage {
-            week_start: format_day(week_mon),
-            week_end: format_day(week_sun),
-            daily_tokens,
-            total_tokens,
-        });
-    }
-
-    weeks
+            WeeklyUsage {
+                week_start: format_day(week_mon),
+                week_end: format_day(week_mon + DAYS_PER_WEEK - 1),
+                daily_tokens,
+                total_tokens,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -277,157 +285,10 @@ fn collect_stats_with_tz(
         DEFAULT_PRICING_TTL_SECS,
         |_| unreachable!(),
     );
-    collect_stats_for_roots(&roots, days, now_unix_secs, tz, &pricing)
+    StatsDataset::collect_for_roots(&roots, now_unix_secs, tz, &pricing).to_report(days)
 }
 
-fn collect_stats_for_roots(
-    roots: &[(&'static str, PathBuf)],
-    days: Option<u32>,
-    now_unix_secs: u64,
-    tz: &TimeZoneSpec,
-    pricing: &PricingCatalog,
-) -> StatsReport {
-    let now_i64 = now_unix_secs as i64;
-    let (today_day_idx, today_local) = tz.local_day_and_date(now_i64);
-    let timezone = tz.format_offset_at(now_i64);
-    let today_utc = unix_secs_to_utc_date(now_unix_secs);
-    let filter_days = days.filter(|&d| d > 0);
-    let filter_cutoff = filter_days.map(|d| today_day_idx - i64::from(d - 1));
-
-    let (sqlite, mut events, covered) = scan_sqlite_conversations(roots, tz, pricing);
-    let fallback_events = scan_transcripts(roots, tz, pricing, &covered);
-    events.extend(fallback_events);
-
-    let mut windows = WindowSummaries::default();
-    let mut totals = PeriodSummary::default();
-    let mut daily_map: BTreeMap<i64, (String, PeriodSummary)> = BTreeMap::new();
-    let mut unfiltered_daily_tokens: BTreeMap<String, u64> = BTreeMap::new();
-    let mut model_map: HashMap<String, ModelAccumulator> = HashMap::new();
-    let mut first_day: Option<i64> = None;
-
-    for ev in &events {
-        first_day = Some(match first_day {
-            Some(prev) => prev.min(ev.local_day),
-            None => ev.local_day,
-        });
-
-        let day_tok = unfiltered_daily_tokens
-            .entry(ev.local_date.clone())
-            .or_insert(0);
-        *day_tok = day_tok.saturating_add(ev.total_tokens);
-
-        accumulate_period(&mut windows.all_time, ev);
-        if ev.local_day == today_day_idx {
-            accumulate_period(&mut windows.today, ev);
-        }
-        if ev.local_day >= today_day_idx - 6 && ev.local_day <= today_day_idx {
-            accumulate_period(&mut windows.last_7d, ev);
-        }
-        if ev.local_day >= today_day_idx - 29 && ev.local_day <= today_day_idx {
-            accumulate_period(&mut windows.last_30d, ev);
-        }
-
-        let in_filter = filter_cutoff
-            .is_none_or(|cutoff| ev.local_day >= cutoff && ev.local_day <= today_day_idx);
-        if !in_filter {
-            continue;
-        }
-
-        accumulate_period(&mut totals, ev);
-
-        let (_, day_summary) = daily_map
-            .entry(ev.local_day)
-            .or_insert_with(|| (ev.local_date.clone(), PeriodSummary::default()));
-        accumulate_period(day_summary, ev);
-
-        let model_entry = model_map.entry(ev.model_group.clone()).or_default();
-        if model_entry.pricing_key.is_none() {
-            model_entry.pricing_key.clone_from(&ev.pricing_key);
-        }
-        accumulate_period(&mut model_entry.summary, ev);
-        if let Some(speed) = ev.decode_speed {
-            model_entry.speeds.push(speed);
-        }
-        if let Some(ttft) = ev.ttft_secs {
-            model_entry.ttfts.push(ttft);
-        }
-    }
-
-    for summary in [
-        &mut windows.today,
-        &mut windows.last_7d,
-        &mut windows.last_30d,
-        &mut windows.all_time,
-        &mut totals,
-    ] {
-        summary.priced_usd = round_usd_6(summary.priced_usd);
-    }
-
-    let daily: Vec<DailyUsage> = daily_map
-        .into_values()
-        .map(|(date, s)| DailyUsage {
-            date,
-            requests: s.requests,
-            input_tokens: s.input_tokens,
-            cache_read_tokens: s.cache_read_tokens,
-            cache_write_tokens: s.cache_write_tokens,
-            output_tokens: s.output_tokens,
-            thinking_tokens: s.thinking_tokens,
-            total_tokens: s.total_tokens,
-            priced_usd: round_usd_6(s.priced_usd),
-            unpriced_requests: s.unpriced_requests,
-        })
-        .collect();
-
-    let mut models: Vec<ModelStats> = model_map
-        .into_iter()
-        .map(|(model, acc)| ModelStats {
-            model,
-            pricing_key: acc.pricing_key,
-            requests: acc.summary.requests,
-            input_tokens: acc.summary.input_tokens,
-            cache_read_tokens: acc.summary.cache_read_tokens,
-            cache_write_tokens: acc.summary.cache_write_tokens,
-            output_tokens: acc.summary.output_tokens,
-            thinking_tokens: acc.summary.thinking_tokens,
-            total_tokens: acc.summary.total_tokens,
-            priced_usd: round_usd_6(acc.summary.priced_usd),
-            unpriced_requests: acc.summary.unpriced_requests,
-            speed_samples: acc.speeds.len(),
-            median_tok_per_sec: compute_median(&acc.speeds),
-            ttft_samples: acc.ttfts.len(),
-            median_ttft_secs: compute_median(&acc.ttfts),
-        })
-        .collect();
-
-    models.sort_by(|a, b| {
-        b.total_tokens
-            .cmp(&a.total_tokens)
-            .then_with(|| a.model.cmp(&b.model))
-    });
-
-    let unfiltered_lookup: HashMap<&str, u64> = unfiltered_daily_tokens
-        .iter()
-        .map(|(date, tokens)| (date.as_str(), *tokens))
-        .collect();
-    let weekly = build_weekly_usage(today_day_idx, &unfiltered_lookup);
-
-    StatsReport {
-        today_local,
-        timezone,
-        today_utc,
-        filter_days,
-        first_active_date: first_day.map(format_day),
-        windows,
-        totals,
-        daily,
-        weekly,
-        models,
-        sqlite,
-    }
-}
-
-/// Runs the `agy-statusline stats` subcommand against the resolved environment directories.
+/// Runs the non-interactive `agy-statusline stats` subcommand (`--plain` / `--json` / piped).
 pub fn run_stats_command<W: Write>(
     home: Option<&Path>,
     days: Option<u32>,
@@ -437,27 +298,36 @@ pub fn run_stats_command<W: Write>(
     now_unix_secs: u64,
     out: &mut W,
 ) -> io::Result<()> {
-    let mut roots: Vec<(&'static str, PathBuf)> = Vec::new();
-    if let Some(cli_dir) = resolve_agy_cli_dir()
-        .or_else(|| home.map(|h| h.join(".gemini").join("antigravity-cli")))
-    {
-        roots.push(("cli", cli_dir));
-    }
-    if let Some(h) = home {
-        roots.push(("desktop", h.join(".gemini").join("antigravity")));
-    }
-
-    let cache_dir =
-        xdg_cache_dir().or_else(|| home.map(|h| h.join(".cache").join("agy-statusline")));
-    let pricing = PricingCatalog::load_effective_with(
-        cache_dir.as_deref(),
-        SyncMode::BlockingIfStale,
+    run_stats_command_with_metric(
+        home,
+        days,
+        StatsMetric::Total,
+        json,
+        no_color,
+        ascii,
         now_unix_secs,
-        DEFAULT_PRICING_TTL_SECS,
-        fetch_models_dev_via_curl,
-    );
-    let tz = TimeZoneSpec::local();
-    let report = collect_stats_for_roots(&roots, days, now_unix_secs, &tz, &pricing);
+        out,
+    )
+}
+
+/// Runs the non-interactive `agy-statusline stats` subcommand with an explicit [`StatsMetric`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_stats_command_with_metric<W: Write>(
+    home: Option<&Path>,
+    days: Option<u32>,
+    metric: StatsMetric,
+    json: bool,
+    no_color: bool,
+    ascii: bool,
+    now_unix_secs: u64,
+    out: &mut W,
+) -> io::Result<()> {
+    let dataset = StatsDataset::collect_from_env(home, now_unix_secs);
+    let report = if json {
+        dataset.to_report(days)
+    } else {
+        dataset.to_report_with_metric(days, metric)
+    };
 
     if json {
         let formatted = serde_json::to_string_pretty(&report)
@@ -465,7 +335,17 @@ pub fn run_stats_command<W: Write>(
         writeln!(out, "{formatted}")?;
         return Ok(());
     }
-    render_stats_report(&report, no_color, ascii, out)
+
+    let metric_heatmap = (metric != StatsMetric::Total)
+        .then(|| dataset.build_metric_heatmap(metric, SourceFilter::All, None).0);
+    render_stats_report_with_metric(
+        &report,
+        metric,
+        metric_heatmap.as_deref(),
+        no_color,
+        ascii,
+        out,
+    )
 }
 
 #[cfg(test)]

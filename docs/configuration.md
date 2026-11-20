@@ -12,7 +12,7 @@
 - `agy-statusline apply [--yes|-y] [--stack|--replace]` — Write `statusLine` into `<agy_cli_dir>/settings.json` (`$ANTIGRAVITY_CLI_HOME`, `$AGY_HOME`, or `~/.gemini/antigravity-cli/settings.json`) while preserving existing custom keys such as `padding` and recording the invoked launcher/symlink path rather than dereferencing symlinks.
 - `agy-statusline apply --disable` — Set `statusLine.enabled = false` in `settings.json` and retain your hook configuration. Both `apply` commands preserve existing Unix file permissions.
 - `agy-statusline doctor` — Report whether the layout config loaded, is missing, is invalid, or could not be read. Inspect AGY `settings.json` wiring and `NO_COLOR`, and render a sample preview.
-- `agy-statusline stats [--days <N>] [--json] [--ascii]` — Summarize local AGY CLI (`$ANTIGRAVITY_CLI_HOME` / `$AGY_HOME` / `~/.gemini/antigravity-cli`) and desktop (`~/.gemini/antigravity`) token usage in the host local timezone (Today / 7d / 30d / All-Time), 20-week GitHub-style Monday–Sunday contribution tile grid, per-model thinking tokens / median speed / median TTFT from SQLite `conversations/<uuid>.db` (`gen_metadata` + `steps.metadata`, with deduplicated `transcript.jsonl` fallback when SQLite has no usable usage records), and estimated API cost from native `model_cost` or auto-fetched `models.dev` pricing (24h TTL cache) (`NO_COLOR` disables ANSI escapes).
+- `agy-statusline stats [--days <N>] [--metric <METRIC>] [--tui|--plain|--json] [--ascii]` — Inspect local AGY CLI (`$ANTIGRAVITY_CLI_HOME` / `$AGY_HOME` / `~/.gemini/antigravity-cli`) and desktop (`~/.gemini/antigravity`) daily & per-model usage in the host local timezone. Launches an interactive `ratatui` TUI automatically on a TTY (or outputs a static report with daily breakdown when piped or passed `--plain`; `--json` outputs machine-readable `StatsReport`). Supports selectable & composable metrics (`total`, `cost`, `io`, `input`, `output`, `cache`, `cache_read`, `cache_write`, `thinking`, `turns`, or `+` combinations like `input+output+cache_write`), and remembers the last interactively selected metric in `config.json` (`stats_metric`). `NO_COLOR` disables ANSI escapes.
 - `agy-statusline pricing [status|sync [--if-stale]]` — Inspect the local `models.dev` pricing cache status (`status`, default), or refresh cached pricing from `models.dev` (`sync`, or `sync --if-stale` to fetch only when missing or past the 24h TTL).
 - `agy-statusline version | --version | -V` — Print version information (`agy-statusline <version>`).
 
@@ -29,6 +29,12 @@ Catalog lookup checks exact model names case-insensitively, then names with norm
 - **Multi-Group Alignment**: Toggle `spacer` per line (or press `+` on `spacer` in `Catalog` for two spacers) to align `Left | Center | Right`.
 - **Live Preview**: Click the preview panel or press `w` to cycle `Auto` / `120col` / `72col`.
 - **Presets & Exit**: `1`–`4` apply presets; `s` saves `config.json` and updates AGY `settings.json`; `S` saves `config.json` only; `q` / `Esc` quits without saving.
+
+### Interactive Stats TUI (`agy-statusline stats`)
+
+- **Metrics & Custom Token Composition**: Press `1`–`8` (or `[` / `]`, or click top pills) to switch presets (`Total`, `Cost ($)`, `In+Out`, `Input`, `Output`, `Cache`, `Think`, `Turns`). Toggle individual token buckets with `i` (Input), `o` (Output), `c` (Cache Read), and `w` (Cache Write) to compose custom non-overlapping metrics. The last selected metric is saved to `config.json` (`stats_metric`) on exit.
+- **Range, Sorting & Filtering**: `t` / `T` cycles time ranges (`7d` / `14d` / `30d` / `90d` / `All`); `s` cycles daily sort (`Date ↓`, `Date ↑`, `Value ↓`); `z` toggles zero-usage calendar gaps; `f` filters `All` / `CLI` / `Desktop`; `g` toggles the 20-week metric-colored heatmap (clicking a tile jumps directly to that date).
+- **Drill-Down & Refresh**: `↑↓` / `j` / `k` / mouse wheel navigates daily rows or models; `Tab` switches between `1. Daily Usage` and `3. Models`; `v` toggles models between `Selected Day` and `Window`; `Enter` / left-click on a model cross-filters the dashboard (`Esc` clears the filter); `r` refreshes local SQLite data; `q` quits.
 
 ## Presets & Defaults
 

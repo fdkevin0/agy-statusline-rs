@@ -11,6 +11,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::fsutil::atomic_write;
+use crate::stats::StatsMetric;
 
 /// Maximum number of configurable statusline rows.
 pub const MAX_ROWS: usize = 3;
@@ -400,6 +401,9 @@ pub struct LayoutConfig {
     pub smart_hide: bool,
     /// Show `+ins -del` working-tree diff stats alongside `vcs` branch.
     pub show_git_diff: bool,
+    /// Last selected `agy-statusline stats` aggregation metric (omitted when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats_metric: Option<StatsMetric>,
     /// Runtime `NO_COLOR` flag injected at the CLI boundary (not serialized).
     #[serde(skip)]
     pub no_color: bool,
@@ -427,6 +431,7 @@ impl LayoutConfig {
             ctx_remaining: false,
             smart_hide: true,
             show_git_diff: true,
+            stats_metric: None,
             no_color: false,
         };
         cfg.normalize_rows();
@@ -547,6 +552,7 @@ impl LayoutConfig {
             ctx_remaining,
             smart_hide,
             show_git_diff,
+            stats_metric: _,
             no_color: _,
         } = self;
         Preset::ALL.iter().copied().find(|p| {
@@ -587,6 +593,30 @@ pub fn save_layout_config(path: &Path, config: &LayoutConfig) -> io::Result<()> 
         .map_err(|e| io::Error::other(format!("failed to serialize layout config: {e}")))?;
     json.push('\n');
     atomic_write(path, json.as_bytes())
+}
+
+/// Loads the persisted `stats_metric` preference from `config.json`, if valid and set.
+pub fn load_saved_stats_metric(path: &Path) -> Option<StatsMetric> {
+    try_load_layout_config(path)
+        .ok()
+        .and_then(|cfg| cfg.stats_metric)
+}
+
+/// Persists `metric` into `config.json` without disturbing existing layout settings.
+///
+/// If `config.json` does not exist yet, writes defaults with `stats_metric` set.
+/// If `config.json` exists but is corrupt/unreadable, leaves it untouched to avoid clobbering user data.
+pub fn save_stats_metric(path: &Path, metric: StatsMetric) -> io::Result<()> {
+    let mut cfg = match try_load_layout_config(path) {
+        Ok(cfg) => cfg,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => LayoutConfig::default(),
+        Err(_) => return Ok(()),
+    };
+    if cfg.stats_metric == Some(metric) {
+        return Ok(());
+    }
+    cfg.stats_metric = Some(metric);
+    save_layout_config(path, &cfg)
 }
 
 #[cfg(test)]
@@ -679,5 +709,34 @@ mod tests {
         assert!(!cfg.rows[1].is_empty());
         assert!(cfg.rows[2].is_empty());
         assert_eq!(WidgetId::CacheHit.priority(), 3);
+    }
+
+    #[test]
+    fn stats_metric_persists_without_breaking_preset_matching_or_corrupt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        // Missing file -> creates defaults with stats_metric saved.
+        assert_eq!(load_saved_stats_metric(&path), None);
+        save_stats_metric(&path, StatsMetric::Cost).unwrap();
+        assert_eq!(load_saved_stats_metric(&path), Some(StatsMetric::Cost));
+        let loaded = load_layout_config(&path);
+        assert_eq!(loaded.matching_preset(), Some(Preset::Full));
+
+        // Preserves custom layout settings when updating metric.
+        let mut custom = LayoutConfig::preset_powerline();
+        custom.bar_length = 12;
+        save_layout_config(&path, &custom).unwrap();
+        let combo: StatsMetric = "input+output+cache_write".parse().unwrap();
+        save_stats_metric(&path, combo).unwrap();
+        let reloaded = load_layout_config(&path);
+        assert_eq!(reloaded.style, VisualStyle::Powerline);
+        assert_eq!(reloaded.bar_length, 12);
+        assert_eq!(reloaded.stats_metric, Some(combo));
+
+        // Corrupt config file is left untouched rather than clobbered.
+        fs::write(&path, "{broken").unwrap();
+        save_stats_metric(&path, StatsMetric::Turns).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{broken");
     }
 }
