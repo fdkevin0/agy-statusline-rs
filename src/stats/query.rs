@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+use super::archive::scan_sqlite_conversations_with_archive;
 use super::metric::{MetricValue, StatsMetric};
 use super::pricing::{fetch_models_dev_via_curl, round_usd_6, PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS};
 use super::scan::{scan_sqlite_conversations, scan_transcripts, UsageEvent, UsageSource};
@@ -17,7 +18,7 @@ use super::{
     ModelStats, PeriodSummary, SqliteStats, StatsReport, WindowSummaries, DAYS_PER_WEEK,
 };
 use crate::db::compute_median;
-use crate::paths::{resolve_agy_cli_dir, xdg_cache_dir};
+use crate::paths::{resolve_agy_cli_dir, xdg_cache_dir, xdg_data_dir};
 use crate::timeutil::civil_date_from_unix_day;
 
 pub(super) const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -371,7 +372,7 @@ fn finish_day_row(
     }
 }
 
-fn resolve_roots(home: Option<&Path>) -> Vec<(&'static str, PathBuf)> {
+pub(super) fn resolve_roots(home: Option<&Path>) -> Vec<(&'static str, PathBuf)> {
     let mut roots: Vec<(&'static str, PathBuf)> = Vec::new();
     if let Some(cli_dir) = resolve_agy_cli_dir()
         .or_else(|| home.map(|h| h.join(".gemini").join("antigravity-cli")))
@@ -385,11 +386,14 @@ fn resolve_roots(home: Option<&Path>) -> Vec<(&'static str, PathBuf)> {
 }
 
 impl StatsDataset {
-    /// Scans all AGY roots resolved from the ambient environment and `home`.
+    /// Scans all AGY roots resolved from the ambient environment and `home`,
+    /// incrementally syncing and loading persistent history from the XDG data archive.
     pub fn collect_from_env(home: Option<&Path>, now_unix_secs: u64) -> Self {
         let roots = resolve_roots(home);
         let cache_dir =
             xdg_cache_dir().or_else(|| home.map(|h| h.join(".cache").join("agy-statusline")));
+        let data_dir = xdg_data_dir()
+            .or_else(|| home.map(|h| h.join(".local").join("share").join("agy-statusline")));
         let pricing = PricingCatalog::load_effective_with(
             cache_dir.as_deref(),
             SyncMode::BlockingIfStale,
@@ -398,12 +402,32 @@ impl StatsDataset {
             fetch_models_dev_via_curl,
         );
         let tz = TimeZoneSpec::local();
-        Self::collect_for_roots(&roots, now_unix_secs, &tz, &pricing)
+        Self::collect_for_roots_with_archive(
+            &roots,
+            data_dir.as_deref(),
+            cache_dir.as_deref(),
+            now_unix_secs,
+            &tz,
+            &pricing,
+        )
     }
 
-    /// Scans explicit roots with injected timezone and pricing catalog.
+    /// Scans explicit roots with injected timezone and pricing catalog (live-only, no archive).
+    #[cfg(test)]
     pub(super) fn collect_for_roots(
         roots: &[(&'static str, PathBuf)],
+        now_unix_secs: u64,
+        tz: &TimeZoneSpec,
+        pricing: &PricingCatalog,
+    ) -> Self {
+        Self::collect_for_roots_with_archive(roots, None, None, now_unix_secs, tz, pricing)
+    }
+
+    /// Scans explicit roots with optional persistent archive sync, timezone, and pricing catalog.
+    pub(super) fn collect_for_roots_with_archive(
+        roots: &[(&'static str, PathBuf)],
+        data_dir: Option<&Path>,
+        cache_dir: Option<&Path>,
         now_unix_secs: u64,
         tz: &TimeZoneSpec,
         pricing: &PricingCatalog,
@@ -413,7 +437,17 @@ impl StatsDataset {
         let timezone = tz.format_offset_at(now_i64);
         let today_utc = unix_secs_to_utc_date(now_unix_secs);
 
-        let (sqlite, mut events, covered) = scan_sqlite_conversations(roots, tz, pricing);
+        let (sqlite, mut events, covered) = match data_dir {
+            Some(dir) => scan_sqlite_conversations_with_archive(
+                roots,
+                Some(dir),
+                cache_dir,
+                now_unix_secs,
+                tz,
+                pricing,
+            ),
+            None => scan_sqlite_conversations(roots, tz, pricing),
+        };
         let fallback_events = scan_transcripts(roots, tz, pricing, &covered);
         events.extend(fallback_events);
 

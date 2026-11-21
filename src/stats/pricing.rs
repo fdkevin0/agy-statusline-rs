@@ -259,15 +259,8 @@ impl PricingCatalog {
         )
     }
 
-    fn estimate_cost_inner(
-        &self,
-        candidates: &[&str],
-        input_tokens: u64,
-        cache_read_tokens: u64,
-        cache_write_tokens: u64,
-        output_tokens: u64,
-        apply_context_tiers: bool,
-    ) -> Option<(String, f64)> {
+    /// Resolves the best matching catalog entry index for `candidates`, independent of token counts.
+    pub(super) fn resolve_entry_idx(&self, candidates: &[&str]) -> Option<usize> {
         if self.entries.is_empty() {
             return None;
         }
@@ -288,15 +281,17 @@ impl PricingCatalog {
             .iter()
             .find_map(|(raw, _)| self.exact_raw.get(raw))
             .or_else(|| {
-                lowered_candidates.iter().find_map(|(_, norm)| self.exact_norm.get(norm))
+                lowered_candidates
+                    .iter()
+                    .find_map(|(_, norm)| self.exact_norm.get(norm))
             })
-            .map(|&idx| &self.entries[idx]);
+            .copied();
 
         // Substring fallback prefers the longest match, breaking equal-length ties by
         // preferring literal raw matches over separator-normalized matches, then key order.
         if matched.is_none() {
-            let mut best: Option<(usize, bool, &IndexedEntry)> = None;
-            for entry in &self.entries {
+            let mut best: Option<(usize, bool, usize)> = None;
+            for (idx, entry) in self.entries.iter().enumerate() {
                 let (match_len, is_raw) = if lowered_candidates
                     .iter()
                     .any(|(raw, _)| raw.contains(&entry.pat_lower))
@@ -311,17 +306,31 @@ impl PricingCatalog {
                 } else {
                     continue;
                 };
-                if best.is_none_or(|(best_len, best_raw, previous)| {
+                if best.is_none_or(|(best_len, best_raw, prev_idx)| {
                     (match_len, is_raw) > (best_len, best_raw)
-                        || ((match_len, is_raw) == (best_len, best_raw) && entry.key < previous.key)
+                        || ((match_len, is_raw) == (best_len, best_raw)
+                            && entry.key < self.entries[prev_idx].key)
                 }) {
-                    best = Some((match_len, is_raw, entry));
+                    best = Some((match_len, is_raw, idx));
                 }
             }
-            matched = best.map(|(_, _, e)| e);
+            matched = best.map(|(_, _, idx)| idx);
         }
 
-        let entry = matched.or_else(|| self.resolve_orchestrator_alias(&lowered_candidates))?;
+        matched.or_else(|| self.resolve_orchestrator_alias_idx(&lowered_candidates))
+    }
+
+    /// Computes USD cost for a pre-resolved catalog entry index.
+    pub(super) fn estimate_cost_for_entry(
+        &self,
+        entry_idx: usize,
+        input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+        apply_context_tiers: bool,
+    ) -> Option<(String, f64)> {
+        let entry = self.entries.get(entry_idx)?;
         let prompt_context_tokens = input_tokens
             .saturating_add(cache_read_tokens)
             .saturating_add(cache_write_tokens);
@@ -359,7 +368,27 @@ impl PricingCatalog {
         Some((entry.key.clone(), round_usd_6(cost)))
     }
 
-    fn resolve_orchestrator_alias(&self, candidates: &[(String, String)]) -> Option<&IndexedEntry> {
+    fn estimate_cost_inner(
+        &self,
+        candidates: &[&str],
+        input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+        apply_context_tiers: bool,
+    ) -> Option<(String, f64)> {
+        let entry_idx = self.resolve_entry_idx(candidates)?;
+        self.estimate_cost_for_entry(
+            entry_idx,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+            apply_context_tiers,
+        )
+    }
+
+    fn resolve_orchestrator_alias_idx(&self, candidates: &[(String, String)]) -> Option<usize> {
         // Resolve the target alias first: explicit Argon/Carbon/Flash-worker qualifiers across all
         // candidates take precedence over the bare `gemini-pro-orchestrator` fallback, and an
         // explicit qualifier never silently falls back to another tier when its rate is absent.
@@ -392,7 +421,7 @@ impl PricingCatalog {
         self.exact_raw
             .get(target_raw)
             .or_else(|| self.exact_norm.get(target_norm))
-            .map(|&idx| &self.entries[idx])
+            .copied()
     }
 }
 

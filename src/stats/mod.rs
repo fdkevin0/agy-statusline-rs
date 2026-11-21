@@ -7,6 +7,7 @@
 //! - `brain/**/transcript.jsonl` as a deduplicated fallback ONLY for conversations that
 //!   have no usable SQLite usage records.
 
+mod archive;
 mod metric;
 mod pricing;
 mod query;
@@ -22,6 +23,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub use archive::{maybe_spawn_background_archive_sync, run_stats_sync_command};
 pub use metric::{MetricValue, StatsMetric, TokenComponent, TokenMask};
 pub use pricing::{run_pricing_command, PricingCatalog, SyncMode};
 pub(crate) use scan::estimate_conversation_cost_usd;
@@ -157,8 +159,12 @@ pub struct ModelStats {
 /// Aggregate speed and TTFT statistics extracted from `conversations/*.db`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SqliteStats {
-    /// Number of valid UUID `.db` files scanned.
+    /// Total valid UUID `.db` conversations tracked (live on disk + preserved in local archive).
     pub db_files: u64,
+    /// Archived conversations preserved in `$XDG_DATA_HOME/agy-statusline/stats_history.db`
+    /// that are no longer present in `conversations/` (e.g. after AGY's 500-DB pruning).
+    #[serde(default)]
+    pub archived_db_files: u64,
     /// Completed turns decoded from `gen_metadata` passing speed sanity bounds.
     pub completed_turns: u64,
     /// Sum of output tokens across completed speed turns.

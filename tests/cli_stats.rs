@@ -180,6 +180,117 @@ fn cli_stats_handles_empty_home() {
     let report: StatsReport = serde_json::from_slice(&empty_out.stdout).unwrap();
     assert_eq!(report.totals.requests, 0);
     assert_eq!(report.sqlite.db_files, 0);
+    assert_eq!(report.sqlite.archived_db_files, 0);
+    assert!(!home.join("data/agy-statusline/stats_history.db").exists());
+}
+
+#[test]
+fn cli_stats_preserves_archived_history_after_pruning_and_supports_sync_subcommand() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let cli_root = home.join(".gemini/antigravity-cli");
+    let now_secs = unix_now_secs();
+    let old_secs = now_secs.saturating_sub(20 * 86_400);
+    seed_sqlite_fixtures(&cli_root, now_secs, old_secs);
+    seed_alpha_rate(home);
+
+    let pruned_uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
+    let kept_uuid = "9e1482f2-6b16-534c-b9cd-fe86006a0b9c";
+    let kept_db = cli_root.join("conversations").join(format!("{kept_uuid}.db"));
+    let kept_conn = Connection::open(&kept_db).unwrap();
+    kept_conn
+        .execute(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB)",
+            [],
+        )
+        .unwrap();
+    kept_conn
+        .execute(
+            "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+            [],
+        )
+        .unwrap();
+    kept_conn
+        .execute(
+            "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+            [build_step_meta_blob(now_secs)],
+        )
+        .unwrap();
+    kept_conn
+        .execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [build_gen_blob(TestGenSpec {
+                step_idx: 1,
+                model_enum: 1526,
+                resp_model: "model-alpha",
+                disp_name: "Model Alpha (High)",
+                input_tok: 4_000,
+                cache_read_tok: 0,
+                output_tok: 100,
+                thinking_tok: 20,
+                dur_secs: 1,
+                ttft_ms: 500,
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+    drop(kept_conn);
+
+    // Explicit `stats sync` archives both live DBs.
+    let sync_out = isolated_agy_cmd(home)
+        .args(["stats", "sync"])
+        .output()
+        .unwrap();
+    assert!(sync_out.status.success(), "{sync_out:?}");
+    let sync_text = String::from_utf8(sync_out.stdout).unwrap();
+    assert!(
+        sync_text.contains("Synced 2 updated / 2 live DBs (2 total, 0 archived)"),
+        "{sync_text}"
+    );
+    assert!(home.join("data/agy-statusline/stats_history.db").is_file());
+
+    // `stats sync --if-stale` skips immediately while the stamp is fresh.
+    let stale_out = isolated_agy_cmd(home)
+        .args(["stats", "sync", "--if-stale"])
+        .output()
+        .unwrap();
+    assert!(stale_out.status.success(), "{stale_out:?}");
+    let stale_text = String::from_utf8(stale_out.stdout).unwrap();
+    assert!(stale_text.contains("Stats archive is fresh"), "{stale_text}");
+
+    // Simulate AGY pruning the older conversation DB and its brain directory.
+    fs::remove_file(
+        cli_root
+            .join("conversations")
+            .join(format!("{pruned_uuid}.db")),
+    )
+    .unwrap();
+    fs::remove_dir_all(cli_root.join("brain").join(pruned_uuid)).unwrap();
+
+    let json_out = isolated_agy_cmd(home)
+        .args(["stats", "--json"])
+        .output()
+        .unwrap();
+    assert!(json_out.status.success(), "{json_out:?}");
+    let report: StatsReport = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(report.sqlite.db_files, 2);
+    assert_eq!(report.sqlite.archived_db_files, 1);
+    assert_eq!(report.sqlite.completed_turns, 3);
+    assert_eq!(report.windows.all_time.requests, 3);
+    assert_eq!(report.windows.all_time.input_tokens, 19_000);
+    assert_eq!(report.windows.all_time.thinking_tokens, 180);
+
+    let plain_out = isolated_agy_cmd(home)
+        .env("NO_COLOR", "1")
+        .args(["stats", "--plain", "--ascii"])
+        .output()
+        .unwrap();
+    assert!(plain_out.status.success(), "{plain_out:?}");
+    let plain_text = String::from_utf8(plain_out.stdout).unwrap();
+    assert!(
+        plain_text.contains("SQLite Turns: 3 turns across 2 DBs (1 archived)"),
+        "{plain_text}"
+    );
 }
 
 #[test]

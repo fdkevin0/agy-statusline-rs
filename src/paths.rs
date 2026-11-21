@@ -46,6 +46,13 @@ fn xdg_cache_dir_from(xdg_cache_home: Option<OsString>, home: Option<PathBuf>) -
     home.map(|h| h.join(".cache").join("agy-statusline"))
 }
 
+fn xdg_data_dir_from(xdg_data_home: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(xdg) = non_empty_path(xdg_data_home) {
+        return Some(xdg.join("agy-statusline"));
+    }
+    home.map(|h| h.join(".local").join("share").join("agy-statusline"))
+}
+
 fn agy_settings_path_from(cli_dir: Option<PathBuf>) -> io::Result<PathBuf> {
     let dir = cli_dir.ok_or_else(|| {
         io::Error::new(
@@ -79,6 +86,11 @@ pub fn xdg_config_dir() -> io::Result<PathBuf> {
 /// Resolves `$XDG_CACHE_HOME/agy-statusline` or `<home>/.cache/agy-statusline`.
 pub fn xdg_cache_dir() -> Option<PathBuf> {
     xdg_cache_dir_from(env::var_os("XDG_CACHE_HOME"), resolve_home_dir())
+}
+
+/// Resolves `$XDG_DATA_HOME/agy-statusline` or `<home>/.local/share/agy-statusline`.
+pub fn xdg_data_dir() -> Option<PathBuf> {
+    xdg_data_dir_from(env::var_os("XDG_DATA_HOME"), resolve_home_dir())
 }
 
 /// Returns the default AGY settings path (`<agy_cli_dir>/settings.json`).
@@ -157,9 +169,19 @@ mod tests {
             Some(PathBuf::from("/xdg/cache/agy-statusline"))
         );
         assert_eq!(
-            xdg_cache_dir_from(os(""), home),
+            xdg_cache_dir_from(os(""), home.clone()),
             Some(PathBuf::from("/home/alice/.cache/agy-statusline"))
         );
         assert_eq!(xdg_cache_dir_from(None, None), None);
+
+        assert_eq!(
+            xdg_data_dir_from(os("/xdg/data"), home.clone()),
+            Some(PathBuf::from("/xdg/data/agy-statusline"))
+        );
+        assert_eq!(
+            xdg_data_dir_from(os(""), home),
+            Some(PathBuf::from("/home/alice/.local/share/agy-statusline"))
+        );
+        assert_eq!(xdg_data_dir_from(None, None), None);
     }
 }
