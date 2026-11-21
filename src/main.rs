@@ -3,7 +3,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
@@ -20,7 +20,8 @@ use agy_statusline::paths::{
     agy_settings_path, resolve_agy_cli_dir, resolve_home_dir, xdg_cache_dir, xdg_config_dir,
 };
 use agy_statusline::stats::{
-    run_pricing_command, run_stats_command_with_metric, run_stats_tui, StatsMetric, SyncMode,
+    maybe_spawn_background_archive_sync, run_pricing_command, run_stats_command_with_metric,
+    run_stats_sync_command, run_stats_tui, StatsMetric, SyncMode,
 };
 use agy_statusline::statusline::{process_statusline, PricingSource, StatuslineRuntime};
 use agy_statusline::tui::run_tui_config;
@@ -75,7 +76,11 @@ enum Command {
     Doctor,
 
     /// Show local daily & model token usage, estimated API cost, and speed stats (launches interactive TUI on a TTY)
+    #[command(args_conflicts_with_subcommands = true)]
     Stats {
+        #[command(subcommand)]
+        action: Option<StatsCommand>,
+
         /// Restrict summary and daily usage to the last N days (>= 1)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         days: Option<u32>,
@@ -125,6 +130,16 @@ struct ConfigArgs {
     /// Apply a built-in preset non-interactively
     #[arg(long, value_enum, value_name = "NAME")]
     preset: Option<Preset>,
+}
+
+#[derive(Debug, Subcommand)]
+enum StatsCommand {
+    /// Incrementally sync local AGY conversation DBs into the persistent stats archive
+    Sync {
+        /// Only sync if the archive was not synced within the last 30 minutes
+        #[arg(long)]
+        if_stale: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -193,6 +208,7 @@ fn main() -> io::Result<()> {
                 return run_doctor(&config_path, &settings_path, no_color, &mut stdout);
             }
             Command::Stats {
+                action,
                 days,
                 metric,
                 tui,
@@ -206,6 +222,15 @@ fn main() -> io::Result<()> {
                         io::ErrorKind::NotFound,
                         "neither HOME, USERPROFILE, ANTIGRAVITY_CLI_HOME, nor AGY_HOME environment variable is set",
                     ));
+                }
+                if let Some(StatsCommand::Sync { if_stale }) = action {
+                    let mut stdout = io::stdout().lock();
+                    return run_stats_sync_command(
+                        home.as_deref(),
+                        if_stale,
+                        unix_now_secs(),
+                        &mut stdout,
+                    );
                 }
                 let config_path = xdg_config_dir().ok().map(|d| d.join("config.json"));
                 let effective_metric = metric
@@ -318,7 +343,14 @@ fn main() -> io::Result<()> {
         now_unix_secs: unix_now_secs(),
     };
     let mut stdout = io::stdout().lock();
-    process_statusline(&input, &runtime, &cfg, &mut stdout)
+    let result = process_statusline(&input, &runtime, &cfg, &mut stdout);
+    let _ = stdout.flush();
+    maybe_spawn_background_archive_sync(
+        resolve_home_dir().as_deref(),
+        calibration_dir.as_deref(),
+        runtime.now_unix_secs,
+    );
+    result
 }
 
 #[cfg(test)]
@@ -388,6 +420,7 @@ mod tests {
         assert!(matches!(
             stats_custom.command,
             Some(Command::Stats {
+                action: None,
                 days: Some(14),
                 metric: Some(StatsMetric::InputOutput),
                 tui: false,
@@ -396,6 +429,17 @@ mod tests {
                 ascii: false,
             })
         ));
+        let stats_sync =
+            Cli::try_parse_from(["agy-statusline", "stats", "sync", "--if-stale"]).unwrap();
+        assert!(matches!(
+            stats_sync.command,
+            Some(Command::Stats {
+                action: Some(StatsCommand::Sync { if_stale: true }),
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["agy-statusline", "stats", "--days", "7", "sync"]).is_err());
+        assert!(Cli::try_parse_from(["agy-statusline", "stats", "--json", "sync"]).is_err());
         assert!(Cli::try_parse_from(["agy-statusline", "pricing", "--if-stale"]).is_err());
         assert!(Cli::try_parse_from(["agy-statusline", "pricing", "status", "--if-stale"]).is_err());
     }

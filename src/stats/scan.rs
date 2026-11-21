@@ -348,16 +348,15 @@ fn resolve_turn_cost(
         return (Some("native".to_string()), Some(round_usd_6(usd)));
     }
     let active: Vec<&str> = candidates.iter().copied().flatten().collect();
-    match pricing.estimate_cost(
-        &active,
-        input_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-        output_tokens,
-    ) {
-        Some((k, usd)) => (Some(k), Some(usd)),
-        None => (None, None),
-    }
+    pricing
+        .estimate_cost(
+            &active,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+        )
+        .unzip()
 }
 
 fn parse_transcript_line(
@@ -562,33 +561,158 @@ pub(super) fn scan_transcripts(
     events
 }
 
-struct DbTarget {
-    source: &'static str,
-    uuid: String,
-    path: PathBuf,
+/// File-level change fingerprint for a SQLite conversation DB and its `-wal` sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DbFileFingerprint {
+    pub(super) db_mtime_secs: i64,
+    pub(super) db_mtime_nanos: u32,
+    pub(super) db_size: u64,
+    /// Normalized to `0` when `wal_size == 0` so AGY startup touching idle 0-byte
+    /// `-wal` files does not trigger redundant re-scans.
+    pub(super) wal_mtime_secs: i64,
+    pub(super) wal_mtime_nanos: u32,
+    pub(super) wal_size: u64,
 }
 
-struct SingleDbScan {
-    source: &'static str,
-    uuid: String,
-    completed_turns: u64,
-    total_output_tokens: u64,
-    speed_samples: Vec<f64>,
-    ttft_samples: Vec<f64>,
-    events: Vec<UsageEvent>,
+fn modified_timestamp(meta: &fs::Metadata) -> (i64, u32) {
+    match meta.modified() {
+        Ok(t) => match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+            Err(e) => {
+                let d = e.duration();
+                (-(d.as_secs() as i64), d.subsec_nanos())
+            }
+        },
+        Err(_) => (0, 0),
+    }
 }
 
-fn scan_single_sqlite_db(
-    target: &DbTarget,
-    tz: &TimeZoneSpec,
-    pricing: &PricingCatalog,
-) -> Option<SingleDbScan> {
-    let db_mtime_secs = fs::metadata(&target.path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64);
+fn wal_sidecar_path(db_path: &Path) -> PathBuf {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push("-wal");
+    PathBuf::from(os)
+}
 
+pub(super) fn db_file_fingerprint(db_path: &Path) -> Option<DbFileFingerprint> {
+    let db_meta = fs::metadata(db_path).ok()?;
+    if !db_meta.is_file() {
+        return None;
+    }
+    let (db_mtime_secs, db_mtime_nanos) = modified_timestamp(&db_meta);
+    let db_size = db_meta.len();
+
+    let (wal_mtime_secs, wal_mtime_nanos, wal_size) = match fs::metadata(wal_sidecar_path(db_path))
+    {
+        Ok(wal_meta) if wal_meta.is_file() && wal_meta.len() > 0 => {
+            let (secs, nanos) = modified_timestamp(&wal_meta);
+            (secs, nanos, wal_meta.len())
+        }
+        _ => (0, 0, 0),
+    };
+
+    Some(DbFileFingerprint {
+        db_mtime_secs,
+        db_mtime_nanos,
+        db_size,
+        wal_mtime_secs,
+        wal_mtime_nanos,
+        wal_size,
+    })
+}
+
+pub(super) fn root_path_key(root: &Path) -> String {
+    canonical_or_self(root).to_string_lossy().into_owned()
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DbTarget {
+    pub(super) source: &'static str,
+    pub(super) root_key: String,
+    pub(super) uuid: String,
+    pub(super) path: PathBuf,
+    pub(super) fingerprint: DbFileFingerprint,
+}
+
+/// Timezone- and pricing-independent turn record extracted from a SQLite conversation DB.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct RawTurn {
+    pub(super) ts_secs: Option<i64>,
+    pub(super) model_enum: u64,
+    pub(super) response_model: Option<String>,
+    pub(super) model_display_name: Option<String>,
+    pub(super) input_tokens: u64,
+    pub(super) cache_read_tokens: u64,
+    pub(super) cache_write_tokens: u64,
+    pub(super) output_tokens: u64,
+    pub(super) thinking_tokens: u64,
+    pub(super) native_cost_usd: Option<f64>,
+    pub(super) decode_speed: Option<f64>,
+    pub(super) ttft_secs: Option<f64>,
+}
+
+impl RawTurn {
+    pub(super) fn has_billable_usage(&self) -> bool {
+        self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cache_read_tokens > 0
+            || self.cache_write_tokens > 0
+            || self.native_cost_usd.is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RawConversationScan {
+    pub(super) source: &'static str,
+    pub(super) root_key: String,
+    pub(super) uuid: String,
+    pub(super) fingerprint: DbFileFingerprint,
+    pub(super) turns: Vec<RawTurn>,
+}
+
+pub(super) fn discover_sqlite_db_targets(roots: &[(&'static str, PathBuf)]) -> Vec<DbTarget> {
+    let mut seen_dbs = HashSet::new();
+    let mut targets = Vec::new();
+
+    for (source, root) in roots {
+        let root_key = root_path_key(root);
+        let conv_dir = root.join("conversations");
+        let Ok(entries) = fs::read_dir(&conv_dir) else {
+            continue;
+        };
+        let mut sorted: Vec<_> = entries.filter_map(Result::ok).collect();
+        sorted.sort_by_key(|e| e.file_name());
+        for entry in sorted {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let Some(stem) = name_str.strip_suffix(".db") else {
+                continue;
+            };
+            if !is_valid_uuid(stem) {
+                continue;
+            }
+            let path = entry.path();
+            let Some(fingerprint) = db_file_fingerprint(&path) else {
+                continue;
+            };
+            let uuid_lower = stem.to_ascii_lowercase();
+            let real = canonical_or_self(&path);
+            if seen_dbs.insert(real) {
+                targets.push(DbTarget {
+                    source,
+                    root_key: root_key.clone(),
+                    uuid: uuid_lower,
+                    path,
+                    fingerprint,
+                });
+            }
+        }
+    }
+
+    targets
+}
+
+fn scan_single_sqlite_db_raw(target: &DbTarget) -> Option<RawConversationScan> {
+    let db_mtime_secs = (target.fingerprint.db_mtime_secs > 0).then_some(target.fingerprint.db_mtime_secs);
     let conn = open_readonly_db(&target.path).ok()?;
 
     let mut step_timestamps: HashMap<u64, i64> = HashMap::new();
@@ -615,16 +739,7 @@ fn scan_single_sqlite_db(
         .ok()?;
     let mut rows = stmt.query([]).ok()?;
 
-    let mut out = SingleDbScan {
-        source: target.source,
-        uuid: target.uuid.clone(),
-        completed_turns: 0,
-        total_output_tokens: 0,
-        speed_samples: Vec::new(),
-        ttft_samples: Vec::new(),
-        events: Vec::new(),
-    };
-
+    let mut turns = Vec::new();
     while let Ok(Some(row)) = rows.next() {
         let Ok(blob) = row.get::<_, Vec<u8>>(0) else {
             continue;
@@ -634,138 +749,50 @@ fn scan_single_sqlite_db(
         };
 
         let decode_speed = rec.decode_speed_tps();
-        if let Some(speed) = decode_speed {
-            out.completed_turns += 1;
-            out.total_output_tokens = out
-                .total_output_tokens
-                .saturating_add(rec.output_tokens);
-            out.speed_samples.push(speed);
-        }
         let ttft_secs = rec.ttft_secs;
-        if let Some(ttft) = ttft_secs {
-            out.ttft_samples.push(ttft);
-        }
-
-        let total_tokens = rec
-            .input_tokens
-            .saturating_add(rec.cache_read_tokens)
-            .saturating_add(rec.cache_write_tokens)
-            .saturating_add(rec.output_tokens);
-        if !has_billable_usage(&rec) {
-            continue;
-        }
-
-        let Some(ts_secs) = rec
+        let ts_secs = rec
             .first_step_index
             .and_then(|step_idx| step_timestamps.get(&step_idx).copied())
             .or(rec.chat_start_created_at_secs)
-            .or(db_mtime_secs)
-        else {
-            continue;
-        };
+            .or(db_mtime_secs);
 
-        let (local_day, local_date) = tz.local_day_and_date(ts_secs);
-        let model_group = derive_model_name(
-            rec.model_display_name.as_deref(),
-            rec.response_model.as_deref(),
-            rec.model_enum,
-        );
-
-        let (pricing_key, cost_usd) = resolve_turn_cost(
-            pricing,
-            rec.model_cost_usd,
-            &[
-                rec.response_model.as_deref(),
-                rec.model_display_name.as_deref(),
-                Some(model_group.as_str()),
-            ],
-            rec.input_tokens,
-            rec.cache_read_tokens,
-            rec.cache_write_tokens,
-            rec.output_tokens,
-        );
-
-        out.events.push(UsageEvent {
-            source: UsageSource::from_root_label(target.source),
-            local_day,
-            local_date,
-            model_group,
-            pricing_key,
+        let turn = RawTurn {
+            ts_secs,
+            model_enum: rec.model_enum,
+            response_model: rec.response_model,
+            model_display_name: rec.model_display_name,
             input_tokens: rec.input_tokens,
             cache_read_tokens: rec.cache_read_tokens,
             cache_write_tokens: rec.cache_write_tokens,
             output_tokens: rec.output_tokens,
             thinking_tokens: rec.thinking_output_tokens,
-            total_tokens,
-            cost_usd,
+            native_cost_usd: rec.model_cost_usd,
             decode_speed,
             ttft_secs,
-        });
+        };
+        if turn.decode_speed.is_none() && turn.ttft_secs.is_none() && !turn.has_billable_usage() {
+            continue;
+        }
+        turns.push(turn);
     }
 
-    Some(out)
+    Some(RawConversationScan {
+        source: target.source,
+        root_key: target.root_key.clone(),
+        uuid: target.uuid.clone(),
+        fingerprint: target.fingerprint,
+        turns,
+    })
 }
 
-pub(super) fn scan_sqlite_conversations(
-    roots: &[(&'static str, PathBuf)],
-    tz: &TimeZoneSpec,
-    pricing: &PricingCatalog,
-) -> (
-    SqliteStats,
-    Vec<UsageEvent>,
-    HashSet<(&'static str, String)>,
-) {
-    let mut seen_dbs = HashSet::new();
-    let mut targets = Vec::new();
-    let mut covered = HashSet::new();
-
-    for (source, root) in roots {
-        let conv_dir = root.join("conversations");
-        let Ok(entries) = fs::read_dir(&conv_dir) else {
-            continue;
-        };
-        let mut sorted: Vec<_> = entries.filter_map(Result::ok).collect();
-        sorted.sort_by_key(|e| e.file_name());
-        for entry in sorted {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            let Some(stem) = name_str.strip_suffix(".db") else {
-                continue;
-            };
-            if !is_valid_uuid(stem) {
-                continue;
-            }
-            let path = entry.path();
-            let Ok(meta) = fs::metadata(&path) else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            let uuid_lower = stem.to_ascii_lowercase();
-            let real = canonical_or_self(&path);
-            if seen_dbs.insert(real) {
-                targets.push(DbTarget {
-                    source,
-                    uuid: uuid_lower,
-                    path,
-                });
-            }
-        }
-    }
-
-    let mut stats = SqliteStats::default();
-    let mut speed_samples = Vec::new();
-    let mut ttft_samples = Vec::new();
-    let mut events = Vec::new();
-
+pub(super) fn scan_sqlite_targets_raw(targets: &[DbTarget]) -> Vec<RawConversationScan> {
     let workers = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .clamp(1, 8);
-    let results: Vec<SingleDbScan> = if targets.len() <= 8 || workers == 1 {
+    if targets.len() <= 8 || workers == 1 {
         targets
             .iter()
-            .filter_map(|t| scan_single_sqlite_db(t, tz, pricing))
+            .filter_map(scan_single_sqlite_db_raw)
             .collect()
     } else {
         let chunk_size = targets.len().div_ceil(workers);
@@ -776,7 +803,7 @@ pub(super) fn scan_sqlite_conversations(
                     scope.spawn(move || {
                         chunk
                             .iter()
-                            .filter_map(|t| scan_single_sqlite_db(t, tz, pricing))
+                            .filter_map(scan_single_sqlite_db_raw)
                             .collect::<Vec<_>>()
                     })
                 })
@@ -789,20 +816,125 @@ pub(super) fn scan_sqlite_conversations(
             }
             merged
         })
-    };
+    }
+}
 
-    for res in results {
-        if !res.events.is_empty() {
-            covered.insert((res.source, res.uuid));
-        }
+pub(super) fn project_sqlite_conversations<'a>(
+    conversations: impl IntoIterator<Item = (&'static str, &'a str, &'a [RawTurn])>,
+    archived_db_files: u64,
+    tz: &TimeZoneSpec,
+    pricing: &PricingCatalog,
+) -> (
+    SqliteStats,
+    Vec<UsageEvent>,
+    HashSet<(&'static str, String)>,
+) {
+    let mut stats = SqliteStats {
+        archived_db_files,
+        ..SqliteStats::default()
+    };
+    let mut speed_samples = Vec::new();
+    let mut ttft_samples = Vec::new();
+    let mut events = Vec::new();
+    let mut covered = HashSet::new();
+    // Memoize model-group derivation and catalog entry resolution across turns so large
+    // multi-month archives avoid repeated O(catalog_size) substring scans per turn.
+    type ModelLookupKey<'b> = (Option<&'b str>, Option<&'b str>, u64);
+    let mut model_resolution_cache: HashMap<ModelLookupKey<'_>, (String, Option<usize>)> =
+        HashMap::new();
+
+    for (source, uuid, turns) in conversations {
         stats.db_files += 1;
-        stats.completed_turns += res.completed_turns;
-        stats.total_output_tokens = stats
-            .total_output_tokens
-            .saturating_add(res.total_output_tokens);
-        speed_samples.extend(res.speed_samples);
-        ttft_samples.extend(res.ttft_samples);
-        events.extend(res.events);
+        let usage_source = UsageSource::from_root_label(source);
+        let mut has_events = false;
+
+        for turn in turns {
+            if let Some(speed) = turn.decode_speed {
+                stats.completed_turns += 1;
+                stats.total_output_tokens = stats
+                    .total_output_tokens
+                    .saturating_add(turn.output_tokens);
+                speed_samples.push(speed);
+            }
+            if let Some(ttft) = turn.ttft_secs {
+                ttft_samples.push(ttft);
+            }
+            if !turn.has_billable_usage() {
+                continue;
+            }
+            let Some(ts_secs) = turn.ts_secs else {
+                continue;
+            };
+
+            let total_tokens = turn
+                .input_tokens
+                .saturating_add(turn.cache_read_tokens)
+                .saturating_add(turn.cache_write_tokens)
+                .saturating_add(turn.output_tokens);
+            let (local_day, local_date) = tz.local_day_and_date(ts_secs);
+            let cache_key = (
+                turn.response_model.as_deref(),
+                turn.model_display_name.as_deref(),
+                turn.model_enum,
+            );
+            let (model_group, entry_idx) = model_resolution_cache
+                .entry(cache_key)
+                .or_insert_with(|| {
+                    let group = derive_model_name(
+                        turn.model_display_name.as_deref(),
+                        turn.response_model.as_deref(),
+                        turn.model_enum,
+                    );
+                    let active: Vec<&str> = [
+                        turn.response_model.as_deref(),
+                        turn.model_display_name.as_deref(),
+                        Some(group.as_str()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    let idx = pricing.resolve_entry_idx(&active);
+                    (group, idx)
+                });
+            let (pricing_key, cost_usd) = if let Some(usd) = turn.native_cost_usd {
+                (Some("native".to_string()), Some(round_usd_6(usd)))
+            } else {
+                (*entry_idx)
+                    .and_then(|idx| {
+                        pricing.estimate_cost_for_entry(
+                            idx,
+                            turn.input_tokens,
+                            turn.cache_read_tokens,
+                            turn.cache_write_tokens,
+                            turn.output_tokens,
+                            true,
+                        )
+                    })
+                    .unzip()
+            };
+
+            has_events = true;
+            events.push(UsageEvent {
+                source: usage_source,
+                local_day,
+                local_date,
+                model_group: model_group.clone(),
+                pricing_key,
+                input_tokens: turn.input_tokens,
+                cache_read_tokens: turn.cache_read_tokens,
+                cache_write_tokens: turn.cache_write_tokens,
+                output_tokens: turn.output_tokens,
+                thinking_tokens: turn.thinking_tokens,
+                total_tokens,
+                cost_usd,
+                decode_speed: turn.decode_speed,
+                ttft_secs: turn.ttft_secs,
+            });
+        }
+
+        if has_events {
+            covered.insert((source, uuid.to_owned()));
+        }
     }
 
     stats.ttft_samples = ttft_samples.len();
