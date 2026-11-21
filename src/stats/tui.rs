@@ -1,22 +1,20 @@
 //! Interactive `ratatui` + `crossterm` TUI for `agy-statusline stats`.
 //!
-//! Displays daily usage with selectable & composable metrics, a metric-aware
-//! 20-week activity heatmap, selected-day composition inspector, and clickable
-//! per-day / window model breakdown with cross-filtering.
+//! Keyboard-first dashboard displaying daily usage with color-coded per-day `Cache%`,
+//! selectable additive metrics, a 20-week activity heatmap, selected-day composition
+//! inspector, and per-day / window model breakdown with cross-filtering.
 
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    self, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use jiff::civil::Date;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -27,12 +25,10 @@ use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthStr;
 
 use super::metric::{
-    format_grouped_u64, format_usd_short, heatmap_level_f64, StatsMetric, TokenComponent,
+    format_grouped_u64, format_pct, format_usd_short, heatmap_level_f64, StatsMetric, UsageCounters,
 };
-use super::query::{
-    HeatmapWeek, RangePreset, SourceFilter, StatsDataset, StatsView, WEEKDAY_NAMES,
-};
-use super::render::{build_month_header, fmt_cache_hit, ASCII_HEATMAP, UNICODE_HEATMAP};
+use super::query::{HeatmapWeek, SourceFilter, StatsDataset, StatsView, WEEKDAY_NAMES};
+use super::render::{build_month_header, ASCII_HEATMAP, UNICODE_HEATMAP};
 use super::state::{StatsAction, StatsPane, StatsTuiState};
 use crate::format::format_tokens_string as fmt_tok;
 use crate::layout::save_stats_metric;
@@ -40,97 +36,10 @@ use crate::tui::TerminalGuard;
 
 const UNICODE_BAR_EIGHTHS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
 
-#[derive(Debug, Clone)]
-struct RectHit<T> {
-    value: T,
-    y: u16,
-    x0: u16,
-    x1: u16,
-}
-
-impl<T> RectHit<T> {
-    fn contains(&self, col: u16, row: u16) -> bool {
-        row == self.y && col >= self.x0 && col < self.x1
-    }
-}
-
 #[derive(Default)]
 struct TableStates {
     daily: TableState,
     models: TableState,
-}
-
-#[derive(Default)]
-struct StatsHitMap {
-    metrics: Vec<RectHit<StatsMetric>>,
-    tokens: Vec<RectHit<TokenComponent>>,
-    ranges: Vec<RectHit<RangePreset>>,
-    source_pill: Option<RectHit<()>>,
-    clear_model_pill: Option<RectHit<()>>,
-    model_scope_pill: Option<RectHit<()>>,
-    daily_pane: Rect,
-    daily_first_row_y: u16,
-    daily_visible_rows: usize,
-    daily_offset: usize,
-    models_pane: Rect,
-    models_first_row_y: u16,
-    models_visible_rows: usize,
-    models_offset: usize,
-    heatmap_cells: Vec<RectHit<String>>,
-}
-
-/// Builds a single bounded horizontal line of spans while tracking clickable `x` spans.
-struct HitLine {
-    spans: Vec<Span<'static>>,
-    y: u16,
-    x: u16,
-    max_x: u16,
-}
-
-impl HitLine {
-    fn new(y: u16, x: u16, max_x: u16) -> Self {
-        Self {
-            spans: Vec::new(),
-            y,
-            x,
-            max_x,
-        }
-    }
-
-    fn push_raw(&mut self, text: impl Into<String>, style: Style) -> bool {
-        let s = text.into();
-        let w = s.width() as u16;
-        if self.x + w > self.max_x {
-            return false;
-        }
-        self.spans.push(Span::styled(s, style));
-        self.x += w;
-        true
-    }
-
-    fn push_pill<T>(&mut self, text: String, style: Style, value: T) -> Option<RectHit<T>> {
-        let w = text.width() as u16;
-        if self.x + w > self.max_x {
-            return None;
-        }
-        let hit = RectHit {
-            value,
-            y: self.y,
-            x0: self.x,
-            x1: self.x + w,
-        };
-        self.spans.push(Span::styled(text, style));
-        self.x += w;
-        if self.x < self.max_x {
-            self.spans.push(Span::raw(" "));
-            self.x += 1;
-        }
-        Some(hit)
-    }
-
-    fn into_line(self) -> Line<'static> {
-        Line::from(self.spans)
-    }
 }
 
 struct Palette {
@@ -156,6 +65,23 @@ impl Palette {
             Style::default().add_modifier(Modifier::DIM)
         } else {
             Style::default().fg(Color::DarkGray)
+        }
+    }
+
+    /// Threshold style for cache hit percentages (`>=80%` green, `50–79%` yellow, `<50%` red).
+    fn cache_hit_style(&self, pct: Option<f64>) -> Style {
+        let Some(p) = pct.filter(|p| p.is_finite()) else {
+            return self.dim();
+        };
+        if self.no_color {
+            return Style::default();
+        }
+        if p >= 80.0 {
+            Style::default().fg(Color::Green)
+        } else if p >= 50.0 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Red)
         }
     }
 
@@ -276,14 +202,14 @@ pub fn run_stats_tui(
     let _guard = TerminalGuard::enter();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut dataset: Option<StatsDataset> = None;
     let mut view: Option<StatsView> = None;
-    let mut hit_map = StatsHitMap::default();
+    let mut daily_visible_rows: usize = 10;
     let mut pending_scan = Some(spawn_dataset_scan(home_owned.clone(), now_unix_secs));
 
     loop {
@@ -331,7 +257,8 @@ pub fn run_stats_tui(
         }
 
         terminal.draw(|frame| {
-            hit_map = draw_stats_ui(frame, &state, &mut tables, dataset.as_ref(), view.as_ref(), &pal);
+            daily_visible_rows =
+                draw_stats_ui(frame, &state, &mut tables, dataset.as_ref(), view.as_ref(), &pal);
         })?;
 
         // Poll only while a background scan is active; block at 0% CPU when idle.
@@ -339,10 +266,10 @@ pub fn run_stats_tui(
             continue;
         }
 
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
+        if let Event::Key(key) = event::read()? {
+            if key.kind == KeyEventKind::Press {
                 let term_h = terminal.size().map_or(30, |s| s.height);
-                let page_size = hit_map.daily_visible_rows.max(5);
+                let page_size = daily_visible_rows.max(5);
                 match state.handle_key(key.code, key.modifiers, view.as_ref(), page_size, term_h) {
                     StatsAction::Quit => break,
                     StatsAction::Refresh => {
@@ -356,12 +283,6 @@ pub fn run_stats_tui(
                     StatsAction::Continue => {}
                 }
             }
-            Event::Mouse(mouse) if !state.loading => {
-                if let Some(v) = view.as_ref() {
-                    handle_mouse(&mut state, mouse, &hit_map, v);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -374,72 +295,6 @@ pub fn run_stats_tui(
         }
     }
     Ok(())
-}
-
-fn handle_mouse(state: &mut StatsTuiState, mouse: MouseEvent, map: &StatsHitMap, view: &StatsView) {
-    let (col, row) = (mouse.column, mouse.row);
-    let pos = Position::new(col, row);
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(hit) = map.metrics.iter().find(|h| h.contains(col, row)) {
-                state.select_metric(hit.value);
-            } else if let Some(hit) = map.tokens.iter().find(|h| h.contains(col, row)) {
-                state.toggle_token_component(hit.value);
-            } else if let Some(hit) = map.ranges.iter().find(|h| h.contains(col, row)) {
-                state.select_range(hit.value);
-            } else if map.source_pill.as_ref().is_some_and(|h| h.contains(col, row)) {
-                state.cycle_source();
-            } else if map
-                .clear_model_pill
-                .as_ref()
-                .is_some_and(|h| h.contains(col, row))
-            {
-                state.clear_model_filter();
-            } else if map
-                .model_scope_pill
-                .as_ref()
-                .is_some_and(|h| h.contains(col, row))
-            {
-                state.toggle_model_scope();
-            } else if let Some(cell) = map.heatmap_cells.iter().find(|h| h.contains(col, row)) {
-                state.click_heatmap_date(&cell.value, view);
-            } else if map.daily_pane.contains(pos) {
-                state.active_pane = StatsPane::Daily;
-                if row >= map.daily_first_row_y {
-                    let rel = usize::from(row - map.daily_first_row_y);
-                    if rel < map.daily_visible_rows {
-                        let idx = map.daily_offset + rel;
-                        if idx < view.daily_rows.len() {
-                            state.select_daily_row(idx, view);
-                        }
-                    }
-                }
-            } else if map.models_pane.contains(pos) {
-                state.active_pane = StatsPane::Models;
-                if row >= map.models_first_row_y {
-                    let rel = usize::from(row - map.models_first_row_y);
-                    if rel < map.models_visible_rows {
-                        state.click_model_row(map.models_offset + rel, view);
-                    }
-                }
-            }
-        }
-        MouseEventKind::ScrollUp => {
-            if map.models_pane.contains(pos) {
-                state.move_model(-1, view);
-            } else if map.daily_pane.contains(pos) {
-                state.move_daily(-1, view);
-            }
-        }
-        MouseEventKind::ScrollDown => {
-            if map.models_pane.contains(pos) {
-                state.move_model(1, view);
-            } else if map.daily_pane.contains(pos) {
-                state.move_daily(1, view);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn render_hbar(value: f64, max: f64, width: usize, ascii: bool) -> String {
@@ -470,23 +325,23 @@ fn draw_stats_ui(
     dataset: Option<&StatsDataset>,
     view: Option<&StatsView>,
     pal: &Palette,
-) -> StatsHitMap {
+) -> usize {
     let area = frame.area();
-    let mut hit_map = StatsHitMap::default();
     let show_heatmap = state.heatmap_visible(area.height) && area.width >= 96;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(3),
             Constraint::Length(if show_heatmap { 11 } else { 3 }),
             Constraint::Min(8),
             Constraint::Length(1),
         ])
         .split(area);
 
-    draw_control_bar(frame, chunks[0], state, dataset, pal, &mut hit_map);
+    draw_control_bar(frame, chunks[0], state, dataset, pal);
 
+    let mut daily_visible_rows = 10;
     if let Some(v) = view {
         if show_heatmap {
             let top = Layout::default()
@@ -494,7 +349,7 @@ fn draw_stats_ui(
                 .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
                 .split(chunks[1]);
             draw_summary_card(frame, top[0], state, v, pal);
-            draw_heatmap_pane(frame, top[1], state, v, pal, &mut hit_map);
+            draw_heatmap_pane(frame, top[1], state, v, pal);
         } else {
             draw_compact_summary(frame, chunks[1], state, v, pal);
         }
@@ -504,7 +359,8 @@ fn draw_stats_ui(
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
                 .split(chunks[2]);
-            draw_daily_pane(frame, main[0], state, &mut tables.daily, v, pal, &mut hit_map);
+            daily_visible_rows =
+                draw_daily_pane(frame, main[0], state, &mut tables.daily, v, pal);
 
             let right = Layout::default()
                 .direction(Direction::Vertical)
@@ -514,11 +370,12 @@ fn draw_stats_ui(
                 ])
                 .split(main[1]);
             draw_day_detail_pane(frame, right[0], v, pal);
-            draw_models_pane(frame, right[1], state, &mut tables.models, v, pal, &mut hit_map);
+            draw_models_pane(frame, right[1], state, &mut tables.models, v, pal);
         } else {
             match state.active_pane {
                 StatsPane::Daily => {
-                    draw_daily_pane(frame, chunks[2], state, &mut tables.daily, v, pal, &mut hit_map);
+                    daily_visible_rows =
+                        draw_daily_pane(frame, chunks[2], state, &mut tables.daily, v, pal);
                 }
                 StatsPane::Models => {
                     let stacked = Layout::default()
@@ -529,7 +386,7 @@ fn draw_stats_ui(
                         ])
                         .split(chunks[2]);
                     draw_day_detail_pane(frame, stacked[0], v, pal);
-                    draw_models_pane(frame, stacked[1], state, &mut tables.models, v, pal, &mut hit_map);
+                    draw_models_pane(frame, stacked[1], state, &mut tables.models, v, pal);
                 }
             }
         }
@@ -545,7 +402,7 @@ fn draw_stats_ui(
     }
 
     draw_footer_bar(frame, chunks[3], state, dataset, pal);
-    hit_map
+    daily_visible_rows
 }
 
 fn draw_control_bar(
@@ -554,7 +411,6 @@ fn draw_control_bar(
     state: &StatsTuiState,
     dataset: Option<&StatsDataset>,
     pal: &Palette,
-    hit_map: &mut StatsHitMap,
 ) {
     let sep = pal.sep();
     let title = match dataset {
@@ -567,56 +423,48 @@ fn draw_control_bar(
         None => " agy-statusline stats ".to_string(),
     };
 
-    let compact = area.width < 98;
-    let inner_x = area.x + 1;
-    let max_x = area.x + area.width.saturating_sub(1);
+    let compact = area.width < 100;
+    let inner_w = usize::from(area.width.saturating_sub(2));
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut push = |text: String, style: Style| -> bool {
+        let w = text.width();
+        if used + w > inner_w {
+            return false;
+        }
+        spans.push(Span::styled(text, style));
+        used += w;
+        true
+    };
 
-    let mut line1 = HitLine::new(area.y + 1, inner_x, max_x);
-    line1.push_raw(if compact { "M: " } else { " Metric: " }, pal.dim());
+    push((if compact { " " } else { " Metric: " }).to_string(), pal.dim());
     for (idx, &preset) in StatsMetric::PRESETS.iter().enumerate() {
         let label = if compact {
             format!("{}:{}", idx + 1, preset.compact_label())
         } else {
             format!(" {}:{} ", idx + 1, preset.label())
         };
-        if let Some(hit) = line1.push_pill(label, pal.pill(state.query.metric == preset), preset) {
-            hit_map.metrics.push(hit);
+        if !push(label, pal.pill(state.query.metric == preset)) {
+            break;
         }
-    }
-    if let StatsMetric::Custom(mask) = state.query.metric {
-        line1.push_raw(format!(" [{}] ", mask.short_label()), pal.pill(true));
+        let _ = push(" ".to_string(), Style::default());
     }
 
-    let mut line2 = HitLine::new(area.y + 2, inner_x, max_x);
-    line2.push_raw(if compact { "T: " } else { " Tokens: " }, pal.dim());
-    let active_mask = state.query.metric.token_mask();
-    let check_glyph = if pal.ascii { "x" } else { "✓" };
-    for &comp in TokenComponent::ALL {
-        let checked = active_mask.is_some_and(|m| m.contains(comp.flag()));
-        let mark = if checked { check_glyph } else { " " };
-        let label = if compact {
-            format!("[{mark}]{}", comp.short_label())
+    if push(format!(" {sep} "), pal.dim()) {
+        if compact {
+            let _ = push(format!("[{}]", state.query.range.label()), pal.pill(true));
         } else {
-            format!("[{mark}] {}({})", comp.short_label(), comp.key_hint())
-        };
-        let style = if checked {
-            pal.bold(Color::Green)
-        } else if active_mask.is_some() {
-            pal.pill(false)
-        } else {
-            pal.dim()
-        };
-        if let Some(hit) = line2.push_pill(label, style, comp) {
-            hit_map.tokens.push(hit);
-        }
-    }
-
-    if line2.push_raw(if compact { " R:" } else { "  Range: " }, pal.dim()) {
-        for &range in &state.range_options {
-            let active = state.query.range == range;
-            let text = if active { format!("[{}]", range.label()) } else { range.label() };
-            if let Some(hit) = line2.push_pill(text, pal.pill(active), range) {
-                hit_map.ranges.push(hit);
+            for &range in &state.range_options {
+                let active = state.query.range == range;
+                let text = if active {
+                    format!("[{}]", range.label())
+                } else {
+                    range.label()
+                };
+                if !push(text, pal.pill(active)) {
+                    break;
+                }
+                let _ = push(" ".to_string(), Style::default());
             }
         }
     }
@@ -629,8 +477,7 @@ fn draw_control_bar(
         } else {
             pal.bold(Color::Yellow)
         };
-        hit_map.source_pill =
-            line2.push_pill(format!(" Src:{} ", state.query.source_filter.label()), style, ());
+        let _ = push(format!(" Src:{} ", state.query.source_filter.label()), style);
     }
 
     if let Some(model) = state.query.model_filter.as_deref() {
@@ -644,11 +491,10 @@ fn draw_control_bar(
                 .add_modifier(Modifier::BOLD)
         };
         let label = crate::render::truncate_to_width(model, 18, if pal.ascii { "..." } else { "…" });
-        hit_map.clear_model_pill = line2.push_pill(format!(" {close} {label} "), style, ());
+        let _ = push(format!(" {close} {label} "), style);
     }
 
-    let bar = Paragraph::new(vec![line1.into_line(), line2.into_line()])
-        .block(pal.pane_block(title, false));
+    let bar = Paragraph::new(Line::from(spans)).block(pal.pane_block(title, false));
     frame.render_widget(bar, area);
 }
 
@@ -682,6 +528,7 @@ fn draw_summary_card(
     } else {
         "-".to_string()
     };
+    let hit_pct = view.summary.cache_hit_pct();
 
     let kv = |k: &'static str, v: String, color: Color| -> Line<'static> {
         Line::from(vec![
@@ -699,11 +546,17 @@ fn draw_summary_card(
         ),
         kv("Peak Day", peak_str, Color::Yellow),
         kv("Active Days", format!("{} / {}d", view.active_days, view.span_days), Color::White),
-        kv(
-            "Turns / Hit",
-            format!("{} turns {sep} {} cache", format_grouped_u64(view.summary.requests), fmt_cache_hit(&view.summary)),
-            Color::White,
-        ),
+        Line::from(vec![
+            Span::styled(format!("  {:<11} ", "Turns / Hit"), pal.dim()),
+            Span::styled(
+                format!("{} turns {sep} ", format_grouped_u64(view.summary.requests)),
+                pal.bold(Color::White),
+            ),
+            Span::styled(
+                format!("{} cache", format_pct(hit_pct)),
+                pal.cache_hit_style(hit_pct).add_modifier(Modifier::BOLD),
+            ),
+        ]),
         kv("Est. Cost", cost, Color::Green),
         kv("Speed/TTFT", format!("{spd} {sep} {ttft}"), Color::White),
     ];
@@ -737,28 +590,50 @@ fn draw_compact_summary(
         ),
         None => "-".to_string(),
     };
-    let line = Line::from(vec![
-        Span::styled(" Total ", pal.dim()),
-        Span::styled(metric.format_display(view.total_value, true), pal.bold(Color::Cyan)),
-        Span::styled(sep.clone(), pal.dim()),
-        Span::styled("Avg ", pal.dim()),
-        Span::styled(
-            format!("{}/d", metric.format_average(view.total_value, view.active_days)),
-            pal.bold(Color::Green),
-        ),
-        Span::styled(sep.clone(), pal.dim()),
-        Span::styled("Peak ", pal.dim()),
-        Span::styled(peak_str, pal.bold(Color::Yellow)),
-        Span::styled(sep.clone(), pal.dim()),
-        Span::styled("Active ", pal.dim()),
-        Span::styled(format!("{}/{}d", view.active_days, view.span_days), pal.bold(Color::White)),
-        Span::styled(sep, pal.dim()),
-        Span::styled("Hit ", pal.dim()),
-        Span::styled(fmt_cache_hit(&view.summary), pal.bold(Color::White)),
-    ]);
+    let hit_pct = view.summary.cache_hit_pct();
+    let inner_w = usize::from(area.width.saturating_sub(2));
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut push_segment = |label: &str, value: String, value_style: Style| {
+        let prefix = if spans.is_empty() { " " } else { sep.as_str() };
+        let seg_w = prefix.width() + label.width() + value.width();
+        if !spans.is_empty() && used + seg_w > inner_w {
+            return;
+        }
+        spans.push(Span::styled(
+            prefix.to_string(),
+            if spans.is_empty() { Style::default() } else { pal.dim() },
+        ));
+        spans.push(Span::styled(label.to_string(), pal.dim()));
+        spans.push(Span::styled(value, value_style));
+        used += seg_w;
+    };
+
+    push_segment(
+        "Total ",
+        metric.format_display(view.total_value, true),
+        pal.bold(Color::Cyan),
+    );
+    push_segment(
+        "Avg ",
+        format!("{}/d", metric.format_average(view.total_value, view.active_days)),
+        pal.bold(Color::Green),
+    );
+    push_segment("Peak ", peak_str, pal.bold(Color::Yellow));
+    push_segment(
+        "Hit ",
+        format_pct(hit_pct),
+        pal.cache_hit_style(hit_pct).add_modifier(Modifier::BOLD),
+    );
+    push_segment(
+        "Active ",
+        format!("{}/{}d", view.active_days, view.span_days),
+        pal.bold(Color::White),
+    );
 
     let title = format!(" Summary ({} {} {}) ", state.query.range.label(), pal.sep(), metric.label());
-    frame.render_widget(Paragraph::new(line).block(pal.pane_block(title, false)), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)).block(pal.pane_block(title, false)), area);
 }
 
 fn draw_heatmap_pane(
@@ -767,7 +642,6 @@ fn draw_heatmap_pane(
     state: &StatsTuiState,
     view: &StatsView,
     pal: &Palette,
-    hit_map: &mut StatsHitMap,
 ) {
     let metric = state.query.metric;
     let sep = pal.sep();
@@ -776,7 +650,8 @@ fn draw_heatmap_pane(
     let inner_w = usize::from(area.width.saturating_sub(2));
     // k weeks occupy 7 ("  Mon  ") + 3*k - 1 = 6 + 3*k columns.
     let max_weeks = (inner_w.saturating_sub(6) / 3).min(view.heatmap_weeks.len());
-    let visible_weeks: &[HeatmapWeek] = &view.heatmap_weeks[view.heatmap_weeks.len().saturating_sub(max_weeks)..];
+    let visible_weeks: &[HeatmapWeek] =
+        &view.heatmap_weeks[view.heatmap_weeks.len().saturating_sub(max_weeks)..];
     let glyphs = if pal.ascii { &ASCII_HEATMAP } else { &UNICODE_HEATMAP };
     let peak_mag = view.heatmap_peak.as_ref().map_or(0.0, |(_, _, v)| v.magnitude());
     let peak_note = match &view.heatmap_peak {
@@ -800,31 +675,14 @@ fn draw_heatmap_pane(
     let week_dates: Vec<Option<Date>> = visible_weeks.iter().map(|w| w.week_start.parse().ok()).collect();
     lines.push(Line::styled(format!("       {}", build_month_header(&week_dates)), pal.dim()));
 
-    let base_y = area.y + 3;
-    let base_x = area.x + 8;
-    let max_y = area.y + area.height.saturating_sub(1);
-    let max_x = area.x + area.width.saturating_sub(1);
     for (wd_idx, wd_name) in WEEKDAY_NAMES.iter().enumerate() {
         let mut row_spans = vec![Span::styled(format!("  {wd_name}  "), pal.dim())];
-        let y = base_y + wd_idx as u16;
         for (w_idx, week) in visible_weeks.iter().enumerate() {
-            let x0 = base_x + (w_idx as u16) * 3;
             match &week.daily[wd_idx] {
                 Some((date, val)) => {
                     let lvl = heatmap_level_f64(val.magnitude(), peak_mag);
                     let is_sel = state.selected_date.as_deref() == Some(date.as_str());
                     row_spans.push(Span::styled(glyphs[lvl], pal.heatmap(lvl, is_sel)));
-                    if y < max_y
-                        && x0 + 2 <= max_x
-                        && (val.is_positive() || state.query.fill_empty_days)
-                    {
-                        hit_map.heatmap_cells.push(RectHit {
-                            value: date.clone(),
-                            y,
-                            x0,
-                            x1: x0 + 2,
-                        });
-                    }
                 }
                 None => row_spans.push(Span::raw("  ")),
             }
@@ -842,6 +700,66 @@ fn right_cell(text: impl Into<String>, style: Style) -> Cell<'static> {
     Cell::from(Text::from(text.into()).alignment(Alignment::Right)).style(style)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DailyCol {
+    Date,
+    Wd,
+    Turns,
+    Input,
+    Cache,
+    Output,
+    CacheHit,
+    Metric,
+    Share,
+    Bar,
+}
+
+impl DailyCol {
+    fn fixed_width(self, narrow: bool) -> Option<u16> {
+        match self {
+            Self::Date => Some(10),
+            Self::Wd => Some(3),
+            Self::Turns | Self::Input | Self::Cache | Self::Output | Self::CacheHit | Self::Share => {
+                Some(6)
+            }
+            Self::Metric => Some(if narrow { 9 } else { 10 }),
+            Self::Bar => None,
+        }
+    }
+
+    fn constraint(self, narrow: bool) -> Constraint {
+        match self.fixed_width(narrow) {
+            Some(w) => Constraint::Length(w),
+            None => Constraint::Min(4),
+        }
+    }
+
+    fn header(self, metric_hdr: &'static str, pal: &Palette) -> Cell<'static> {
+        match self {
+            Self::Date => Cell::from("Date"),
+            Self::Wd => Cell::from("Wd"),
+            Self::Turns => right_cell("Turns", pal.dim()),
+            Self::Input => right_cell("Input", pal.dim()),
+            Self::Cache => right_cell("Cache", pal.dim()),
+            Self::Output => right_cell("Output", pal.dim()),
+            Self::CacheHit => right_cell("Cache%", pal.dim()),
+            Self::Metric => right_cell(metric_hdr, pal.dim()),
+            Self::Share => right_cell("Share", pal.dim()),
+            Self::Bar => Cell::from("Bar"),
+        }
+    }
+}
+
+fn daily_columns(inner_w: usize) -> &'static [DailyCol] {
+    use DailyCol::*;
+    match inner_w {
+        72.. => &[Date, Wd, Turns, Input, Cache, Output, CacheHit, Metric, Bar],
+        48..72 => &[Date, Wd, CacheHit, Metric, Share, Bar],
+        36..48 => &[Date, CacheHit, Metric, Bar],
+        _ => &[Date, Metric, Bar],
+    }
+}
+
 fn draw_daily_pane(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -849,8 +767,7 @@ fn draw_daily_pane(
     table_state: &mut TableState,
     view: &StatsView,
     pal: &Palette,
-    hit_map: &mut StatsHitMap,
-) {
+) -> usize {
     let active = state.active_pane == StatsPane::Daily;
     let metric = state.query.metric;
     let sep = pal.sep();
@@ -861,121 +778,57 @@ fn draw_daily_pane(
         metric.label(),
     );
 
-    hit_map.daily_pane = area;
     if view.daily_rows.is_empty() {
         let empty = Paragraph::new(Line::styled("  No usage recorded in this window.", pal.dim()))
             .block(pal.pane_block(title, active));
         frame.render_widget(empty, area);
-        return;
+        return 0;
     }
 
     let inner_w = usize::from(area.width.saturating_sub(2));
     let inner_h = usize::from(area.height.saturating_sub(2));
     let has_footer = inner_h >= 5;
-    let full = inner_w >= 72;
-    let medium = !full && inner_w >= 48;
+    let narrow = inner_w < 48;
+    let cols = daily_columns(inner_w);
+
     let total_mag = view.total_value.magnitude();
     let metric_hdr = metric.label();
 
-    let bar_w = if full {
-        inner_w.saturating_sub(62).max(4)
-    } else if medium {
-        inner_w.saturating_sub(36).max(4)
-    } else {
-        inner_w.saturating_sub(24).max(4)
-    };
+    // Exact non-bar footprint: 2-col highlight symbol + fixed columns + 1-col spacing between columns.
+    let fixed_cols_w: usize = cols
+        .iter()
+        .filter_map(|c| c.fixed_width(narrow).map(usize::from))
+        .sum();
+    let non_bar_w = 2 + fixed_cols_w + cols.len().saturating_sub(1);
+    let bar_w = inner_w.saturating_sub(non_bar_w).max(4);
+
     let bar_style = pal.fg(Color::Indexed(42));
     let val_style = pal.bold(Color::Cyan);
+    let summary_hit_pct = view.summary.cache_hit_pct();
+    let summary_hit_str = format_pct(summary_hit_pct);
+    let summary_hit_style = pal.cache_hit_style(summary_hit_pct).add_modifier(Modifier::BOLD);
+    let summary_cache_tot = view
+        .summary
+        .cache_read_tokens
+        .saturating_add(view.summary.cache_write_tokens);
+    let summary_metric_str = metric.format_display(view.total_value, true);
 
-    let (header, widths, footer_opt): (Row<'static>, Vec<Constraint>, Option<Row<'static>>) = if full {
-        let hdr = Row::new([
-            Cell::from("Date"),
-            Cell::from("Wd"),
-            right_cell("Turns", pal.dim()),
-            right_cell("Input", pal.dim()),
-            right_cell("Cache", pal.dim()),
-            right_cell("Output", pal.dim()),
-            right_cell(metric_hdr, pal.dim()),
-            Cell::from("Bar"),
-        ])
-        .style(pal.dim());
-        let w = vec![
-            Constraint::Length(10),
-            Constraint::Length(3),
-            Constraint::Length(6),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(10),
-            Constraint::Min(4),
-        ];
-        let cache_tot = view
-            .summary
-            .cache_read_tokens
-            .saturating_add(view.summary.cache_write_tokens);
-        let foot = has_footer.then(|| {
-            Row::new([
-                Cell::from("Total"),
-                Cell::from(""),
-                right_cell(view.summary.requests.to_string(), val_style),
-                right_cell(fmt_tok(view.summary.input_tokens), val_style),
-                right_cell(fmt_tok(cache_tot), val_style),
-                right_cell(fmt_tok(view.summary.output_tokens), val_style),
-                right_cell(metric.format_display(view.total_value, true), val_style),
-                Cell::from(""),
-            ])
-            .style(val_style)
+    let header = Row::new(cols.iter().map(|c| c.header(metric_hdr, pal))).style(pal.dim());
+    let widths: Vec<Constraint> = cols.iter().map(|c| c.constraint(narrow)).collect();
+    let footer_opt = has_footer.then(|| {
+        let cells = cols.iter().map(|col| match col {
+            DailyCol::Date => Cell::from("Total"),
+            DailyCol::Wd | DailyCol::Bar => Cell::from(""),
+            DailyCol::Turns => right_cell(view.summary.requests.to_string(), val_style),
+            DailyCol::Input => right_cell(fmt_tok(view.summary.input_tokens), val_style),
+            DailyCol::Cache => right_cell(fmt_tok(summary_cache_tot), val_style),
+            DailyCol::Output => right_cell(fmt_tok(view.summary.output_tokens), val_style),
+            DailyCol::CacheHit => right_cell(summary_hit_str.clone(), summary_hit_style),
+            DailyCol::Metric => right_cell(summary_metric_str.clone(), val_style),
+            DailyCol::Share => right_cell(if total_mag > 0.0 { "100%" } else { "-" }, val_style),
         });
-        (hdr, w, foot)
-    } else if medium {
-        let hdr = Row::new([
-            Cell::from("Date"),
-            Cell::from("Wd"),
-            right_cell(metric_hdr, pal.dim()),
-            right_cell("Share", pal.dim()),
-            Cell::from("Bar"),
-        ])
-        .style(pal.dim());
-        let w = vec![
-            Constraint::Length(10),
-            Constraint::Length(3),
-            Constraint::Length(10),
-            Constraint::Length(6),
-            Constraint::Min(4),
-        ];
-        let foot = has_footer.then(|| {
-            Row::new([
-                Cell::from("Total"),
-                Cell::from(""),
-                right_cell(metric.format_display(view.total_value, true), val_style),
-                right_cell(if total_mag > 0.0 { "100%" } else { "-" }, val_style),
-                Cell::from(""),
-            ])
-            .style(val_style)
-        });
-        (hdr, w, foot)
-    } else {
-        let hdr = Row::new([
-            Cell::from("Date"),
-            right_cell(metric_hdr, pal.dim()),
-            Cell::from("Bar"),
-        ])
-        .style(pal.dim());
-        let w = vec![
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Min(4),
-        ];
-        let foot = has_footer.then(|| {
-            Row::new([
-                Cell::from("Total"),
-                right_cell(metric.format_display(view.total_value, true), val_style),
-                Cell::from(""),
-            ])
-            .style(val_style)
-        });
-        (hdr, w, foot)
-    };
+        Row::new(cells).style(val_style)
+    });
 
     let rows: Vec<Row<'static>> = view
         .daily_rows
@@ -984,46 +837,36 @@ fn draw_daily_pane(
             let zero = row.summary.requests == 0;
             let row_style = if zero { pal.dim() } else { Style::default() };
             let m_style = if zero { pal.dim() } else { val_style };
+            let hit_pct = row.summary.cache_hit_pct();
+            let hit_str = format_pct(hit_pct);
+            let hit_style = pal.cache_hit_style(hit_pct);
             let val_str = metric.format_display(row.metric_value, true);
             let bar = render_hbar(row.metric_value.magnitude(), view.daily_max, bar_w, pal.ascii);
-            if full {
-                let cache_tot = row
-                    .summary
-                    .cache_read_tokens
-                    .saturating_add(row.summary.cache_write_tokens);
-                Row::new([
-                    Cell::from(row.date.clone()),
-                    Cell::from(row.weekday),
-                    right_cell(row.summary.requests.to_string(), row_style),
-                    right_cell(fmt_tok(row.summary.input_tokens), row_style),
-                    right_cell(fmt_tok(cache_tot), row_style),
-                    right_cell(fmt_tok(row.summary.output_tokens), row_style),
-                    right_cell(val_str, m_style),
-                    Cell::from(bar).style(bar_style),
-                ])
-                .style(row_style)
-            } else if medium {
-                let share = if total_mag > 0.0 {
-                    format!("{:.1}%", (row.metric_value.magnitude() / total_mag) * 100.0)
-                } else {
-                    "-".to_string()
-                };
-                Row::new([
-                    Cell::from(row.date.clone()),
-                    Cell::from(row.weekday),
-                    right_cell(val_str, m_style),
-                    right_cell(share, row_style),
-                    Cell::from(bar).style(bar_style),
-                ])
-                .style(row_style)
-            } else {
-                Row::new([
-                    Cell::from(row.date.clone()),
-                    right_cell(val_str, m_style),
-                    Cell::from(bar).style(bar_style),
-                ])
-                .style(row_style)
-            }
+            let cache_tot = row
+                .summary
+                .cache_read_tokens
+                .saturating_add(row.summary.cache_write_tokens);
+
+            let cells = cols.iter().map(|col| match col {
+                DailyCol::Date => Cell::from(row.date.clone()),
+                DailyCol::Wd => Cell::from(row.weekday),
+                DailyCol::Turns => right_cell(row.summary.requests.to_string(), row_style),
+                DailyCol::Input => right_cell(fmt_tok(row.summary.input_tokens), row_style),
+                DailyCol::Cache => right_cell(fmt_tok(cache_tot), row_style),
+                DailyCol::Output => right_cell(fmt_tok(row.summary.output_tokens), row_style),
+                DailyCol::CacheHit => right_cell(hit_str.clone(), hit_style),
+                DailyCol::Metric => right_cell(val_str.clone(), m_style),
+                DailyCol::Share => {
+                    let share = if total_mag > 0.0 {
+                        format!("{:.1}%", (row.metric_value.magnitude() / total_mag) * 100.0)
+                    } else {
+                        "-".to_string()
+                    };
+                    right_cell(share, row_style)
+                }
+                DailyCol::Bar => Cell::from(bar.clone()).style(bar_style),
+            });
+            Row::new(cells).style(row_style)
         })
         .collect();
 
@@ -1041,10 +884,6 @@ fn draw_daily_pane(
     frame.render_stateful_widget(table, area, table_state);
 
     let visible_rows = inner_h.saturating_sub(1 + usize::from(has_footer));
-    hit_map.daily_first_row_y = area.y + 2;
-    hit_map.daily_visible_rows = visible_rows;
-    hit_map.daily_offset = table_state.offset();
-
     if view.daily_rows.len() > visible_rows && area.height > 3 {
         let mut sb = ScrollbarState::new(view.daily_rows.len()).position(state.daily_idx);
         frame.render_stateful_widget(
@@ -1055,6 +894,7 @@ fn draw_daily_pane(
             &mut sb,
         );
     }
+    visible_rows
 }
 
 fn draw_day_detail_pane(frame: &mut Frame<'_>, area: Rect, view: &StatsView, pal: &Palette) {
@@ -1087,7 +927,11 @@ fn draw_day_detail_pane(frame: &mut Frame<'_>, area: Rect, view: &StatsView, pal
             Span::styled(" Total ", pal.dim()),
             Span::styled(fmt_tok(s.total_tokens), pal.bold(Color::Cyan)),
             Span::styled(format!(" {sep} Hit "), pal.dim()),
-            Span::styled(fmt_cache_hit(s), pal.bold(Color::White)),
+            Span::styled(
+                format_pct(s.cache_hit_pct()),
+                pal.cache_hit_style(s.cache_hit_pct())
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!(" {sep} {spd} / {ttft}"), pal.dim()),
         ]),
         build_composition_bar(s, usize::from(area.width.saturating_sub(4)).clamp(10, 42), pal),
@@ -1169,19 +1013,10 @@ fn draw_models_pane(
     table_state: &mut TableState,
     view: &StatsView,
     pal: &Palette,
-    hit_map: &mut StatsHitMap,
 ) {
     let active = state.active_pane == StatsPane::Models;
     let metric = state.query.metric;
     let title = format!(" 3. Models [{}] (v) ", state.query.model_scope.label());
-
-    hit_map.models_pane = area;
-    hit_map.model_scope_pill = Some(RectHit {
-        value: (),
-        y: area.y,
-        x0: area.x + 1,
-        x1: area.x + area.width.saturating_sub(1),
-    });
 
     let models = state.active_models(view);
     if models.is_empty() {
@@ -1193,8 +1028,7 @@ fn draw_models_pane(
 
     let inner_w = usize::from(area.width.saturating_sub(2));
     let inner_h = usize::from(area.height.saturating_sub(2));
-    let show_pct = inner_w >= 34;
-    let total_mag: f64 = models.iter().map(|m| metric.extract(m).magnitude()).sum();
+    let show_hit = inner_w >= 34;
     let filter_glyph = if pal.ascii { "* " } else { "● " };
 
     let rows: Vec<Row<'static>> = models
@@ -1213,20 +1047,16 @@ fn draw_models_pane(
                 Cell::from(name).style(name_style),
                 right_cell(metric.format_display(val, true), val_style),
             ];
-            if show_pct {
-                let pct = if total_mag > 0.0 {
-                    format!("{:.0}%", (val.magnitude() / total_mag) * 100.0)
-                } else {
-                    "-".to_string()
-                };
-                cells.push(right_cell(pct, pal.dim()));
+            if show_hit {
+                let hit_pct = m.cache_hit_pct();
+                cells.push(right_cell(format_pct(hit_pct), pal.cache_hit_style(hit_pct)));
             }
             Row::new(cells)
         })
         .collect();
 
-    let widths = if show_pct {
-        vec![Constraint::Min(10), Constraint::Length(10), Constraint::Length(4)]
+    let widths = if show_hit {
+        vec![Constraint::Min(10), Constraint::Length(10), Constraint::Length(6)]
     } else {
         vec![Constraint::Min(10), Constraint::Length(10)]
     };
@@ -1241,10 +1071,6 @@ fn draw_models_pane(
     *table_state.offset_mut() = table_state.offset().min(state.model_idx);
     table_state.select(active.then_some(state.model_idx));
     frame.render_stateful_widget(table, area, table_state);
-
-    hit_map.models_first_row_y = area.y + 1;
-    hit_map.models_visible_rows = inner_h;
-    hit_map.models_offset = table_state.offset();
 
     if models.len() > inner_h && area.height > 2 {
         let mut sb = ScrollbarState::new(models.len()).position(state.model_idx);
@@ -1269,9 +1095,9 @@ fn draw_footer_bar(
     let text = if let Some(msg) = &state.status_msg {
         format!(" {msg}")
     } else if let Some(model) = &state.query.model_filter {
-        format!(" Filtered: {model}{sep}Esc Clear{sep}1-8 Metric{sep}i/o/c/w Tokens{sep}t Range{sep}s Sort{sep}r Refresh{sep}q Quit")
+        format!(" Filtered: {model}{sep}Esc Clear{sep}1-5 Metric{sep}t Range{sep}s Sort{sep}r Refresh{sep}q Quit")
     } else if area.width < 92 {
-        format!(" 1-8 Metric{sep}i/o/c/w Tok{sep}t Range{sep}s Sort{sep}Tab Pane{sep}Enter Filter{sep}q Quit")
+        format!(" 1-5 Metric{sep}t Range{sep}s Sort{sep}Tab Pane{sep}Enter Filter{sep}q Quit")
     } else {
         let src_hint = if dataset.is_some_and(|d| d.has_cli && d.has_desktop) {
             format!("{sep}f Src")
@@ -1279,7 +1105,7 @@ fn draw_footer_bar(
             String::new()
         };
         format!(
-            " 1-8 Metric{sep}i/o/c/w Tokens{sep}t Range{sep}s Sort{sep}v Day/Win{sep}z Gaps{sep}g Heatmap{src_hint}{sep}Tab Pane{sep}Enter Filter{sep}r Refresh{sep}q Quit"
+            " 1-5 Metric{sep}t Range{sep}s Sort{sep}v Day/Win{sep}z Gaps{sep}g Heatmap{src_hint}{sep}Tab Pane{sep}Enter Filter{sep}r Refresh{sep}q Quit"
         )
     };
     let style = if state.status_msg.is_some() {
@@ -1377,13 +1203,19 @@ mod tests {
     }
 
     #[test]
-    fn tui_renders_wide_dashboard_with_heatmap_daily_and_detail() {
+    fn tui_renders_wide_dashboard_with_daily_and_model_cache_rates() {
         let text = render_buffer_text(120, 36, StatsMetric::Cost, false);
         assert!(text.contains("agy-statusline stats"));
+        assert!(text.contains("5:Turns"));
         assert!(text.contains("Activity (20w · Cost ($))"));
         assert!(text.contains("1. Daily Usage"));
+        assert!(text.contains("Cache%"));
         assert!(text.contains("2026-11-20"));
         assert!(text.contains("2026-11-19"));
+        // Per-day cache hit rates: 45K/50K = 90.0% (11-20), 80K/105K = 76.2% (11-19), total 125K/155K = 80.6%
+        assert!(text.contains("90.0%"));
+        assert!(text.contains("76.2%"));
+        assert!(text.contains("80.6%"));
         assert!(text.contains("~$1.50"));
         assert!(text.contains("~$0.25"));
         assert!(text.contains("2. Day: 2026-11-20"));
@@ -1391,10 +1223,23 @@ mod tests {
     }
 
     #[test]
-    fn tui_renders_compact_80x24_ascii_without_overflow() {
+    fn tui_renders_medium_and_compact_80x24_with_daily_cache_rate_and_no_clipping() {
+        // 96x30 exercises medium daily layout (inner_w = 57) with per-day Cache% alongside Cost.
+        let med = render_buffer_text(96, 30, StatsMetric::Cost, true);
+        assert!(med.contains("Cache%"));
+        assert!(med.contains("90.0%"));
+        assert!(med.contains("76.2%"));
+        assert!(med.contains("80.6%"));
+
+        // 80x24 exercises compact summary (with width-budgeted Hit% + Active) and full daily table.
         let text = render_buffer_text(80, 24, StatsMetric::InputOutput, true);
         assert!(text.contains("Summary (All | In+Out)"));
+        assert!(text.contains("Hit 80.6%"));
+        assert!(!text.contains("Active|"));
         assert!(text.contains("1. Daily Usage"));
+        assert!(text.contains("Cache%"));
+        assert!(text.contains("90.0%"));
+        assert!(text.contains("76.2%"));
         assert!(text.contains("2026-11-20"));
         assert!(text.contains("2026-11-19"));
         assert!(text.contains("24K"));
@@ -1402,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn heatmap_hit_map_stays_inside_borders_and_unfocused_models_offset_recovers() {
+    fn unfocused_models_offset_recovers_on_short_terminal() {
         let ds = test_dataset();
         let mut st = StatsTuiState::new(None, StatsMetric::Cost);
         st.loading = false;
@@ -1410,7 +1255,6 @@ mod tests {
         let view = ds.compute_view(&st.query, None);
         st.sync_with_view(&view);
 
-        // 96x20 forces heatmap onto a short terminal (inner_w = 56, height < 11) and tests exact width/height bounds.
         let mut tables = TableStates::default();
         *tables.models.offset_mut() = 10;
         let pal = Palette {
@@ -1419,22 +1263,12 @@ mod tests {
         };
         let backend = TestBackend::new(96, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut hit_map = StatsHitMap::default();
         terminal
             .draw(|frame| {
-                hit_map = draw_stats_ui(frame, &st, &mut tables, Some(&ds), Some(&view), &pal);
+                draw_stats_ui(frame, &st, &mut tables, Some(&ds), Some(&view), &pal);
             })
             .unwrap();
 
-        // Only active tiles inside the heatmap inner bounds are registered; zero bleed into daily_pane.
-        assert!(hit_map
-            .heatmap_cells
-            .iter()
-            .all(|h| h.x1 <= 95 && h.y < hit_map.daily_pane.y));
-        assert!(hit_map.heatmap_cells.len() <= 2);
-
-        // Unfocused models table recovers from stale offset = 10 back to 0.
         assert_eq!(tables.models.offset(), 0);
-        assert_eq!(hit_map.models_offset, 0);
     }
 }

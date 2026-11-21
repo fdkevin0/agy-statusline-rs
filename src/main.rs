@@ -85,7 +85,7 @@ enum Command {
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         days: Option<u32>,
 
-        /// Primary aggregation metric (total, cost, io, input, output, cache, cache_read, cache_write, thinking, turns, or '+' combos like input+output)
+        /// Primary aggregation metric (total, cost, io, output, turns)
         #[arg(long, value_name = "METRIC", conflicts_with = "json")]
         metric: Option<StatsMetric>,
 

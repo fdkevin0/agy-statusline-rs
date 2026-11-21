@@ -5,11 +5,12 @@
 //! interactive TUI queries across arbitrary metrics, time ranges, sort orders,
 //! sources, and model filters.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use super::archive::scan_sqlite_conversations_with_archive;
-use super::metric::{MetricValue, StatsMetric};
+use super::metric::{MetricValue, StatsMetric, UsageCounters};
 use super::pricing::{fetch_models_dev_via_curl, round_usd_6, PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS};
 use super::scan::{scan_transcripts, UsageEvent, UsageSource};
 use super::tz::{format_day, unix_secs_to_utc_date, TimeZoneSpec};
@@ -97,6 +98,8 @@ pub enum DailySort {
     DateAsc,
     /// Highest value under the active [`StatsMetric`] first.
     MetricDesc,
+    /// Lowest prompt cache hit rate first (days without prompt tokens sink to the bottom).
+    CacheHitAsc,
 }
 
 impl DailySort {
@@ -104,7 +107,8 @@ impl DailySort {
         match self {
             Self::DateDesc => Self::DateAsc,
             Self::DateAsc => Self::MetricDesc,
-            Self::MetricDesc => Self::DateDesc,
+            Self::MetricDesc => Self::CacheHitAsc,
+            Self::CacheHitAsc => Self::DateDesc,
         }
     }
 
@@ -113,9 +117,11 @@ impl DailySort {
             (Self::DateDesc, false) => "Date ↓",
             (Self::DateAsc, false) => "Date ↑",
             (Self::MetricDesc, false) => "Value ↓",
+            (Self::CacheHitAsc, false) => "Cache% ↑",
             (Self::DateDesc, true) => "Date desc",
             (Self::DateAsc, true) => "Date asc",
             (Self::MetricDesc, true) => "Value desc",
+            (Self::CacheHitAsc, true) => "Cache% asc",
         }
     }
 }
@@ -712,6 +718,16 @@ impl StatsDataset {
                     .cmp_desc(b.metric_value)
                     .then_with(|| b.day_idx.cmp(&a.day_idx))
             }),
+            DailySort::CacheHitAsc => daily_rows.sort_by(|a, b| {
+                match (a.summary.cache_hit_pct(), b.summary.cache_hit_pct()) {
+                    (Some(x), Some(y)) => x.total_cmp(&y),
+                    // Days without prompt tokens (including empty gap rows) sink to the bottom.
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                }
+                .then_with(|| b.day_idx.cmp(&a.day_idx))
+            }),
         }
 
         let daily_max = daily_rows
@@ -769,7 +785,6 @@ impl StatsDataset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stats::metric::TokenMask;
     use crate::timeutil::unix_day_from_civil_date;
 
     fn sample_dataset() -> StatsDataset {
@@ -868,16 +883,16 @@ mod tests {
         assert_eq!(v_cost.heatmap_peak.as_ref().unwrap().0, "2026-11-19");
         assert_eq!(v_cost.window_models[0].model, "Model Pro");
 
-        // Custom token mask: Cache Write only -> 2026-11-19 (2,000) > 2026-11-18 (500) > 2026-11-20 (0)
-        let q_cw = StatsQuery {
-            metric: StatsMetric::Custom(TokenMask::CACHE_WRITE),
+        // Output metric: 2026-11-19 (4,000) > 2026-11-18 (500) > 2026-11-20 (200)
+        let q_out = StatsQuery {
+            metric: StatsMetric::Output,
             sort: DailySort::MetricDesc,
             ..Default::default()
         };
-        let v_cw = ds.compute_view(&q_cw, None);
-        assert_eq!(v_cw.daily_rows[0].date, "2026-11-19");
-        assert_eq!(v_cw.daily_rows[0].metric_value, MetricValue::Count(2_000));
-        assert_eq!(v_cw.total_value, MetricValue::Count(2_500));
+        let v_out = ds.compute_view(&q_out, None);
+        assert_eq!(v_out.daily_rows[0].date, "2026-11-19");
+        assert_eq!(v_out.daily_rows[0].metric_value, MetricValue::Count(4_000));
+        assert_eq!(v_out.total_value, MetricValue::Count(4_700));
 
         // Source filter Desktop isolates 2026-11-20 only.
         let q_desk = StatsQuery {
@@ -919,5 +934,19 @@ mod tests {
         let v_huge = ds.compute_view(&q_huge, None);
         assert_eq!(v_huge.daily_rows.len(), MAX_GAP_FILL_DAYS as usize);
         assert_eq!(v_huge.active_days, 3);
+
+        // CacheHitAsc: Day 3 (0.0%) -> Day 2 (58.8%) -> Day 1 (98.4%), while empty gap days sink to the bottom.
+        let q_hit_asc = StatsQuery {
+            range: RangePreset::Days(5),
+            sort: DailySort::CacheHitAsc,
+            fill_empty_days: true,
+            ..Default::default()
+        };
+        let v_hit = ds.compute_view(&q_hit_asc, None);
+        assert_eq!(v_hit.daily_rows[0].date, "2026-11-20");
+        assert_eq!(v_hit.daily_rows[1].date, "2026-11-19");
+        assert_eq!(v_hit.daily_rows[2].date, "2026-11-18");
+        assert_eq!(v_hit.daily_rows[3].summary.requests, 0);
+        assert_eq!(v_hit.daily_rows[4].summary.requests, 0);
     }
 }

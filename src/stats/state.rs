@@ -2,17 +2,17 @@
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::metric::{StatsMetric, TokenComponent};
+use super::metric::StatsMetric;
 use super::query::{ModelScope, RangePreset, StatsQuery, StatsView};
 use super::ModelStats;
 
 /// Focused interactive pane inside the `stats` TUI.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StatsPane {
-    /// Scrollable daily usage table with inline proportional bar.
+    /// Scrollable daily usage table with per-day `Cache%` and proportional bar.
     #[default]
     Daily,
-    /// Per-day or window model breakdown with Enter/click cross-filtering.
+    /// Per-day or window model breakdown with `Enter` cross-filtering.
     Models,
 }
 
@@ -120,11 +120,6 @@ impl StatsTuiState {
         }
     }
 
-    pub fn toggle_token_component(&mut self, comp: TokenComponent) {
-        let next = self.query.metric.toggle_component(comp);
-        self.select_metric(next);
-    }
-
     pub fn select_range(&mut self, range: RangePreset) {
         if self.query.range != range {
             self.query.range = range;
@@ -209,20 +204,6 @@ impl StatsTuiState {
         self.select_daily_row(next, view);
     }
 
-    /// Jumps to a clicked heatmap date, widening `range` to `All` if outside the active window.
-    pub fn click_heatmap_date(&mut self, date: &str, view: &StatsView) {
-        self.active_pane = StatsPane::Daily;
-        self.selected_date = Some(date.to_string());
-        if let Some(pos) = view.daily_rows.iter().position(|r| r.date == date) {
-            self.daily_idx = pos;
-        } else if self.query.range != RangePreset::All {
-            self.query.range = RangePreset::All;
-        }
-        self.model_idx = 0;
-        self.view_dirty = true;
-        self.status_msg = None;
-    }
-
     pub fn move_model(&mut self, delta: isize, view: &StatsView) {
         let len = self.active_models(view).len();
         if len == 0 {
@@ -233,10 +214,9 @@ impl StatsTuiState {
         self.model_idx = (self.model_idx as isize + delta).clamp(0, max_idx) as usize;
     }
 
-    /// Selects model row `idx` and toggles cross-filtering on that model.
-    pub fn click_model_row(&mut self, idx: usize, view: &StatsView) {
-        let models = self.active_models(view);
-        if let Some(m) = models.get(idx) {
+    /// Toggles cross-filtering on the model at `idx`.
+    pub fn toggle_model_filter(&mut self, idx: usize, view: &StatsView) {
+        if let Some(m) = self.active_models(view).get(idx) {
             self.active_pane = StatsPane::Models;
             self.model_idx = idx;
             let name = m.model.clone();
@@ -276,16 +256,12 @@ impl StatsTuiState {
         }
 
         match code {
-            KeyCode::Char(c @ '1'..='8') => {
+            KeyCode::Char(c @ '1'..='5') => {
                 let idx = (c as u8 - b'1') as usize;
                 if let Some(&metric) = StatsMetric::PRESETS.get(idx) {
                     self.select_metric(metric);
                 }
             }
-            KeyCode::Char('i') => self.toggle_token_component(TokenComponent::Input),
-            KeyCode::Char('o') => self.toggle_token_component(TokenComponent::Output),
-            KeyCode::Char('c') => self.toggle_token_component(TokenComponent::CacheRead),
-            KeyCode::Char('w') => self.toggle_token_component(TokenComponent::CacheWrite),
             KeyCode::Char('[') => self.select_metric(self.query.metric.step(-1)),
             KeyCode::Char(']') => self.select_metric(self.query.metric.step(1)),
             KeyCode::Char('t') => self.cycle_range(1),
@@ -359,7 +335,7 @@ impl StatsTuiState {
             KeyCode::Enter => {
                 if let Some(v) = view {
                     match self.active_pane {
-                        StatsPane::Models => self.click_model_row(self.model_idx, v),
+                        StatsPane::Models => self.toggle_model_filter(self.model_idx, v),
                         StatsPane::Daily => self.active_pane = StatsPane::Models,
                     }
                 }
@@ -374,8 +350,8 @@ impl StatsTuiState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stats::metric::{MetricValue, TokenMask};
-    use crate::stats::query::{DailyRow, DayDetail};
+    use crate::stats::metric::MetricValue;
+    use crate::stats::query::{DailyRow, DailySort, DayDetail};
     use crate::stats::PeriodSummary;
 
     fn dummy_view() -> StatsView {
@@ -436,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_controls_switch_metrics_tokens_range_sort_and_model_filter() {
+    fn keyboard_controls_switch_metrics_range_sort_and_model_filter() {
         let view = dummy_view();
         let mut st = StatsTuiState::new(Some(10), StatsMetric::Total);
         st.loading = false;
@@ -456,16 +432,23 @@ mod tests {
         );
         assert_eq!(st.query.range, RangePreset::Days(10));
 
-        // 2 -> Cost ($), then 'i' switches to Input, then 'w' composes Input + CacheWrite
+        // 2 -> Cost ($), 4 -> Output, ] -> Turns
         st.handle_key(KeyCode::Char('2'), KeyModifiers::NONE, Some(&view), 10, 36);
         assert_eq!(st.query.metric, StatsMetric::Cost);
-        st.handle_key(KeyCode::Char('i'), KeyModifiers::NONE, Some(&view), 10, 36);
-        assert_eq!(st.query.metric, StatsMetric::Input);
-        st.handle_key(KeyCode::Char('w'), KeyModifiers::NONE, Some(&view), 10, 36);
-        assert_eq!(
-            st.query.metric,
-            StatsMetric::Custom(TokenMask::INPUT | TokenMask::CACHE_WRITE)
-        );
+        st.handle_key(KeyCode::Char('4'), KeyModifiers::NONE, Some(&view), 10, 36);
+        assert_eq!(st.query.metric, StatsMetric::Output);
+        st.handle_key(KeyCode::Char(']'), KeyModifiers::NONE, Some(&view), 10, 36);
+        assert_eq!(st.query.metric, StatsMetric::Turns);
+
+        // 's' cycles DateDesc -> DateAsc -> MetricDesc -> CacheHitAsc -> DateDesc
+        st.handle_key(KeyCode::Char('s'), KeyModifiers::NONE, Some(&view), 10, 36);
+        assert_eq!(st.query.sort, DailySort::DateAsc);
+        st.handle_key(KeyCode::Char('s'), KeyModifiers::NONE, Some(&view), 10, 36);
+        assert_eq!(st.query.sort, DailySort::MetricDesc);
+        st.handle_key(KeyCode::Char('s'), KeyModifiers::NONE, Some(&view), 10, 36);
+        assert_eq!(st.query.sort, DailySort::CacheHitAsc);
+        st.handle_key(KeyCode::Char('s'), KeyModifiers::NONE, Some(&view), 10, 36);
+        assert_eq!(st.query.sort, DailySort::DateDesc);
 
         // Down selects 2026-11-19
         st.handle_key(KeyCode::Down, KeyModifiers::NONE, Some(&view), 10, 36);
@@ -486,15 +469,5 @@ mod tests {
             st.handle_key(KeyCode::Esc, KeyModifiers::NONE, Some(&view), 10, 36),
             StatsAction::Quit
         );
-    }
-
-    #[test]
-    fn clicking_out_of_range_heatmap_date_widens_range_to_all() {
-        let view = dummy_view();
-        let mut st = StatsTuiState::new(Some(7), StatsMetric::Total);
-        st.loading = false;
-        st.click_heatmap_date("2026-10-01", &view);
-        assert_eq!(st.query.range, RangePreset::All);
-        assert_eq!(st.selected_date.as_deref(), Some("2026-10-01"));
     }
 }

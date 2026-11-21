@@ -6,7 +6,9 @@ use jiff::civil::Date;
 use jiff::ToSpan;
 use unicode_width::UnicodeWidthStr;
 
-use super::metric::{format_usd_full, heatmap_level_f64, MetricValue, StatsMetric};
+use super::metric::{
+    cache_hit_pct, format_pct, format_usd_full, heatmap_level_f64, MetricValue, StatsMetric,
+};
 use super::query::{HeatmapWeek, WEEKDAY_NAMES};
 use super::{DailyUsage, PeriodSummary, StatsReport, ACTIVITY_WEEKS};
 use crate::format::format_tokens_string as fmt_tok;
@@ -21,22 +23,15 @@ const HEATMAP_ANSI_CODES: [&str; 5] = ["2", "38;5;29", "38;5;36", "38;5;42", "1;
 const DEFAULT_STATIC_DAILY_LIMIT: usize = 14;
 
 pub(super) fn fmt_cache_hit(summary: &PeriodSummary) -> String {
-    fmt_cache_hit_parts(
+    format_pct(cache_hit_pct(
         summary.input_tokens,
         summary.cache_read_tokens,
         summary.cache_write_tokens,
-    )
+    ))
 }
 
 fn fmt_cache_hit_parts(input: u64, cache_read: u64, cache_write: u64) -> String {
-    let denom = input
-        .saturating_add(cache_read)
-        .saturating_add(cache_write);
-    if denom == 0 {
-        return "-".to_string();
-    }
-    let pct = (cache_read as f64) * 100.0 / (denom as f64);
-    format!("{pct:.1}%")
+    format_pct(cache_hit_pct(input, cache_read, cache_write))
 }
 
 fn fmt_usd(usd: f64, priced_requests: u64, unpriced_requests: u64) -> String {

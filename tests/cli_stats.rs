@@ -332,6 +332,8 @@ fn cli_stats_plain_lists_daily_usage_switches_metrics_and_rejects_tui_without_tt
     let cost_text = String::from_utf8(cost_out.stdout).unwrap();
     assert!(cost_text.contains("Daily (2d | Cost ($)):"), "{cost_text}");
     assert!(cost_text.contains("~$0.01"), "{cost_text}");
+    assert!(cost_text.contains("66.7%"), "{cost_text}");
+    assert!(cost_text.contains("0.0%"), "{cost_text}");
 
     let tui_err = isolated_agy_cmd(home)
         .env("NO_COLOR", "1")

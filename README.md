@@ -36,7 +36,7 @@ agy-statusline apply --yes
 agy-statusline doctor
 ```
 
-4. Inspect local CLI & desktop daily/model token usage, speed, TTFT, and estimated API cost interactively (with selectable/composable metrics, or `--plain` / `--json` for static output):
+4. Inspect local CLI & desktop daily/model token usage, cache hit rates, speed, TTFT, and estimated API cost interactively (or `--plain` / `--json` for static output):
 
 ```sh
 agy-statusline stats
