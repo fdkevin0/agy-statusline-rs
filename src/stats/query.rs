@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use super::archive::scan_sqlite_conversations_with_archive;
 use super::metric::{MetricValue, StatsMetric};
 use super::pricing::{fetch_models_dev_via_curl, round_usd_6, PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS};
-use super::scan::{scan_sqlite_conversations, scan_transcripts, UsageEvent, UsageSource};
+use super::scan::{scan_transcripts, UsageEvent, UsageSource};
 use super::tz::{format_day, unix_secs_to_utc_date, TimeZoneSpec};
 use super::{
     accumulate_period, activity_week_mondays, build_weekly_usage, DailyUsage, ModelAccumulator,
@@ -412,17 +412,6 @@ impl StatsDataset {
         )
     }
 
-    /// Scans explicit roots with injected timezone and pricing catalog (live-only, no archive).
-    #[cfg(test)]
-    pub(super) fn collect_for_roots(
-        roots: &[(&'static str, PathBuf)],
-        now_unix_secs: u64,
-        tz: &TimeZoneSpec,
-        pricing: &PricingCatalog,
-    ) -> Self {
-        Self::collect_for_roots_with_archive(roots, None, None, now_unix_secs, tz, pricing)
-    }
-
     /// Scans explicit roots with optional persistent archive sync, timezone, and pricing catalog.
     pub(super) fn collect_for_roots_with_archive(
         roots: &[(&'static str, PathBuf)],
@@ -437,17 +426,14 @@ impl StatsDataset {
         let timezone = tz.format_offset_at(now_i64);
         let today_utc = unix_secs_to_utc_date(now_unix_secs);
 
-        let (sqlite, mut events, covered) = match data_dir {
-            Some(dir) => scan_sqlite_conversations_with_archive(
-                roots,
-                dir,
-                cache_dir,
-                now_unix_secs,
-                tz,
-                pricing,
-            ),
-            None => scan_sqlite_conversations(roots, tz, pricing),
-        };
+        let (sqlite, mut events, covered) = scan_sqlite_conversations_with_archive(
+            roots,
+            data_dir,
+            cache_dir,
+            now_unix_secs,
+            tz,
+            pricing,
+        );
         let fallback_events = scan_transcripts(roots, tz, pricing, &covered);
         events.extend(fallback_events);
 

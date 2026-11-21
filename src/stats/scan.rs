@@ -348,16 +348,15 @@ fn resolve_turn_cost(
         return (Some("native".to_string()), Some(round_usd_6(usd)));
     }
     let active: Vec<&str> = candidates.iter().copied().flatten().collect();
-    match pricing.estimate_cost(
-        &active,
-        input_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-        output_tokens,
-    ) {
-        Some((k, usd)) => (Some(k), Some(usd)),
-        None => (None, None),
-    }
+    pricing
+        .estimate_cost(
+            &active,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+        )
+        .unzip()
 }
 
 fn parse_transcript_line(
@@ -649,7 +648,16 @@ pub(super) struct RawTurn {
     pub(super) native_cost_usd: Option<f64>,
     pub(super) decode_speed: Option<f64>,
     pub(super) ttft_secs: Option<f64>,
-    pub(super) has_billable_usage: bool,
+}
+
+impl RawTurn {
+    pub(super) fn has_billable_usage(&self) -> bool {
+        self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cache_read_tokens > 0
+            || self.cache_write_tokens > 0
+            || self.native_cost_usd.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -742,18 +750,13 @@ fn scan_single_sqlite_db_raw(target: &DbTarget) -> Option<RawConversationScan> {
 
         let decode_speed = rec.decode_speed_tps();
         let ttft_secs = rec.ttft_secs;
-        let billable = has_billable_usage(&rec);
-        if decode_speed.is_none() && ttft_secs.is_none() && !billable {
-            continue;
-        }
-
         let ts_secs = rec
             .first_step_index
             .and_then(|step_idx| step_timestamps.get(&step_idx).copied())
             .or(rec.chat_start_created_at_secs)
             .or(db_mtime_secs);
 
-        turns.push(RawTurn {
+        let turn = RawTurn {
             ts_secs,
             model_enum: rec.model_enum,
             response_model: rec.response_model,
@@ -766,8 +769,11 @@ fn scan_single_sqlite_db_raw(target: &DbTarget) -> Option<RawConversationScan> {
             native_cost_usd: rec.model_cost_usd,
             decode_speed,
             ttft_secs,
-            has_billable_usage: billable,
-        });
+        };
+        if turn.decode_speed.is_none() && turn.ttft_secs.is_none() && !turn.has_billable_usage() {
+            continue;
+        }
+        turns.push(turn);
     }
 
     Some(RawConversationScan {
@@ -853,7 +859,7 @@ pub(super) fn project_sqlite_conversations<'a>(
             if let Some(ttft) = turn.ttft_secs {
                 ttft_samples.push(ttft);
             }
-            if !turn.has_billable_usage {
+            if !turn.has_billable_usage() {
                 continue;
             }
             let Some(ts_secs) = turn.ts_secs else {
@@ -892,20 +898,19 @@ pub(super) fn project_sqlite_conversations<'a>(
                 });
             let (pricing_key, cost_usd) = if let Some(usd) = turn.native_cost_usd {
                 (Some("native".to_string()), Some(round_usd_6(usd)))
-            } else if let Some(idx) = *entry_idx {
-                match pricing.estimate_cost_for_entry(
-                    idx,
-                    turn.input_tokens,
-                    turn.cache_read_tokens,
-                    turn.cache_write_tokens,
-                    turn.output_tokens,
-                    true,
-                ) {
-                    Some((k, usd)) => (Some(k), Some(usd)),
-                    None => (None, None),
-                }
             } else {
-                (None, None)
+                (*entry_idx)
+                    .and_then(|idx| {
+                        pricing.estimate_cost_for_entry(
+                            idx,
+                            turn.input_tokens,
+                            turn.cache_read_tokens,
+                            turn.cache_write_tokens,
+                            turn.output_tokens,
+                            true,
+                        )
+                    })
+                    .unzip()
             };
 
             has_events = true;
@@ -936,27 +941,6 @@ pub(super) fn project_sqlite_conversations<'a>(
     stats.median_tok_per_sec = compute_median(&speed_samples);
     stats.median_ttft_secs = compute_median(&ttft_samples);
     (stats, events, covered)
-}
-
-pub(super) fn scan_sqlite_conversations(
-    roots: &[(&'static str, PathBuf)],
-    tz: &TimeZoneSpec,
-    pricing: &PricingCatalog,
-) -> (
-    SqliteStats,
-    Vec<UsageEvent>,
-    HashSet<(&'static str, String)>,
-) {
-    let targets = discover_sqlite_db_targets(roots);
-    let scanned = scan_sqlite_targets_raw(&targets);
-    project_sqlite_conversations(
-        scanned
-            .iter()
-            .map(|c| (c.source, c.uuid.as_str(), c.turns.as_slice())),
-        0,
-        tz,
-        pricing,
-    )
 }
 
 fn has_billable_usage(rec: &GenMetadataRecord) -> bool {

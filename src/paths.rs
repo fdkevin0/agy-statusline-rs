@@ -149,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_xdg_config_and_cache_dirs() {
+    fn resolves_xdg_config_cache_and_data_dirs() {
         let home = Some(PathBuf::from("/home/alice"));
         assert_eq!(
             xdg_config_dir_from(os("/xdg/cfg"), home.clone()).unwrap(),

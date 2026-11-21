@@ -19,7 +19,7 @@ pub fn unix_now_secs() -> u64 {
 /// Seeds a fresh empty `models_dev_pricing.json` and `stats_archive_sync.ts` under
 /// `cache_dir/agy-statusline` when absent so offline CLI tests never trigger detached
 /// background `pricing sync` / `stats sync` child processes while preserving existing fixtures.
-pub fn seed_offline_pricing_if_missing(cache_dir: &Path) {
+pub fn seed_offline_cache_stamps_if_missing(cache_dir: &Path) {
     let app_cache = cache_dir.join("agy-statusline");
     fs::create_dir_all(&app_cache).unwrap();
     let now_secs = unix_now_secs();
@@ -42,7 +42,7 @@ pub fn seed_offline_pricing_if_missing(cache_dir: &Path) {
 /// `TZ = UTC`, and offline pricing/sync stamps pre-seeded if missing.
 pub fn isolated_cmd(program: impl AsRef<Path>, dir: &Path) -> Command {
     let xdg_cache = dir.join("cache");
-    seed_offline_pricing_if_missing(&xdg_cache);
+    seed_offline_cache_stamps_if_missing(&xdg_cache);
 
     let mut cmd = Command::new(program.as_ref());
     cmd.current_dir(dir)

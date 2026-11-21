@@ -56,6 +56,10 @@ fn deduplicate_roots(roots: &[(&'static str, PathBuf)]) -> Vec<(&'static str, St
     out
 }
 
+fn sqlite_io_err(context: &str, err: rusqlite::Error) -> io::Error {
+    io::Error::other(format!("{context}: {err}"))
+}
+
 fn acquire_init_lock(parent: &Path) -> io::Result<File> {
     fs::create_dir_all(parent)?;
     let lock = fs::OpenOptions::new()
@@ -82,66 +86,98 @@ fn configure_connection_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-fn open_archive_db(db_path: &Path) -> rusqlite::Result<Option<Connection>> {
-    // Fast path for an existing archive DB: inspect `user_version` and `journal_mode`
-    // read-only first so newer-schema files are never mutated and steady-state runs avoid
-    // touching the init lock or re-running `PRAGMA journal_mode = WAL`.
+/// Opens (or initializes) `db_path`, returning `Ok(None)` without mutating the file
+/// when the archive was created by a newer schema version (`user_version > 1`).
+fn open_archive_db(db_path: &Path) -> io::Result<Option<Connection>> {
+    // Inspect an existing file read-only first so a WAL-mode future-schema DB is never
+    // checkpointed or modified on close, and steady-state runs avoid the init lock.
     if db_path.is_file() {
-        let conn = Connection::open_with_flags(
+        let ro = Connection::open_with_flags(
             db_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        conn.busy_timeout(Duration::from_millis(ARCHIVE_BUSY_TIMEOUT_MS))?;
-        let version = read_user_version(&conn)?;
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| sqlite_io_err("failed to inspect stats archive", e))?;
+        ro.busy_timeout(Duration::from_millis(ARCHIVE_BUSY_TIMEOUT_MS))
+            .map_err(|e| sqlite_io_err("failed to configure stats archive timeout", e))?;
+        let version = read_user_version(&ro)
+            .map_err(|e| sqlite_io_err("failed to read stats archive schema version", e))?;
         if version > ARCHIVE_SCHEMA_VERSION {
-            // Never mutate or overwrite an archive created by a newer schema version.
             return Ok(None);
         }
-        if version == ARCHIVE_SCHEMA_VERSION
-            && read_journal_mode(&conn)?.eq_ignore_ascii_case("wal")
-        {
-            configure_connection_pragmas(&conn)?;
+        let is_wal = read_journal_mode(&ro)
+            .map_err(|e| sqlite_io_err("failed to read stats archive journal mode", e))?
+            .eq_ignore_ascii_case("wal");
+        drop(ro);
+
+        if version == ARCHIVE_SCHEMA_VERSION && is_wal {
+            let conn = Connection::open_with_flags(
+                db_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|e| sqlite_io_err("failed to open stats archive", e))?;
+            conn.busy_timeout(Duration::from_millis(ARCHIVE_BUSY_TIMEOUT_MS))
+                .map_err(|e| sqlite_io_err("failed to configure stats archive timeout", e))?;
+            configure_connection_pragmas(&conn)
+                .map_err(|e| sqlite_io_err("failed to configure stats archive pragmas", e))?;
             return Ok(Some(conn));
         }
-        // Release the connection before taking the OS init lock so WAL upgrade/migration
-        // cannot deadlock with another initializer.
-        drop(conn);
     }
 
     // Serialize cold creation, WAL upgrade, and schema migration across concurrent processes
     // so parallel cold starts never hit SQLite's lock-upgrade SQLITE_BUSY deadlock on
     // `PRAGMA journal_mode = WAL`.
-    let Some(parent) = db_path.parent() else {
-        return Ok(None);
-    };
-    let Ok(_init_lock) = acquire_init_lock(parent) else {
-        return Ok(None);
-    };
+    let parent = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "archive path has no parent"))?;
+    let _init_lock = acquire_init_lock(parent)?;
+
+    if db_path.is_file() {
+        let ro = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| sqlite_io_err("failed to inspect stats archive", e))?;
+        ro.busy_timeout(Duration::from_millis(ARCHIVE_BUSY_TIMEOUT_MS))
+            .map_err(|e| sqlite_io_err("failed to configure stats archive timeout", e))?;
+        if read_user_version(&ro)
+            .map_err(|e| sqlite_io_err("failed to read stats archive schema version", e))?
+            > ARCHIVE_SCHEMA_VERSION
+        {
+            return Ok(None);
+        }
+    }
 
     let mut conn = Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    conn.busy_timeout(Duration::from_millis(ARCHIVE_BUSY_TIMEOUT_MS))?;
+    )
+    .map_err(|e| sqlite_io_err("failed to open stats archive", e))?;
+    conn.busy_timeout(Duration::from_millis(ARCHIVE_BUSY_TIMEOUT_MS))
+        .map_err(|e| sqlite_io_err("failed to configure stats archive timeout", e))?;
 
-    let version = read_user_version(&conn)?;
-    if version > ARCHIVE_SCHEMA_VERSION {
-        return Ok(None);
+    let version = read_user_version(&conn)
+        .map_err(|e| sqlite_io_err("failed to read stats archive schema version", e))?;
+    if !read_journal_mode(&conn)
+        .map_err(|e| sqlite_io_err("failed to read stats archive journal mode", e))?
+        .eq_ignore_ascii_case("wal")
+    {
+        conn.execute_batch("PRAGMA journal_mode = WAL;")
+            .map_err(|e| sqlite_io_err("failed to enable WAL on stats archive", e))?;
     }
-    if !read_journal_mode(&conn)?.eq_ignore_ascii_case("wal") {
-        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
-    }
-    configure_connection_pragmas(&conn)?;
+    configure_connection_pragmas(&conn)
+        .map_err(|e| sqlite_io_err("failed to configure stats archive pragmas", e))?;
 
     if version < ARCHIVE_SCHEMA_VERSION {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| sqlite_io_err("failed to begin stats archive migration", e))?;
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS archived_conversations (
                 root_path        TEXT NOT NULL,
                 uuid             TEXT NOT NULL,
-                source           TEXT NOT NULL,
                 db_mtime_secs    INTEGER NOT NULL,
                 db_mtime_nanos   INTEGER NOT NULL,
                 db_size          INTEGER NOT NULL,
@@ -168,7 +204,6 @@ fn open_archive_db(db_path: &Path) -> rusqlite::Result<Option<Connection>> {
                 native_cost_usd    REAL,
                 decode_speed       REAL,
                 ttft_secs          REAL,
-                has_billable_usage INTEGER NOT NULL,
                 PRIMARY KEY (root_path, uuid, turn_idx),
                 FOREIGN KEY (root_path, uuid)
                     REFERENCES archived_conversations (root_path, uuid)
@@ -176,18 +211,22 @@ fn open_archive_db(db_path: &Path) -> rusqlite::Result<Option<Connection>> {
             ) WITHOUT ROWID;
 
             PRAGMA user_version = 1;",
-        )?;
-        tx.commit()?;
+        )
+        .map_err(|e| sqlite_io_err("failed to initialize stats archive schema", e))?;
+        tx.commit()
+            .map_err(|e| sqlite_io_err("failed to commit stats archive schema", e))?;
     }
 
     Ok(Some(conn))
 }
 
+type FingerprintIndex = HashMap<String, HashMap<String, DbFileFingerprint>>;
+
 fn load_existing_fingerprints(
     conn: &Connection,
     unique_roots: &[(&'static str, String)],
-) -> rusqlite::Result<HashMap<(String, String), DbFileFingerprint>> {
-    let mut out = HashMap::new();
+) -> rusqlite::Result<FingerprintIndex> {
+    let mut out: FingerprintIndex = HashMap::with_capacity(unique_roots.len());
     let mut stmt = conn.prepare(
         "SELECT uuid, db_mtime_secs, db_mtime_nanos, db_size,
                 wal_mtime_secs, wal_mtime_nanos, wal_size
@@ -195,6 +234,7 @@ fn load_existing_fingerprints(
          WHERE root_path = ?1",
     )?;
     for (_, root_key) in unique_roots {
+        let mut by_uuid = HashMap::new();
         let mut rows = stmt.query([root_key.as_str()])?;
         while let Some(row) = rows.next()? {
             let uuid: String = row.get(0)?;
@@ -206,8 +246,9 @@ fn load_existing_fingerprints(
                 wal_mtime_nanos: row.get::<_, i64>(5)?.max(0) as u32,
                 wal_size: row.get::<_, i64>(6)?.max(0) as u64,
             };
-            out.insert((root_key.clone(), uuid), fp);
+            by_uuid.insert(uuid, fp);
         }
+        out.insert(root_key.clone(), by_uuid);
     }
     Ok(out)
 }
@@ -225,13 +266,12 @@ fn upsert_scanned_conversations(
     {
         let mut upsert_conv = tx.prepare(
             "INSERT INTO archived_conversations (
-                root_path, uuid, source,
+                root_path, uuid,
                 db_mtime_secs, db_mtime_nanos, db_size,
                 wal_mtime_secs, wal_mtime_nanos, wal_size,
                 synced_at_secs
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(root_path, uuid) DO UPDATE SET
-                source          = excluded.source,
                 db_mtime_secs   = excluded.db_mtime_secs,
                 db_mtime_nanos  = excluded.db_mtime_nanos,
                 db_size         = excluded.db_size,
@@ -248,13 +288,13 @@ fn upsert_scanned_conversations(
                 model_enum, response_model, model_display_name,
                 input_tokens, cache_read_tokens, cache_write_tokens,
                 output_tokens, thinking_tokens,
-                native_cost_usd, decode_speed, ttft_secs, has_billable_usage
+                native_cost_usd, decode_speed, ttft_secs
              ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7,
                 ?8, ?9, ?10,
                 ?11, ?12,
-                ?13, ?14, ?15, ?16
+                ?13, ?14, ?15
              )",
         )?;
 
@@ -263,7 +303,6 @@ fn upsert_scanned_conversations(
             upsert_conv.execute(params![
                 conv.root_key,
                 conv.uuid,
-                conv.source,
                 fp.db_mtime_secs,
                 i64::from(fp.db_mtime_nanos),
                 fp.db_size.min(i64::MAX as u64) as i64,
@@ -290,7 +329,6 @@ fn upsert_scanned_conversations(
                     turn.native_cost_usd,
                     turn.decode_speed,
                     turn.ttft_secs,
-                    i64::from(turn.has_billable_usage),
                 ])?;
             }
         }
@@ -298,25 +336,48 @@ fn upsert_scanned_conversations(
     tx.commit()
 }
 
+/// Syncs modified `targets` into `conn` and returns `(scanned, total_stored, archived_only)`.
 fn sync_changed_targets(
     conn: &mut Connection,
     unique_roots: &[(&'static str, String)],
     targets: &[DbTarget],
     now_unix_secs: u64,
-) -> rusqlite::Result<u64> {
-    let existing = load_existing_fingerprints(conn, unique_roots)?;
+) -> rusqlite::Result<(u64, u64, u64)> {
+    let mut existing = load_existing_fingerprints(conn, unique_roots)?;
     let changed_targets: Vec<_> = targets
         .iter()
         .filter(|t| {
             existing
-                .get(&(t.root_key.clone(), t.uuid.clone()))
+                .get(t.root_key.as_str())
+                .and_then(|by_uuid| by_uuid.get(t.uuid.as_str()))
                 .is_none_or(|prev| *prev != t.fingerprint)
         })
         .cloned()
         .collect();
     let scanned = scan_sqlite_targets_raw(&changed_targets);
     upsert_scanned_conversations(conn, &scanned, now_unix_secs)?;
-    Ok(scanned.len() as u64)
+
+    for conv in &scanned {
+        existing
+            .entry(conv.root_key.clone())
+            .or_default()
+            .insert(conv.uuid.clone(), conv.fingerprint);
+    }
+    let live_keys: HashSet<(&str, &str)> = targets
+        .iter()
+        .map(|t| (t.root_key.as_str(), t.uuid.as_str()))
+        .collect();
+    let mut total_db_files = 0u64;
+    let mut archived_db_files = 0u64;
+    for (root_key, by_uuid) in &existing {
+        total_db_files += by_uuid.len() as u64;
+        for uuid in by_uuid.keys() {
+            if !live_keys.contains(&(root_key.as_str(), uuid.as_str())) {
+                archived_db_files += 1;
+            }
+        }
+    }
+    Ok((scanned.len() as u64, total_db_files, archived_db_files))
 }
 
 struct StoredConversation {
@@ -328,11 +389,8 @@ struct StoredConversation {
 fn load_stored_conversations(
     conn: &Connection,
     unique_roots: &[(&'static str, String)],
-    live_keys: &HashSet<(&str, &str)>,
-) -> rusqlite::Result<(Vec<StoredConversation>, u64)> {
+) -> rusqlite::Result<Vec<StoredConversation>> {
     let mut conversations = Vec::new();
-    let mut archived_db_files = 0u64;
-
     let mut conv_stmt = conn.prepare(
         "SELECT uuid FROM archived_conversations WHERE root_path = ?1 ORDER BY uuid ASC",
     )?;
@@ -340,7 +398,7 @@ fn load_stored_conversations(
         "SELECT uuid, ts_secs, model_enum, response_model, model_display_name,
                 input_tokens, cache_read_tokens, cache_write_tokens,
                 output_tokens, thinking_tokens,
-                native_cost_usd, decode_speed, ttft_secs, has_billable_usage
+                native_cost_usd, decode_speed, ttft_secs
          FROM archived_turns
          WHERE root_path = ?1
          ORDER BY uuid ASC, turn_idx ASC",
@@ -364,7 +422,6 @@ fn load_stored_conversations(
                 native_cost_usd: row.get(10)?,
                 decode_speed: row.get(11)?,
                 ttft_secs: row.get(12)?,
-                has_billable_usage: row.get::<_, i64>(13)? != 0,
             };
             turns_by_uuid.entry(uuid).or_default().push(turn);
         }
@@ -372,9 +429,6 @@ fn load_stored_conversations(
         let mut conv_rows = conv_stmt.query([root_key.as_str()])?;
         while let Some(row) = conv_rows.next()? {
             let uuid: String = row.get(0)?;
-            if !live_keys.contains(&(root_key.as_str(), uuid.as_str())) {
-                archived_db_files += 1;
-            }
             let turns = turns_by_uuid.remove(&uuid).unwrap_or_default();
             conversations.push(StoredConversation {
                 source,
@@ -384,28 +438,7 @@ fn load_stored_conversations(
         }
     }
 
-    Ok((conversations, archived_db_files))
-}
-
-fn count_stored_conversations(
-    conn: &Connection,
-    unique_roots: &[(&'static str, String)],
-    live_keys: &HashSet<(&str, &str)>,
-) -> rusqlite::Result<(u64, u64)> {
-    let mut total = 0u64;
-    let mut archived = 0u64;
-    let mut stmt = conn.prepare("SELECT uuid FROM archived_conversations WHERE root_path = ?1")?;
-    for (_, root_key) in unique_roots {
-        let mut rows = stmt.query([root_key.as_str()])?;
-        while let Some(row) = rows.next()? {
-            let uuid: String = row.get(0)?;
-            total += 1;
-            if !live_keys.contains(&(root_key.as_str(), uuid.as_str())) {
-                archived += 1;
-            }
-        }
-    }
-    Ok((total, archived))
+    Ok(conversations)
 }
 
 pub(super) fn is_sync_fresh(cache_dir: &Path, now_unix_secs: u64, interval_secs: u64) -> bool {
@@ -447,13 +480,14 @@ fn project_live_targets(
 }
 
 /// Incrementally syncs live SQLite conversation DBs into `data_dir/stats_history.db`
-/// and projects all live + archived conversations through `tz` and `pricing`.
+/// (when `data_dir` is `Some`) and projects all live + archived conversations through
+/// `tz` and `pricing`.
 ///
-/// Falls back transparently to a live-only scan when the archive database cannot be
-/// opened or updated.
+/// Falls back transparently to a live-only scan when `data_dir` is `None` or the archive
+/// database cannot be opened or updated.
 pub(super) fn scan_sqlite_conversations_with_archive(
     roots: &[(&'static str, PathBuf)],
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     cache_dir: Option<&Path>,
     now_unix_secs: u64,
     tz: &TimeZoneSpec,
@@ -463,29 +497,27 @@ pub(super) fn scan_sqlite_conversations_with_archive(
     Vec<UsageEvent>,
     HashSet<(&'static str, String)>,
 ) {
-    let archive_path = data_dir.join(ARCHIVE_DB_FILENAME);
-    let unique_roots = deduplicate_roots(roots);
     let targets = discover_sqlite_db_targets(roots);
+    let Some(dir) = data_dir else {
+        return project_live_targets(&targets, tz, pricing);
+    };
+    let archive_path = dir.join(ARCHIVE_DB_FILENAME);
 
     // Avoid creating an empty archive DB on a fresh home with no conversations.
     if targets.is_empty() && !archive_path.exists() {
         return (SqliteStats::default(), Vec::new(), HashSet::new());
     }
 
+    let unique_roots = deduplicate_roots(roots);
     let Ok(Some(mut conn)) = open_archive_db(&archive_path) else {
         return project_live_targets(&targets, tz, pricing);
     };
-    if sync_changed_targets(&mut conn, &unique_roots, &targets, now_unix_secs).is_err() {
-        return project_live_targets(&targets, tz, pricing);
-    }
-
-    let live_keys: HashSet<(&str, &str)> = targets
-        .iter()
-        .map(|t| (t.root_key.as_str(), t.uuid.as_str()))
-        .collect();
-    let Ok((stored, archived_db_files)) =
-        load_stored_conversations(&conn, &unique_roots, &live_keys)
+    let Ok((_, _, archived_db_files)) =
+        sync_changed_targets(&mut conn, &unique_roots, &targets, now_unix_secs)
     else {
+        return project_live_targets(&targets, tz, pricing);
+    };
+    let Ok(stored) = load_stored_conversations(&conn, &unique_roots) else {
         return project_live_targets(&targets, tz, pricing);
     };
 
@@ -522,24 +554,15 @@ pub(super) fn sync_roots_into_archive(
         });
     }
 
-    let mut conn = open_archive_db(&archive_path)
-        .map_err(|e| io::Error::other(format!("failed to open stats archive: {e}")))?
-        .ok_or_else(|| {
-            io::Error::other(format!(
-                "stats archive at {} uses an unsupported newer schema or unwritable directory",
-                archive_path.display()
-            ))
-        })?;
-    let scanned_db_files = sync_changed_targets(&mut conn, &unique_roots, &targets, now_unix_secs)
-        .map_err(|e| io::Error::other(format!("failed to update stats archive: {e}")))?;
-
-    let live_keys: HashSet<(&str, &str)> = targets
-        .iter()
-        .map(|t| (t.root_key.as_str(), t.uuid.as_str()))
-        .collect();
-    let (total_db_files, archived_db_files) =
-        count_stored_conversations(&conn, &unique_roots, &live_keys)
-            .map_err(|e| io::Error::other(format!("failed to count archived DBs: {e}")))?;
+    let mut conn = open_archive_db(&archive_path)?.ok_or_else(|| {
+        io::Error::other(format!(
+            "stats archive at {} uses a newer unsupported schema version",
+            archive_path.display()
+        ))
+    })?;
+    let (scanned_db_files, total_db_files, archived_db_files) =
+        sync_changed_targets(&mut conn, &unique_roots, &targets, now_unix_secs)
+            .map_err(|e| sqlite_io_err("failed to update stats archive", e))?;
 
     record_sync_stamp(cache_dir, now_unix_secs);
     Ok(ArchiveSyncSummary {
@@ -702,7 +725,7 @@ mod tests {
 
         let (stats1, events1, covered1) = scan_sqlite_conversations_with_archive(
             &roots,
-            &data_dir,
+            Some(&data_dir),
             Some(&cache_dir),
             1_795_200_000,
             &tz,
@@ -719,7 +742,7 @@ mod tests {
 
         let (stats2, events2, covered2) = scan_sqlite_conversations_with_archive(
             &roots,
-            &data_dir,
+            Some(&data_dir),
             Some(&cache_dir),
             1_795_200_100,
             &tz,
@@ -777,7 +800,7 @@ mod tests {
 
         let (stats, events, _) = scan_sqlite_conversations_with_archive(
             &roots,
-            &data_dir,
+            Some(&data_dir),
             None,
             1_795_200_040,
             &TimeZoneSpec::utc(),
@@ -810,7 +833,7 @@ mod tests {
         let pricing = PricingCatalog::default();
         let (_, events_a, _) = scan_sqlite_conversations_with_archive(
             &[("cli", root_a.clone())],
-            &data_dir,
+            Some(&data_dir),
             None,
             1_795_200_000,
             &tz,
@@ -818,7 +841,7 @@ mod tests {
         );
         let (_, events_b, _) = scan_sqlite_conversations_with_archive(
             &[("cli", root_b.clone())],
-            &data_dir,
+            Some(&data_dir),
             None,
             1_795_200_000,
             &tz,
@@ -849,7 +872,7 @@ mod tests {
         let roots = [("cli", cli_root.clone())];
         let (_, ev_unpriced, _) = scan_sqlite_conversations_with_archive(
             &roots,
-            &data_dir,
+            Some(&data_dir),
             None,
             ts_secs + 60,
             &TimeZoneSpec::utc(),
@@ -880,7 +903,7 @@ mod tests {
         let tz_plus8 = TimeZoneSpec::fixed_offset(8 * 3_600);
         let (stats, ev_repriced, _) = scan_sqlite_conversations_with_archive(
             &roots,
-            &data_dir,
+            Some(&data_dir),
             None,
             ts_secs + 120,
             &tz_plus8,
@@ -912,8 +935,8 @@ mod tests {
         drop(c1);
 
         let (stats, events, _) = scan_sqlite_conversations_with_archive(
-            &[("cli", cli_root)],
-            &data_dir,
+            &[("cli", cli_root.clone())],
+            Some(&data_dir),
             None,
             1_795_200_000,
             &TimeZoneSpec::utc(),
@@ -923,7 +946,7 @@ mod tests {
         assert_eq!(stats.archived_db_files, 0);
         assert_eq!(events.len(), 1);
 
-        // Verify the newer-schema DB bytes, journal mode, and sidecars were untouched.
+        // Verify delete-mode newer-schema DB bytes, journal mode, and sidecars were untouched.
         assert_eq!(fs::read(&archive_path).unwrap(), bytes_before);
         assert!(!data_dir.join(format!("{ARCHIVE_DB_FILENAME}-wal")).exists());
         assert!(!data_dir.join(ARCHIVE_INIT_LOCK_FILENAME).exists());
@@ -934,6 +957,43 @@ mod tests {
         .unwrap();
         assert_eq!(read_user_version(&check).unwrap(), 99);
         assert_eq!(read_journal_mode(&check).unwrap(), "delete");
+        drop(check);
+
+        // Also verify a WAL-mode newer-schema DB with an active uncheckpointed `-wal` is
+        // never checkpointed or mutated.
+        let wal_data_dir = dir.path().join("data_wal");
+        fs::create_dir_all(&wal_data_dir).unwrap();
+        let wal_archive = wal_data_dir.join(ARCHIVE_DB_FILENAME);
+        let wal_sidecar = wal_data_dir.join(format!("{ARCHIVE_DB_FILENAME}-wal"));
+        let wal_conn = Connection::open(&wal_archive).unwrap();
+        wal_conn
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE future_v99 (id INTEGER PRIMARY KEY);
+                 INSERT INTO future_v99 VALUES (1);
+                 PRAGMA user_version = 99;",
+            )
+            .unwrap();
+        let wal_db_before = fs::read(&wal_archive).unwrap();
+        let wal_log_before = fs::read(&wal_sidecar).unwrap();
+        assert!(!wal_log_before.is_empty());
+
+        let (wal_stats, wal_events, _) = scan_sqlite_conversations_with_archive(
+            &[("cli", cli_root)],
+            Some(&wal_data_dir),
+            None,
+            1_795_200_000,
+            &TimeZoneSpec::utc(),
+            &PricingCatalog::default(),
+        );
+        assert_eq!(wal_stats.db_files, 1);
+        assert_eq!(wal_stats.archived_db_files, 0);
+        assert_eq!(wal_events.len(), 1);
+        assert_eq!(fs::read(&wal_archive).unwrap(), wal_db_before);
+        assert_eq!(fs::read(&wal_sidecar).unwrap(), wal_log_before);
+        assert!(!wal_data_dir.join(ARCHIVE_INIT_LOCK_FILENAME).exists());
+        drop(wal_conn);
     }
 
     #[test]

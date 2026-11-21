@@ -1,11 +1,13 @@
-//! Read-only local usage, estimated cost, and speed statistics (`agy-statusline stats`).
+//! Local usage, estimated cost, and speed statistics (`agy-statusline stats`).
 //!
-//! Scans AGY local directories in read-only mode:
+//! Scans AGY local directories in read-only mode and incrementally archives normalized
+//! per-turn SQLite facts into `$XDG_DATA_HOME/agy-statusline/stats_history.db`:
 //! - `conversations/<uuid>.db` (`gen_metadata` joined with `steps.metadata`) as the
 //!   authoritative primary source for turns, tokens, thinking tokens, model names,
-//!   timestamps, decode speed, and TTFT.
+//!   timestamps, decode speed, and TTFT (retained in the local archive after AGY prunes
+//!   older sessions beyond its 500-DB startup cap).
 //! - `brain/**/transcript.jsonl` as a deduplicated fallback ONLY for conversations that
-//!   have no usable SQLite usage records.
+//!   have no usable SQLite usage records (live or archived).
 
 mod archive;
 mod metric;
@@ -156,7 +158,7 @@ pub struct ModelStats {
     pub median_ttft_secs: Option<f64>,
 }
 
-/// Aggregate speed and TTFT statistics extracted from `conversations/*.db`.
+/// Aggregate speed and TTFT statistics from live `conversations/*.db` and the local history archive.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SqliteStats {
     /// Total valid UUID `.db` conversations tracked (live on disk + preserved in local archive).
@@ -200,7 +202,7 @@ pub struct StatsReport {
     pub weekly: Vec<WeeklyUsage>,
     /// Per-model breakdown sorted by `total_tokens` descending.
     pub models: Vec<ModelStats>,
-    /// Aggregate statistics from SQLite `conversations/*.db` (`gen_metadata`).
+    /// Aggregate statistics from live `conversations/*.db` and the local history archive (`gen_metadata`).
     pub sqlite: SqliteStats,
 }
 
@@ -291,7 +293,8 @@ fn collect_stats_with_tz(
         DEFAULT_PRICING_TTL_SECS,
         |_| unreachable!(),
     );
-    StatsDataset::collect_for_roots(&roots, now_unix_secs, tz, &pricing).to_report(days)
+    StatsDataset::collect_for_roots_with_archive(&roots, None, None, now_unix_secs, tz, &pricing)
+        .to_report(days)
 }
 
 /// Runs the non-interactive `agy-statusline stats` subcommand (`--plain` / `--json` / piped).
