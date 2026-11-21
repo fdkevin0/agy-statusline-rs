@@ -26,7 +26,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 pub use archive::{maybe_spawn_background_archive_sync, run_stats_sync_command};
-pub use metric::{MetricValue, StatsMetric, TokenComponent, TokenMask};
+pub use metric::{MetricValue, StatsMetric};
 pub use pricing::{run_pricing_command, PricingCatalog, SyncMode};
 pub(crate) use scan::estimate_conversation_cost_usd;
 pub use tui::run_stats_tui;

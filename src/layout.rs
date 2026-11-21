@@ -402,7 +402,11 @@ pub struct LayoutConfig {
     /// Show `+ins -del` working-tree diff stats alongside `vcs` branch.
     pub show_git_diff: bool,
     /// Last selected `agy-statusline stats` aggregation metric (omitted when unset).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_stats_metric"
+    )]
     pub stats_metric: Option<StatsMetric>,
     /// Runtime `NO_COLOR` flag injected at the CLI boundary (not serialized).
     #[serde(skip)]
@@ -595,6 +599,17 @@ pub fn save_layout_config(path: &Path, config: &LayoutConfig) -> io::Result<()> 
     atomic_write(path, json.as_bytes())
 }
 
+fn deserialize_optional_stats_metric<'de, D>(
+    deserializer: D,
+) -> Result<Option<StatsMetric>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    // Ignore removed legacy metric strings (e.g. pre-0.5 custom masks) instead of invalidating config.json.
+    Ok(raw.and_then(|s| s.parse::<StatsMetric>().ok()))
+}
+
 /// Loads the persisted `stats_metric` preference from `config.json`, if valid and set.
 pub fn load_saved_stats_metric(path: &Path) -> Option<StatsMetric> {
     try_load_layout_config(path)
@@ -727,12 +742,21 @@ mod tests {
         let mut custom = LayoutConfig::preset_powerline();
         custom.bar_length = 12;
         save_layout_config(&path, &custom).unwrap();
-        let combo: StatsMetric = "input+output+cache_write".parse().unwrap();
-        save_stats_metric(&path, combo).unwrap();
+        save_stats_metric(&path, StatsMetric::InputOutput).unwrap();
         let reloaded = load_layout_config(&path);
         assert_eq!(reloaded.style, VisualStyle::Powerline);
         assert_eq!(reloaded.bar_length, 12);
-        assert_eq!(reloaded.stats_metric, Some(combo));
+        assert_eq!(reloaded.stats_metric, Some(StatsMetric::InputOutput));
+
+        // Legacy/removed stats_metric values in config.json degrade to None without discarding layout settings.
+        let raw = fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"io\"", "\"input+output+cache_write\"");
+        fs::write(&path, raw).unwrap();
+        let degraded = load_layout_config(&path);
+        assert_eq!(degraded.style, VisualStyle::Powerline);
+        assert_eq!(degraded.bar_length, 12);
+        assert_eq!(degraded.stats_metric, None);
 
         // Corrupt config file is left untouched rather than clobbered.
         fs::write(&path, "{broken").unwrap();
