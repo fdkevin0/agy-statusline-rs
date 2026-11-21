@@ -333,6 +333,19 @@ fn cli_stats_plain_lists_daily_usage_switches_metrics_and_rejects_tui_without_tt
     assert!(cost_text.contains("Daily (2d | Cost ($)):"), "{cost_text}");
     assert!(cost_text.contains("~$0.01"), "{cost_text}");
 
+    let hit_out = isolated_agy_cmd(home)
+        .env("NO_COLOR", "1")
+        .args(["stats", "--plain", "--ascii", "--metric", "cache_hit"])
+        .output()
+        .unwrap();
+    assert!(hit_out.status.success(), "{hit_out:?}");
+    let hit_text = String::from_utf8(hit_out.stdout).unwrap();
+    assert!(hit_text.contains("Metric Cache%"), "{hit_text}");
+    assert!(hit_text.contains("Activity (20w | Cache%):"), "{hit_text}");
+    assert!(hit_text.contains("Daily (2d | Cache%):"), "{hit_text}");
+    assert!(hit_text.contains("66.7%"), "{hit_text}");
+    assert!(hit_text.contains("0.0%"), "{hit_text}");
+
     let tui_err = isolated_agy_cmd(home)
         .env("NO_COLOR", "1")
         .args(["stats", "--tui"])

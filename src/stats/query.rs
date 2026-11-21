@@ -5,11 +5,12 @@
 //! interactive TUI queries across arbitrary metrics, time ranges, sort orders,
 //! sources, and model filters.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use super::archive::scan_sqlite_conversations_with_archive;
-use super::metric::{MetricValue, StatsMetric};
+use super::metric::{format_pct, MetricValue, StatsMetric};
 use super::pricing::{fetch_models_dev_via_curl, round_usd_6, PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS};
 use super::scan::{scan_transcripts, UsageEvent, UsageSource};
 use super::tz::{format_day, unix_secs_to_utc_date, TimeZoneSpec};
@@ -97,6 +98,8 @@ pub enum DailySort {
     DateAsc,
     /// Highest value under the active [`StatsMetric`] first.
     MetricDesc,
+    /// Lowest value under the active [`StatsMetric`] first.
+    MetricAsc,
 }
 
 impl DailySort {
@@ -104,7 +107,8 @@ impl DailySort {
         match self {
             Self::DateDesc => Self::DateAsc,
             Self::DateAsc => Self::MetricDesc,
-            Self::MetricDesc => Self::DateDesc,
+            Self::MetricDesc => Self::MetricAsc,
+            Self::MetricAsc => Self::DateDesc,
         }
     }
 
@@ -113,9 +117,11 @@ impl DailySort {
             (Self::DateDesc, false) => "Date ↓",
             (Self::DateAsc, false) => "Date ↑",
             (Self::MetricDesc, false) => "Value ↓",
+            (Self::MetricAsc, false) => "Value ↑",
             (Self::DateDesc, true) => "Date desc",
             (Self::DateAsc, true) => "Date asc",
             (Self::MetricDesc, true) => "Value desc",
+            (Self::MetricAsc, true) => "Value asc",
         }
     }
 }
@@ -248,6 +254,7 @@ pub struct StatsView {
     pub active_days: usize,
     pub span_days: usize,
     pub peak_day: Option<(String, &'static str, MetricValue)>,
+    pub lowest_day: Option<(String, &'static str, MetricValue)>,
     pub median_tok_per_sec: Option<f64>,
     pub median_ttft_secs: Option<f64>,
     pub daily_rows: Vec<DailyRow>,
@@ -256,6 +263,30 @@ pub struct StatsView {
     pub heatmap_peak: Option<(String, &'static str, MetricValue)>,
     pub window_models: Vec<ModelStats>,
     pub selected_day: Option<DayDetail>,
+}
+
+impl StatsView {
+    /// Unweighted mean of daily rate percentages across days with a recorded sample.
+    pub fn daily_avg_rate(&self) -> Option<f64> {
+        let mut sum = 0.0_f64;
+        let mut count = 0usize;
+        for row in &self.daily_rows {
+            if let Some(pct) = row.metric_value.ratio_pct() {
+                sum += pct;
+                count += 1;
+            }
+        }
+        (count > 0).then(|| sum / (count as f64))
+    }
+
+    /// Formats the daily average for `metric` (unweighted daily mean for rates, `total / active_days` for additive metrics).
+    pub fn daily_avg_display(&self, metric: StatsMetric) -> String {
+        if metric.is_rate() {
+            format_pct(self.daily_avg_rate())
+        } else {
+            metric.format_average(self.total_value, self.active_days)
+        }
+    }
 }
 
 /// In-memory snapshot of all locally scanned usage events and environment metadata.
@@ -334,18 +365,26 @@ fn finish_day_row(
     acc: Option<DayAccumulator>,
     metric: StatsMetric,
     peak_day: &mut Option<(String, &'static str, MetricValue)>,
+    lowest_day: &mut Option<(String, &'static str, MetricValue)>,
 ) -> DailyRow {
     let wd = weekday_name(day_idx);
     match acc {
         Some(mut acc) => {
             acc.summary.priced_usd = round_usd_6(acc.summary.priced_usd);
             let val = metric.extract(&acc.summary);
-            if val.is_positive()
-                && peak_day
+            if val.has_sample() {
+                if peak_day
                     .as_ref()
-                    .is_none_or(|(_, _, prev)| val.magnitude() > prev.magnitude())
-            {
-                *peak_day = Some((acc.date.clone(), wd, val));
+                    .is_none_or(|(_, _, prev)| val.cmp_desc(*prev) == Ordering::Less)
+                {
+                    *peak_day = Some((acc.date.clone(), wd, val));
+                }
+                if lowest_day
+                    .as_ref()
+                    .is_none_or(|(_, _, prev)| val.cmp_asc(*prev) == Ordering::Less)
+                {
+                    *lowest_day = Some((acc.date.clone(), wd, val));
+                }
             }
             DailyRow {
                 day_idx,
@@ -596,10 +635,10 @@ impl StatsDataset {
                         let val = by_day
                             .get(&day_idx)
                             .map_or(zero_val, |s| metric.extract(s));
-                        if val.is_positive()
+                        if val.has_sample()
                             && peak
                                 .as_ref()
-                                .is_none_or(|(_, _, prev)| val.magnitude() > prev.magnitude())
+                                .is_none_or(|(_, _, prev)| val.cmp_desc(*prev) == Ordering::Less)
                         {
                             peak = Some((date.clone(), WEEKDAY_NAMES[d], val));
                         }
@@ -680,6 +719,7 @@ impl StatsDataset {
         };
 
         let mut peak_day: Option<(String, &'static str, MetricValue)> = None;
+        let mut lowest_day: Option<(String, &'static str, MetricValue)> = None;
         let mut daily_rows: Vec<DailyRow> = if query.fill_empty_days {
             cutoff
                 .or_else(|| day_map.keys().next().copied())
@@ -693,14 +733,24 @@ impl StatsDataset {
                     );
                     let start = raw_start.max(end.saturating_sub(MAX_GAP_FILL_DAYS - 1));
                     (start..=end)
-                        .map(|d| finish_day_row(d, day_map.remove(&d), query.metric, &mut peak_day))
+                        .map(|d| {
+                            finish_day_row(
+                                d,
+                                day_map.remove(&d),
+                                query.metric,
+                                &mut peak_day,
+                                &mut lowest_day,
+                            )
+                        })
                         .collect()
                 })
                 .unwrap_or_default()
         } else {
             day_map
                 .into_iter()
-                .map(|(d, acc)| finish_day_row(d, Some(acc), query.metric, &mut peak_day))
+                .map(|(d, acc)| {
+                    finish_day_row(d, Some(acc), query.metric, &mut peak_day, &mut lowest_day)
+                })
                 .collect()
         };
 
@@ -710,6 +760,13 @@ impl StatsDataset {
             DailySort::MetricDesc => daily_rows.sort_by(|a, b| {
                 a.metric_value
                     .cmp_desc(b.metric_value)
+                    .then_with(|| b.day_idx.cmp(&a.day_idx))
+            }),
+            DailySort::MetricAsc => daily_rows.sort_by(|a, b| {
+                // Sink empty gap-filled days below active days consistently across all metrics.
+                (a.summary.requests == 0)
+                    .cmp(&(b.summary.requests == 0))
+                    .then_with(|| a.metric_value.cmp_asc(b.metric_value))
                     .then_with(|| b.day_idx.cmp(&a.day_idx))
             }),
         }
@@ -754,6 +811,7 @@ impl StatsDataset {
             active_days,
             span_days,
             peak_day,
+            lowest_day,
             median_tok_per_sec: compute_median(&window_speeds),
             median_ttft_secs: compute_median(&window_ttfts),
             daily_rows,
@@ -919,5 +977,44 @@ mod tests {
         let v_huge = ds.compute_view(&q_huge, None);
         assert_eq!(v_huge.daily_rows.len(), MAX_GAP_FILL_DAYS as usize);
         assert_eq!(v_huge.active_days, 3);
+
+        // CacheHit metric: Day 1 = 90_000 / 91_500 = 98.4%, Day 2 = 10_000 / 17_000 = 58.8%, Day 3 = 0 / 2_000 = 0.0%
+        let q_hit_asc = StatsQuery {
+            range: RangePreset::Days(5),
+            metric: StatsMetric::CacheHit,
+            sort: DailySort::MetricAsc,
+            fill_empty_days: true,
+            ..Default::default()
+        };
+        let v_hit = ds.compute_view(&q_hit_asc, None);
+        // Active days sort ascending (0.0% -> 58.8% -> 98.4%), while empty gap days (`-`) sink to the bottom.
+        assert_eq!(v_hit.daily_rows[0].date, "2026-11-20");
+        assert_eq!(v_hit.daily_rows[1].date, "2026-11-19");
+        assert_eq!(v_hit.daily_rows[2].date, "2026-11-18");
+        assert_eq!(v_hit.daily_rows[3].metric_value, MetricValue::Ratio(None));
+        assert_eq!(v_hit.daily_rows[4].metric_value, MetricValue::Ratio(None));
+        assert_eq!(v_hit.peak_day.as_ref().unwrap().0, "2026-11-18");
+        assert_eq!(v_hit.lowest_day.as_ref().unwrap().0, "2026-11-20");
+        // Weighted overall: 100_000 / 110_500 = 90.5%; unweighted daily avg: (98.36 + 58.82 + 0.0) / 3 = 52.4%
+        assert_eq!(
+            StatsMetric::CacheHit.format_display(v_hit.total_value, true),
+            "90.5%"
+        );
+        assert_eq!(v_hit.daily_avg_display(StatsMetric::CacheHit), "52.4%");
+
+        // MetricAsc also sinks empty gap-filled days below active days for additive token metrics.
+        let q_tot_asc = StatsQuery {
+            range: RangePreset::Days(5),
+            metric: StatsMetric::Total,
+            sort: DailySort::MetricAsc,
+            fill_empty_days: true,
+            ..Default::default()
+        };
+        let v_tot_asc = ds.compute_view(&q_tot_asc, None);
+        assert_eq!(v_tot_asc.daily_rows[0].date, "2026-11-20");
+        assert_eq!(v_tot_asc.daily_rows[1].date, "2026-11-19");
+        assert_eq!(v_tot_asc.daily_rows[2].date, "2026-11-18");
+        assert_eq!(v_tot_asc.daily_rows[3].summary.requests, 0);
+        assert_eq!(v_tot_asc.daily_rows[4].summary.requests, 0);
     }
 }

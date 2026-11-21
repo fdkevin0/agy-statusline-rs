@@ -1,12 +1,15 @@
 //! Terminal report and 20-week activity heatmap renderer for `agy-statusline stats`.
 
+use std::cmp::Ordering;
 use std::io::{self, Write};
 
 use jiff::civil::Date;
 use jiff::ToSpan;
 use unicode_width::UnicodeWidthStr;
 
-use super::metric::{format_usd_full, heatmap_level_f64, MetricValue, StatsMetric};
+use super::metric::{
+    cache_hit_pct, format_pct, format_usd_full, heatmap_level_f64, MetricValue, StatsMetric,
+};
 use super::query::{HeatmapWeek, WEEKDAY_NAMES};
 use super::{DailyUsage, PeriodSummary, StatsReport, ACTIVITY_WEEKS};
 use crate::format::format_tokens_string as fmt_tok;
@@ -21,22 +24,15 @@ const HEATMAP_ANSI_CODES: [&str; 5] = ["2", "38;5;29", "38;5;36", "38;5;42", "1;
 const DEFAULT_STATIC_DAILY_LIMIT: usize = 14;
 
 pub(super) fn fmt_cache_hit(summary: &PeriodSummary) -> String {
-    fmt_cache_hit_parts(
+    format_pct(cache_hit_pct(
         summary.input_tokens,
         summary.cache_read_tokens,
         summary.cache_write_tokens,
-    )
+    ))
 }
 
 fn fmt_cache_hit_parts(input: u64, cache_read: u64, cache_write: u64) -> String {
-    let denom = input
-        .saturating_add(cache_read)
-        .saturating_add(cache_write);
-    if denom == 0 {
-        return "-".to_string();
-    }
-    let pct = (cache_read as f64) * 100.0 / (denom as f64);
-    format!("{pct:.1}%")
+    format_pct(cache_hit_pct(input, cache_read, cache_write))
 }
 
 fn fmt_usd(usd: f64, priced_requests: u64, unpriced_requests: u64) -> String {
@@ -158,10 +154,10 @@ fn write_heatmap_grid<W: Write>(
     for week in weeks {
         for (wd_idx, slot) in week.daily.iter().enumerate() {
             if let Some((date, val)) = slot {
-                if val.is_positive()
+                if val.has_sample()
                     && peak
                         .as_ref()
-                        .is_none_or(|(_, _, p)| val.magnitude() > p.magnitude())
+                        .is_none_or(|(_, _, p)| val.cmp_desc(*p) == Ordering::Less)
                 {
                     peak = Some((date.clone(), WEEKDAY_NAMES[wd_idx], *val));
                 }
@@ -175,6 +171,7 @@ fn write_heatmap_grid<W: Write>(
         &UNICODE_HEATMAP
     };
     let peak_mag = peak.as_ref().map_or(0.0, |(_, _, v)| v.magnitude());
+    let scale_max = if metric.is_rate() { 100.0 } else { peak_mag };
     let peak_note = match peak {
         Some((date, wd, val)) => format!(
             "peak {} on {date} ({wd})",
@@ -229,7 +226,7 @@ fn write_heatmap_grid<W: Write>(
             for week in &weeks[..=last_w] {
                 match &week.daily[wd_idx] {
                     Some((_, val)) => {
-                        let lvl = heatmap_level_f64(val.magnitude(), peak_mag);
+                        let lvl = heatmap_level_f64(val.magnitude(), scale_max);
                         row_cells.push(style_wrap(no_color, HEATMAP_ANSI_CODES[lvl], glyphs[lvl]));
                     }
                     None => row_cells.push("  ".to_string()),
@@ -290,34 +287,45 @@ fn write_daily_table<W: Write>(
     writeln!(out, "\n{}", style_wrap(no_color, "38;5;117", &section_title))?;
 
     let metric_hdr = metric.label();
+    let hit_extra = metric != StatsMetric::CacheHit;
     let cost_extra = show_cost && metric != StatsMetric::Cost;
+    let hit_col_hdr = if hit_extra { "  Cache Hit" } else { "" };
     let cost_col_hdr = if cost_extra { "  Est. Cost" } else { "" };
     let hdr = format!(
-        "  {:<10} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>10}{cost_col_hdr}  Bar",
-        "Date", "Turns", "Input", "Cache", "Output", "Cache Hit", metric_hdr
+        "  {:<10} {:>6}  {:>8}  {:>8}  {:>8}{hit_col_hdr}  {:>10}{cost_col_hdr}  Bar",
+        "Date", "Turns", "Input", "Cache", "Output", metric_hdr
     );
     writeln!(out, "{}", style_wrap(no_color, "2", &hdr))?;
 
-    let max_mag = rows
-        .iter()
-        .map(|d| metric.extract(*d).magnitude())
-        .fold(0.0_f64, f64::max);
+    let max_mag = if metric.is_rate() {
+        100.0
+    } else {
+        rows.iter()
+            .map(|d| metric.extract(*d).magnitude())
+            .fold(0.0_f64, f64::max)
+    };
 
     for d in &rows {
         let cache_tot = d.cache_read_tokens.saturating_add(d.cache_write_tokens);
-        let hit = fmt_cache_hit_parts(d.input_tokens, d.cache_read_tokens, d.cache_write_tokens);
         let val = metric.extract(*d);
         let val_str = metric.format_display(val, true);
         let bar = static_bar(val.magnitude(), max_mag, 10, ascii);
         write!(
             out,
-            "  {:<10} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {}",
+            "  {:<10} {:>6}  {:>8}  {:>8}  {:>8}",
             d.date,
             d.requests,
             fmt_tok(d.input_tokens),
             fmt_tok(cache_tot),
             fmt_tok(d.output_tokens),
-            hit,
+        )?;
+        if hit_extra {
+            let hit = fmt_cache_hit_parts(d.input_tokens, d.cache_read_tokens, d.cache_write_tokens);
+            write!(out, "  {:>9}", hit)?;
+        }
+        write!(
+            out,
+            "  {}",
             style_wrap(no_color, "1;38;5;81", &format!("{val_str:>10}")),
         )?;
         if cost_extra {

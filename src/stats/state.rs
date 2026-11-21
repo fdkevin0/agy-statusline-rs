@@ -276,7 +276,7 @@ impl StatsTuiState {
         }
 
         match code {
-            KeyCode::Char(c @ '1'..='8') => {
+            KeyCode::Char(c @ '1'..='9') => {
                 let idx = (c as u8 - b'1') as usize;
                 if let Some(&metric) = StatsMetric::PRESETS.get(idx) {
                     self.select_metric(metric);
@@ -397,6 +397,7 @@ mod tests {
             active_days: 2,
             span_days: 2,
             peak_day: None,
+            lowest_day: None,
             median_tok_per_sec: None,
             median_ttft_secs: None,
             daily_rows: vec![
@@ -456,9 +457,11 @@ mod tests {
         );
         assert_eq!(st.query.range, RangePreset::Days(10));
 
-        // 2 -> Cost ($), then 'i' switches to Input, then 'w' composes Input + CacheWrite
+        // 2 -> Cost ($), 9 -> Cache%, then 'i' switches to Input, then 'w' composes Input + CacheWrite
         st.handle_key(KeyCode::Char('2'), KeyModifiers::NONE, Some(&view), 10, 36);
         assert_eq!(st.query.metric, StatsMetric::Cost);
+        st.handle_key(KeyCode::Char('9'), KeyModifiers::NONE, Some(&view), 10, 36);
+        assert_eq!(st.query.metric, StatsMetric::CacheHit);
         st.handle_key(KeyCode::Char('i'), KeyModifiers::NONE, Some(&view), 10, 36);
         assert_eq!(st.query.metric, StatsMetric::Input);
         st.handle_key(KeyCode::Char('w'), KeyModifiers::NONE, Some(&view), 10, 36);
@@ -466,6 +469,16 @@ mod tests {
             st.query.metric,
             StatsMetric::Custom(TokenMask::INPUT | TokenMask::CACHE_WRITE)
         );
+
+        // 's' cycles DateDesc -> DateAsc -> MetricDesc -> MetricAsc -> DateDesc
+        st.handle_key(KeyCode::Char('s'), KeyModifiers::NONE, Some(&view), 10, 36);
+        assert_eq!(st.query.sort, crate::stats::query::DailySort::DateAsc);
+        st.handle_key(KeyCode::Char('s'), KeyModifiers::NONE, Some(&view), 10, 36);
+        assert_eq!(st.query.sort, crate::stats::query::DailySort::MetricDesc);
+        st.handle_key(KeyCode::Char('s'), KeyModifiers::NONE, Some(&view), 10, 36);
+        assert_eq!(st.query.sort, crate::stats::query::DailySort::MetricAsc);
+        st.handle_key(KeyCode::Char('s'), KeyModifiers::NONE, Some(&view), 10, 36);
+        assert_eq!(st.query.sort, crate::stats::query::DailySort::DateDesc);
 
         // Down selects 2026-11-19
         st.handle_key(KeyCode::Down, KeyModifiers::NONE, Some(&view), 10, 36);

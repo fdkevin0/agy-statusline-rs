@@ -135,6 +135,22 @@ impl TokenMask {
     }
 }
 
+/// Computes prompt cache hit percentage in `0.0..=100.0`, or `None` when no prompt tokens exist.
+pub(super) fn cache_hit_pct(input: u64, cache_read: u64, cache_write: u64) -> Option<f64> {
+    let denom = input
+        .saturating_add(cache_read)
+        .saturating_add(cache_write);
+    (denom > 0).then(|| (cache_read as f64) * 100.0 / (denom as f64))
+}
+
+/// Formats an optional percentage (`92.5%` or `-`).
+pub(super) fn format_pct(pct: Option<f64>) -> String {
+    match pct {
+        Some(p) if p.is_finite() => format!("{p:.1}%"),
+        _ => "-".to_string(),
+    }
+}
+
 /// Shared read-only projection over usage aggregates (`PeriodSummary`, `DailyUsage`, `ModelStats`).
 pub(super) trait UsageCounters {
     fn requests(&self) -> u64;
@@ -146,6 +162,14 @@ pub(super) trait UsageCounters {
     fn priced_usd(&self) -> f64;
     fn priced_requests(&self) -> u64;
     fn unpriced_requests(&self) -> u64;
+
+    fn cache_hit_pct(&self) -> Option<f64> {
+        cache_hit_pct(
+            self.input_tokens(),
+            self.cache_read_tokens(),
+            self.cache_write_tokens(),
+        )
+    }
 }
 
 impl UsageCounters for PeriodSummary {
@@ -196,11 +220,12 @@ pub enum StatsMetric {
     Cache,
     Thinking,
     Turns,
+    CacheHit,
     Custom(TokenMask),
 }
 
 impl StatsMetric {
-    /// The 8 built-in preset metrics in shortcut key (`1`–`8`) order.
+    /// The 9 built-in preset metrics in shortcut key (`1`–`9`) order.
     pub const PRESETS: &'static [Self] = &[
         Self::Total,
         Self::Cost,
@@ -210,7 +235,13 @@ impl StatsMetric {
         Self::Cache,
         Self::Thinking,
         Self::Turns,
+        Self::CacheHit,
     ];
+
+    /// Returns `true` for non-additive percentage/rate metrics (such as [`Self::CacheHit`]).
+    pub const fn is_rate(self) -> bool {
+        matches!(self, Self::CacheHit)
+    }
 
     /// Canonicalizes a non-empty [`TokenMask`] into a named preset when it matches one.
     pub fn from_mask(mask: TokenMask) -> Self {
@@ -224,7 +255,7 @@ impl StatsMetric {
         }
     }
 
-    /// Underlying [`TokenMask`] for additive token metrics, or `None` for `Cost`/`Thinking`/`Turns`.
+    /// Underlying [`TokenMask`] for additive token metrics, or `None` for non-token/rate metrics.
     pub const fn token_mask(self) -> Option<TokenMask> {
         match self {
             Self::Total => Some(TokenMask::ALL),
@@ -233,7 +264,7 @@ impl StatsMetric {
             Self::Output => Some(TokenMask::OUTPUT),
             Self::Cache => Some(TokenMask::CACHE),
             Self::Custom(mask) => Some(mask),
-            Self::Cost | Self::Thinking | Self::Turns => None,
+            Self::Cost | Self::Thinking | Self::Turns | Self::CacheHit => None,
         }
     }
 
@@ -267,11 +298,12 @@ impl StatsMetric {
             Self::Cache => "Cache".to_string(),
             Self::Thinking => "Think".to_string(),
             Self::Turns => "Turns".to_string(),
+            Self::CacheHit => "Cache%".to_string(),
             Self::Custom(mask) => mask.short_label(),
         }
     }
 
-    /// Ultra-short label for narrow terminals (`< 98` cols).
+    /// Ultra-short label for narrow terminals.
     pub fn compact_label(self) -> String {
         match self {
             Self::Total => "Tot".to_string(),
@@ -282,6 +314,7 @@ impl StatsMetric {
             Self::Cache => "Cch".to_string(),
             Self::Thinking => "Thk".to_string(),
             Self::Turns => "Trn".to_string(),
+            Self::CacheHit => "Hit%".to_string(),
             Self::Custom(mask) => mask.short_label(),
         }
     }
@@ -296,6 +329,7 @@ impl StatsMetric {
             },
             Self::Thinking => MetricValue::Count(rec.thinking_tokens()),
             Self::Turns => MetricValue::Count(rec.requests()),
+            Self::CacheHit => MetricValue::Ratio(rec.cache_hit_pct()),
             _ => {
                 let mask = self.token_mask().unwrap_or(TokenMask::ALL);
                 MetricValue::Count(mask.sum(
@@ -331,6 +365,7 @@ impl StatsMetric {
             (Self::Turns, MetricValue::Count(n)) => format_grouped_u64(n),
             (_, MetricValue::Count(n)) => fmt_tok(n),
             (_, MetricValue::Usd { usd, .. }) => format_usd_short(usd),
+            (_, MetricValue::Ratio(pct)) => format_pct(pct),
         }
     }
 
@@ -365,6 +400,7 @@ impl StatsMetric {
             }
             (_, MetricValue::Count(n)) => fmt_tok(((n as f64) / denom).round() as u64),
             (_, MetricValue::Usd { usd, .. }) => format_usd_short(usd / denom),
+            (_, MetricValue::Ratio(pct)) => format_pct(pct),
         }
     }
 }
@@ -380,6 +416,7 @@ impl fmt::Display for StatsMetric {
             Self::Cache => f.write_str("cache"),
             Self::Thinking => f.write_str("thinking"),
             Self::Turns => f.write_str("turns"),
+            Self::CacheHit => f.write_str("cache_hit"),
             Self::Custom(mask) => f.write_str(&mask.canonical_cli()),
         }
     }
@@ -402,6 +439,8 @@ impl FromStr for StatsMetric {
             "cache" => return Ok(Self::Cache),
             "thinking" | "think" => return Ok(Self::Thinking),
             "turns" | "requests" | "req" => return Ok(Self::Turns),
+            "cache_hit" | "cache-hit" | "cache_rate" | "cache-rate" | "cache%" | "hit"
+            | "hit%" => return Ok(Self::CacheHit),
             _ => {}
         }
 
@@ -416,7 +455,7 @@ impl FromStr for StatsMetric {
                 "cache" => mask |= TokenMask::CACHE,
                 _ => {
                     return Err(format!(
-                        "unknown metric '{raw}'; expected total, cost, io, input, output, cache, cache_read, cache_write, thinking, turns, or '+' combinations (e.g. input+output+cache_write)"
+                        "unknown metric '{raw}'; expected total, cost, io, input, output, cache, cache_hit, cache_read, cache_write, thinking, turns, or '+' combinations (e.g. input+output+cache_write)"
                     ));
                 }
             }
@@ -451,6 +490,8 @@ pub enum MetricValue {
         priced_requests: u64,
         unpriced_requests: u64,
     },
+    /// Percentage in `0.0..=100.0`, or `None` when the denominator is zero.
+    Ratio(Option<f64>),
 }
 
 impl MetricValue {
@@ -463,23 +504,77 @@ impl MetricValue {
                 ..
             } if priced_requests > 0 && usd.is_finite() && usd > 0.0 => usd,
             Self::Usd { .. } => 0.0,
+            Self::Ratio(Some(pct)) if pct.is_finite() && pct > 0.0 => pct,
+            Self::Ratio(_) => 0.0,
         }
     }
 
     pub fn is_positive(self) -> bool {
         match self {
             Self::Count(n) => n > 0,
+            Self::Usd { .. } | Self::Ratio(_) => self.magnitude() > 0.0,
+        }
+    }
+
+    /// Returns `true` when this value represents a recorded observation
+    /// (including a valid `0.0%` ratio, while excluding missing `-` ratios or zero counts).
+    pub fn has_sample(self) -> bool {
+        match self {
+            Self::Ratio(Some(pct)) => pct.is_finite(),
+            Self::Ratio(None) => false,
+            Self::Count(n) => n > 0,
             Self::Usd { .. } => self.magnitude() > 0.0,
+        }
+    }
+
+    pub fn ratio_pct(self) -> Option<f64> {
+        match self {
+            Self::Ratio(pct) => pct.filter(|p| p.is_finite()),
+            _ => None,
         }
     }
 
     pub fn cmp_desc(self, other: Self) -> Ordering {
         match (self, other) {
             (Self::Count(a), Self::Count(b)) => b.cmp(&a),
-            _ => other
-                .magnitude()
-                .partial_cmp(&self.magnitude())
-                .unwrap_or(Ordering::Equal),
+            (Self::Ratio(_), Self::Ratio(_)) => match (self.ratio_pct(), other.ratio_pct()) {
+                (Some(x), Some(y)) => y.total_cmp(&x),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+            _ => other.magnitude().total_cmp(&self.magnitude()),
+        }
+    }
+
+    pub fn cmp_asc(self, other: Self) -> Ordering {
+        match (self, other) {
+            (Self::Count(a), Self::Count(b)) => a.cmp(&b),
+            (Self::Ratio(_), Self::Ratio(_)) => match (self.ratio_pct(), other.ratio_pct()) {
+                (Some(x), Some(y)) => x.total_cmp(&y),
+                // Missing `-` entries always sink to the bottom even in ascending sort.
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+            (
+                Self::Usd {
+                    usd: a,
+                    priced_requests: pa,
+                    ..
+                },
+                Self::Usd {
+                    usd: b,
+                    priced_requests: pb,
+                    ..
+                },
+            ) => match (pa > 0 && a.is_finite(), pb > 0 && b.is_finite()) {
+                (true, true) => a.total_cmp(&b),
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => Ordering::Equal,
+            },
+            _ => self.magnitude().total_cmp(&other.magnitude()),
         }
     }
 }
@@ -567,6 +662,30 @@ mod tests {
             "input+output+cache".parse::<StatsMetric>().unwrap(),
             StatsMetric::Total
         );
+        assert_eq!(
+            "cache_hit".parse::<StatsMetric>().unwrap(),
+            StatsMetric::CacheHit
+        );
+        assert_eq!(
+            "cache-rate".parse::<StatsMetric>().unwrap(),
+            StatsMetric::CacheHit
+        );
+        assert_eq!(
+            "hit%".parse::<StatsMetric>().unwrap(),
+            StatsMetric::CacheHit
+        );
+        assert_eq!(StatsMetric::CacheHit.to_string(), "cache_hit");
+        assert_eq!(StatsMetric::CacheHit.label(), "Cache%");
+        assert!(StatsMetric::CacheHit.is_rate());
+        assert!(!StatsMetric::Total.is_rate());
+        assert_eq!(
+            serde_json::to_string(&StatsMetric::CacheHit).unwrap(),
+            "\"cache_hit\""
+        );
+        assert_eq!(
+            serde_json::from_str::<StatsMetric>("\"cache_hit\"").unwrap(),
+            StatsMetric::CacheHit
+        );
 
         let combo: StatsMetric = "input+output+cache_write".parse().unwrap();
         assert_eq!(combo.to_string(), "input+output+cache_write");
@@ -636,5 +755,32 @@ mod tests {
             StatsMetric::Custom(TokenMask::CACHE_WRITE).extract(&summary),
             MetricValue::Count(500)
         );
+
+        // Cache hit: 9_000 / (1_000 + 9_000 + 500) = 85.714...%
+        let hit = StatsMetric::CacheHit.extract(&summary);
+        assert_eq!(StatsMetric::CacheHit.format_display(hit, true), "85.7%");
+        assert_eq!(StatsMetric::CacheHit.format_average(hit, 7), "85.7%");
+        assert!(hit.has_sample());
+
+        let zero_hit = StatsMetric::CacheHit.extract(&PeriodSummary {
+            requests: 1,
+            input_tokens: 1_000,
+            ..Default::default()
+        });
+        let missing_hit = StatsMetric::CacheHit.extract(&PeriodSummary::default());
+        assert_eq!(StatsMetric::CacheHit.format_display(zero_hit, true), "0.0%");
+        assert_eq!(StatsMetric::CacheHit.format_display(missing_hit, true), "-");
+        assert!(zero_hit.has_sample());
+        assert!(!missing_hit.has_sample());
+        // Valid 0.0% always sorts ahead of missing `-` and non-finite ratios in both desc and asc order.
+        let nan_hit = MetricValue::Ratio(Some(f64::NAN));
+        assert_eq!(hit.cmp_desc(zero_hit), Ordering::Less);
+        assert_eq!(zero_hit.cmp_desc(missing_hit), Ordering::Less);
+        assert_eq!(zero_hit.cmp_desc(nan_hit), Ordering::Less);
+        assert_eq!(nan_hit.cmp_desc(missing_hit), Ordering::Equal);
+        assert_eq!(zero_hit.cmp_asc(hit), Ordering::Less);
+        assert_eq!(zero_hit.cmp_asc(missing_hit), Ordering::Less);
+        assert_eq!(zero_hit.cmp_asc(nan_hit), Ordering::Less);
+        assert_eq!(nan_hit.cmp_asc(missing_hit), Ordering::Equal);
     }
 }
