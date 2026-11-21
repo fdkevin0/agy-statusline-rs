@@ -236,11 +236,15 @@ fn cli_stats_preserves_archived_history_after_pruning_and_supports_sync_subcomma
         .unwrap();
     drop(kept_conn);
 
-    // Explicit `stats sync` archives both live DBs.
-    let sync_out = isolated_agy_cmd(home)
-        .args(["stats", "sync"])
-        .output()
-        .unwrap();
+    // Build the command first (which seeds offline pricing), then remove the pre-seeded
+    // sync stamp so this test proves `stats sync` creates the stamp itself.
+    let mut sync_cmd = isolated_agy_cmd(home);
+    let stamp_path = home.join("cache/agy-statusline/stats_archive_sync.ts");
+    fs::remove_file(&stamp_path).unwrap();
+    assert!(!stamp_path.exists());
+
+    // Explicit `stats sync` archives both live DBs and writes the sync stamp.
+    let sync_out = sync_cmd.args(["stats", "sync"]).output().unwrap();
     assert!(sync_out.status.success(), "{sync_out:?}");
     let sync_text = String::from_utf8(sync_out.stdout).unwrap();
     assert!(
@@ -248,6 +252,7 @@ fn cli_stats_preserves_archived_history_after_pruning_and_supports_sync_subcomma
         "{sync_text}"
     );
     assert!(home.join("data/agy-statusline/stats_history.db").is_file());
+    assert!(stamp_path.is_file());
 
     // `stats sync --if-stale` skips immediately while the stamp is fresh.
     let stale_out = isolated_agy_cmd(home)

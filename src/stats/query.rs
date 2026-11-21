@@ -440,7 +440,7 @@ impl StatsDataset {
         let (sqlite, mut events, covered) = match data_dir {
             Some(dir) => scan_sqlite_conversations_with_archive(
                 roots,
-                Some(dir),
+                dir,
                 cache_dir,
                 now_unix_secs,
                 tz,
