@@ -30,7 +30,7 @@ pub use archive::{maybe_spawn_background_archive_sync, run_stats_sync_command};
 pub use metric::{MetricValue, StatsMetric};
 pub(crate) use pricing::{
     is_pricing_fingerprint_fresh, maybe_spawn_pricing_sync_if_stale, pricing_cache_fingerprint,
-    PricingFileFingerprint,
+    PricingFileFingerprint, DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE,
 };
 pub use pricing::{run_pricing_command, PricingCatalog, SyncMode};
 pub(crate) use scan::{
@@ -40,8 +40,6 @@ pub use tui::run_stats_tui;
 pub use tz::unix_secs_to_utc_date;
 
 use crate::timeutil::civil_date_from_unix_day;
-#[cfg(test)]
-use pricing::DEFAULT_PRICING_TTL_SECS;
 use query::{SourceFilter, StatsDataset};
 use render::render_stats_report_with_metric;
 #[cfg(test)]

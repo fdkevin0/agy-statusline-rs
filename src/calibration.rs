@@ -18,8 +18,8 @@ use crate::metrics::{resolve_quota_views_with_reset_at, QuotaResolution, QuotaVi
 use crate::statusline::StatuslinePayload;
 use crate::timeutil::SECS_PER_DAY;
 
-const SCHEMA_VERSION: u32 = 3;
-const CACHE_FILENAME: &str = "quota_cal.json";
+pub(crate) const SCHEMA_VERSION: u32 = 3;
+pub(crate) const CACHE_FILENAME: &str = "quota_cal.json";
 const LOCK_FILENAME: &str = "quota_cal.lock";
 
 const MIN_TTL_SECS: u64 = 7 * (SECS_PER_DAY as u64);

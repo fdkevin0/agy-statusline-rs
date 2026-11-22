@@ -16,12 +16,12 @@ use crate::paths::xdg_cache_dir;
 use crate::timeutil::{unix_now_secs, SECS_PER_DAY};
 
 /// Default cache TTL for auto-fetched `models.dev` pricing data (24 hours).
-pub(super) const DEFAULT_PRICING_TTL_SECS: u64 = SECS_PER_DAY as u64;
+pub(crate) const DEFAULT_PRICING_TTL_SECS: u64 = SECS_PER_DAY as u64;
 /// Cooldown after a failed network fetch before retrying automatically (5 minutes).
 const PRICING_RETRY_COOLDOWN_SECS: u64 = 300;
 /// Public unauthenticated `models.dev` API endpoint.
 const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
-const MODELS_DEV_CACHE_FILE: &str = "models_dev_pricing.json";
+pub(crate) const MODELS_DEV_CACHE_FILE: &str = "models_dev_pricing.json";
 const MODELS_DEV_ERR_FILE: &str = "models_dev_pricing.err";
 const MAX_PRICING_JSON_BYTES: u64 = 16 * 1024 * 1024;
 
