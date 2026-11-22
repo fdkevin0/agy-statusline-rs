@@ -39,7 +39,9 @@ const SKIP_DIRS: &[&str] = &[
 pub(super) fn is_effort_token(word: &str) -> bool {
     matches!(
         word,
-        "low"
+        "xlow"
+            | "extralow"
+            | "low"
             | "medium"
             | "med"
             | "high"
@@ -248,6 +250,12 @@ fn canonical_or_self(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn is_non_empty_file(path: &Path) -> bool {
+    // Follow symlinks via `fs::metadata` so symlinked transcripts remain discoverable and
+    // deduplicated by `canonical_or_self`.
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
 fn cascade_hint_from_transcript_path(path: &Path) -> String {
     let components: Vec<String> = path
         .components()
@@ -301,7 +309,7 @@ fn collect_transcript_jobs_in_brain(
         if meta.is_dir() {
             if depth == 0 {
                 let mut push_if_file = |candidate: PathBuf| -> bool {
-                    if !candidate.is_file() {
+                    if !is_non_empty_file(&candidate) {
                         return false;
                     }
                     let real = canonical_or_self(&candidate);
@@ -322,6 +330,7 @@ fn collect_transcript_jobs_in_brain(
                 ] {
                     if push_if_file(candidate) {
                         matched_fast = true;
+                        break;
                     }
                 }
                 if !matched_fast {
@@ -331,6 +340,7 @@ fn collect_transcript_jobs_in_brain(
                     ] {
                         if push_if_file(candidate) {
                             matched_fast = true;
+                            break;
                         }
                     }
                 }
@@ -347,9 +357,10 @@ fn collect_transcript_jobs_in_brain(
                 jobs,
             );
         } else if meta.is_file()
+            && meta.len() > 0
             && (name_str == COMPACT_TRANSCRIPT_FILENAME
                 || (name_str == FULL_TRANSCRIPT_FILENAME
-                    && !dir.join(COMPACT_TRANSCRIPT_FILENAME).is_file()))
+                    && !is_non_empty_file(&dir.join(COMPACT_TRANSCRIPT_FILENAME))))
         {
             let real = canonical_or_self(&path);
             if seen_files.insert(real) {
@@ -1211,6 +1222,24 @@ mod tests {
             "Model Alpha"
         );
         assert_eq!(
+            derive_model_name(
+                Some("Gemini 3.5 Flash (Extra Low)"),
+                Some("gemini-3.5-flash-extra-low"),
+                1527
+            ),
+            "Gemini 3.5 Flash"
+        );
+        assert_eq!(
+            derive_model_name(
+                Some("Gemini 3.5 Flash (xLow)"),
+                Some("gemini-3.5-flash-xlow"),
+                1528
+            ),
+            "Gemini 3.5 Flash"
+        );
+        assert!(is_effort_token("extralow"));
+        assert!(is_effort_token("xlow"));
+        assert_eq!(
             derive_model_name(Some("Orchestrator (TierA)"), Some("pro-orchestrator"), 1667),
             "Orchestrator (TierA)"
         );
@@ -1459,6 +1488,107 @@ mod tests {
         assert_eq!(report.totals.input_tokens, 1000);
         assert_eq!(report.totals.output_tokens, 100);
         assert_eq!(report.totals.total_tokens, 1100);
+    }
+
+    #[test]
+    fn empty_compact_transcript_does_not_shadow_populated_transcript_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        // Depth-0 fast path: 0-byte transcript.jsonl alongside populated transcript_full.jsonl.
+        let std_dir = home.join(
+            ".gemini/antigravity-cli/brain/dddddddd-dddd-4ddd-8ddd-dddddddddddd/.system_generated/logs",
+        );
+        fs::create_dir_all(&std_dir).unwrap();
+        fs::write(std_dir.join("transcript.jsonl"), b"").unwrap();
+        fs::write(
+            std_dir.join("transcript_full.jsonl"),
+            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"step_index\":1,\"model\":\"full-after-empty-std\",\"input_tokens\":400,\"output_tokens\":40}\n",
+        )
+        .unwrap();
+
+        // Recursive nested path: 0-byte transcript.jsonl alongside populated transcript_full.jsonl.
+        let nested_dir = home.join(".gemini/antigravity/brain/group/nested");
+        fs::create_dir_all(&nested_dir).unwrap();
+        fs::write(nested_dir.join("transcript.jsonl"), b"").unwrap();
+        fs::write(
+            nested_dir.join("transcript_full.jsonl"),
+            "{\"created_at\":\"2026-11-18T11:00:00Z\",\"step_index\":2,\"model\":\"full-after-empty-nested\",\"input_tokens\":600,\"output_tokens\":60}\n",
+        )
+        .unwrap();
+
+        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
+        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
+        assert_eq!(report.totals.requests, 2);
+        assert_eq!(report.totals.input_tokens, 1000);
+        assert_eq!(report.totals.output_tokens, 100);
+        assert_eq!(report.totals.total_tokens, 1100);
+    }
+
+    #[test]
+    fn depth0_fast_path_queues_only_first_non_empty_transcript_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let brain = home.join(".gemini/antigravity-cli/brain");
+
+        // Session with both `.system_generated/logs/transcript.jsonl` and `<session>/transcript.jsonl`.
+        // Lines omit `responseId` and the second file has an extra line so double-queuing would inflate totals.
+        let compact_session = brain.join("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+        let std_compact = compact_session.join(".system_generated/logs/transcript.jsonl");
+        fs::create_dir_all(std_compact.parent().unwrap()).unwrap();
+        fs::write(
+            &std_compact,
+            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"model\":\"compact-primary\",\"input_tokens\":400,\"output_tokens\":40}\n",
+        )
+        .unwrap();
+        fs::write(
+            compact_session.join("transcript.jsonl"),
+            concat!(
+                "{\"created_at\":\"2026-11-18T10:00:00Z\",\"model\":\"compact-dup\",\"input_tokens\":400,\"output_tokens\":40}\n",
+                "{\"created_at\":\"2026-11-18T10:01:00Z\",\"model\":\"compact-dup\",\"input_tokens\":9000,\"output_tokens\":900}\n",
+            ),
+        )
+        .unwrap();
+
+        // Session with both `.system_generated/logs/transcript_full.jsonl` and `<session>/transcript_full.jsonl`.
+        let full_session = brain.join("ffffffff-ffff-4fff-8fff-ffffffffffff");
+        let std_full = full_session.join(".system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(std_full.parent().unwrap()).unwrap();
+        fs::write(
+            &std_full,
+            "{\"created_at\":\"2026-11-18T10:30:00Z\",\"model\":\"full-primary\",\"input_tokens\":300,\"output_tokens\":30}\n",
+        )
+        .unwrap();
+        fs::write(
+            full_session.join("transcript_full.jsonl"),
+            concat!(
+                "{\"created_at\":\"2026-11-18T10:30:00Z\",\"model\":\"full-dup\",\"input_tokens\":300,\"output_tokens\":30}\n",
+                "{\"created_at\":\"2026-11-18T10:31:00Z\",\"model\":\"full-dup\",\"input_tokens\":8000,\"output_tokens\":800}\n",
+            ),
+        )
+        .unwrap();
+
+        let mut visited_dirs = HashSet::new();
+        let mut seen_files = HashSet::new();
+        let mut jobs = Vec::new();
+        collect_transcript_jobs_in_brain(
+            &brain,
+            "cli",
+            0,
+            &mut visited_dirs,
+            &mut seen_files,
+            &mut jobs,
+        );
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].path, std_compact);
+        assert_eq!(jobs[1].path, std_full);
+
+        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
+        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
+        assert_eq!(report.totals.requests, 2);
+        assert_eq!(report.totals.input_tokens, 700);
+        assert_eq!(report.totals.output_tokens, 70);
+        assert_eq!(report.totals.total_tokens, 770);
     }
 
     fn seed_cost_db(cli_dir: &Path, uuid: &str, idx: i64, blob: Vec<u8>) {

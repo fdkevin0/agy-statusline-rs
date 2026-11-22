@@ -219,9 +219,12 @@ fn run_git_diff_bounded(dir: &Path, timeout: Duration) -> Option<(u64, u64)> {
     cmd.args(["--no-optional-locks", "-C"])
         .arg(dir)
         .args(["diff", "--numstat", "HEAD"]);
-    run_command_stdout_bounded(&mut cmd, timeout, 2 * 1024 * 1024)
-        .ok()
-        .map(|bytes| parse_numstat(&bytes))
+    let out = run_command_stdout_bounded(&mut cmd, timeout, 2 * 1024 * 1024).ok()?;
+    if !out.truncated && out.status.is_some_and(|s| s.success()) {
+        Some(parse_numstat(&out.stdout))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

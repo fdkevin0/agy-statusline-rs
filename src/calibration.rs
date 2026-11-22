@@ -12,12 +12,13 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::db::is_absent_or_real_file;
 use crate::fsutil::atomic_write;
 use crate::metrics::{resolve_quota_views_with_reset_at, QuotaResolution, QuotaView};
 use crate::statusline::StatuslinePayload;
 use crate::timeutil::SECS_PER_DAY;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const CACHE_FILENAME: &str = "quota_cal.json";
 const LOCK_FILENAME: &str = "quota_cal.lock";
 
@@ -66,12 +67,70 @@ pub struct BucketCalibration {
     pub updated_at_secs: u64,
 }
 
+/// Normalized, non-PII account and plan scope isolating calibrated quota budgets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccountScope {
+    /// Normalized lowercase plan tier (e.g. `"pro"`, `"ultra"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_tier: Option<String>,
+    /// Deterministic 64-bit FNV-1a hex digest of normalized lowercase user email.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_hash: Option<String>,
+}
+
+fn fnv1a_64_hex(input: &str) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+fn normalize_scope_token(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+impl AccountScope {
+    fn from_payload(payload: &StatuslinePayload) -> Self {
+        Self {
+            plan_tier: normalize_scope_token(payload.plan_tier.as_deref()),
+            email_hash: normalize_scope_token(payload.email.as_deref())
+                .map(|email| fnv1a_64_hex(&email)),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.plan_tier.is_none() && self.email_hash.is_none()
+    }
+
+    fn conflicts_with(&self, incoming: &Self) -> bool {
+        let plan_conflict = matches!(
+            (&self.plan_tier, &incoming.plan_tier),
+            (Some(a), Some(b)) if a != b
+        );
+        let email_conflict = matches!(
+            (&self.email_hash, &incoming.email_hash),
+            (Some(a), Some(b)) if a != b
+        );
+        plan_conflict || email_conflict
+    }
+}
+
 /// On-disk JSON store (`$XDG_CACHE_HOME/agy-statusline/quota_cal.json`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CalibrationStore {
-    /// Store schema version (`2`).
+    /// Store schema version (`3`).
     pub schema_version: u32,
+    /// Non-PII account and plan scope for all stored buckets.
+    #[serde(default, skip_serializing_if = "AccountScope::is_empty")]
+    pub account_scope: AccountScope,
     /// Per-bucket calibration map keyed by raw quota bucket ID.
     pub buckets: BTreeMap<String, BucketCalibration>,
 }
@@ -80,8 +139,35 @@ impl Default for CalibrationStore {
     fn default() -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
+            account_scope: AccountScope::default(),
             buckets: BTreeMap::new(),
         }
+    }
+}
+
+impl CalibrationStore {
+    fn scope_conflicts(&self, incoming: &AccountScope) -> bool {
+        self.account_scope.conflicts_with(incoming)
+    }
+
+    /// Reconciles stored scope against `incoming`: clears buckets on conflict,
+    /// backfills absent fields without clearing, and preserves stored fields when incoming is absent.
+    fn reconcile_scope(&mut self, incoming: &AccountScope) -> bool {
+        if self.scope_conflicts(incoming) {
+            self.buckets.clear();
+            self.account_scope = incoming.clone();
+            return true;
+        }
+        let mut changed = false;
+        if self.account_scope.plan_tier.is_none() && incoming.plan_tier.is_some() {
+            self.account_scope.plan_tier = incoming.plan_tier.clone();
+            changed = true;
+        }
+        if self.account_scope.email_hash.is_none() && incoming.email_hash.is_some() {
+            self.account_scope.email_hash = incoming.email_hash.clone();
+            changed = true;
+        }
+        changed
     }
 }
 
@@ -91,23 +177,29 @@ pub fn load_calibration_store(cache_dir: &Path) -> CalibrationStore {
     let Ok(raw) = fs::read_to_string(path) else {
         return CalibrationStore::default();
     };
-    let Ok(mut store) = serde_json::from_str::<CalibrationStore>(&raw) else {
+    let Ok(store) = serde_json::from_str::<CalibrationStore>(&raw) else {
         return CalibrationStore::default();
     };
     if store.schema_version != SCHEMA_VERSION {
-        store.schema_version = SCHEMA_VERSION;
-        store.buckets.clear();
+        return CalibrationStore::default();
     }
     store
 }
 
 fn try_lock_calibration(cache_dir: &Path) -> io::Result<fs::File> {
     fs::create_dir_all(cache_dir)?;
+    let lock_path = cache_dir.join(LOCK_FILENAME);
+    if !is_absent_or_real_file(&lock_path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsafe calibration lock file (symlink/non-regular file)",
+        ));
+    }
     let lock = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
-        .open(cache_dir.join(LOCK_FILENAME))?;
+        .open(&lock_path)?;
     lock.try_lock().map_err(io::Error::from)?;
     Ok(lock)
 }
@@ -247,7 +339,11 @@ fn calibrate_bucket(
     }
 
     entry.last_fraction = Some(frac);
-    if reset_at_secs.is_some() {
+    if is_new_cycle {
+        // Clear stale reset_at when a new cycle starts at untouched 100% (suppressed reset_at),
+        // preventing the first consumption tick from falsely tripping `reset_shifted_forward`.
+        entry.last_reset_at_secs = reset_at_secs;
+    } else if reset_at_secs.is_some() {
         entry.last_reset_at_secs = reset_at_secs;
     }
 
@@ -301,13 +397,15 @@ fn calibrate_resolved(
     resolved: ResolvedViews,
     now_unix_secs: u64,
 ) -> ([Option<QuotaView>; 2], bool) {
+    let incoming_scope = AccountScope::from_payload(payload);
+    let mut changed = store.reconcile_scope(&incoming_scope);
+
     let conv_id = payload
         .conversation_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let session_tokens = extract_session_tokens(payload);
-    let mut changed = false;
     let views = resolved.map(|slot| {
         let (view, reset_at) = slot?;
         if view.remaining_amount.is_some() {
@@ -374,9 +472,11 @@ pub(crate) fn calibrate_quota_views_at(
             }
             views
         } else {
+            let incoming_scope = AccountScope::from_payload(payload);
+            let allow_estimates = !store.scope_conflicts(&incoming_scope);
             resolved.map(|slot| {
                 let (mut view, _) = slot?;
-                if view.remaining_amount.is_none() {
+                if allow_estimates && view.remaining_amount.is_none() {
                     view.est_remaining_tokens = store
                         .buckets
                         .get(&view.bucket_key)
@@ -439,6 +539,16 @@ mod tests {
             quota: Some(quota),
             ..Default::default()
         }
+    }
+
+    fn with_scope(
+        mut payload: StatuslinePayload,
+        plan_tier: Option<&str>,
+        email: Option<&str>,
+    ) -> StatuslinePayload {
+        payload.plan_tier = plan_tier.map(str::to_string);
+        payload.email = email.map(str::to_string);
+        payload
     }
 
     #[test]
@@ -591,6 +701,7 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            ..Default::default()
         };
         write_calibration_store(dir.path(), &seeded).unwrap();
         let cal_path = dir.path().join(CACHE_FILENAME);
@@ -619,6 +730,7 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            ..Default::default()
         };
         write_calibration_store(dir.path(), &stale).unwrap();
 
@@ -646,5 +758,234 @@ mod tests {
         let p_jitter_minus1 = make_payload("conv-jitter", 10_000, 0, 0.90, 13_979, 0.98, 499_981);
         calibrate_quota_views_at(&p_jitter_minus1, Some(dir.path()), t0 + 20);
         assert_eq!(fs::read_to_string(&cal_path).unwrap(), before_raw);
+    }
+
+    #[test]
+    fn untouched_full_window_rolling_reset_does_not_rewrite_disk_or_trigger_new_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = 1_795_000_000;
+        let cal_path = dir.path().join(CACHE_FILENAME);
+
+        // Rolling reset_time = now + window across 0s, +30s, +700s (> NEW_CYCLE_RESET_SHIFT_SECS).
+        let p0 = make_payload("conv-full", 10_000, 0, 1.0, 18_000, 1.0, 604_800);
+        let (q5_0, qw_0) = calibrate_quota_views_at(&p0, Some(dir.path()), t0);
+        assert_eq!(q5_0.unwrap().reset_compact, None);
+        assert_eq!(qw_0.unwrap().reset_compact, None);
+        let before_raw = fs::read_to_string(&cal_path).unwrap();
+        let loaded = load_calibration_store(dir.path());
+        assert_eq!(loaded.buckets["acme-5h"].last_reset_at_secs, None);
+        assert_eq!(loaded.buckets["acme-5h"].updated_at_secs, t0);
+
+        let p1 = make_payload("conv-full", 10_000, 0, 1.0, 18_000, 1.0, 604_800);
+        calibrate_quota_views_at(&p1, Some(dir.path()), t0 + 30);
+        assert_eq!(fs::read_to_string(&cal_path).unwrap(), before_raw);
+
+        let p2 = make_payload("conv-full", 10_000, 0, 1.0, 18_000, 1.0, 604_800);
+        calibrate_quota_views_at(&p2, Some(dir.path()), t0 + 700);
+        assert_eq!(fs::read_to_string(&cal_path).unwrap(), before_raw);
+
+        // Also confirm in-memory that +30s and +700s rolling ticks never clear divergence via false is_new_cycle.
+        let mut mem = CalibrationStore::default();
+        calibrate_store_at(&mut mem, &p0, t0);
+        mem.buckets
+            .get_mut("acme-5h")
+            .unwrap()
+            .external_divergence_in_cycle = true;
+        let (_, changed_30) =
+            calibrate_resolved(&mut mem, &p1, resolve_views(&p1, t0 + 30), t0 + 30);
+        assert!(!changed_30);
+        assert!(mem.buckets["acme-5h"].external_divergence_in_cycle);
+        let (_, changed_700) =
+            calibrate_resolved(&mut mem, &p2, resolve_views(&p2, t0 + 700), t0 + 700);
+        assert!(!changed_700);
+        assert!(mem.buckets["acme-5h"].external_divergence_in_cycle);
+    }
+
+    #[test]
+    fn cycle_reset_to_untouched_full_then_delayed_consumption_calibrates_cleanly() {
+        let mut store = CalibrationStore::default();
+        let t0 = 1_795_000_000;
+
+        let p_old = make_payload("conv-cycle", 100_000, 0, 0.50, 10_000, 0.90, 500_000);
+        calibrate_store_at(&mut store, &p_old, t0);
+        assert_eq!(
+            store.buckets["acme-5h"].last_reset_at_secs,
+            Some(t0 + 10_000)
+        );
+
+        // Cycle resets to untouched 100% -> clears stale last_reset_at_secs to None.
+        let t1 = t0 + 10_100;
+        let p_reset = make_payload("conv-cycle", 100_000, 0, 1.00, 18_000, 0.90, 489_900);
+        let (q5_reset, _) = calibrate_store_at(&mut store, &p_reset, t1);
+        assert_eq!(q5_reset.unwrap().reset_compact, None);
+        assert_eq!(store.buckets["acme-5h"].last_reset_at_secs, None);
+        assert_eq!(store.buckets["acme-5h"].anchor_fraction, Some(1.0));
+
+        // 15 minutes later: +200K tokens drops quota to 90% -> calibrates 2.0M pool without false shift.
+        let t2 = t1 + 900;
+        let p_use = make_payload("conv-cycle", 300_000, 0, 0.90, 17_100, 0.89, 489_000);
+        let (q5_use, _) = calibrate_store_at(&mut store, &p_use, t2);
+        assert_eq!(q5_use.unwrap().est_remaining_tokens, Some(1_800_000));
+        assert_eq!(store.buckets["acme-5h"].sample_count, 1);
+        assert_eq!(
+            store.buckets["acme-5h"].last_reset_at_secs,
+            Some(t2 + 17_100)
+        );
+    }
+
+    #[test]
+    fn account_and_plan_scope_isolates_calibration_and_lock_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let cal_path = dir.path().join(CACHE_FILENAME);
+        let t0 = 1_795_000_000;
+
+        // Calibrate 2.0M pool for ("Pro", "Alice@Example.COM").
+        let p1 = with_scope(
+            make_payload("conv-scope", 10_000, 0, 0.90, 14_000, 0.98, 500_000),
+            Some("Pro"),
+            Some("Alice@Example.COM"),
+        );
+        calibrate_quota_views_at(&p1, Some(dir.path()), t0);
+        let p2 = with_scope(
+            make_payload("conv-scope", 210_000, 0, 0.80, 13_940, 0.97, 499_940),
+            Some("Pro"),
+            Some("Alice@Example.COM"),
+        );
+        let (q5_2, _) = calibrate_quota_views_at(&p2, Some(dir.path()), t0 + 60);
+        assert_eq!(q5_2.unwrap().est_remaining_tokens, Some(1_600_000));
+
+        // Disk cache stores normalized plan and hashed email, never raw email PII.
+        let raw_after_p2 = fs::read_to_string(&cal_path).unwrap();
+        assert!(!raw_after_p2.contains("Alice"));
+        assert!(!raw_after_p2.contains("alice"));
+        assert!(!raw_after_p2.contains("example.com"));
+        assert!(raw_after_p2.contains("\"plan_tier\": \"pro\""));
+        assert!(raw_after_p2.contains("\"email_hash\""));
+
+        // Missing email/plan_tier preserves existing calibration and stored scope without rewriting disk.
+        let p_missing = with_scope(
+            make_payload("conv-scope", 210_000, 0, 0.80, 13_880, 0.97, 499_880),
+            None,
+            None,
+        );
+        let (q5_missing, _) = calibrate_quota_views_at(&p_missing, Some(dir.path()), t0 + 120);
+        assert_eq!(q5_missing.unwrap().est_remaining_tokens, Some(1_600_000));
+        assert_eq!(fs::read_to_string(&cal_path).unwrap(), raw_after_p2);
+
+        // Equivalent casing/whitespace preserves calibration without rewriting disk.
+        let p_norm = with_scope(
+            make_payload("conv-scope", 210_000, 0, 0.80, 13_820, 0.97, 499_820),
+            Some("  PRO "),
+            Some(" alice@example.com "),
+        );
+        let (q5_norm, _) = calibrate_quota_views_at(&p_norm, Some(dir.path()), t0 + 180);
+        assert_eq!(q5_norm.unwrap().est_remaining_tokens, Some(1_600_000));
+        assert_eq!(fs::read_to_string(&cal_path).unwrap(), raw_after_p2);
+
+        // Switching plan_tier clears prior calibrated buckets and anchors.
+        let p_ultra = with_scope(
+            make_payload("conv-scope", 210_000, 0, 0.80, 13_760, 0.97, 499_760),
+            Some("Ultra"),
+            Some("alice@example.com"),
+        );
+        let (q5_ultra, _) = calibrate_quota_views_at(&p_ultra, Some(dir.path()), t0 + 240);
+        assert_eq!(q5_ultra.unwrap().est_remaining_tokens, None);
+        let after_plan_switch = load_calibration_store(dir.path());
+        assert_eq!(
+            after_plan_switch.account_scope.plan_tier.as_deref(),
+            Some("ultra")
+        );
+        assert_eq!(after_plan_switch.buckets["acme-5h"].sample_count, 0);
+        assert_eq!(
+            after_plan_switch.buckets["acme-5h"].calibrated_total_tokens,
+            None
+        );
+
+        // Calibrate 4.0M pool under ("Ultra", "alice@example.com").
+        let p_ultra_cal = with_scope(
+            make_payload("conv-scope", 610_000, 0, 0.70, 13_700, 0.96, 499_700),
+            Some("Ultra"),
+            Some("alice@example.com"),
+        );
+        let (q5_ultra_cal, _) = calibrate_quota_views_at(&p_ultra_cal, Some(dir.path()), t0 + 300);
+        assert_eq!(q5_ultra_cal.unwrap().est_remaining_tokens, Some(2_800_000));
+
+        // Lock-contention read-only path hides estimates on conflicting scope, keeps on matching/missing.
+        let before_lock = fs::read_to_string(&cal_path).unwrap();
+        let lock = try_lock_calibration(dir.path()).expect("acquire lock");
+        let p_lock_plan_conflict = with_scope(
+            make_payload("conv-scope", 610_000, 0, 0.70, 13_640, 0.96, 499_640),
+            Some("Pro"),
+            Some("alice@example.com"),
+        );
+        let (q5_lock_plan, _) =
+            calibrate_quota_views_at(&p_lock_plan_conflict, Some(dir.path()), t0 + 360);
+        assert_eq!(q5_lock_plan.unwrap().est_remaining_tokens, None);
+
+        let p_lock_email_conflict = with_scope(
+            make_payload("conv-scope", 610_000, 0, 0.70, 13_640, 0.96, 499_640),
+            Some("Ultra"),
+            Some("bob@example.com"),
+        );
+        let (q5_lock_email, _) =
+            calibrate_quota_views_at(&p_lock_email_conflict, Some(dir.path()), t0 + 360);
+        assert_eq!(q5_lock_email.unwrap().est_remaining_tokens, None);
+
+        let p_lock_match = with_scope(
+            make_payload("conv-scope", 610_000, 0, 0.70, 13_640, 0.96, 499_640),
+            Some("Ultra"),
+            Some("alice@example.com"),
+        );
+        let (q5_lock_match, _) = calibrate_quota_views_at(&p_lock_match, Some(dir.path()), t0 + 360);
+        assert_eq!(q5_lock_match.unwrap().est_remaining_tokens, Some(2_800_000));
+        assert_eq!(fs::read_to_string(&cal_path).unwrap(), before_lock);
+        drop(lock);
+
+        // Switching email clears prior calibrated buckets and records the new email hash.
+        let p_bob = with_scope(
+            make_payload("conv-scope", 610_000, 0, 0.70, 13_580, 0.96, 499_580),
+            Some("Ultra"),
+            Some("bob@example.com"),
+        );
+        let (q5_bob, _) = calibrate_quota_views_at(&p_bob, Some(dir.path()), t0 + 420);
+        assert_eq!(q5_bob.unwrap().est_remaining_tokens, None);
+        let after_bob = load_calibration_store(dir.path());
+        assert_eq!(
+            after_bob.account_scope.email_hash.as_deref(),
+            Some(fnv1a_64_hex("bob@example.com").as_str())
+        );
+        assert_eq!(after_bob.buckets["acme-5h"].sample_count, 0);
+
+        // Backfilling a previously absent scope field preserves calibrated buckets without clearing.
+        let mut partial = CalibrationStore::default();
+        let p_partial_1 = with_scope(
+            make_payload("conv-part", 10_000, 0, 0.90, 14_000, 0.98, 500_000),
+            Some("Pro"),
+            None,
+        );
+        calibrate_store_at(&mut partial, &p_partial_1, t0);
+        let p_partial_2 = with_scope(
+            make_payload("conv-part", 210_000, 0, 0.80, 13_940, 0.97, 499_940),
+            Some("Pro"),
+            None,
+        );
+        calibrate_store_at(&mut partial, &p_partial_2, t0 + 60);
+        let p_backfill = with_scope(
+            make_payload("conv-part", 210_000, 0, 0.80, 13_880, 0.97, 499_880),
+            Some("Pro"),
+            Some("carol@example.com"),
+        );
+        let ([q5_backfill, _], backfill_changed) = calibrate_resolved(
+            &mut partial,
+            &p_backfill,
+            resolve_views(&p_backfill, t0 + 120),
+            t0 + 120,
+        );
+        assert!(backfill_changed);
+        assert_eq!(q5_backfill.unwrap().est_remaining_tokens, Some(1_600_000));
+        assert_eq!(
+            partial.account_scope.email_hash.as_deref(),
+            Some(fnv1a_64_hex("carol@example.com").as_str())
+        );
     }
 }

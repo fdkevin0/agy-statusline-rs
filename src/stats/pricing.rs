@@ -408,17 +408,11 @@ impl PricingCatalog {
         resp_has_codename || disp_is_specific
     }
 
-    fn resolve_orchestrator_alias_idx(&self, candidates: &[(String, String)]) -> Option<usize> {
-        // Dynamically resolve an explicit orchestrator codename against canonical Gemini entries
-        // in the loaded catalog (no hardcoded generation or cross-tier fallback).
-        let codename = candidates
-            .iter()
-            .find_map(|(_, norm)| extract_orchestrator_codename(norm))?;
-        let requested_ver = candidates
-            .iter()
-            .filter(|(_, norm)| norm.split_whitespace().any(|w| w == "orchestrator"))
-            .find_map(|(_, norm)| extract_explicit_version(norm));
-
+    fn find_best_canonical_gemini_entry(
+        &self,
+        codename: &str,
+        requested_ver: Option<(u32, u32)>,
+    ) -> Option<usize> {
         let mut best: Option<((u32, u32), bool, usize)> = None;
         for (idx, entry) in self.entries.iter().enumerate() {
             let Some((ver, entry_codename)) = parse_canonical_gemini_codename_entry(entry) else {
@@ -443,6 +437,28 @@ impl PricingCatalog {
         }
         best.map(|(_, _, idx)| idx)
     }
+
+    fn resolve_orchestrator_alias_idx(&self, candidates: &[(String, String)]) -> Option<usize> {
+        // Dynamically resolve an explicit orchestrator codename against canonical Gemini entries
+        // in the loaded catalog (no hardcoded generation or cross-tier fallback).
+        // Scan all post-`orchestrator` tokens across candidates so non-catalog routing tags
+        // (e.g. `-v2`, `-b`, `-agent`) do not shadow a real codename later in the same string
+        // or in a subsequent candidate such as `model_display_name`.
+        let fallback_ver = candidates
+            .iter()
+            .filter(|(_, norm)| norm.split_whitespace().any(|w| w == "orchestrator"))
+            .find_map(|(_, norm)| extract_explicit_version(norm));
+
+        for (_, norm) in candidates {
+            let requested_ver = extract_explicit_version(norm).or(fallback_ver);
+            for codename in orchestrator_codename_candidates(norm) {
+                if let Some(idx) = self.find_best_canonical_gemini_entry(codename, requested_ver) {
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
 }
 
 fn is_generic_orchestrator_token(word: &str) -> bool {
@@ -458,11 +474,15 @@ fn is_generic_family_token(word: &str) -> bool {
         || matches!(word, "gemini" | "orchestrator" | "antigravity" | "google")
 }
 
-fn extract_orchestrator_codename(norm: &str) -> Option<&str> {
+fn orchestrator_codename_candidates(norm: &str) -> impl Iterator<Item = &str> {
     norm.split_whitespace()
         .skip_while(|&w| w != "orchestrator")
         .skip(1)
-        .find(|w| !is_generic_orchestrator_token(w) && !w.bytes().all(|b| b.is_ascii_digit()))
+        .filter(|w| !is_generic_orchestrator_token(w) && !w.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn extract_orchestrator_codename(norm: &str) -> Option<&str> {
+    orchestrator_codename_candidates(norm).next()
 }
 
 fn extract_explicit_version(norm: &str) -> Option<(u32, u32)> {
@@ -563,12 +583,10 @@ fn in_retry_cooldown(cache_dir: &Path, now_secs: u64) -> bool {
 }
 
 fn record_retry_cooldown(cache_dir: &Path, now_secs: u64) {
-    if fs::create_dir_all(cache_dir).is_ok() {
-        let _ = fs::write(
-            cache_dir.join(MODELS_DEV_ERR_FILE),
-            format!("{now_secs}\n"),
-        );
-    }
+    let _ = atomic_write(
+        &cache_dir.join(MODELS_DEV_ERR_FILE),
+        format!("{now_secs}\n").as_bytes(),
+    );
 }
 
 fn spawn_background_pricing_sync() {
@@ -1278,6 +1296,117 @@ mod tests {
         assert_eq!(
             catalog.estimate_cost(
                 &["gemini-pro-orchestrator", "Orchestrator (Xenon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn orchestrator_alias_skips_unmatched_tokens_across_candidates_and_preserves_version_pinning() {
+        let mut models = BTreeMap::new();
+        models.insert(
+            "gemini-4-carbon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 2.0,
+                output_per_mtok: 10.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "gemini-4-argon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 4.0,
+                output_per_mtok: 20.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "gemini-4-neon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 3.0,
+                output_per_mtok: 15.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "gemini-5.2-neon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 5.5,
+                output_per_mtok: 25.0,
+                ..Default::default()
+            },
+        );
+        let catalog = PricingCatalog::from_models(models);
+
+        // Unmatched routing tags after `orchestrator` (`-v2`, `-b`, `-agent`) must not shadow
+        // a real codename in `model_display_name`.
+        assert_eq!(
+            catalog.estimate_cost(
+                &["gemini-pro-orchestrator-v2", "Orchestrator (Argon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            ),
+            Some(("gemini-4-argon".to_owned(), 4.0))
+        );
+        assert_eq!(
+            catalog.estimate_cost(
+                &["gemini-pro-orchestrator-b", "Orchestrator (Argon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            ),
+            Some(("gemini-4-argon".to_owned(), 4.0))
+        );
+        assert_eq!(
+            catalog.estimate_cost(
+                &["gemini-pro-orchestrator-agent", "Orchestrator (Argon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            ),
+            Some(("gemini-4-argon".to_owned(), 4.0))
+        );
+
+        // Within a single candidate, skip unmatched `v2` and resolve trailing `Carbon`.
+        assert_eq!(
+            catalog.estimate_cost(&["Orchestrator (v2) (Carbon)"], 1_000_000, 0, 0, 0),
+            Some(("gemini-4-carbon".to_owned(), 2.0))
+        );
+
+        // Explicit version from an earlier candidate pins generation across candidates.
+        assert_eq!(
+            catalog.estimate_cost(
+                &["gemini-4-orchestrator-v2", "Orchestrator (Neon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            ),
+            Some(("gemini-4-neon".to_owned(), 3.0))
+        );
+
+        // When only gen 5 is in the catalog, pinning gen 4 across candidates refuses gen 5.
+        let mut gen5_only = BTreeMap::new();
+        gen5_only.insert(
+            "gemini-5.2-neon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 5.5,
+                output_per_mtok: 25.0,
+                ..Default::default()
+            },
+        );
+        let gen5_catalog = PricingCatalog::from_models(gen5_only);
+        assert_eq!(
+            gen5_catalog.estimate_cost(
+                &["gemini-4-orchestrator-v2", "Orchestrator (Neon)"],
                 1_000_000,
                 0,
                 0,

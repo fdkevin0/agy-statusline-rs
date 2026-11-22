@@ -92,36 +92,40 @@ pub(crate) fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
-enum DbCandidate {
-    Valid(PathBuf),
+/// Safety classification for a SQLite database file and its `-wal`/`-shm` sidecars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlitePathStatus {
+    /// Regular non-symlink database file whose `-wal`/`-shm` sidecars are absent or regular files.
+    Valid,
+    /// Database file is absent and its `-wal`/`-shm` sidecars are absent or regular files.
     Missing,
-    Rejected,
+    /// Database path or a `-wal`/`-shm` sidecar is a symlink, non-regular file, or unreadable.
+    Unsafe,
 }
 
-fn inspect_sqlite_file(db_path: PathBuf) -> DbCandidate {
-    match fs::symlink_metadata(&db_path) {
+/// Inspects `db_path` and its `-wal`/`-shm` sidecars without following symlinks.
+pub(crate) fn inspect_sqlite_path(db_path: &Path) -> SqlitePathStatus {
+    let base = match fs::symlink_metadata(db_path) {
         Ok(meta) => {
             let ft = meta.file_type();
             if ft.is_symlink() || !ft.is_file() {
-                return DbCandidate::Rejected;
+                return SqlitePathStatus::Unsafe;
             }
+            SqlitePathStatus::Valid
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return DbCandidate::Missing,
-        Err(_) => return DbCandidate::Rejected,
-    }
-    if !is_absent_or_real_file(&sidecar_path(&db_path, "-wal"))
-        || !is_absent_or_real_file(&sidecar_path(&db_path, "-shm"))
+        Err(err) if err.kind() == io::ErrorKind::NotFound => SqlitePathStatus::Missing,
+        Err(_) => return SqlitePathStatus::Unsafe,
+    };
+    if !is_absent_or_real_file(&sidecar_path(db_path, "-wal"))
+        || !is_absent_or_real_file(&sidecar_path(db_path, "-shm"))
     {
-        return DbCandidate::Rejected;
+        return SqlitePathStatus::Unsafe;
     }
-    DbCandidate::Valid(db_path)
+    base
 }
 
 pub(crate) fn is_safe_sqlite_file(db_path: &Path) -> bool {
-    matches!(
-        inspect_sqlite_file(db_path.to_path_buf()),
-        DbCandidate::Valid(_)
-    )
+    matches!(inspect_sqlite_path(db_path), SqlitePathStatus::Valid)
 }
 
 /// Resolves `<cli_dir>/conversations/<conversation_id>.db`, falling back to lowercase
@@ -138,16 +142,16 @@ pub(crate) fn resolve_conversation_db_path(cli_dir: &Path, conversation_id: &str
     if !is_real_dir(&conv_dir) {
         return None;
     }
-    match inspect_sqlite_file(conv_dir.join(format!("{conversation_id}.db"))) {
-        DbCandidate::Valid(path) => Some(path),
-        DbCandidate::Rejected => None,
-        DbCandidate::Missing => {
+    let exact = conv_dir.join(format!("{conversation_id}.db"));
+    match inspect_sqlite_path(&exact) {
+        SqlitePathStatus::Valid => Some(exact),
+        SqlitePathStatus::Unsafe => None,
+        SqlitePathStatus::Missing => {
             let lower = conversation_id.to_ascii_lowercase();
             if lower != conversation_id {
-                match inspect_sqlite_file(conv_dir.join(format!("{lower}.db"))) {
-                    DbCandidate::Valid(path) => Some(path),
-                    DbCandidate::Missing | DbCandidate::Rejected => None,
-                }
+                let candidate = conv_dir.join(format!("{lower}.db"));
+                matches!(inspect_sqlite_path(&candidate), SqlitePathStatus::Valid)
+                    .then_some(candidate)
             } else {
                 None
             }
@@ -505,5 +509,22 @@ mod tests {
         )
         .unwrap();
         assert!(resolve_conversation_db_path(&cli_dir, &wal_mixed_upper).is_none());
+
+        // Missing DB with clean sidecars is Missing; dangling symlink and
+        // missing DB with symlinked sidecars are Unsafe.
+        let missing_db = conv_dir.join("absent.db");
+        assert_eq!(inspect_sqlite_path(&missing_db), SqlitePathStatus::Missing);
+        assert!(!is_safe_sqlite_file(&missing_db));
+
+        let dangling_db = conv_dir.join("dangling.db");
+        symlink(external.join("does_not_exist.db"), &dangling_db).unwrap();
+        assert_eq!(inspect_sqlite_path(&dangling_db), SqlitePathStatus::Unsafe);
+
+        let poisoned_missing = conv_dir.join("poisoned_missing.db");
+        symlink(&target_sidecar, sidecar_path(&poisoned_missing, "-wal")).unwrap();
+        assert_eq!(
+            inspect_sqlite_path(&poisoned_missing),
+            SqlitePathStatus::Unsafe
+        );
     }
 }

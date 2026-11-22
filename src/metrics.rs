@@ -8,7 +8,10 @@ use crate::timeutil::{parse_rfc3339_unix_secs, SECS_PER_DAY as SECS_PER_DAY_I64}
 const SECS_PER_HOUR: u64 = 3_600;
 const SECS_PER_DAY: u64 = SECS_PER_DAY_I64 as u64;
 const SECS_PER_WEEK: u64 = 7 * SECS_PER_DAY;
+const SECS_PER_MONTH: u64 = 30 * SECS_PER_DAY;
 const PACE_BEHIND_DELTA_PCT: f64 = 15.0;
+const UNTOUCHED_WINDOW_TOLERANCE_SECS: u64 = 60;
+const UNTOUCHED_FULL_FRAC_MIN: f64 = 1.0 - 1e-6;
 const STRUCTURAL_NOISE_TOKENS: &[&str] = &["wtu", "quota", "pool", "limit"];
 
 /// Resolved rate-limit view for `quota_5h` or `quota_weekly` widgets.
@@ -130,6 +133,7 @@ fn parse_window_token(token: &str) -> Option<(u64, String)> {
         "hourly" | "hour" => return Some((SECS_PER_HOUR, "1h".to_string())),
         "daily" | "day" => return Some((SECS_PER_DAY, "1d".to_string())),
         "weekly" | "week" => return Some((SECS_PER_WEEK, "7d".to_string())),
+        "monthly" | "month" => return Some((SECS_PER_MONTH, "mo".to_string())),
         _ => {}
     }
     if let Some(num) = token.strip_suffix('h') {
@@ -211,27 +215,52 @@ fn collect_model_tokens(payload: &StatuslinePayload) -> BTreeSet<String> {
     tokens
 }
 
-fn resolve_reset_timing(bucket: &QuotaBucket, now_unix_secs: u64) -> (Option<u64>, Option<u64>) {
-    let parsed_reset_time = bucket
-        .reset_time
-        .as_deref()
-        .and_then(parse_rfc3339_unix_secs);
-    let reset_secs = match bucket.reset_in_seconds {
-        Some(secs) if secs <= 0 => None,
-        Some(secs) => Some(secs as u64),
-        None => parsed_reset_time.and_then(|reset_unix| {
-            let diff = i128::from(reset_unix) - i128::from(now_unix_secs);
-            (diff > 0).then(|| diff.min(i128::from(u64::MAX)) as u64)
-        }),
-    };
-    let reset_at_secs = match parsed_reset_time {
-        Some(ts) => (ts >= 0).then_some(ts as u64),
-        None => bucket
-            .reset_in_seconds
-            .filter(|&s| s > 0)
-            .map(|s| now_unix_secs.saturating_add(s as u64)),
-    };
-    (reset_secs, reset_at_secs)
+#[derive(Debug, Clone, Copy, Default)]
+struct ResetTiming {
+    remaining_secs: Option<u64>,
+    reset_at_secs: Option<u64>,
+}
+
+impl ResetTiming {
+    fn resolve(bucket: &QuotaBucket, now_unix_secs: u64) -> Self {
+        let parsed_reset_time = bucket
+            .reset_time
+            .as_deref()
+            .and_then(parse_rfc3339_unix_secs);
+        let remaining_secs = match bucket.reset_in_seconds {
+            Some(secs) if secs <= 0 => None,
+            Some(secs) => Some(secs as u64),
+            None => parsed_reset_time.and_then(|reset_unix| {
+                let diff = i128::from(reset_unix) - i128::from(now_unix_secs);
+                (diff > 0).then(|| diff.min(i128::from(u64::MAX)) as u64)
+            }),
+        };
+        let reset_at_secs = match parsed_reset_time {
+            Some(ts) => (ts >= 0).then_some(ts as u64),
+            None => bucket
+                .reset_in_seconds
+                .filter(|&s| s > 0)
+                .map(|s| now_unix_secs.saturating_add(s as u64)),
+        };
+        Self {
+            remaining_secs,
+            reset_at_secs,
+        }
+    }
+
+    /// Suppresses rolling `now + window_secs` reset timestamps on untouched 100% buckets
+    /// so idle ticks do not render a synthetic full-window countdown or drift `last_reset_at_secs`.
+    fn suppress_if_untouched_full(self, remaining_frac: Option<f64>, window_secs: u64) -> Self {
+        let is_untouched_full = remaining_frac.is_some_and(|frac| frac >= UNTOUCHED_FULL_FRAC_MIN)
+            && self
+                .remaining_secs
+                .is_some_and(|s| s.abs_diff(window_secs) <= UNTOUCHED_WINDOW_TOLERANCE_SECS);
+        if is_untouched_full {
+            Self::default()
+        } else {
+            self
+        }
+    }
 }
 
 fn build_quota_view(
@@ -240,17 +269,21 @@ fn build_quota_view(
     bucket: &QuotaBucket,
     now_unix_secs: u64,
 ) -> Option<(QuotaView, Option<u64>, bool)> {
-    let (remaining_pct, remaining_amount, has_frac) =
+    let (remaining_frac, remaining_pct, remaining_amount) =
         if let Some(frac) = bucket.remaining_fraction.filter(|f| f.is_finite()) {
-            ((frac * 100.0).clamp(0.0, 100.0), None, true)
+            let clamped = frac.clamp(0.0, 1.0);
+            (Some(clamped), clamped * 100.0, None)
         } else {
             let amt = bucket.remaining_amount.filter(|&a| a >= 0)?;
-            (0.0, Some(amt), false)
+            (None, 0.0, Some(amt))
         };
-    let (reset_secs, reset_at_secs) = resolve_reset_timing(bucket, now_unix_secs);
-    let reset_compact = reset_secs.map(format_duration_compact);
+    let has_frac = remaining_frac.is_some();
+    let timing = ResetTiming::resolve(bucket, now_unix_secs)
+        .suppress_if_untouched_full(remaining_frac, desc.window_secs);
+    let reset_compact = timing.remaining_secs.map(format_duration_compact);
     let pace_behind = has_frac
-        && reset_secs
+        && timing
+            .remaining_secs
             .filter(|&s| s <= desc.window_secs)
             .is_some_and(|s| {
                 let time_left_pct = (s as f64) * 100.0 / (desc.window_secs as f64);
@@ -267,17 +300,58 @@ fn build_quota_view(
             pace_behind,
             est_remaining_tokens: None,
         },
-        reset_at_secs,
+        timing.reset_at_secs,
         has_frac,
     ))
+}
+
+/// Model-to-provider affinity derived across all quota descriptors (including disabled buckets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelAffinity {
+    /// Model matched one or more 1p provider namespaces present in the quota map.
+    KnownProvider(BTreeSet<String>),
+    /// Model identity is known, but does not match any 1p provider in the quota map.
+    ThirdParty,
+    /// Payload has no model identity (`id` and `display_name` absent or empty).
+    Unknown,
+}
+
+fn resolve_model_affinity(
+    model_tokens: &BTreeSet<String>,
+    all_descriptors: &[(&str, BucketDescriptor, &QuotaBucket)],
+) -> ModelAffinity {
+    if model_tokens.is_empty() {
+        return ModelAffinity::Unknown;
+    }
+
+    // Infer 1p provider affinity across both active and disabled buckets so disabling all
+    // 1p buckets for a model still identifies it as 1p instead of falling back to `3p-*`.
+    let mut effective_providers = BTreeSet::new();
+    for (_, desc, _) in all_descriptors {
+        let Some(ref p) = desc.provider else {
+            continue;
+        };
+        let direct_match = model_tokens.contains(p);
+        let qualifier_match =
+            !desc.qualifiers.is_empty() && desc.qualifiers.iter().all(|q| model_tokens.contains(q));
+        if direct_match || qualifier_match {
+            effective_providers.insert(p.clone());
+        }
+    }
+
+    if effective_providers.is_empty() {
+        ModelAffinity::ThirdParty
+    } else {
+        ModelAffinity::KnownProvider(effective_providers)
+    }
 }
 
 /// Ordered bucket-to-model affinity precedence (higher variants win).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum BucketMatchTier {
-    /// 3p bucket when model matches a known 1p provider and qualifiers are unmatched.
+    /// 3p bucket when model identity is absent and qualifiers are unmatched.
     ThirdPartyMismatch,
-    /// 3p bucket when model matches a known 1p provider with no unmatched qualifiers.
+    /// 3p bucket when model identity is absent and qualifiers are empty.
     ThirdPartyFallback,
     /// 1p bucket from an unrelated provider when model identity is known.
     UnrelatedProvider,
@@ -298,48 +372,61 @@ type AffinityScore = (BucketMatchTier, usize, isize);
 fn score_bucket(
     desc: &BucketDescriptor,
     model_tokens: &BTreeSet<String>,
-    effective_providers: &BTreeSet<String>,
-    has_model_identity: bool,
-) -> AffinityScore {
-    let provider_matched = desc
-        .provider
-        .as_ref()
-        .is_some_and(|p| effective_providers.contains(p));
+    affinity: &ModelAffinity,
+) -> Option<AffinityScore> {
     let matched_q = desc
         .qualifiers
         .iter()
         .filter(|q| model_tokens.contains(*q))
         .count();
     let unmatched_q = desc.qualifiers.len() - matched_q;
-    let is_3p_model = has_model_identity && effective_providers.is_empty();
 
-    let tier = if desc.is_3p {
-        if is_3p_model && unmatched_q == 0 && matched_q > 0 {
-            BucketMatchTier::ExactQualifiedMatch
-        } else if is_3p_model && unmatched_q == 0 {
-            BucketMatchTier::ProviderOrThirdPartyExact
-        } else if is_3p_model {
-            BucketMatchTier::GenericOrThirdPartyPartial
-        } else if unmatched_q == 0 {
-            BucketMatchTier::ThirdPartyFallback
-        } else {
-            BucketMatchTier::ThirdPartyMismatch
+    let tier = match (desc.is_3p, affinity) {
+        // Known 1p models never cross-match 3p pools when their 1p buckets are disabled.
+        (true, ModelAffinity::KnownProvider(_)) => return None,
+        (true, ModelAffinity::ThirdParty) => {
+            if unmatched_q == 0 && matched_q > 0 {
+                BucketMatchTier::ExactQualifiedMatch
+            } else if unmatched_q == 0 {
+                BucketMatchTier::ProviderOrThirdPartyExact
+            } else {
+                BucketMatchTier::GenericOrThirdPartyPartial
+            }
         }
-    } else if provider_matched && unmatched_q == 0 && matched_q > 0 {
-        BucketMatchTier::ExactQualifiedMatch
-    } else if (provider_matched && unmatched_q == 0) || (matched_q > 0 && unmatched_q == 0) {
-        BucketMatchTier::ProviderOrThirdPartyExact
-    } else if provider_matched {
-        BucketMatchTier::ProviderPartialQualifier
-    } else if !has_model_identity && unmatched_q == 0 {
-        BucketMatchTier::GenericOrThirdPartyPartial
-    } else if !has_model_identity {
-        BucketMatchTier::NoModelQualified
-    } else {
-        BucketMatchTier::UnrelatedProvider
+        (true, ModelAffinity::Unknown) => {
+            if unmatched_q == 0 {
+                BucketMatchTier::ThirdPartyFallback
+            } else {
+                BucketMatchTier::ThirdPartyMismatch
+            }
+        }
+        (false, ModelAffinity::KnownProvider(providers)) => {
+            let provider_matched = desc
+                .provider
+                .as_ref()
+                .is_some_and(|p| providers.contains(p));
+            if provider_matched && unmatched_q == 0 && matched_q > 0 {
+                BucketMatchTier::ExactQualifiedMatch
+            } else if (provider_matched && unmatched_q == 0) || (matched_q > 0 && unmatched_q == 0)
+            {
+                BucketMatchTier::ProviderOrThirdPartyExact
+            } else if provider_matched {
+                BucketMatchTier::ProviderPartialQualifier
+            } else {
+                BucketMatchTier::UnrelatedProvider
+            }
+        }
+        (false, ModelAffinity::ThirdParty) => BucketMatchTier::UnrelatedProvider,
+        (false, ModelAffinity::Unknown) => {
+            if unmatched_q == 0 {
+                BucketMatchTier::GenericOrThirdPartyPartial
+            } else {
+                BucketMatchTier::NoModelQualified
+            }
+        }
     };
 
-    (tier, matched_q, -(unmatched_q as isize))
+    Some((tier, matched_q, -(unmatched_q as isize)))
 }
 
 struct Candidate {
@@ -383,47 +470,28 @@ pub(crate) fn resolve_quota_views_with_reset_at(
         return (None, None);
     };
     let model_tokens = collect_model_tokens(payload);
-    let has_model_identity = !model_tokens.is_empty();
 
-    let mut active_descriptors: Vec<(&str, BucketDescriptor, &QuotaBucket)> = Vec::new();
-    let mut provider_tokens_in_map = BTreeSet::new();
-    for (key, bucket) in quota {
-        if bucket.disabled == Some(true) {
-            continue;
-        }
-        let Some(desc) = parse_bucket_descriptor(key) else {
-            continue;
-        };
-        if let Some(ref p) = desc.provider {
-            provider_tokens_in_map.insert(p.clone());
-        }
-        active_descriptors.push((key.as_str(), desc, bucket));
-    }
-
-    // Seed effective providers from model tokens directly matching any provider in the quota map,
-    // plus providers of buckets whose non-empty qualifiers all appear in the model tokens.
-    let mut effective_providers: BTreeSet<String> = provider_tokens_in_map
-        .into_iter()
-        .filter(|p| model_tokens.contains(p))
+    let all_descriptors: Vec<(&str, BucketDescriptor, &QuotaBucket)> = quota
+        .iter()
+        .filter_map(|(key, bucket)| {
+            parse_bucket_descriptor(key).map(|desc| (key.as_str(), desc, bucket))
+        })
         .collect();
-    for (_, desc, _) in &active_descriptors {
-        if let Some(ref p) = desc.provider {
-            if !desc.qualifiers.is_empty()
-                && desc.qualifiers.iter().all(|q| model_tokens.contains(q))
-            {
-                effective_providers.insert(p.clone());
-            }
-        }
-    }
+    let affinity = resolve_model_affinity(&model_tokens, &all_descriptors);
 
     let mut best_short: Option<Candidate> = None;
     let mut best_multi: Option<Candidate> = None;
-    for (key, desc, bucket) in active_descriptors {
+    for (key, desc, bucket) in all_descriptors {
+        if bucket.disabled == Some(true) {
+            continue;
+        }
+        let Some(score) = score_bucket(&desc, &model_tokens, &affinity) else {
+            continue;
+        };
         let Some((view, reset_at, has_frac)) = build_quota_view(key, &desc, bucket, now_unix_secs)
         else {
             continue;
         };
-        let score = score_bucket(&desc, &model_tokens, &effective_providers, has_model_identity);
         let cand = Candidate {
             score,
             has_frac,
@@ -894,5 +962,261 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(current_context_tokens(&payload), Some(u64::MAX));
+    }
+
+    #[test]
+    fn untouched_full_window_suppresses_rolling_reset_time_and_keeps_active_windows() {
+        // 2026-11-18T12:00:00Z is 1_795_003_200; 5h earlier is 1_794_985_200.
+        let now = 1_795_003_200 - 18_000;
+
+        let untouched_exact = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: Some("acme-4-base".to_string()),
+                ..Default::default()
+            }),
+            quota: Some(BTreeMap::from([
+                (
+                    "acme-5h".to_string(),
+                    QuotaBucket {
+                        remaining_fraction: Some(1.0),
+                        reset_in_seconds: Some(18_000),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "acme-weekly".to_string(),
+                    QuotaBucket {
+                        remaining_fraction: Some(1.0),
+                        reset_in_seconds: Some(604_800 + 60),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        let (short_res, weekly_res) = resolve_quota_views_with_reset_at(&untouched_exact, now);
+        let (q5, reset_at_5) = short_res.unwrap();
+        assert_eq!(q5.reset_compact, None);
+        assert_eq!(reset_at_5, None);
+        assert!(!q5.pace_behind);
+        let (qw, reset_at_w) = weekly_res.unwrap();
+        assert_eq!(qw.reset_compact, None);
+        assert_eq!(reset_at_w, None);
+        assert!(!qw.pace_behind);
+
+        // Lower -60s boundary and RFC3339 reset_time fallback are also suppressed at 100%.
+        let untouched_rfc3339 = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: Some("acme-4-base".to_string()),
+                ..Default::default()
+            }),
+            quota: Some(BTreeMap::from([
+                (
+                    "acme-5h".to_string(),
+                    QuotaBucket {
+                        remaining_fraction: Some(1.0),
+                        reset_time: Some("2026-11-18T12:00:00Z".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "acme-weekly".to_string(),
+                    QuotaBucket {
+                        remaining_fraction: Some(1.0),
+                        reset_in_seconds: Some(604_800 - 60),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        let (short_rfc, weekly_low) = resolve_quota_views_with_reset_at(&untouched_rfc3339, now);
+        let (q5_rfc, reset_at_rfc) = short_rfc.unwrap();
+        assert_eq!(q5_rfc.reset_compact, None);
+        assert_eq!(reset_at_rfc, None);
+        assert!(!q5_rfc.pace_behind);
+        let (qw_low, reset_at_low) = weekly_low.unwrap();
+        assert_eq!(qw_low.reset_compact, None);
+        assert_eq!(reset_at_low, None);
+        assert!(!qw_low.pace_behind);
+
+        // 100% bucket whose window started (> 60s elapsed) keeps reset_compact and reset_at.
+        let started_full = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: Some("acme-4-base".to_string()),
+                ..Default::default()
+            }),
+            quota: Some(BTreeMap::from([(
+                "acme-5h".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(1.0),
+                    reset_in_seconds: Some(18_000 - 120),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let (q5_started, reset_at_started) =
+            resolve_quota_views_with_reset_at(&started_full, now)
+                .0
+                .unwrap();
+        assert_eq!(q5_started.reset_compact.as_deref(), Some("4h58m"));
+        assert_eq!(reset_at_started, Some(now + 17_880));
+        assert!(!q5_started.pace_behind);
+
+        // 99% bucket keeps reset_compact and reset_at even when reset_in_seconds == window_secs.
+        let consumed_99 = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: Some("acme-4-base".to_string()),
+                ..Default::default()
+            }),
+            quota: Some(BTreeMap::from([(
+                "acme-5h".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(0.99),
+                    reset_in_seconds: Some(18_000),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let (q5_99, reset_at_99) = resolve_quota_views_with_reset_at(&consumed_99, now)
+            .0
+            .unwrap();
+        assert_eq!(q5_99.reset_compact.as_deref(), Some("5h"));
+        assert_eq!(reset_at_99, Some(now + 18_000));
+        assert!(!q5_99.pace_behind);
+    }
+
+    #[test]
+    fn parses_monthly_and_month_windows() {
+        assert_eq!(
+            parse_window_token("monthly"),
+            Some((30 * SECS_PER_DAY, "mo".to_string()))
+        );
+        assert_eq!(
+            parse_window_token("month"),
+            Some((30 * SECS_PER_DAY, "mo".to_string()))
+        );
+
+        let acme_monthly = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: Some("acme-pro".to_string()),
+                ..Default::default()
+            }),
+            quota: Some(BTreeMap::from([(
+                "acme-monthly".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(0.75),
+                    reset_in_seconds: Some(15 * SECS_PER_DAY as i64),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let qm = resolve_quota_weekly_at(&acme_monthly, 0).unwrap();
+        assert_eq!(qm.label, "mo");
+        assert_eq!(qm.window_secs, 30 * SECS_PER_DAY);
+        assert_eq!(qm.bucket_key, "acme-monthly");
+
+        let third_party_month = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: Some("vendorx-pro".to_string()),
+                ..Default::default()
+            }),
+            quota: Some(BTreeMap::from([(
+                "3p-month".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(0.50),
+                    reset_in_seconds: Some(10 * SECS_PER_DAY as i64),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let q3m = resolve_quota_weekly_at(&third_party_month, 0).unwrap();
+        assert_eq!(q3m.label, "3p mo");
+        assert_eq!(q3m.window_secs, 30 * SECS_PER_DAY);
+    }
+
+    #[test]
+    fn disabled_first_party_buckets_never_cross_match_third_party() {
+        let quota = BTreeMap::from([
+            (
+                "gemini-5h".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(0.50),
+                    reset_in_seconds: Some(3_600),
+                    disabled: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "3p-5h".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(0.80),
+                    reset_in_seconds: Some(7_200),
+                    ..Default::default()
+                },
+            ),
+            (
+                "acme-tier1-weekly".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(0.60),
+                    reset_in_seconds: Some(86_400),
+                    disabled: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "3p-weekly".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(0.75),
+                    reset_in_seconds: Some(172_800),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        // Gemini model sees disabled `gemini-5h` -> identified as KnownProvider("gemini"), rejects `3p-*`.
+        let gemini = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: Some("gemini-4-pro".to_string()),
+                ..Default::default()
+            }),
+            quota: Some(quota.clone()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_quota_5h_at(&gemini, 0), None);
+        assert_eq!(resolve_quota_weekly_at(&gemini, 0), None);
+
+        // Qualifier-matched model sees disabled `acme-tier1-weekly` -> identified as KnownProvider("acme"), rejects `3p-*`.
+        let qualified = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: None,
+                display_name: Some("Orchestrator (Tier1)".to_string()),
+                ..Default::default()
+            }),
+            quota: Some(quota.clone()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_quota_weekly_at(&qualified, 0), None);
+        assert_eq!(resolve_quota_5h_at(&qualified, 0), None);
+
+        // Third-party model still matches active `3p-5h` and `3p-weekly`.
+        let third_party = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: Some("claude-sonnet-4".to_string()),
+                ..Default::default()
+            }),
+            quota: Some(quota),
+            ..Default::default()
+        };
+        let q5 = resolve_quota_5h_at(&third_party, 0).unwrap();
+        assert_eq!(q5.bucket_key, "3p-5h");
+        assert_eq!(q5.label, "3p 5h");
+        let qw = resolve_quota_weekly_at(&third_party, 0).unwrap();
+        assert_eq!(qw.bucket_key, "3p-weekly");
+        assert_eq!(qw.label, "3p 7d");
     }
 }
