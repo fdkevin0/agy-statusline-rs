@@ -25,6 +25,64 @@ const MODELS_DEV_CACHE_FILE: &str = "models_dev_pricing.json";
 const MODELS_DEV_ERR_FILE: &str = "models_dev_pricing.err";
 const MAX_PRICING_JSON_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Metadata-only change fingerprint for `models_dev_pricing.json`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PricingFileFingerprint {
+    pub(crate) exists: bool,
+    pub(crate) mtime_secs: i64,
+    pub(crate) mtime_nanos: u32,
+    pub(crate) len: u64,
+}
+
+/// Computes a metadata-only fingerprint for `models_dev_pricing.json` without reading or parsing it.
+pub(crate) fn pricing_cache_fingerprint(cache_dir: Option<&Path>) -> PricingFileFingerprint {
+    let Some(dir) = cache_dir else {
+        return PricingFileFingerprint::default();
+    };
+    let Ok(meta) = fs::metadata(dir.join(MODELS_DEV_CACHE_FILE)) else {
+        return PricingFileFingerprint::default();
+    };
+    if !meta.is_file() {
+        return PricingFileFingerprint::default();
+    }
+    let (mtime_secs, mtime_nanos) = match meta.modified() {
+        Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+            Err(e) => {
+                let d = e.duration();
+                (-(d.as_secs() as i64), d.subsec_nanos())
+            }
+        },
+        Err(_) => (0, 0),
+    };
+    PricingFileFingerprint {
+        exists: true,
+        mtime_secs,
+        mtime_nanos,
+        len: meta.len(),
+    }
+}
+
+/// Returns `true` when the pricing file exists and its file mtime is within the default 24h TTL.
+pub(crate) fn is_pricing_fingerprint_fresh(fp: PricingFileFingerprint, now_secs: u64) -> bool {
+    fp.exists
+        && fp.mtime_secs >= 0
+        && now_secs.saturating_sub(fp.mtime_secs as u64) < DEFAULT_PRICING_TTL_SECS
+}
+
+/// Spawns a detached background `pricing sync --if-stale` when `models_dev_pricing.json` is
+/// missing or its file mtime is past the default TTL, without reading or parsing the JSON file.
+pub(crate) fn maybe_spawn_pricing_sync_if_stale(cache_dir: Option<&Path>, now_secs: u64) {
+    let Some(dir) = cache_dir else {
+        return;
+    };
+    let fp = pricing_cache_fingerprint(Some(dir));
+    if !is_pricing_fingerprint_fresh(fp, now_secs) && !in_retry_cooldown(dir, now_secs) {
+        record_retry_cooldown(dir, now_secs);
+        spawn_background_pricing_sync();
+    }
+}
+
 /// Controls how [`PricingCatalog`] cache loading handles missing or expired pricing data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
@@ -153,11 +211,22 @@ impl PricingCatalog {
         }
     }
 
-    /// Loads rates from the models.dev cache using the requested refresh mode.
-    pub(crate) fn load_effective(mode: SyncMode, now_secs: u64) -> Self {
-        let cache_dir = xdg_cache_dir();
+    /// Loads rates from `cache_dir` (falling back to the XDG cache dir when `None`) using `mode`.
+    pub(crate) fn load_effective_in(
+        cache_dir: Option<&Path>,
+        mode: SyncMode,
+        now_secs: u64,
+    ) -> Self {
+        let fallback_dir;
+        let effective_dir = match cache_dir {
+            Some(dir) => Some(dir),
+            None => {
+                fallback_dir = xdg_cache_dir();
+                fallback_dir.as_deref()
+            }
+        };
         Self::load_effective_with(
-            cache_dir.as_deref(),
+            effective_dir,
             mode,
             now_secs,
             DEFAULT_PRICING_TTL_SECS,

@@ -19,7 +19,7 @@ use super::{
     ModelStats, PeriodSummary, SqliteStats, StatsReport, WindowSummaries, DAYS_PER_WEEK,
 };
 use crate::db::compute_median;
-use crate::paths::{resolve_agy_cli_dir, xdg_cache_dir, xdg_data_dir};
+use crate::paths::{resolve_agy_roots, resolve_effective_home_env, xdg_cache_dir, xdg_data_dir};
 use crate::timeutil::civil_date_from_unix_day;
 
 pub(super) const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -378,24 +378,12 @@ fn finish_day_row(
     }
 }
 
-pub(super) fn resolve_roots(home: Option<&Path>) -> Vec<(&'static str, PathBuf)> {
-    let mut roots: Vec<(&'static str, PathBuf)> = Vec::new();
-    if let Some(cli_dir) = resolve_agy_cli_dir()
-        .or_else(|| home.map(|h| h.join(".gemini").join("antigravity-cli")))
-    {
-        roots.push(("cli", cli_dir));
-    }
-    if let Some(h) = home {
-        roots.push(("desktop", h.join(".gemini").join("antigravity")));
-    }
-    roots
-}
-
 impl StatsDataset {
     /// Scans all AGY roots resolved from the ambient environment and `home`,
     /// incrementally syncing and loading persistent history from the XDG data archive.
     pub fn collect_from_env(home: Option<&Path>, now_unix_secs: u64) -> Self {
-        let roots = resolve_roots(home);
+        let effective_home = resolve_effective_home_env(home);
+        let roots = resolve_agy_roots(effective_home.as_deref());
         let cache_dir =
             xdg_cache_dir().or_else(|| home.map(|h| h.join(".cache").join("agy-statusline")));
         let data_dir = xdg_data_dir()
@@ -408,8 +396,9 @@ impl StatsDataset {
             fetch_models_dev_via_curl,
         );
         let tz = TimeZoneSpec::local();
-        Self::collect_for_roots_with_archive(
+        Self::collect_for_roots_inner(
             &roots,
+            effective_home.as_deref(),
             data_dir.as_deref(),
             cache_dir.as_deref(),
             now_unix_secs,
@@ -419,8 +408,21 @@ impl StatsDataset {
     }
 
     /// Scans explicit roots with optional persistent archive sync, timezone, and pricing catalog.
+    #[cfg(test)]
     pub(super) fn collect_for_roots_with_archive(
         roots: &[(&'static str, PathBuf)],
+        data_dir: Option<&Path>,
+        cache_dir: Option<&Path>,
+        now_unix_secs: u64,
+        tz: &TimeZoneSpec,
+        pricing: &PricingCatalog,
+    ) -> Self {
+        Self::collect_for_roots_inner(roots, None, data_dir, cache_dir, now_unix_secs, tz, pricing)
+    }
+
+    fn collect_for_roots_inner(
+        roots: &[(&'static str, PathBuf)],
+        ephemeral_home: Option<&Path>,
         data_dir: Option<&Path>,
         cache_dir: Option<&Path>,
         now_unix_secs: u64,
@@ -434,6 +436,7 @@ impl StatsDataset {
 
         let (sqlite, mut events, covered) = scan_sqlite_conversations_with_archive(
             roots,
+            ephemeral_home,
             data_dir,
             cache_dir,
             now_unix_secs,

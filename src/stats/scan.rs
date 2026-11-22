@@ -6,15 +6,17 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::pricing::{normalize_model_key, round_usd_6, PricingCatalog};
+use super::pricing::{normalize_model_key, round_usd_6, PricingCatalog, PricingFileFingerprint};
 use super::tz::TimeZoneSpec;
 use super::SqliteStats;
 use crate::db::{
     compute_median, is_absent_or_real_file, is_real_dir, is_safe_sqlite_file, is_valid_uuid,
     open_readonly_db, resolve_conversation_db_path, sidecar_path,
 };
+use crate::fsutil::atomic_write;
 use crate::protobuf::{
     extract_gen_metadata_record, extract_step_metadata_record, extract_trajectory_created_at_secs,
     is_sane_decode_speed, MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
@@ -623,7 +625,7 @@ pub(super) fn scan_transcripts(
 }
 
 /// File-level change fingerprint for a SQLite conversation DB and its `-wal` sidecar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct DbFileFingerprint {
     pub(super) db_mtime_secs: i64,
     pub(super) db_mtime_nanos: u32,
@@ -1753,10 +1755,131 @@ pub(super) fn project_sqlite_conversations<'a>(
     (stats, events, covered)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ConversationCost {
     pub(crate) usd: Option<f64>,
     pub(crate) subagent_usd: Option<f64>,
     pub(crate) unpriced_turns: u64,
+}
+
+const CONV_COST_CACHE_FILE: &str = "conv_cost_cache.json";
+const CONV_COST_CACHE_SCHEMA_VERSION: u32 = 1;
+const CONV_COST_CACHE_MAX_ENTRIES: usize = 32;
+const MAX_CONV_COST_CACHE_BYTES: u64 = 512 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct CachedConversationCost {
+    usd: Option<f64>,
+    subagent_usd: Option<f64>,
+    unpriced_turns: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ConvCostCacheEntry {
+    cli_dir: String,
+    conversation_id: String,
+    parent_fp: Option<DbFileFingerprint>,
+    summaries_fp: Option<DbFileFingerprint>,
+    descendants: Vec<(String, Option<DbFileFingerprint>)>,
+    pricing_fp: PricingFileFingerprint,
+    cost: CachedConversationCost,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ConvCostCacheFile {
+    schema_version: u32,
+    #[serde(default)]
+    entries: Vec<ConvCostCacheEntry>,
+}
+
+fn conversation_db_fingerprint(cli_dir: &Path, conversation_id: &str) -> Option<DbFileFingerprint> {
+    let db_path = resolve_conversation_db_path(cli_dir, conversation_id)?;
+    db_file_fingerprint(&db_path)
+}
+
+fn summaries_db_fingerprint(cli_dir: &Path) -> Option<DbFileFingerprint> {
+    db_file_fingerprint(&cli_dir.join("conversation_summaries.db"))
+}
+
+fn read_conv_cost_cache_file(cache_dir: &Path) -> Option<ConvCostCacheFile> {
+    let path = cache_dir.join(CONV_COST_CACHE_FILE);
+    let meta = fs::symlink_metadata(&path).ok()?;
+    let ft = meta.file_type();
+    if ft.is_symlink() || !ft.is_file() || meta.len() > MAX_CONV_COST_CACHE_BYTES {
+        return None;
+    }
+    let bytes = fs::read(&path).ok()?;
+    let parsed = serde_json::from_slice::<ConvCostCacheFile>(&bytes).ok()?;
+    (parsed.schema_version == CONV_COST_CACHE_SCHEMA_VERSION).then_some(parsed)
+}
+
+fn write_conv_cost_cache_entry_with_limit(
+    cache_dir: &Path,
+    entry: ConvCostCacheEntry,
+    max_entries: usize,
+) {
+    let mut file = read_conv_cost_cache_file(cache_dir).unwrap_or(ConvCostCacheFile {
+        schema_version: CONV_COST_CACHE_SCHEMA_VERSION,
+        entries: Vec::new(),
+    });
+    file.entries
+        .retain(|e| !(e.cli_dir == entry.cli_dir && e.conversation_id == entry.conversation_id));
+    file.entries.insert(0, entry);
+    file.entries.truncate(max_entries);
+    if let Ok(bytes) = serde_json::to_vec(&file) {
+        let _ = atomic_write(&cache_dir.join(CONV_COST_CACHE_FILE), &bytes);
+    }
+}
+
+/// Fast `lstat`-only lookup in `conv_cost_cache.json` before parsing `models_dev_pricing.json`
+/// or opening any SQLite DB for cost scanning.
+pub(crate) fn lookup_cached_conversation_cost(
+    cache_dir: &Path,
+    cli_dir: &Path,
+    conversation_id: &str,
+    pricing_fp: PricingFileFingerprint,
+) -> Option<ConversationCost> {
+    if !is_valid_uuid(conversation_id) {
+        return None;
+    }
+    let parent_fp = conversation_db_fingerprint(cli_dir, conversation_id);
+    let summaries_fp = summaries_db_fingerprint(cli_dir);
+    if parent_fp.is_none() && summaries_fp.is_none() {
+        return None;
+    }
+    let cache = read_conv_cost_cache_file(cache_dir)?;
+    let cli_dir_key = root_path_key(cli_dir);
+    let conv_id_lower = conversation_id.to_ascii_lowercase();
+    let entry = cache
+        .entries
+        .iter()
+        .find(|e| e.cli_dir == cli_dir_key && e.conversation_id == conv_id_lower)?;
+    if entry.parent_fp != parent_fp
+        || entry.summaries_fp != summaries_fp
+        || entry.pricing_fp != pricing_fp
+    {
+        return None;
+    }
+    let descendants_match = entry
+        .descendants
+        .iter()
+        .all(|(desc_id, desc_fp)| conversation_db_fingerprint(cli_dir, desc_id) == *desc_fp);
+    if !descendants_match {
+        return None;
+    }
+    if !entry.cost.usd.is_none_or(|v| v.is_finite() && v >= 0.0)
+        || !entry
+            .cost
+            .subagent_usd
+            .is_none_or(|v| v.is_finite() && v >= 0.0)
+    {
+        return None;
+    }
+    Some(ConversationCost {
+        usd: entry.cost.usd,
+        subagent_usd: entry.cost.subagent_usd,
+        unpriced_turns: entry.cost.unpriced_turns,
+    })
 }
 
 fn resolve_descendant_conversation_ids(cli_dir: &Path, root_id: &str) -> Vec<String> {
@@ -1809,33 +1932,10 @@ fn read_single_db_turns(db_path: &Path) -> Option<Vec<RawTurn>> {
     extract_sqlite_db_turns(&conn, None)
 }
 
-/// Estimates the subtotal for priced usage in a SQLite conversation and any descendant subagents.
-pub(crate) fn estimate_conversation_cost_usd(
-    cli_dir: &Path,
-    conversation_id: &str,
+fn compute_conversation_cost_from_turns(
+    tagged_turns: Vec<(bool, RawTurn)>,
     pricing: &PricingCatalog,
 ) -> Option<ConversationCost> {
-    if !is_valid_uuid(conversation_id) {
-        return None;
-    }
-    let mut tagged_turns: Vec<(bool, RawTurn)> = Vec::new();
-    if let Some(db_path) = resolve_conversation_db_path(cli_dir, conversation_id) {
-        for turn in read_single_db_turns(&db_path)? {
-            tagged_turns.push((false, turn));
-        }
-    }
-
-    for desc_id in resolve_descendant_conversation_ids(cli_dir, conversation_id) {
-        let Some(db_path) = resolve_conversation_db_path(cli_dir, &desc_id) else {
-            continue;
-        };
-        if let Some(turns) = read_single_db_turns(&db_path) {
-            for turn in turns {
-                tagged_turns.push((true, turn));
-            }
-        }
-    }
-
     if tagged_turns.is_empty() {
         return None;
     }
@@ -1896,6 +1996,82 @@ pub(crate) fn estimate_conversation_cost_usd(
         subagent_usd: (sub_priced > 0 && sub_usd.is_finite()).then(|| round_usd_6(sub_usd)),
         unpriced_turns: total_unpriced,
     })
+}
+
+/// Estimates the subtotal for priced usage in a SQLite conversation and any descendant subagents,
+/// optionally reusing an already-open read-only parent connection and persisting the result into
+/// the bounded LRU `conv_cost_cache.json` cache.
+pub(crate) fn estimate_conversation_cost_usd_with_parent_conn(
+    cli_dir: &Path,
+    conversation_id: &str,
+    pricing: &PricingCatalog,
+    parent_conn: Option<&rusqlite::Connection>,
+    cache_target: Option<(&Path, PricingFileFingerprint)>,
+) -> Option<ConversationCost> {
+    if !is_valid_uuid(conversation_id) {
+        return None;
+    }
+
+    let parent_db_path = resolve_conversation_db_path(cli_dir, conversation_id);
+    // Stat before reading so concurrent SQLite commits invalidate on the next tick.
+    let parent_fp = parent_db_path.as_deref().and_then(db_file_fingerprint);
+
+    let mut tagged_turns: Vec<(bool, RawTurn)> = Vec::new();
+    if let Some(conn) = parent_conn {
+        for turn in extract_sqlite_db_turns(conn, None)? {
+            tagged_turns.push((false, turn));
+        }
+    } else if let Some(db_path) = parent_db_path.as_deref() {
+        for turn in read_single_db_turns(db_path)? {
+            tagged_turns.push((false, turn));
+        }
+    }
+
+    let summaries_fp = summaries_db_fingerprint(cli_dir);
+    let desc_ids = resolve_descendant_conversation_ids(cli_dir, conversation_id);
+    let mut descendants = Vec::with_capacity(desc_ids.len());
+    for desc_id in desc_ids {
+        let desc_db_path = resolve_conversation_db_path(cli_dir, &desc_id);
+        let desc_fp = desc_db_path.as_deref().and_then(db_file_fingerprint);
+        descendants.push((desc_id.to_ascii_lowercase(), desc_fp));
+        if let Some(turns) = desc_db_path.as_deref().and_then(read_single_db_turns) {
+            for turn in turns {
+                tagged_turns.push((true, turn));
+            }
+        }
+    }
+
+    let cost = compute_conversation_cost_from_turns(tagged_turns, pricing)?;
+    if let Some((cache_dir, pricing_fp)) = cache_target {
+        write_conv_cost_cache_entry_with_limit(
+            cache_dir,
+            ConvCostCacheEntry {
+                cli_dir: root_path_key(cli_dir),
+                conversation_id: conversation_id.to_ascii_lowercase(),
+                parent_fp,
+                summaries_fp,
+                descendants,
+                pricing_fp,
+                cost: CachedConversationCost {
+                    usd: cost.usd,
+                    subagent_usd: cost.subagent_usd,
+                    unpriced_turns: cost.unpriced_turns,
+                },
+            },
+            CONV_COST_CACHE_MAX_ENTRIES,
+        );
+    }
+    Some(cost)
+}
+
+/// Estimates the subtotal for priced usage in a SQLite conversation and any descendant subagents.
+#[cfg(test)]
+fn estimate_conversation_cost_usd(
+    cli_dir: &Path,
+    conversation_id: &str,
+    pricing: &PricingCatalog,
+) -> Option<ConversationCost> {
+    estimate_conversation_cost_usd_with_parent_conn(cli_dir, conversation_id, pricing, None, None)
 }
 
 #[cfg(test)]
@@ -2982,5 +3158,75 @@ mod tests {
         let mut altered = fp_no_wal;
         altered.db_ctime_secs = altered.db_ctime_secs.saturating_sub(1);
         assert_ne!(altered, fp_no_wal);
+    }
+
+    #[test]
+    fn conv_cost_cache_bounds_lru_entries_and_promotes_updated_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+        let mk_entry = |id: &str, usd: f64| ConvCostCacheEntry {
+            cli_dir: "/isolated/cli".to_string(),
+            conversation_id: id.to_string(),
+            parent_fp: None,
+            summaries_fp: None,
+            descendants: Vec::new(),
+            pricing_fp: PricingFileFingerprint::default(),
+            cost: CachedConversationCost {
+                usd: Some(usd),
+                subagent_usd: None,
+                unpriced_turns: 0,
+            },
+        };
+
+        write_conv_cost_cache_entry_with_limit(
+            cache_dir,
+            mk_entry("11111111-1111-4111-8111-111111111111", 1.0),
+            2,
+        );
+        write_conv_cost_cache_entry_with_limit(
+            cache_dir,
+            mk_entry("22222222-2222-4222-8222-222222222222", 2.0),
+            2,
+        );
+        write_conv_cost_cache_entry_with_limit(
+            cache_dir,
+            mk_entry("33333333-3333-4333-8333-333333333333", 3.0),
+            2,
+        );
+
+        let after_evict = read_conv_cost_cache_file(cache_dir).unwrap();
+        assert_eq!(after_evict.entries.len(), 2);
+        assert_eq!(
+            after_evict.entries[0].conversation_id,
+            "33333333-3333-4333-8333-333333333333"
+        );
+        assert_eq!(
+            after_evict.entries[1].conversation_id,
+            "22222222-2222-4222-8222-222222222222"
+        );
+
+        // Updating entry 2 promotes it to MRU so entry 3 is evicted next.
+        write_conv_cost_cache_entry_with_limit(
+            cache_dir,
+            mk_entry("22222222-2222-4222-8222-222222222222", 2.5),
+            2,
+        );
+        write_conv_cost_cache_entry_with_limit(
+            cache_dir,
+            mk_entry("44444444-4444-4444-8444-444444444444", 4.0),
+            2,
+        );
+
+        let after_promote = read_conv_cost_cache_file(cache_dir).unwrap();
+        assert_eq!(after_promote.entries.len(), 2);
+        assert_eq!(
+            after_promote.entries[0].conversation_id,
+            "44444444-4444-4444-8444-444444444444"
+        );
+        assert_eq!(
+            after_promote.entries[1].conversation_id,
+            "22222222-2222-4222-8222-222222222222"
+        );
+        assert_eq!(after_promote.entries[1].cost.usd, Some(2.5));
     }
 }

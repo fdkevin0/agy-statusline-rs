@@ -17,7 +17,6 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 
 use super::pricing::PricingCatalog;
-use super::query::resolve_roots;
 use super::scan::{
     discover_sqlite_db_targets, project_sqlite_conversations, root_path_key,
     scan_sqlite_targets_raw, DbFileFingerprint, DbTarget, RawConversationScan, RawTurn,
@@ -27,7 +26,10 @@ use super::tz::TimeZoneSpec;
 use super::SqliteStats;
 use crate::db::{inspect_sqlite_path, is_absent_or_real_file, is_real_dir, SqlitePathStatus};
 use crate::fsutil::atomic_write;
-use crate::paths::{xdg_cache_dir, xdg_data_dir};
+use crate::paths::{
+    ephemeral_acp_root_prefixes, resolve_agy_roots, resolve_effective_home_env, xdg_cache_dir,
+    xdg_data_dir,
+};
 
 pub(crate) const ARCHIVE_DB_FILENAME: &str = "stats_history.db";
 pub(super) const SYNC_STAMP_FILENAME: &str = "stats_archive_sync.ts";
@@ -58,6 +60,37 @@ fn deduplicate_roots(roots: &[(&'static str, PathBuf)]) -> Vec<(&'static str, St
         }
     }
     out
+}
+
+/// Appends previously archived ephemeral isolated ACP roots (under `ephemeral_home`'s
+/// `.t3/userdata/providers/antigravity/` or `.pi/agent/cache/antigravity-acp/`) into
+/// `unique_roots` as `"cli"` so their archived turns stay visible after those temporary
+/// directories are removed from disk, without breaching isolation for unrelated roots.
+fn merge_archived_ephemeral_roots(
+    conn: &Connection,
+    unique_roots: &mut Vec<(&'static str, String)>,
+    ephemeral_home: Option<&Path>,
+) -> rusqlite::Result<()> {
+    let Some(home) = ephemeral_home else {
+        return Ok(());
+    };
+    let prefixes = ephemeral_acp_root_prefixes(home);
+    let mut seen: HashSet<String> = unique_roots.iter().map(|(_, k)| k.clone()).collect();
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT root_path FROM archived_conversations ORDER BY root_path ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let root_key: String = row.get(0)?;
+        let root_path = Path::new(&root_key);
+        let is_ephemeral = prefixes
+            .iter()
+            .any(|prefix| root_path != prefix.as_path() && root_path.starts_with(prefix));
+        if is_ephemeral && seen.insert(root_key.clone()) {
+            unique_roots.push(("cli", root_key));
+        }
+    }
+    Ok(())
 }
 
 fn sqlite_io_err(context: &str, err: rusqlite::Error) -> io::Error {
@@ -581,10 +614,15 @@ fn project_live_targets(
 /// (when `data_dir` is `Some`) and projects all live + archived conversations through
 /// `tz` and `pricing`.
 ///
+/// When `ephemeral_home` is `Some`, previously archived ephemeral isolated ACP roots
+/// (T3/pi) under that home are merged into the loaded root set so their history persists
+/// after temporary directories are removed from disk.
+///
 /// Falls back transparently to a live-only scan when `data_dir` is `None` or the archive
 /// database cannot be opened or updated.
 pub(super) fn scan_sqlite_conversations_with_archive(
     roots: &[(&'static str, PathBuf)],
+    ephemeral_home: Option<&Path>,
     data_dir: Option<&Path>,
     cache_dir: Option<&Path>,
     now_unix_secs: u64,
@@ -603,10 +641,13 @@ pub(super) fn scan_sqlite_conversations_with_archive(
         return (SqliteStats::default(), Vec::new(), SqliteCoverage::default());
     }
 
-    let unique_roots = deduplicate_roots(roots);
+    let mut unique_roots = deduplicate_roots(roots);
     let Ok(Some(mut conn)) = open_archive_db(&archive_path) else {
         return project_live_targets(&targets, tz, pricing);
     };
+    if merge_archived_ephemeral_roots(&conn, &mut unique_roots, ephemeral_home).is_err() {
+        return project_live_targets(&targets, tz, pricing);
+    }
     let Ok((_, _, archived_db_files)) =
         sync_changed_targets(&mut conn, &unique_roots, &targets, now_unix_secs)
     else {
@@ -630,12 +671,13 @@ pub(super) fn scan_sqlite_conversations_with_archive(
 /// Runs an incremental archive sync against `roots` and returns sync counts.
 pub(super) fn sync_roots_into_archive(
     roots: &[(&'static str, PathBuf)],
+    ephemeral_home: Option<&Path>,
     data_dir: &Path,
     cache_dir: Option<&Path>,
     now_unix_secs: u64,
 ) -> io::Result<ArchiveSyncSummary> {
     let archive_path = data_dir.join(ARCHIVE_DB_FILENAME);
-    let unique_roots = deduplicate_roots(roots);
+    let mut unique_roots = deduplicate_roots(roots);
     let targets = discover_sqlite_db_targets(roots);
 
     if targets.is_empty() && matches!(inspect_sqlite_path(&archive_path), SqlitePathStatus::Missing)
@@ -656,6 +698,8 @@ pub(super) fn sync_roots_into_archive(
             archive_path.display()
         ))
     })?;
+    merge_archived_ephemeral_roots(&conn, &mut unique_roots, ephemeral_home)
+        .map_err(|e| sqlite_io_err("failed to inspect archived ephemeral roots", e))?;
     let (scanned_db_files, total_db_files, archived_db_files) =
         sync_changed_targets(&mut conn, &unique_roots, &targets, now_unix_secs)
             .map_err(|e| sqlite_io_err("failed to update stats archive", e))?;
@@ -677,7 +721,8 @@ pub fn run_stats_sync_command<W: Write>(
     now_unix_secs: u64,
     out: &mut W,
 ) -> io::Result<()> {
-    let roots = resolve_roots(home);
+    let effective_home = resolve_effective_home_env(home);
+    let roots = resolve_agy_roots(effective_home.as_deref());
     let data_dir = xdg_data_dir()
         .or_else(|| home.map(|h| h.join(".local").join("share").join("agy-statusline")))
         .ok_or_else(|| {
@@ -703,7 +748,13 @@ pub fn run_stats_sync_command<W: Write>(
         return Ok(());
     }
 
-    let summary = sync_roots_into_archive(&roots, &data_dir, cache_dir.as_deref(), now_unix_secs)?;
+    let summary = sync_roots_into_archive(
+        &roots,
+        effective_home.as_deref(),
+        &data_dir,
+        cache_dir.as_deref(),
+        now_unix_secs,
+    )?;
     writeln!(
         out,
         "Synced {} updated / {} live DBs ({} total, {} archived) -> {}",
@@ -756,7 +807,7 @@ pub fn maybe_spawn_background_archive_sync(
     cache_dir: Option<&Path>,
     now_unix_secs: u64,
 ) {
-    let roots = resolve_roots(home);
+    let roots = resolve_agy_roots(home);
     maybe_spawn_background_archive_sync_for_roots(&roots, cache_dir, now_unix_secs);
 }
 
@@ -832,6 +883,7 @@ mod tests {
 
         let (stats1, events1, covered1) = scan_sqlite_conversations_with_archive(
             &roots,
+            None,
             Some(&data_dir),
             Some(&cache_dir),
             1_795_200_000,
@@ -849,6 +901,7 @@ mod tests {
 
         let (stats2, events2, covered2) = scan_sqlite_conversations_with_archive(
             &roots,
+            None,
             Some(&data_dir),
             Some(&cache_dir),
             1_795_200_100,
@@ -882,17 +935,17 @@ mod tests {
         drop(conn);
 
         let roots = [("cli", cli_root.clone())];
-        let s1 = sync_roots_into_archive(&roots, &data_dir, None, 1_795_200_000).unwrap();
+        let s1 = sync_roots_into_archive(&roots, None, &data_dir, None, 1_795_200_000).unwrap();
         assert_eq!(s1.live_db_files, 1);
         assert_eq!(s1.scanned_db_files, 1);
 
         // Idle second sync skips unchanged DB.
-        let s2 = sync_roots_into_archive(&roots, &data_dir, None, 1_795_200_010).unwrap();
+        let s2 = sync_roots_into_archive(&roots, None, &data_dir, None, 1_795_200_010).unwrap();
         assert_eq!(s2.scanned_db_files, 0);
 
         // Touching a 0-byte -wal sidecar (like AGY startup does) must not trigger a re-scan.
         fs::write(&wal1, b"").unwrap();
-        let s3 = sync_roots_into_archive(&roots, &data_dir, None, 1_795_200_020).unwrap();
+        let s3 = sync_roots_into_archive(&roots, None, &data_dir, None, 1_795_200_020).unwrap();
         assert_eq!(s3.scanned_db_files, 0);
 
         // Open in WAL mode with autocheckpoint disabled so turn 2 lives only in -wal.
@@ -902,11 +955,12 @@ mod tests {
             .unwrap();
         insert_turn(&live_conn, 2, 1_795_000_060, "model-alpha", 3_000);
 
-        let s4 = sync_roots_into_archive(&roots, &data_dir, None, 1_795_200_030).unwrap();
+        let s4 = sync_roots_into_archive(&roots, None, &data_dir, None, 1_795_200_030).unwrap();
         assert_eq!(s4.scanned_db_files, 1);
 
         let (stats, events, _) = scan_sqlite_conversations_with_archive(
             &roots,
+            None,
             Some(&data_dir),
             None,
             1_795_200_040,
@@ -940,6 +994,7 @@ mod tests {
         let pricing = PricingCatalog::default();
         let (_, events_a, _) = scan_sqlite_conversations_with_archive(
             &[("cli", root_a.clone())],
+            None,
             Some(&data_dir),
             None,
             1_795_200_000,
@@ -948,6 +1003,7 @@ mod tests {
         );
         let (_, events_b, _) = scan_sqlite_conversations_with_archive(
             &[("cli", root_b.clone())],
+            None,
             Some(&data_dir),
             None,
             1_795_200_000,
@@ -979,6 +1035,7 @@ mod tests {
         let roots = [("cli", cli_root.clone())];
         let (_, ev_unpriced, _) = scan_sqlite_conversations_with_archive(
             &roots,
+            None,
             Some(&data_dir),
             None,
             ts_secs + 60,
@@ -1010,6 +1067,7 @@ mod tests {
         let tz_plus8 = TimeZoneSpec::fixed_offset(8 * 3_600);
         let (stats, ev_repriced, _) = scan_sqlite_conversations_with_archive(
             &roots,
+            None,
             Some(&data_dir),
             None,
             ts_secs + 120,
@@ -1043,6 +1101,7 @@ mod tests {
 
         let (stats, events, _) = scan_sqlite_conversations_with_archive(
             &[("cli", cli_root.clone())],
+            None,
             Some(&data_dir),
             None,
             1_795_200_000,
@@ -1088,6 +1147,7 @@ mod tests {
 
         let (wal_stats, wal_events, _) = scan_sqlite_conversations_with_archive(
             &[("cli", cli_root)],
+            None,
             Some(&wal_data_dir),
             None,
             1_795_200_000,
@@ -1397,7 +1457,8 @@ mod tests {
         drop(v1);
 
         let roots = [("cli", cli_root.clone()), ("desktop", desk_root.clone())];
-        let summary1 = sync_roots_into_archive(&roots, &data_dir, None, 1_795_200_000).unwrap();
+        let summary1 =
+            sync_roots_into_archive(&roots, None, &data_dir, None, 1_795_200_000).unwrap();
         assert_eq!(summary1.live_db_files, 2);
         assert_eq!(summary1.scanned_db_files, 2);
         assert_eq!(summary1.total_db_files, 3);
@@ -1409,13 +1470,15 @@ mod tests {
         drop(check);
 
         // Second sync sees scan_rev == 2 and unchanged fingerprints -> 0 rescans.
-        let summary2 = sync_roots_into_archive(&roots, &data_dir, None, 1_795_200_010).unwrap();
+        let summary2 =
+            sync_roots_into_archive(&roots, None, &data_dir, None, 1_795_200_010).unwrap();
         assert_eq!(summary2.scanned_db_files, 0);
 
         // Projecting across both roots preserves pruned v1 turn, backfills compaction step,
         // and cross-root Union-Find deduplicates the shared CLI/Desktop turn!
         let (stats, events, covered) = scan_sqlite_conversations_with_archive(
             &roots,
+            None,
             Some(&data_dir),
             None,
             1_795_200_020,
@@ -1439,7 +1502,104 @@ mod tests {
             )
             .unwrap();
         drop(mutate);
-        let summary3 = sync_roots_into_archive(&roots, &data_dir, None, 1_795_200_030).unwrap();
+        let summary3 =
+            sync_roots_into_archive(&roots, None, &data_dir, None, 1_795_200_030).unwrap();
         assert_eq!(summary3.scanned_db_files, 1);
+    }
+
+    #[test]
+    fn archive_preserves_ephemeral_t3_root_after_directory_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let data_dir = dir.path().join("data");
+        let cache_dir = dir.path().join("cache");
+
+        let t3_proj = home
+            .join(".t3")
+            .join("userdata")
+            .join("providers")
+            .join("antigravity")
+            .join("p1");
+        let t3_root = t3_proj.join("antigravity-acp");
+        let unrelated_root = dir.path().join("unrelated-root");
+
+        let u_t3 = "88888888-8888-4888-8888-888888888888";
+        let u_other = "99999999-9999-4999-8999-999999999999";
+
+        let c_t3 = create_live_db(&t3_root.join("conversations").join(format!("{u_t3}.db")));
+        insert_turn(&c_t3, 1, 1_795_000_000, "model-t3", 2_500);
+        drop(c_t3);
+
+        let c_other =
+            create_live_db(&unrelated_root.join("conversations").join(format!("{u_other}.db")));
+        insert_turn(&c_other, 1, 1_795_000_000, "model-other", 9_999);
+        drop(c_other);
+
+        // Archive an unrelated root into the same DB to verify ephemeral merging never leaks it.
+        sync_roots_into_archive(
+            &[("cli", unrelated_root)],
+            None,
+            &data_dir,
+            None,
+            1_795_100_000,
+        )
+        .unwrap();
+
+        let tz = TimeZoneSpec::utc();
+        let pricing = PricingCatalog::default();
+        let roots_before = crate::paths::resolve_agy_roots_from(Some(home), None, None, None, None);
+        assert!(roots_before.contains(&("cli", t3_root.clone())));
+
+        let (stats1, events1, covered1) = scan_sqlite_conversations_with_archive(
+            &roots_before,
+            Some(home),
+            Some(&data_dir),
+            Some(&cache_dir),
+            1_795_200_000,
+            &tz,
+            &pricing,
+        );
+        assert_eq!(stats1.db_files, 1);
+        assert_eq!(stats1.archived_db_files, 0);
+        assert_eq!(stats1.completed_turns, 1);
+        assert_eq!(events1.len(), 1);
+        assert_eq!(events1[0].model_group, "model-t3");
+        assert!(covered1.conversations.contains(&("cli", u_t3.to_string())));
+
+        // Delete the entire ephemeral T3 directory from disk.
+        fs::remove_dir_all(&t3_proj).unwrap();
+
+        let roots_after = crate::paths::resolve_agy_roots_from(Some(home), None, None, None, None);
+        assert!(!roots_after.iter().any(|(_, p)| p == &t3_root));
+
+        let (stats2, events2, covered2) = scan_sqlite_conversations_with_archive(
+            &roots_after,
+            Some(home),
+            Some(&data_dir),
+            Some(&cache_dir),
+            1_795_200_100,
+            &tz,
+            &pricing,
+        );
+        assert_eq!(stats2.db_files, 1);
+        assert_eq!(stats2.archived_db_files, 1);
+        assert_eq!(stats2.completed_turns, 1);
+        assert_eq!(events2.len(), 1);
+        assert_eq!(events2[0].model_group, "model-t3");
+        assert_eq!(events2[0].input_tokens, 2_500);
+        assert!(covered2.conversations.contains(&("cli", u_t3.to_string())));
+
+        let sync_after = sync_roots_into_archive(
+            &roots_after,
+            Some(home),
+            &data_dir,
+            Some(&cache_dir),
+            1_795_200_200,
+        )
+        .unwrap();
+        assert_eq!(sync_after.live_db_files, 0);
+        assert_eq!(sync_after.scanned_db_files, 0);
+        assert_eq!(sync_after.total_db_files, 1);
+        assert_eq!(sync_after.archived_db_files, 1);
     }
 }
