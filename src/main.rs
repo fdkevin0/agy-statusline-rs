@@ -17,7 +17,8 @@ use agy_statusline::layout::{
     load_layout_config, load_saved_stats_metric, save_layout_config, LayoutConfig, Preset,
 };
 use agy_statusline::paths::{
-    agy_settings_path, resolve_agy_cli_dir, resolve_home_dir, xdg_cache_dir, xdg_config_dir,
+    agy_settings_path, resolve_agy_cli_dir, resolve_agy_roots, resolve_home_dir, xdg_cache_dir,
+    xdg_config_dir,
 };
 use agy_statusline::stats::{
     maybe_spawn_background_archive_sync, run_pricing_command, run_stats_command_with_metric,
@@ -217,10 +218,10 @@ fn main() -> io::Result<()> {
                 ascii,
             } => {
                 let home = resolve_home_dir();
-                if home.is_none() && resolve_agy_cli_dir().is_none() {
+                if resolve_agy_roots(home.as_deref()).is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
-                        "neither HOME, USERPROFILE, ANTIGRAVITY_CLI_HOME, nor AGY_HOME environment variable is set",
+                        "no AGY data roots found (set HOME, USERPROFILE, ANTIGRAVITY_CLI_HOME, AGY_HOME, ANTIGRAVITY_HOME, or ANTIGRAVITY_DATA_DIR)",
                     ));
                 }
                 if let Some(StatsCommand::Sync { if_stale }) = action {

@@ -283,7 +283,7 @@ fn tier2_doctor_reports_conversations_archive_and_agy_cli_status() {
         "doctor stdout:\n{populated}"
     );
     assert!(
-        populated.contains("stats_history.db [found, 2.0 KiB]"),
+        populated.contains("stats_history.db [found, 2.0 KiB, unreadable schema]"),
         "doctor stdout:\n{populated}"
     );
 }
