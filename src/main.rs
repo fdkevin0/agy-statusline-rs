@@ -72,7 +72,7 @@ enum Command {
         disable: bool,
     },
 
-    /// Check configuration, AGY hook, and render a live sample preview
+    /// Check configuration, AGY CLI/hook, local storage, and render a live sample preview
     Doctor,
 
     /// Show local daily & model token usage, estimated API cost, and speed stats (launches interactive TUI on a TTY)

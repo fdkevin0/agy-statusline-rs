@@ -1,14 +1,13 @@
 //! Pure-Rust Git branch/worktree probing and bounded, cached diff statistics.
 
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::process::Command;
+use std::time::{Duration, UNIX_EPOCH};
 
 use crate::fsutil::atomic_write;
 use crate::paths::xdg_cache_dir;
+use crate::procutil::run_command_stdout_bounded;
 use crate::timeutil::unix_now_secs;
 
 const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -215,60 +214,14 @@ fn parse_numstat(bytes: &[u8]) -> (u64, u64) {
     (added, deleted)
 }
 
-fn wait_child_bounded(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(remaining.min(Duration::from_millis(5)));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-}
-
 fn run_git_diff_bounded(dir: &Path, timeout: Duration) -> Option<(u64, u64)> {
-    let deadline = Instant::now() + timeout;
-    let mut child = Command::new("git")
-        .args(["--no-optional-locks", "-C"])
+    let mut cmd = Command::new("git");
+    cmd.args(["--no-optional-locks", "-C"])
         .arg(dir)
-        .args(["diff", "--numstat", "HEAD"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let stdout = child.stdout.take()?;
-    let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let res = stdout.take(2 * 1024 * 1024).read_to_end(&mut buf).map(|_| buf);
-        let _ = tx.send(res);
-    });
-
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match rx.recv_timeout(remaining) {
-        Ok(Ok(bytes)) => {
-            let status = wait_child_bounded(&mut child, deadline)?;
-            status.success().then(|| parse_numstat(&bytes))
-        }
-        _ => {
-            let _ = child.kill();
-            let _ = child.wait();
-            None
-        }
-    }
+        .args(["diff", "--numstat", "HEAD"]);
+    run_command_stdout_bounded(&mut cmd, timeout, 2 * 1024 * 1024)
+        .ok()
+        .map(|bytes| parse_numstat(&bytes))
 }
 
 #[cfg(test)]

@@ -230,3 +230,107 @@ fn tier2_apply_and_doctor_honor_antigravity_cli_home_and_agy_home() {
     );
     assert!(doctor_text.contains("enabled=true"));
 }
+
+#[test]
+fn tier2_doctor_reports_conversations_archive_and_agy_cli_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let empty = stdout(
+        isolated_agy_cmd(root)
+            .env("NO_COLOR", "1")
+            .arg("doctor")
+            .output()
+            .unwrap(),
+    );
+    assert!(empty.contains("AGY CLI:  not found"), "doctor stdout:\n{empty}");
+    assert!(
+        empty.contains("conversations [not found]"),
+        "doctor stdout:\n{empty}"
+    );
+    assert!(
+        empty.contains("stats_history.db [not found]"),
+        "doctor stdout:\n{empty}"
+    );
+
+    let conv_dir = root.join(".gemini/antigravity-cli/conversations");
+    fs::create_dir_all(&conv_dir).unwrap();
+    fs::write(
+        conv_dir.join("11111111-1111-4111-8111-111111111111.db"),
+        b"db",
+    )
+    .unwrap();
+    fs::write(
+        conv_dir.join("11111111-1111-4111-8111-111111111111.db-wal"),
+        b"wal",
+    )
+    .unwrap();
+    fs::write(conv_dir.join("not-a-uuid.db"), b"junk").unwrap();
+
+    let archive_path = root.join("data/agy-statusline/stats_history.db");
+    fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+    fs::write(&archive_path, vec![0u8; 2048]).unwrap();
+
+    let populated = stdout(
+        isolated_agy_cmd(root)
+            .env("NO_COLOR", "1")
+            .arg("doctor")
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        populated.contains("conversations [found, 1 session .db file]"),
+        "doctor stdout:\n{populated}"
+    );
+    assert!(
+        populated.contains("stats_history.db [found, 2.0 KiB]"),
+        "doctor stdout:\n{populated}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tier2_doctor_probes_agy_version_and_handles_nonzero_exit() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let agy_bin = bin_dir.join("agy");
+
+    // Symlink the real compiled binary (supports `--version`) instead of a shell stub.
+    symlink(BIN, &agy_bin).unwrap();
+    let ok_out = stdout(
+        isolated_agy_cmd(root)
+            .env("NO_COLOR", "1")
+            .env("PATH", &bin_dir)
+            .arg("doctor")
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        ok_out.contains(&format!(
+            "AGY CLI:  agy-statusline {}",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "doctor stdout:\n{ok_out}"
+    );
+
+    // Symlink the real system `false` utility to verify non-zero exit never fails `doctor`.
+    fs::remove_file(&agy_bin).unwrap();
+    symlink(which::which("false").unwrap(), &agy_bin).unwrap();
+    let err_out = stdout(
+        isolated_agy_cmd(root)
+            .env("NO_COLOR", "1")
+            .env("PATH", &bin_dir)
+            .arg("doctor")
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        err_out.contains("AGY CLI:  unavailable (exit"),
+        "doctor stdout:\n{err_out}"
+    );
+    assert!(err_out.contains("Preview:"), "doctor stdout:\n{err_out}");
+}
