@@ -28,8 +28,14 @@ use serde::{Deserialize, Serialize};
 pub(crate) use archive::ARCHIVE_DB_FILENAME;
 pub use archive::{maybe_spawn_background_archive_sync, run_stats_sync_command};
 pub use metric::{MetricValue, StatsMetric};
+pub(crate) use pricing::{
+    is_pricing_fingerprint_fresh, maybe_spawn_pricing_sync_if_stale, pricing_cache_fingerprint,
+    PricingFileFingerprint,
+};
 pub use pricing::{run_pricing_command, PricingCatalog, SyncMode};
-pub(crate) use scan::estimate_conversation_cost_usd;
+pub(crate) use scan::{
+    estimate_conversation_cost_usd_with_parent_conn, lookup_cached_conversation_cost,
+};
 pub use tui::run_stats_tui;
 pub use tz::unix_secs_to_utc_date;
 
