@@ -526,7 +526,7 @@ fn parse_canonical_gemini_codename_entry(entry: &IndexedEntry) -> Option<((u32, 
     Some(((major, minor), codename))
 }
 
-fn normalize_model_key(raw: &str) -> String {
+pub(super) fn normalize_model_key(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut prev_space = true;
     for ch in raw.chars() {

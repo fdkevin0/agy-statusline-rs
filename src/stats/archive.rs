@@ -20,7 +20,8 @@ use super::pricing::PricingCatalog;
 use super::query::resolve_roots;
 use super::scan::{
     discover_sqlite_db_targets, project_sqlite_conversations, root_path_key,
-    scan_sqlite_targets_raw, DbFileFingerprint, DbTarget, RawConversationScan, RawTurn, UsageEvent,
+    scan_sqlite_targets_raw, DbFileFingerprint, DbTarget, RawConversationScan, RawTurn,
+    SqliteCoverage, UsageEvent,
 };
 use super::tz::TimeZoneSpec;
 use super::SqliteStats;
@@ -33,7 +34,8 @@ pub(super) const SYNC_STAMP_FILENAME: &str = "stats_archive_sync.ts";
 pub(super) const DEFAULT_ARCHIVE_SYNC_INTERVAL_SECS: u64 = 1_800;
 
 const ARCHIVE_INIT_LOCK_FILENAME: &str = "stats_history.lock";
-const ARCHIVE_SCHEMA_VERSION: i32 = 1;
+const ARCHIVE_SCHEMA_VERSION: i32 = 2;
+const CURRENT_SCAN_REV: i64 = 2;
 const ARCHIVE_BUSY_TIMEOUT_MS: u64 = 5_000;
 
 /// Summary of an incremental archive sync run.
@@ -103,7 +105,7 @@ fn configure_connection_pragmas(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Opens (or initializes) `db_path`, returning `Ok(None)` without mutating the file
-/// when the archive was created by a newer schema version (`user_version > 1`).
+/// when the archive was created by a newer schema version (`user_version > ARCHIVE_SCHEMA_VERSION`).
 fn open_archive_db(db_path: &Path) -> io::Result<Option<Connection>> {
     // Inspect an existing file read-only first so a WAL-mode future-schema DB is never
     // checkpointed or modified on close, and steady-state runs avoid the init lock.
@@ -198,45 +200,74 @@ fn open_archive_db(db_path: &Path) -> io::Result<Option<Connection>> {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| sqlite_io_err("failed to begin stats archive migration", e))?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS archived_conversations (
-                root_path        TEXT NOT NULL,
-                uuid             TEXT NOT NULL,
-                db_mtime_secs    INTEGER NOT NULL,
-                db_mtime_nanos   INTEGER NOT NULL,
-                db_size          INTEGER NOT NULL,
-                wal_mtime_secs   INTEGER NOT NULL,
-                wal_mtime_nanos  INTEGER NOT NULL,
-                wal_size         INTEGER NOT NULL,
-                synced_at_secs   INTEGER NOT NULL,
-                PRIMARY KEY (root_path, uuid)
-            ) WITHOUT ROWID;
+        let tx_version = read_user_version(&tx)
+            .map_err(|e| sqlite_io_err("failed to read stats archive schema version", e))?;
+        if tx_version == 0 {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS archived_conversations (
+                    root_path        TEXT NOT NULL,
+                    uuid             TEXT NOT NULL,
+                    db_mtime_secs    INTEGER NOT NULL,
+                    db_mtime_nanos   INTEGER NOT NULL,
+                    db_ctime_secs    INTEGER NOT NULL DEFAULT 0,
+                    db_ctime_nanos   INTEGER NOT NULL DEFAULT 0,
+                    db_size          INTEGER NOT NULL,
+                    wal_mtime_secs   INTEGER NOT NULL,
+                    wal_mtime_nanos  INTEGER NOT NULL,
+                    wal_ctime_secs   INTEGER NOT NULL DEFAULT 0,
+                    wal_ctime_nanos  INTEGER NOT NULL DEFAULT 0,
+                    wal_size         INTEGER NOT NULL,
+                    scan_rev         INTEGER NOT NULL DEFAULT 2,
+                    synced_at_secs   INTEGER NOT NULL,
+                    PRIMARY KEY (root_path, uuid)
+                ) WITHOUT ROWID;
 
-            CREATE TABLE IF NOT EXISTS archived_turns (
-                root_path          TEXT NOT NULL,
-                uuid               TEXT NOT NULL,
-                turn_idx           INTEGER NOT NULL,
-                ts_secs            INTEGER,
-                model_enum         INTEGER NOT NULL,
-                response_model     TEXT,
-                model_display_name TEXT,
-                input_tokens       INTEGER NOT NULL,
-                cache_read_tokens  INTEGER NOT NULL,
-                cache_write_tokens INTEGER NOT NULL,
-                output_tokens      INTEGER NOT NULL,
-                thinking_tokens    INTEGER NOT NULL,
-                native_cost_usd    REAL,
-                decode_speed       REAL,
-                ttft_secs          REAL,
-                PRIMARY KEY (root_path, uuid, turn_idx),
-                FOREIGN KEY (root_path, uuid)
-                    REFERENCES archived_conversations (root_path, uuid)
-                    ON DELETE CASCADE
-            ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS archived_turns (
+                    root_path          TEXT NOT NULL,
+                    uuid               TEXT NOT NULL,
+                    turn_idx           INTEGER NOT NULL,
+                    ts_secs            INTEGER,
+                    ts_quality         INTEGER NOT NULL DEFAULT 0,
+                    model_enum         INTEGER NOT NULL,
+                    response_model     TEXT,
+                    model_display_name TEXT,
+                    input_tokens       INTEGER NOT NULL,
+                    cache_read_tokens  INTEGER NOT NULL,
+                    cache_write_tokens INTEGER NOT NULL,
+                    output_tokens      INTEGER NOT NULL,
+                    thinking_tokens    INTEGER NOT NULL,
+                    native_cost_usd    REAL,
+                    decode_speed       REAL,
+                    ttft_secs          REAL,
+                    id_11              TEXT,
+                    id_12              TEXT,
+                    id_7               TEXT,
+                    PRIMARY KEY (root_path, uuid, turn_idx),
+                    FOREIGN KEY (root_path, uuid)
+                        REFERENCES archived_conversations (root_path, uuid)
+                        ON DELETE CASCADE
+                ) WITHOUT ROWID;
 
-            PRAGMA user_version = 1;",
-        )
-        .map_err(|e| sqlite_io_err("failed to initialize stats archive schema", e))?;
+                PRAGMA user_version = 2;",
+            )
+            .map_err(|e| sqlite_io_err("failed to initialize stats archive schema", e))?;
+        } else if tx_version == 1 {
+            // Non-destructive v1 -> v2 upgrade: preserve all archived (including pruned) rows,
+            // defaulting scan_rev = 1 so still-live DBs rescan once to backfill identities/retries.
+            tx.execute_batch(
+                "ALTER TABLE archived_conversations ADD COLUMN db_ctime_secs   INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE archived_conversations ADD COLUMN db_ctime_nanos  INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE archived_conversations ADD COLUMN wal_ctime_secs  INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE archived_conversations ADD COLUMN wal_ctime_nanos INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE archived_conversations ADD COLUMN scan_rev        INTEGER NOT NULL DEFAULT 1;
+                 ALTER TABLE archived_turns         ADD COLUMN ts_quality      INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE archived_turns         ADD COLUMN id_11           TEXT;
+                 ALTER TABLE archived_turns         ADD COLUMN id_12           TEXT;
+                 ALTER TABLE archived_turns         ADD COLUMN id_7            TEXT;
+                 PRAGMA user_version = 2;",
+            )
+            .map_err(|e| sqlite_io_err("failed to migrate stats archive schema v1->v2", e))?;
+        }
         tx.commit()
             .map_err(|e| sqlite_io_err("failed to commit stats archive schema", e))?;
     }
@@ -244,7 +275,13 @@ fn open_archive_db(db_path: &Path) -> io::Result<Option<Connection>> {
     Ok(Some(conn))
 }
 
-type FingerprintIndex = HashMap<String, HashMap<String, DbFileFingerprint>>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoredFingerprint {
+    fingerprint: DbFileFingerprint,
+    scan_rev: i64,
+}
+
+type FingerprintIndex = HashMap<String, HashMap<String, StoredFingerprint>>;
 
 fn load_existing_fingerprints(
     conn: &Connection,
@@ -252,8 +289,9 @@ fn load_existing_fingerprints(
 ) -> rusqlite::Result<FingerprintIndex> {
     let mut out: FingerprintIndex = HashMap::with_capacity(unique_roots.len());
     let mut stmt = conn.prepare(
-        "SELECT uuid, db_mtime_secs, db_mtime_nanos, db_size,
-                wal_mtime_secs, wal_mtime_nanos, wal_size
+        "SELECT uuid, db_mtime_secs, db_mtime_nanos, db_ctime_secs, db_ctime_nanos, db_size,
+                wal_mtime_secs, wal_mtime_nanos, wal_ctime_secs, wal_ctime_nanos, wal_size,
+                scan_rev
          FROM archived_conversations
          WHERE root_path = ?1",
     )?;
@@ -265,12 +303,23 @@ fn load_existing_fingerprints(
             let fp = DbFileFingerprint {
                 db_mtime_secs: row.get(1)?,
                 db_mtime_nanos: row.get::<_, i64>(2)?.max(0) as u32,
-                db_size: row.get::<_, i64>(3)?.max(0) as u64,
-                wal_mtime_secs: row.get(4)?,
-                wal_mtime_nanos: row.get::<_, i64>(5)?.max(0) as u32,
-                wal_size: row.get::<_, i64>(6)?.max(0) as u64,
+                db_ctime_secs: row.get(3)?,
+                db_ctime_nanos: row.get::<_, i64>(4)?.max(0) as u32,
+                db_size: row.get::<_, i64>(5)?.max(0) as u64,
+                wal_mtime_secs: row.get(6)?,
+                wal_mtime_nanos: row.get::<_, i64>(7)?.max(0) as u32,
+                wal_ctime_secs: row.get(8)?,
+                wal_ctime_nanos: row.get::<_, i64>(9)?.max(0) as u32,
+                wal_size: row.get::<_, i64>(10)?.max(0) as u64,
             };
-            by_uuid.insert(uuid, fp);
+            let scan_rev: i64 = row.get(11)?;
+            by_uuid.insert(
+                uuid,
+                StoredFingerprint {
+                    fingerprint: fp,
+                    scan_rev,
+                },
+            );
         }
         out.insert(root_key.clone(), by_uuid);
     }
@@ -291,34 +340,41 @@ fn upsert_scanned_conversations(
         let mut upsert_conv = tx.prepare(
             "INSERT INTO archived_conversations (
                 root_path, uuid,
-                db_mtime_secs, db_mtime_nanos, db_size,
-                wal_mtime_secs, wal_mtime_nanos, wal_size,
-                synced_at_secs
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                db_mtime_secs, db_mtime_nanos, db_ctime_secs, db_ctime_nanos, db_size,
+                wal_mtime_secs, wal_mtime_nanos, wal_ctime_secs, wal_ctime_nanos, wal_size,
+                scan_rev, synced_at_secs
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(root_path, uuid) DO UPDATE SET
                 db_mtime_secs   = excluded.db_mtime_secs,
                 db_mtime_nanos  = excluded.db_mtime_nanos,
+                db_ctime_secs   = excluded.db_ctime_secs,
+                db_ctime_nanos  = excluded.db_ctime_nanos,
                 db_size         = excluded.db_size,
                 wal_mtime_secs  = excluded.wal_mtime_secs,
                 wal_mtime_nanos = excluded.wal_mtime_nanos,
+                wal_ctime_secs  = excluded.wal_ctime_secs,
+                wal_ctime_nanos = excluded.wal_ctime_nanos,
                 wal_size        = excluded.wal_size,
+                scan_rev        = excluded.scan_rev,
                 synced_at_secs  = excluded.synced_at_secs",
         )?;
         let mut delete_turns =
             tx.prepare("DELETE FROM archived_turns WHERE root_path = ?1 AND uuid = ?2")?;
         let mut insert_turn = tx.prepare(
             "INSERT INTO archived_turns (
-                root_path, uuid, turn_idx, ts_secs,
+                root_path, uuid, turn_idx, ts_secs, ts_quality,
                 model_enum, response_model, model_display_name,
                 input_tokens, cache_read_tokens, cache_write_tokens,
                 output_tokens, thinking_tokens,
-                native_cost_usd, decode_speed, ttft_secs
+                native_cost_usd, decode_speed, ttft_secs,
+                id_11, id_12, id_7
              ) VALUES (
-                ?1, ?2, ?3, ?4,
-                ?5, ?6, ?7,
-                ?8, ?9, ?10,
-                ?11, ?12,
-                ?13, ?14, ?15
+                ?1, ?2, ?3, ?4, ?5,
+                ?6, ?7, ?8,
+                ?9, ?10, ?11,
+                ?12, ?13,
+                ?14, ?15, ?16,
+                ?17, ?18, ?19
              )",
         )?;
 
@@ -329,10 +385,15 @@ fn upsert_scanned_conversations(
                 conv.uuid,
                 fp.db_mtime_secs,
                 i64::from(fp.db_mtime_nanos),
+                fp.db_ctime_secs,
+                i64::from(fp.db_ctime_nanos),
                 fp.db_size.min(i64::MAX as u64) as i64,
                 fp.wal_mtime_secs,
                 i64::from(fp.wal_mtime_nanos),
+                fp.wal_ctime_secs,
+                i64::from(fp.wal_ctime_nanos),
                 fp.wal_size.min(i64::MAX as u64) as i64,
+                CURRENT_SCAN_REV,
                 synced_at,
             ])?;
             delete_turns.execute(params![conv.root_key, conv.uuid])?;
@@ -342,6 +403,7 @@ fn upsert_scanned_conversations(
                     conv.uuid,
                     idx as i64,
                     turn.ts_secs,
+                    i64::from(turn.ts_quality),
                     turn.model_enum.min(i64::MAX as u64) as i64,
                     turn.response_model.as_deref(),
                     turn.model_display_name.as_deref(),
@@ -353,6 +415,9 @@ fn upsert_scanned_conversations(
                     turn.native_cost_usd,
                     turn.decode_speed,
                     turn.ttft_secs,
+                    turn.id_11.as_deref(),
+                    turn.id_12.as_deref(),
+                    turn.id_7.as_deref(),
                 ])?;
             }
         }
@@ -374,7 +439,9 @@ fn sync_changed_targets(
             existing
                 .get(t.root_key.as_str())
                 .and_then(|by_uuid| by_uuid.get(t.uuid.as_str()))
-                .is_none_or(|prev| *prev != t.fingerprint)
+                .is_none_or(|prev| {
+                    prev.scan_rev != CURRENT_SCAN_REV || prev.fingerprint != t.fingerprint
+                })
         })
         .cloned()
         .collect();
@@ -382,10 +449,13 @@ fn sync_changed_targets(
     upsert_scanned_conversations(conn, &scanned, now_unix_secs)?;
 
     for conv in &scanned {
-        existing
-            .entry(conv.root_key.clone())
-            .or_default()
-            .insert(conv.uuid.clone(), conv.fingerprint);
+        existing.entry(conv.root_key.clone()).or_default().insert(
+            conv.uuid.clone(),
+            StoredFingerprint {
+                fingerprint: conv.fingerprint,
+                scan_rev: CURRENT_SCAN_REV,
+            },
+        );
     }
     let live_keys: HashSet<(&str, &str)> = targets
         .iter()
@@ -419,10 +489,11 @@ fn load_stored_conversations(
         "SELECT uuid FROM archived_conversations WHERE root_path = ?1 ORDER BY uuid ASC",
     )?;
     let mut turn_stmt = conn.prepare(
-        "SELECT uuid, ts_secs, model_enum, response_model, model_display_name,
+        "SELECT uuid, ts_secs, ts_quality, model_enum, response_model, model_display_name,
                 input_tokens, cache_read_tokens, cache_write_tokens,
                 output_tokens, thinking_tokens,
-                native_cost_usd, decode_speed, ttft_secs
+                native_cost_usd, decode_speed, ttft_secs,
+                id_11, id_12, id_7
          FROM archived_turns
          WHERE root_path = ?1
          ORDER BY uuid ASC, turn_idx ASC",
@@ -435,17 +506,21 @@ fn load_stored_conversations(
             let uuid: String = row.get(0)?;
             let turn = RawTurn {
                 ts_secs: row.get(1)?,
-                model_enum: row.get::<_, i64>(2)?.max(0) as u64,
-                response_model: row.get(3)?,
-                model_display_name: row.get(4)?,
-                input_tokens: row.get::<_, i64>(5)?.max(0) as u64,
-                cache_read_tokens: row.get::<_, i64>(6)?.max(0) as u64,
-                cache_write_tokens: row.get::<_, i64>(7)?.max(0) as u64,
-                output_tokens: row.get::<_, i64>(8)?.max(0) as u64,
-                thinking_tokens: row.get::<_, i64>(9)?.max(0) as u64,
-                native_cost_usd: row.get(10)?,
-                decode_speed: row.get(11)?,
-                ttft_secs: row.get(12)?,
+                ts_quality: row.get::<_, i64>(2)?.clamp(0, i64::from(u8::MAX)) as u8,
+                model_enum: row.get::<_, i64>(3)?.max(0) as u64,
+                response_model: row.get(4)?,
+                model_display_name: row.get(5)?,
+                input_tokens: row.get::<_, i64>(6)?.max(0) as u64,
+                cache_read_tokens: row.get::<_, i64>(7)?.max(0) as u64,
+                cache_write_tokens: row.get::<_, i64>(8)?.max(0) as u64,
+                output_tokens: row.get::<_, i64>(9)?.max(0) as u64,
+                thinking_tokens: row.get::<_, i64>(10)?.max(0) as u64,
+                native_cost_usd: row.get(11)?,
+                decode_speed: row.get(12)?,
+                ttft_secs: row.get(13)?,
+                id_11: row.get(14)?,
+                id_12: row.get(15)?,
+                id_7: row.get(16)?,
             };
             turns_by_uuid.entry(uuid).or_default().push(turn);
         }
@@ -490,11 +565,7 @@ fn project_live_targets(
     targets: &[DbTarget],
     tz: &TimeZoneSpec,
     pricing: &PricingCatalog,
-) -> (
-    SqliteStats,
-    Vec<UsageEvent>,
-    HashSet<(&'static str, String)>,
-) {
+) -> (SqliteStats, Vec<UsageEvent>, SqliteCoverage) {
     let scanned = scan_sqlite_targets_raw(targets);
     project_sqlite_conversations(
         scanned
@@ -519,11 +590,7 @@ pub(super) fn scan_sqlite_conversations_with_archive(
     now_unix_secs: u64,
     tz: &TimeZoneSpec,
     pricing: &PricingCatalog,
-) -> (
-    SqliteStats,
-    Vec<UsageEvent>,
-    HashSet<(&'static str, String)>,
-) {
+) -> (SqliteStats, Vec<UsageEvent>, SqliteCoverage) {
     let targets = discover_sqlite_db_targets(roots);
     let Some(dir) = data_dir else {
         return project_live_targets(&targets, tz, pricing);
@@ -533,7 +600,7 @@ pub(super) fn scan_sqlite_conversations_with_archive(
     // Avoid creating an empty archive DB on a fresh home with no conversations.
     if targets.is_empty() && matches!(inspect_sqlite_path(&archive_path), SqlitePathStatus::Missing)
     {
-        return (SqliteStats::default(), Vec::new(), HashSet::new());
+        return (SqliteStats::default(), Vec::new(), SqliteCoverage::default());
     }
 
     let unique_roots = deduplicate_roots(roots);
@@ -775,7 +842,7 @@ mod tests {
         assert_eq!(stats1.archived_db_files, 0);
         assert_eq!(stats1.completed_turns, 2);
         assert_eq!(events1.len(), 2);
-        assert!(covered1.contains(&("cli", u1.to_string())));
+        assert!(covered1.conversations.contains(&("cli", u1.to_string())));
 
         // Simulate AGY pruning the oldest conversation DB on startup.
         fs::remove_file(&db1).unwrap();
@@ -794,8 +861,8 @@ mod tests {
         assert_eq!(stats2.median_tok_per_sec, stats1.median_tok_per_sec);
         assert_eq!(stats2.median_ttft_secs, stats1.median_ttft_secs);
         assert_eq!(events2.len(), 2);
-        assert!(covered2.contains(&("cli", u1.to_string())));
-        assert!(covered2.contains(&("cli", u2.to_string())));
+        assert!(covered2.conversations.contains(&("cli", u1.to_string())));
+        assert!(covered2.conversations.contains(&("cli", u2.to_string())));
     }
 
     #[test]
@@ -1163,5 +1230,216 @@ mod tests {
 
         // Ignored symlinked conversations/ returns before recording the throttle stamp or spawning.
         assert!(!cache_dir.join(SYNC_STAMP_FILENAME).exists());
+    }
+
+    #[test]
+    fn archive_migrates_v1_to_v2_preserving_pruned_rows_and_backfilling_live_identities() {
+        use crate::protobuf::{encode_step_blob, StepBlobSpec, UsageSpec};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cli_root = dir.path().join("cli");
+        let desk_root = dir.path().join("desktop");
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let u_pruned = "11111111-1111-4111-8111-111111111111";
+        let u_live_cli = "22222222-2222-4222-8222-222222222222";
+        let u_live_desk = "33333333-3333-4333-8333-333333333333";
+
+        // Create live CLI DB containing a turn with id_11="shared-id" and an uncovered compaction step.
+        let cli_db = cli_root
+            .join("conversations")
+            .join(format!("{u_live_cli}.db"));
+        let cli_conn = create_live_db(&cli_db);
+        cli_conn
+            .execute(
+                "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+                [encode_step_meta_blob(1_795_100_000)],
+            )
+            .unwrap();
+        cli_conn
+            .execute(
+                "INSERT INTO steps (idx, metadata) VALUES (2, ?1)",
+                [encode_step_blob(StepBlobSpec {
+                    created_at_secs: Some(1_795_100_010),
+                    usage: Some(UsageSpec {
+                        model_enum: 1526,
+                        input_tok: 500,
+                        output_tok: 50,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+        cli_conn
+            .execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+                [encode_gen_blob(GenBlobSpec {
+                    step_indices: vec![1],
+                    model_enum: 1526,
+                    resp_model: Some("model-alpha"),
+                    disp_name: Some("Model Alpha"),
+                    input_tok: 2_000,
+                    output_tok: 200,
+                    id_11: Some("shared-id"),
+                    dur_secs: 2,
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+        drop(cli_conn);
+
+        // Create live Desktop DB with a mirrored copy of the same turn sharing id_11="shared-id".
+        let desk_db = desk_root
+            .join("conversations")
+            .join(format!("{u_live_desk}.db"));
+        let desk_conn = create_live_db(&desk_db);
+        desk_conn
+            .execute(
+                "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+                [encode_step_meta_blob(1_795_100_000)],
+            )
+            .unwrap();
+        desk_conn
+            .execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+                [encode_gen_blob(GenBlobSpec {
+                    step_indices: vec![1],
+                    model_enum: 1526,
+                    resp_model: Some("model-alpha"),
+                    disp_name: Some("Model Alpha"),
+                    input_tok: 2_000,
+                    output_tok: 200,
+                    id_11: Some("shared-id"),
+                    dur_secs: 2,
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+        drop(desk_conn);
+
+        let cli_root_key = root_path_key(&cli_root);
+        let cli_fp = super::super::scan::db_file_fingerprint(&cli_db).unwrap();
+
+        // Seed an authentic v1 archive DB containing 1 pruned conversation and 1 live CLI DB
+        // matching the exact current mtime/size (proving scan_rev=1 triggers a one-time v2 rescan
+        // even when mtime/size are unchanged and even on platforms where ctime == 0).
+        let archive_path = data_dir.join(ARCHIVE_DB_FILENAME);
+        let v1 = Connection::open(&archive_path).unwrap();
+        v1.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE archived_conversations (
+                 root_path        TEXT NOT NULL,
+                 uuid             TEXT NOT NULL,
+                 db_mtime_secs    INTEGER NOT NULL,
+                 db_mtime_nanos   INTEGER NOT NULL,
+                 db_size          INTEGER NOT NULL,
+                 wal_mtime_secs   INTEGER NOT NULL,
+                 wal_mtime_nanos  INTEGER NOT NULL,
+                 wal_size         INTEGER NOT NULL,
+                 synced_at_secs   INTEGER NOT NULL,
+                 PRIMARY KEY (root_path, uuid)
+             ) WITHOUT ROWID;
+             CREATE TABLE archived_turns (
+                 root_path          TEXT NOT NULL,
+                 uuid               TEXT NOT NULL,
+                 turn_idx           INTEGER NOT NULL,
+                 ts_secs            INTEGER,
+                 model_enum         INTEGER NOT NULL,
+                 response_model     TEXT,
+                 model_display_name TEXT,
+                 input_tokens       INTEGER NOT NULL,
+                 cache_read_tokens  INTEGER NOT NULL,
+                 cache_write_tokens INTEGER NOT NULL,
+                 output_tokens      INTEGER NOT NULL,
+                 thinking_tokens    INTEGER NOT NULL,
+                 native_cost_usd    REAL,
+                 decode_speed       REAL,
+                 ttft_secs          REAL,
+                 PRIMARY KEY (root_path, uuid, turn_idx),
+                 FOREIGN KEY (root_path, uuid)
+                     REFERENCES archived_conversations (root_path, uuid)
+                     ON DELETE CASCADE
+             ) WITHOUT ROWID;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        v1.execute(
+            "INSERT INTO archived_conversations VALUES (?1, ?2, 100, 0, 4096, 0, 0, 0, 1000)",
+            params![cli_root_key, u_pruned],
+        )
+        .unwrap();
+        v1.execute(
+            "INSERT INTO archived_turns VALUES (?1, ?2, 0, 1795000000, 100, 'pruned-model', 'Pruned Model', 900, 0, 0, 90, 0, NULL, 90.0, 0.3)",
+            params![cli_root_key, u_pruned],
+        )
+        .unwrap();
+        v1.execute(
+            "INSERT INTO archived_conversations VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1000)",
+            params![
+                cli_root_key,
+                u_live_cli,
+                cli_fp.db_mtime_secs,
+                i64::from(cli_fp.db_mtime_nanos),
+                cli_fp.db_size as i64,
+                cli_fp.wal_mtime_secs,
+                i64::from(cli_fp.wal_mtime_nanos),
+                cli_fp.wal_size as i64,
+            ],
+        )
+        .unwrap();
+        v1.execute(
+            "INSERT INTO archived_turns VALUES (?1, ?2, 0, 1795100000, 1526, 'model-alpha', 'Model Alpha', 2000, 0, 0, 200, 0, NULL, 100.0, NULL)",
+            params![cli_root_key, u_live_cli],
+        )
+        .unwrap();
+        drop(v1);
+
+        let roots = [("cli", cli_root.clone()), ("desktop", desk_root.clone())];
+        let summary1 = sync_roots_into_archive(&roots, &data_dir, None, 1_795_200_000).unwrap();
+        assert_eq!(summary1.live_db_files, 2);
+        assert_eq!(summary1.scanned_db_files, 2);
+        assert_eq!(summary1.total_db_files, 3);
+        assert_eq!(summary1.archived_db_files, 1);
+
+        // Verify user_version upgraded to 2 without losing the pruned v1 row.
+        let check = Connection::open(&archive_path).unwrap();
+        assert_eq!(read_user_version(&check).unwrap(), ARCHIVE_SCHEMA_VERSION);
+        drop(check);
+
+        // Second sync sees scan_rev == 2 and unchanged fingerprints -> 0 rescans.
+        let summary2 = sync_roots_into_archive(&roots, &data_dir, None, 1_795_200_010).unwrap();
+        assert_eq!(summary2.scanned_db_files, 0);
+
+        // Projecting across both roots preserves pruned v1 turn, backfills compaction step,
+        // and cross-root Union-Find deduplicates the shared CLI/Desktop turn!
+        let (stats, events, covered) = scan_sqlite_conversations_with_archive(
+            &roots,
+            Some(&data_dir),
+            None,
+            1_795_200_020,
+            &TimeZoneSpec::utc(),
+            &PricingCatalog::default(),
+        );
+        assert_eq!(stats.db_files, 3);
+        assert_eq!(stats.archived_db_files, 1);
+        // 1 pruned turn + 1 deduplicated shared turn (not 2!) = 2 completed speed turns.
+        assert_eq!(stats.completed_turns, 2);
+        // 1 pruned turn + 1 deduplicated shared turn + 1 backfilled compaction step = 3 events.
+        assert_eq!(events.len(), 3);
+        assert!(covered.response_ids.contains("shared-id"));
+
+        // Verify a ctime-only change triggers a rescan on the next sync.
+        let mutate = Connection::open(&archive_path).unwrap();
+        mutate
+            .execute(
+                "UPDATE archived_conversations SET db_ctime_secs = db_ctime_secs - 1 WHERE root_path = ?1 AND uuid = ?2",
+                params![cli_root_key, u_live_cli],
+            )
+            .unwrap();
+        drop(mutate);
+        let summary3 = sync_roots_into_archive(&roots, &data_dir, None, 1_795_200_030).unwrap();
+        assert_eq!(summary3.scanned_db_files, 1);
     }
 }
