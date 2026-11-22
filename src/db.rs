@@ -4,6 +4,8 @@
 //! `gen_metadata` rows and extracts decode/e2e speed, TTFT, thinking tokens,
 //! and context window metadata.
 
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -67,25 +69,90 @@ impl SpeedReader for SqliteSpeedReader {
     }
 }
 
+pub(crate) fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| {
+        let ft = meta.file_type();
+        !ft.is_symlink() && ft.is_dir()
+    })
+}
+
+pub(crate) fn is_absent_or_real_file(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            !ft.is_symlink() && ft.is_file()
+        }
+        Err(err) => err.kind() == io::ErrorKind::NotFound,
+    }
+}
+
+pub(crate) fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+enum DbCandidate {
+    Valid(PathBuf),
+    Missing,
+    Rejected,
+}
+
+fn inspect_sqlite_file(db_path: PathBuf) -> DbCandidate {
+    match fs::symlink_metadata(&db_path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() || !ft.is_file() {
+                return DbCandidate::Rejected;
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return DbCandidate::Missing,
+        Err(_) => return DbCandidate::Rejected,
+    }
+    if !is_absent_or_real_file(&sidecar_path(&db_path, "-wal"))
+        || !is_absent_or_real_file(&sidecar_path(&db_path, "-shm"))
+    {
+        return DbCandidate::Rejected;
+    }
+    DbCandidate::Valid(db_path)
+}
+
+pub(crate) fn is_safe_sqlite_file(db_path: &Path) -> bool {
+    matches!(
+        inspect_sqlite_file(db_path.to_path_buf()),
+        DbCandidate::Valid(_)
+    )
+}
+
 /// Resolves `<cli_dir>/conversations/<conversation_id>.db`, falling back to lowercase
-/// `<conversation_id_lower>.db` on case-sensitive filesystems.
+/// `<conversation_id_lower>.db` on case-sensitive filesystems only when the exact-case
+/// file is absent.
+///
+/// Rejects symlinks and non-regular files for `conversations/`, the target `.db`,
+/// and any existing `-wal`/`-shm` sidecars.
 pub(crate) fn resolve_conversation_db_path(cli_dir: &Path, conversation_id: &str) -> Option<PathBuf> {
     if !is_valid_uuid(conversation_id) {
         return None;
     }
     let conv_dir = cli_dir.join("conversations");
-    let exact = conv_dir.join(format!("{conversation_id}.db"));
-    if exact.is_file() {
-        return Some(exact);
+    if !is_real_dir(&conv_dir) {
+        return None;
     }
-    let lower = conversation_id.to_ascii_lowercase();
-    if lower != conversation_id {
-        let lower_path = conv_dir.join(format!("{lower}.db"));
-        if lower_path.is_file() {
-            return Some(lower_path);
+    match inspect_sqlite_file(conv_dir.join(format!("{conversation_id}.db"))) {
+        DbCandidate::Valid(path) => Some(path),
+        DbCandidate::Rejected => None,
+        DbCandidate::Missing => {
+            let lower = conversation_id.to_ascii_lowercase();
+            if lower != conversation_id {
+                match inspect_sqlite_file(conv_dir.join(format!("{lower}.db"))) {
+                    DbCandidate::Valid(path) => Some(path),
+                    DbCandidate::Missing | DbCandidate::Rejected => None,
+                }
+            } else {
+                None
+            }
         }
     }
-    None
 }
 
 /// Validates canonical `8-4-4-4-12` lowercase/uppercase hexadecimal UUID strings.
@@ -358,5 +425,85 @@ mod tests {
         let via_upper = resolve_conversation_db_path(&cli_dir, &upper).unwrap();
         assert_eq!(exact, via_upper);
         assert!(resolve_conversation_db_path(&cli_dir, "not-a-uuid").is_none());
+    }
+
+    #[test]
+    fn resolve_conversation_db_path_accepts_regular_sidecars_and_rejects_non_files() {
+        let (dir, conn, uuid) = create_temp_conv_db();
+        drop(conn);
+        let cli_dir = dir.path().join(".gemini/antigravity-cli");
+        let conv_dir = cli_dir.join("conversations");
+
+        fs::write(conv_dir.join(format!("{uuid}.db-wal")), b"wal").unwrap();
+        fs::write(conv_dir.join(format!("{uuid}.db-shm")), b"shm").unwrap();
+        assert!(resolve_conversation_db_path(&cli_dir, uuid).is_some());
+
+        let dir_uuid = "11111111-1111-4111-8111-111111111111";
+        fs::create_dir(conv_dir.join(format!("{dir_uuid}.db"))).unwrap();
+        assert!(resolve_conversation_db_path(&cli_dir, dir_uuid).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_conversation_db_path_rejects_symlinks_for_dir_db_and_sidecars() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cli_dir = dir.path().join("cli");
+        let conv_dir = cli_dir.join("conversations");
+        let external = dir.path().join("external");
+        fs::create_dir_all(&conv_dir).unwrap();
+        fs::create_dir_all(&external).unwrap();
+
+        let target_db = external.join("target.db");
+        fs::write(&target_db, b"sqlite").unwrap();
+        let target_sidecar = external.join("sidecar");
+        fs::write(&target_sidecar, b"sidecar").unwrap();
+
+        // Symlinked <uuid>.db is rejected (exact and uppercase lookup).
+        let sym_uuid = "22222222-2222-4222-8222-222222222222";
+        symlink(&target_db, conv_dir.join(format!("{sym_uuid}.db"))).unwrap();
+        assert!(resolve_conversation_db_path(&cli_dir, sym_uuid).is_none());
+        assert!(resolve_conversation_db_path(&cli_dir, &sym_uuid.to_ascii_uppercase()).is_none());
+
+        // Real <uuid>.db with symlinked -wal sidecar is rejected.
+        let wal_uuid = "33333333-3333-4333-8333-333333333333";
+        fs::write(conv_dir.join(format!("{wal_uuid}.db")), b"sqlite").unwrap();
+        symlink(&target_sidecar, conv_dir.join(format!("{wal_uuid}.db-wal"))).unwrap();
+        assert!(resolve_conversation_db_path(&cli_dir, wal_uuid).is_none());
+
+        // Real <uuid>.db with symlinked -shm sidecar is rejected.
+        let shm_uuid = "44444444-4444-4444-8444-444444444444";
+        fs::write(conv_dir.join(format!("{shm_uuid}.db")), b"sqlite").unwrap();
+        symlink(&target_sidecar, conv_dir.join(format!("{shm_uuid}.db-shm"))).unwrap();
+        assert!(resolve_conversation_db_path(&cli_dir, shm_uuid).is_none());
+
+        // Symlinked conversations/ directory is rejected.
+        let sym_cli = dir.path().join("sym_cli");
+        let real_conv = dir.path().join("real_conv");
+        fs::create_dir_all(&sym_cli).unwrap();
+        fs::create_dir_all(&real_conv).unwrap();
+        let ok_uuid = "55555555-5555-4555-8555-555555555555";
+        fs::write(real_conv.join(format!("{ok_uuid}.db")), b"sqlite").unwrap();
+        symlink(&real_conv, sym_cli.join("conversations")).unwrap();
+        assert!(resolve_conversation_db_path(&sym_cli, ok_uuid).is_none());
+
+        // Uppercase symlink or poisoned sidecar must never fall back to a lowercase real DB.
+        let mixed_lower = "66666666-6666-4666-8666-66666666666a";
+        let mixed_upper = mixed_lower.to_ascii_uppercase();
+        fs::write(conv_dir.join(format!("{mixed_lower}.db")), b"sqlite").unwrap();
+        symlink(&target_db, conv_dir.join(format!("{mixed_upper}.db"))).unwrap();
+        assert!(resolve_conversation_db_path(&cli_dir, &mixed_upper).is_none());
+
+        let wal_mixed_lower = "77777777-7777-4777-8777-77777777777b";
+        let wal_mixed_upper = wal_mixed_lower.to_ascii_uppercase();
+        fs::write(conv_dir.join(format!("{wal_mixed_lower}.db")), b"sqlite").unwrap();
+        fs::write(conv_dir.join(format!("{wal_mixed_upper}.db")), b"sqlite").unwrap();
+        symlink(
+            &target_sidecar,
+            conv_dir.join(format!("{wal_mixed_upper}.db-wal")),
+        )
+        .unwrap();
+        assert!(resolve_conversation_db_path(&cli_dir, &wal_mixed_upper).is_none());
     }
 }

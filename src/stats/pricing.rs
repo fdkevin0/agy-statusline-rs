@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::scan::is_effort_token;
 use crate::fsutil::atomic_write;
 use crate::paths::xdg_cache_dir;
 use crate::timeutil::{unix_now_secs, SECS_PER_DAY};
@@ -388,41 +389,121 @@ impl PricingCatalog {
         )
     }
 
-    fn resolve_orchestrator_alias_idx(&self, candidates: &[(String, String)]) -> Option<usize> {
-        // Resolve the target alias first: explicit Argon/Carbon/Flash-worker qualifiers across all
-        // candidates take precedence over the bare `gemini-pro-orchestrator` fallback, and an
-        // explicit qualifier never silently falls back to another tier when its rate is absent.
-        let (target_raw, target_norm) = candidates
-            .iter()
-            .find_map(|(_, norm)| {
-                if norm == "gemini flash worker agy" {
-                    return Some(("gemini-4-hydrogen", "gemini 4 hydrogen"));
-                }
-                if !norm.split_whitespace().any(|w| w == "orchestrator") {
-                    return None;
-                }
-                if norm.split_whitespace().any(|w| w == "argon")
-                    || norm == "gemini pro orchestrator g1 pro"
-                {
-                    Some(("gemini-4-argon", "gemini 4 argon"))
-                } else if norm.split_whitespace().any(|w| w == "carbon") {
-                    Some(("gemini-4-carbon", "gemini 4 carbon"))
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                candidates
-                    .iter()
-                    .any(|(_, norm)| norm == "gemini pro orchestrator")
-                    .then_some(("gemini-4-carbon", "gemini 4 carbon"))
-            })?;
-
-        self.exact_raw
-            .get(target_raw)
-            .or_else(|| self.exact_norm.get(target_norm))
-            .copied()
+    /// Returns `true` when `response_model` carries an explicit orchestrator codename or
+    /// `model_display_name` carries any specific model/version token beyond generic family,
+    /// role, and effort words.
+    pub(super) fn has_specific_model_qualifier(
+        response_model: Option<&str>,
+        model_display_name: Option<&str>,
+    ) -> bool {
+        let resp_has_codename = response_model
+            .map(|s| normalize_model_key(s.trim()))
+            .is_some_and(|norm| extract_orchestrator_codename(&norm).is_some());
+        let disp_is_specific = model_display_name
+            .map(|s| normalize_model_key(s.trim()))
+            .is_some_and(|norm| {
+                norm.split_whitespace()
+                    .any(|w| !is_generic_family_token(w))
+            });
+        resp_has_codename || disp_is_specific
     }
+
+    fn resolve_orchestrator_alias_idx(&self, candidates: &[(String, String)]) -> Option<usize> {
+        // Dynamically resolve an explicit orchestrator codename against canonical Gemini entries
+        // in the loaded catalog (no hardcoded generation or cross-tier fallback).
+        let codename = candidates
+            .iter()
+            .find_map(|(_, norm)| extract_orchestrator_codename(norm))?;
+        let requested_ver = candidates
+            .iter()
+            .filter(|(_, norm)| norm.split_whitespace().any(|w| w == "orchestrator"))
+            .find_map(|(_, norm)| extract_explicit_version(norm));
+
+        let mut best: Option<((u32, u32), bool, usize)> = None;
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let Some((ver, entry_codename)) = parse_canonical_gemini_codename_entry(entry) else {
+                continue;
+            };
+            if entry_codename != codename {
+                continue;
+            }
+            if let Some(req) = requested_ver {
+                if ver != req {
+                    continue;
+                }
+            }
+            let is_kebab = entry.pat_lower.contains('-');
+            if best.is_none_or(|(best_ver, best_kebab, prev_idx)| {
+                (ver, is_kebab) > (best_ver, best_kebab)
+                    || ((ver, is_kebab) == (best_ver, best_kebab)
+                        && entry.key < self.entries[prev_idx].key)
+            }) {
+                best = Some((ver, is_kebab, idx));
+            }
+        }
+        best.map(|(_, _, idx)| idx)
+    }
+}
+
+fn is_generic_orchestrator_token(word: &str) -> bool {
+    is_effort_token(word)
+        || matches!(
+            word,
+            "pro" | "flash" | "agy" | "g1" | "worker" | "tiered" | "thinking" | "preview" | "latest"
+        )
+}
+
+fn is_generic_family_token(word: &str) -> bool {
+    is_generic_orchestrator_token(word)
+        || matches!(word, "gemini" | "orchestrator" | "antigravity" | "google")
+}
+
+fn extract_orchestrator_codename(norm: &str) -> Option<&str> {
+    norm.split_whitespace()
+        .skip_while(|&w| w != "orchestrator")
+        .skip(1)
+        .find(|w| !is_generic_orchestrator_token(w) && !w.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn extract_explicit_version(norm: &str) -> Option<(u32, u32)> {
+    // Only inspect tokens before `orchestrator` so trailing date/build suffixes
+    // (e.g. `gemini-pro-orchestrator-2026-04`) are never misread as generation numbers.
+    let mut words = norm
+        .split_whitespace()
+        .take_while(|&w| w != "orchestrator");
+    while let Some(w) = words.next() {
+        if let Ok(major) = w.parse::<u32>() {
+            let minor = words
+                .next()
+                .and_then(|next| next.parse::<u32>().ok())
+                .unwrap_or(0);
+            return Some((major, minor));
+        }
+    }
+    None
+}
+
+/// Parses a canonical unprefixed Gemini catalog key (`gemini-<major>[.<minor>]-<codename>` or
+/// separator-equivalent `Gemini 4 Argon`), excluding provider-prefixed (`vertex/...`),
+/// regional (`...@eu`), and variant-suffixed (`...-contributor`) keys.
+fn parse_canonical_gemini_codename_entry(entry: &IndexedEntry) -> Option<((u32, u32), &str)> {
+    if entry.pat_lower.contains('/') || entry.pat_lower.contains('@') {
+        return None;
+    }
+    let mut words = entry.pat_norm.split_whitespace();
+    if words.next()? != "gemini" {
+        return None;
+    }
+    let major = words.next()?.parse::<u32>().ok()?;
+    let third = words.next()?;
+    let (minor, codename) = match third.parse::<u32>() {
+        Ok(minor) => (minor, words.next()?),
+        Err(_) => (0, third),
+    };
+    if words.next().is_some() {
+        return None;
+    }
+    Some(((major, minor), codename))
 }
 
 fn normalize_model_key(raw: &str) -> String {
@@ -1019,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_alias_prefers_explicit_qualifier_and_matches_normalized_catalog_name() {
+    fn orchestrator_alias_resolves_dynamically_across_generations_without_hardcoded_fallbacks() {
         let mut models = BTreeMap::new();
         models.insert(
             "gemini-4-carbon".to_string(),
@@ -1032,49 +1113,111 @@ mod tests {
         models.insert(
             "Gemini 4 Argon".to_string(),
             ModelPricingRate {
-                input_per_mtok: 7.5,
+                input_per_mtok: 4.0,
+                output_per_mtok: 20.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "gemini-4-neon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 3.0,
                 output_per_mtok: 15.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "gemini-5.2-neon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 5.5,
+                output_per_mtok: 25.0,
+                ..Default::default()
+            },
+        );
+        // Non-canonical reseller/regional/variant keys must be ignored even with higher versions.
+        models.insert(
+            "vertex/gemini-9-neon".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 99.0,
+                output_per_mtok: 99.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "gemini-9-neon@eu".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 88.0,
+                output_per_mtok: 88.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "gemini-9-neon-contributor".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 77.0,
+                output_per_mtok: 77.0,
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "Gemini 4 Krypton".to_string(),
+            ModelPricingRate {
+                input_per_mtok: 6.25,
+                output_per_mtok: 30.0,
                 ..Default::default()
             },
         );
         let catalog = PricingCatalog::from_models(models);
 
-        // Even when `gemini-4-carbon` is present, an explicit Argon display name wins over
-        // the bare `gemini-pro-orchestrator` ID.
-        let (matched_key, usd) = catalog
+        // Without an explicit generation, resolves dynamically to the latest canonical entry.
+        let (neon_key, neon_usd) = catalog
             .estimate_cost(
-                &["gemini-pro-orchestrator", "Orchestrator (Argon)"],
+                &["gemini-pro-orchestrator", "Orchestrator (Neon)"],
                 1_000_000,
                 0,
                 0,
                 0,
             )
             .unwrap();
-        assert_eq!(matched_key, "Gemini 4 Argon");
-        assert!((usd - 7.5).abs() < 1e-6);
+        assert_eq!(neon_key, "gemini-5.2-neon");
+        assert!((neon_usd - 5.5).abs() < 1e-6);
 
-        // Without an explicit Argon qualifier, bare `gemini-pro-orchestrator` still resolves to Carbon.
-        let (carbon_key, carbon_usd) = catalog
-            .estimate_cost(&["gemini-pro-orchestrator"], 1_000_000, 0, 0, 0)
+        let (neon_id_key, neon_id_usd) = catalog
+            .estimate_cost(&["gemini-pro-orchestrator-neon"], 1_000_000, 0, 0, 0)
             .unwrap();
-        assert_eq!(carbon_key, "gemini-4-carbon");
-        assert!((carbon_usd - 2.0).abs() < 1e-6);
+        assert_eq!(neon_id_key, "gemini-5.2-neon");
+        assert!((neon_id_usd - 5.5).abs() < 1e-6);
 
-        // When Argon's rate is absent from the catalog, explicit Argon must stay unpriced
-        // rather than falling back to Carbon's rate via bare `gemini-pro-orchestrator`.
-        let mut carbon_only = BTreeMap::new();
-        carbon_only.insert(
-            "gemini-4-carbon".to_string(),
-            ModelPricingRate {
-                input_per_mtok: 2.0,
-                output_per_mtok: 10.0,
-                ..Default::default()
-            },
-        );
-        let carbon_catalog = PricingCatalog::from_models(carbon_only);
+        // Explicit generation pins to that exact generation rather than latest.
+        let (neon_v4_key, neon_v4_usd) = catalog
+            .estimate_cost(
+                &["gemini-pro-orchestrator", "Gemini 4 Orchestrator (Neon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(neon_v4_key, "gemini-4-neon");
+        assert!((neon_v4_usd - 3.0).abs() < 1e-6);
+
+        // Trailing date/build numbers after `orchestrator` are not treated as generation numbers.
+        let (dated_key, dated_usd) = catalog
+            .estimate_cost(
+                &["gemini-pro-orchestrator-2026-04", "Orchestrator (Neon)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(dated_key, "gemini-5.2-neon");
+        assert!((dated_usd - 5.5).abs() < 1e-6);
+
+        // Missing explicit generation stays unpriced rather than crossing generations.
         assert_eq!(
-            carbon_catalog.estimate_cost(
-                &["gemini-pro-orchestrator", "Orchestrator (Argon)"],
+            catalog.estimate_cost(
+                &["gemini-pro-orchestrator", "Gemini 6 Orchestrator (Neon)"],
                 1_000_000,
                 0,
                 0,
@@ -1082,66 +1225,59 @@ mod tests {
             ),
             None
         );
-    }
 
-    #[test]
-    fn flash_worker_alias_maps_to_gemini_4_hydrogen_without_cross_tier_fallback() {
-        let mut models = BTreeMap::new();
-        models.insert(
-            "gemini-4-hydrogen".to_string(),
-            ModelPricingRate {
-                input_per_mtok: 1.5,
-                output_per_mtok: 7.5,
-                ..Default::default()
-            },
-        );
-        models.insert(
-            "gemini-4-carbon".to_string(),
-            ModelPricingRate {
-                input_per_mtok: 2.0,
-                output_per_mtok: 10.0,
-                ..Default::default()
-            },
-        );
-        let catalog = PricingCatalog::from_models(models);
-
-        let (matched_key, usd) = catalog
+        // Matches separator-normalized catalog names and ignores effort qualifiers.
+        let (argon_key, argon_usd) = catalog
             .estimate_cost(
-                &["gemini-flash-worker-agy", "Gemini Flash"],
+                &["gemini-pro-orchestrator-g1-pro", "Orchestrator (Argon)"],
                 1_000_000,
                 0,
                 0,
                 0,
             )
             .unwrap();
-        assert_eq!(matched_key, "gemini-4-hydrogen");
-        assert!((usd - 1.5).abs() < 1e-6);
+        assert_eq!(argon_key, "Gemini 4 Argon");
+        assert!((argon_usd - 4.0).abs() < 1e-6);
 
-        let (precedence_key, precedence_usd) = catalog
+        let (krypton_key, krypton_usd) = catalog
             .estimate_cost(
-                &["gemini-pro-orchestrator", "gemini-flash-worker-agy"],
+                &["gemini-pro-orchestrator", "Orchestrator (Krypton) (High)"],
                 1_000_000,
                 0,
                 0,
                 0,
             )
             .unwrap();
-        assert_eq!(precedence_key, "gemini-4-hydrogen");
-        assert!((precedence_usd - 1.5).abs() < 1e-6);
+        assert_eq!(krypton_key, "Gemini 4 Krypton");
+        assert!((krypton_usd - 6.25).abs() < 1e-6);
 
-        let mut carbon_only = BTreeMap::new();
-        carbon_only.insert(
-            "gemini-4-carbon".to_string(),
-            ModelPricingRate {
-                input_per_mtok: 2.0,
-                output_per_mtok: 10.0,
-                ..Default::default()
-            },
-        );
-        let carbon_catalog = PricingCatalog::from_models(carbon_only);
+        // Bare routing IDs without explicit codenames and unpriced codenames stay unpriced
+        // (no hardcoded Carbon/Argon/Hydrogen guesses).
         assert_eq!(
-            carbon_catalog.estimate_cost(
-                &["gemini-pro-orchestrator", "gemini-flash-worker-agy"],
+            catalog.estimate_cost(&["gemini-pro-orchestrator"], 1_000_000, 0, 0, 0),
+            None
+        );
+        assert_eq!(
+            catalog.estimate_cost(
+                &["gemini-pro-orchestrator", "Orchestrator (High)"],
+                1_000_000,
+                0,
+                0,
+                0,
+            ),
+            None
+        );
+        assert_eq!(
+            catalog.estimate_cost(&["gemini-pro-orchestrator-g1-pro"], 1_000_000, 0, 0, 0),
+            None
+        );
+        assert_eq!(
+            catalog.estimate_cost(&["gemini-flash-worker-agy", "Gemini Flash"], 1_000_000, 0, 0, 0),
+            None
+        );
+        assert_eq!(
+            catalog.estimate_cost(
+                &["gemini-pro-orchestrator", "Orchestrator (Xenon)"],
                 1_000_000,
                 0,
                 0,

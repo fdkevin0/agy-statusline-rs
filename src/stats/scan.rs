@@ -1,4 +1,4 @@
-//! Read-only SQLite `gen_metadata` and `transcript.jsonl` scanners.
+//! Read-only SQLite `gen_metadata` and `transcript.jsonl` / `transcript_full.jsonl` scanners.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -11,7 +11,10 @@ use serde_json::Value;
 use super::pricing::{round_usd_6, PricingCatalog};
 use super::tz::TimeZoneSpec;
 use super::SqliteStats;
-use crate::db::{compute_median, is_valid_uuid, open_readonly_db, resolve_conversation_db_path};
+use crate::db::{
+    compute_median, is_absent_or_real_file, is_real_dir, is_safe_sqlite_file, is_valid_uuid,
+    open_readonly_db, resolve_conversation_db_path, sidecar_path,
+};
 use crate::protobuf::{
     extract_gen_metadata_record, extract_step_created_at_secs, is_sane_decode_speed,
     GenMetadataRecord, MAX_TTFT_SECS,
@@ -19,6 +22,8 @@ use crate::protobuf::{
 use crate::timeutil::parse_rfc3339_unix_secs;
 
 const MAX_TRANSCRIPT_SCAN_DEPTH: usize = 4;
+const COMPACT_TRANSCRIPT_FILENAME: &str = "transcript.jsonl";
+const FULL_TRANSCRIPT_FILENAME: &str = "transcript_full.jsonl";
 
 const SKIP_DIRS: &[&str] = &[
     "steps",
@@ -31,15 +36,9 @@ const SKIP_DIRS: &[&str] = &[
     "__pycache__",
 ];
 
-fn is_effort_qualifier(tag: &str) -> bool {
-    let norm: String = tag
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| !matches!(c, ' ' | '-' | '_'))
-        .collect();
+pub(super) fn is_effort_token(word: &str) -> bool {
     matches!(
-        norm.as_str(),
+        word,
         "low"
             | "medium"
             | "med"
@@ -52,6 +51,16 @@ fn is_effort_qualifier(tag: &str) -> bool {
             | "none"
             | "off"
     )
+}
+
+fn is_effort_qualifier(tag: &str) -> bool {
+    let norm: String = tag
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-' | '_'))
+        .collect();
+    is_effort_token(&norm)
 }
 
 /// Derives a clean display model group name strictly from AGY metadata without hardcoded models.
@@ -291,23 +300,38 @@ fn collect_transcript_jobs_in_brain(
 
         if meta.is_dir() {
             if depth == 0 {
-                let std_log = path
-                    .join(".system_generated")
-                    .join("logs")
-                    .join("transcript.jsonl");
-                let direct_log = path.join("transcript.jsonl");
+                let mut push_if_file = |candidate: PathBuf| -> bool {
+                    if !candidate.is_file() {
+                        return false;
+                    }
+                    let real = canonical_or_self(&candidate);
+                    if seen_files.insert(real) {
+                        jobs.push(TranscriptJob {
+                            cascade_hint: name_str.clone().into_owned(),
+                            path: candidate,
+                            source,
+                        });
+                    }
+                    true
+                };
+                let std_dir = path.join(".system_generated").join("logs");
                 let mut matched_fast = false;
-                for candidate in [std_log, direct_log] {
-                    if candidate.is_file() {
-                        let real = canonical_or_self(&candidate);
-                        if seen_files.insert(real) {
-                            jobs.push(TranscriptJob {
-                                cascade_hint: name_str.clone().into_owned(),
-                                path: candidate,
-                                source,
-                            });
-                        }
+                for candidate in [
+                    std_dir.join(COMPACT_TRANSCRIPT_FILENAME),
+                    path.join(COMPACT_TRANSCRIPT_FILENAME),
+                ] {
+                    if push_if_file(candidate) {
                         matched_fast = true;
+                    }
+                }
+                if !matched_fast {
+                    for candidate in [
+                        std_dir.join(FULL_TRANSCRIPT_FILENAME),
+                        path.join(FULL_TRANSCRIPT_FILENAME),
+                    ] {
+                        if push_if_file(candidate) {
+                            matched_fast = true;
+                        }
                     }
                 }
                 if matched_fast {
@@ -322,7 +346,11 @@ fn collect_transcript_jobs_in_brain(
                 seen_files,
                 jobs,
             );
-        } else if meta.is_file() && name_str == "transcript.jsonl" {
+        } else if meta.is_file()
+            && (name_str == COMPACT_TRANSCRIPT_FILENAME
+                || (name_str == FULL_TRANSCRIPT_FILENAME
+                    && !dir.join(COMPACT_TRANSCRIPT_FILENAME).is_file()))
+        {
             let real = canonical_or_self(&path);
             if seen_files.insert(real) {
                 jobs.push(TranscriptJob {
@@ -587,28 +615,35 @@ fn modified_timestamp(meta: &fs::Metadata) -> (i64, u32) {
     }
 }
 
-fn wal_sidecar_path(db_path: &Path) -> PathBuf {
-    let mut os = db_path.as_os_str().to_os_string();
-    os.push("-wal");
-    PathBuf::from(os)
-}
-
 pub(super) fn db_file_fingerprint(db_path: &Path) -> Option<DbFileFingerprint> {
-    let db_meta = fs::metadata(db_path).ok()?;
-    if !db_meta.is_file() {
+    let db_meta = fs::symlink_metadata(db_path).ok()?;
+    let db_ft = db_meta.file_type();
+    if db_ft.is_symlink() || !db_ft.is_file() {
+        return None;
+    }
+    if !is_absent_or_real_file(&sidecar_path(db_path, "-shm")) {
         return None;
     }
     let (db_mtime_secs, db_mtime_nanos) = modified_timestamp(&db_meta);
     let db_size = db_meta.len();
 
-    let (wal_mtime_secs, wal_mtime_nanos, wal_size) = match fs::metadata(wal_sidecar_path(db_path))
-    {
-        Ok(wal_meta) if wal_meta.is_file() && wal_meta.len() > 0 => {
-            let (secs, nanos) = modified_timestamp(&wal_meta);
-            (secs, nanos, wal_meta.len())
-        }
-        _ => (0, 0, 0),
-    };
+    let (wal_mtime_secs, wal_mtime_nanos, wal_size) =
+        match fs::symlink_metadata(sidecar_path(db_path, "-wal")) {
+            Ok(wal_meta) => {
+                let wal_ft = wal_meta.file_type();
+                if wal_ft.is_symlink() || !wal_ft.is_file() {
+                    return None;
+                }
+                if wal_meta.len() > 0 {
+                    let (secs, nanos) = modified_timestamp(&wal_meta);
+                    (secs, nanos, wal_meta.len())
+                } else {
+                    (0, 0, 0)
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0, 0, 0),
+            Err(_) => return None,
+        };
 
     Some(DbFileFingerprint {
         db_mtime_secs,
@@ -676,6 +711,9 @@ pub(super) fn discover_sqlite_db_targets(roots: &[(&'static str, PathBuf)]) -> V
     for (source, root) in roots {
         let root_key = root_path_key(root);
         let conv_dir = root.join("conversations");
+        if !is_real_dir(&conv_dir) {
+            continue;
+        }
         let Ok(entries) = fs::read_dir(&conv_dir) else {
             continue;
         };
@@ -840,8 +878,9 @@ pub(super) fn project_sqlite_conversations<'a>(
     // Memoize model-group derivation and catalog entry resolution across turns so large
     // multi-month archives avoid repeated O(catalog_size) substring scans per turn.
     type ModelLookupKey<'b> = (Option<&'b str>, Option<&'b str>, u64);
-    let mut model_resolution_cache: HashMap<ModelLookupKey<'_>, (String, Option<usize>)> =
+    let mut model_resolution_cache: HashMap<ModelLookupKey<'_>, (String, Option<usize>, bool)> =
         HashMap::new();
+    let mut unresolved_events: Vec<(usize, &'a str)> = Vec::new();
 
     for (source, uuid, turns) in conversations {
         stats.db_files += 1;
@@ -877,7 +916,7 @@ pub(super) fn project_sqlite_conversations<'a>(
                 turn.model_display_name.as_deref(),
                 turn.model_enum,
             );
-            let (model_group, entry_idx) = model_resolution_cache
+            let (model_group, entry_idx, has_specific_qualifier) = model_resolution_cache
                 .entry(cache_key)
                 .or_insert_with(|| {
                     let group = derive_model_name(
@@ -894,7 +933,11 @@ pub(super) fn project_sqlite_conversations<'a>(
                     .flatten()
                     .collect();
                     let idx = pricing.resolve_entry_idx(&active);
-                    (group, idx)
+                    let specific = PricingCatalog::has_specific_model_qualifier(
+                        turn.response_model.as_deref(),
+                        turn.model_display_name.as_deref(),
+                    );
+                    (group, idx, specific)
                 });
             let (pricing_key, cost_usd) = if let Some(usd) = turn.native_cost_usd {
                 (Some("native".to_string()), Some(round_usd_6(usd)))
@@ -912,6 +955,17 @@ pub(super) fn project_sqlite_conversations<'a>(
                     })
                     .unzip()
             };
+
+            if turn.native_cost_usd.is_none() && entry_idx.is_none() && !*has_specific_qualifier {
+                if let Some(resp) = turn
+                    .response_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    unresolved_events.push((events.len(), resp));
+                }
+            }
 
             has_events = true;
             events.push(UsageEvent {
@@ -934,6 +988,51 @@ pub(super) fn project_sqlite_conversations<'a>(
 
         if has_events {
             covered.insert((source, uuid.to_owned()));
+        }
+    }
+
+    // Dynamically infer pricing for turns whose response_model uniquely resolved to one
+    // catalog entry elsewhere in the dataset (e.g. legacy generic display names for a worker
+    // routing ID), while never inferring across ambiguous or explicitly-qualified tiers.
+    if !unresolved_events.is_empty() {
+        let mut inferred: HashMap<&str, Option<usize>> = HashMap::new();
+        for ((resp_opt, _, _), (_, entry_idx, has_specific_qualifier)) in &model_resolution_cache {
+            let Some(resp) = resp_opt.map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            match (*entry_idx, *has_specific_qualifier) {
+                (Some(idx), _) => {
+                    inferred
+                        .entry(resp)
+                        .and_modify(|slot| {
+                            if *slot != Some(idx) {
+                                *slot = None;
+                            }
+                        })
+                        .or_insert(Some(idx));
+                }
+                (None, true) => {
+                    inferred.insert(resp, None);
+                }
+                (None, false) => {}
+            }
+        }
+        for (event_idx, resp) in unresolved_events {
+            let Some(idx) = inferred.get(resp).copied().flatten() else {
+                continue;
+            };
+            let ev = &mut events[event_idx];
+            if let Some((key, usd)) = pricing.estimate_cost_for_entry(
+                idx,
+                ev.input_tokens,
+                ev.cache_read_tokens,
+                ev.cache_write_tokens,
+                ev.output_tokens,
+                true,
+            ) {
+                ev.pricing_key = Some(key);
+                ev.cost_usd = Some(usd);
+            }
         }
     }
 
@@ -962,6 +1061,9 @@ fn resolve_descendant_conversation_ids(cli_dir: &Path, root_id: &str) -> Vec<Str
         return Vec::new();
     }
     let summaries_path = cli_dir.join("conversation_summaries.db");
+    if !is_safe_sqlite_file(&summaries_path) {
+        return Vec::new();
+    }
     let Ok(conn) = open_readonly_db(&summaries_path) else {
         return Vec::new();
     };
@@ -1270,6 +1372,95 @@ mod tests {
         assert_eq!(report.totals.total_tokens, 1350);
     }
 
+    #[test]
+    fn transcript_full_fallback_counts_usage_when_compact_transcript_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        // Standard depth-0 layout: .system_generated/logs/transcript_full.jsonl only.
+        let std_full = home.join(
+            ".gemini/antigravity-cli/brain/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/.system_generated/logs/transcript_full.jsonl",
+        );
+        fs::create_dir_all(std_full.parent().unwrap()).unwrap();
+        fs::write(
+            &std_full,
+            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"step_index\":1,\"model\":\"full-std\",\"input_tokens\":1000,\"output_tokens\":200}\n",
+        )
+        .unwrap();
+
+        // Direct depth-0 layout: transcript_full.jsonl only.
+        let direct_full = home.join(
+            ".gemini/antigravity/brain/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/transcript_full.jsonl",
+        );
+        fs::create_dir_all(direct_full.parent().unwrap()).unwrap();
+        fs::write(
+            &direct_full,
+            "{\"created_at\":\"2026-11-18T10:30:00Z\",\"step_index\":1,\"model\":\"full-direct\",\"input_tokens\":500,\"output_tokens\":50}\n",
+        )
+        .unwrap();
+
+        // Recursive nested layout: nested/sub/transcript_full.jsonl only.
+        let nested_full =
+            home.join(".gemini/antigravity-cli/brain/group/sub/transcript_full.jsonl");
+        fs::create_dir_all(nested_full.parent().unwrap()).unwrap();
+        fs::write(
+            &nested_full,
+            "{\"created_at\":\"2026-11-18T11:00:00Z\",\"step_index\":1,\"model\":\"full-nested\",\"input_tokens\":300,\"output_tokens\":30}\n",
+        )
+        .unwrap();
+
+        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
+        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
+        assert_eq!(report.totals.requests, 3);
+        assert_eq!(report.totals.input_tokens, 1800);
+        assert_eq!(report.totals.output_tokens, 280);
+        assert_eq!(report.totals.total_tokens, 2080);
+    }
+
+    #[test]
+    fn transcript_full_is_skipped_when_compact_transcript_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        // Depth-0 fast path: both transcript.jsonl and transcript_full.jsonl exist.
+        // Distinct step_index and token counts ensure scanning transcript_full.jsonl would inflate totals.
+        let std_dir = home.join(
+            ".gemini/antigravity-cli/brain/cccccccc-cccc-4ccc-8ccc-cccccccccccc/.system_generated/logs",
+        );
+        fs::create_dir_all(&std_dir).unwrap();
+        fs::write(
+            std_dir.join("transcript.jsonl"),
+            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"step_index\":1,\"model\":\"compact-std\",\"input_tokens\":400,\"output_tokens\":40}\n",
+        )
+        .unwrap();
+        fs::write(
+            std_dir.join("transcript_full.jsonl"),
+            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"step_index\":99,\"model\":\"compact-std\",\"input_tokens\":9000,\"output_tokens\":900}\n",
+        )
+        .unwrap();
+
+        // Recursive nested path: both transcript.jsonl and transcript_full.jsonl in same parent dir.
+        let nested_dir = home.join(".gemini/antigravity/brain/group/nested");
+        fs::create_dir_all(&nested_dir).unwrap();
+        fs::write(
+            nested_dir.join("transcript.jsonl"),
+            "{\"created_at\":\"2026-11-18T11:00:00Z\",\"step_index\":2,\"model\":\"compact-nested\",\"input_tokens\":600,\"output_tokens\":60}\n",
+        )
+        .unwrap();
+        fs::write(
+            nested_dir.join("transcript_full.jsonl"),
+            "{\"created_at\":\"2026-11-18T11:00:00Z\",\"step_index\":88,\"model\":\"compact-nested\",\"input_tokens\":8000,\"output_tokens\":800}\n",
+        )
+        .unwrap();
+
+        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
+        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
+        assert_eq!(report.totals.requests, 2);
+        assert_eq!(report.totals.input_tokens, 1000);
+        assert_eq!(report.totals.output_tokens, 100);
+        assert_eq!(report.totals.total_tokens, 1100);
+    }
+
     fn seed_cost_db(cli_dir: &Path, uuid: &str, idx: i64, blob: Vec<u8>) {
         let db_path = cli_dir.join("conversations").join(format!("{uuid}.db"));
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -1393,5 +1584,102 @@ mod tests {
         assert_eq!(combined.usd, Some(0.45));
         assert_eq!(combined.subagent_usd, Some(0.35));
         assert_eq!(combined.unpriced_turns, 1);
+    }
+
+    #[test]
+    fn project_sqlite_infers_unambiguous_response_model_without_crossing_ambiguous_or_explicit_tiers()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(
+            cache_dir.join("models_dev_pricing.json"),
+            r#"{
+              "fetched_at": 1000,
+              "models": {
+                "gemini-4-hydrogen": { "input_per_mtok": 1.5, "output_per_mtok": 7.5 },
+                "gemini-4-carbon": { "input_per_mtok": 2.0, "output_per_mtok": 10.0 },
+                "gemini-4-argon": { "input_per_mtok": 4.0, "output_per_mtok": 20.0 }
+              }
+            }"#,
+        )
+        .unwrap();
+        let pricing = PricingCatalog::load_effective_with(
+            Some(&cache_dir),
+            crate::stats::SyncMode::Offline,
+            1000,
+            86_400,
+            |_| unreachable!(),
+        );
+
+        let ts = Some(1_700_000_000_i64);
+        let mk_turn = |resp: &str, disp: Option<&str>| RawTurn {
+            ts_secs: ts,
+            model_enum: 0,
+            response_model: Some(resp.to_string()),
+            model_display_name: disp.map(str::to_string),
+            input_tokens: 1_000_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            thinking_tokens: 0,
+            native_cost_usd: None,
+            decode_speed: None,
+            ttft_secs: None,
+        };
+
+        let turns = vec![
+            // Unambiguous worker routing ID: turn 0 has full display name, turn 1 has legacy generic name.
+            mk_turn(
+                "gemini-flash-worker-agy",
+                Some("Gemini 4 Hydrogen (Orchestrator)"),
+            ),
+            mk_turn("gemini-flash-worker-agy", Some("Gemini Flash")),
+            // Ambiguous routing ID observed with two distinct models: bare turn 4 must stay unpriced.
+            mk_turn("gemini-pro-orchestrator", Some("Orchestrator (Carbon)")),
+            mk_turn("gemini-pro-orchestrator", Some("Orchestrator (Argon)")),
+            mk_turn("gemini-pro-orchestrator", None),
+            // Routing ID with an explicit unpriced codename: turn 6 and bare turn 7 must stay unpriced.
+            mk_turn("custom-orchestrator", Some("Orchestrator (Carbon)")),
+            mk_turn("custom-orchestrator", Some("Orchestrator (Xenon)")),
+            mk_turn("custom-orchestrator", None),
+            // Shared worker routing ID upgraded to a newer unpriced model whose name precedes
+            // `(Orchestrator)`: turn 9 and generic turn 10 must stay unpriced (never mispriced as Hydrogen).
+            mk_turn(
+                "shared-worker-id",
+                Some("Gemini 4 Hydrogen (Orchestrator)"),
+            ),
+            mk_turn("shared-worker-id", Some("Gemini 5 Plasma (Orchestrator)")),
+            mk_turn("shared-worker-id", Some("Gemini Flash")),
+        ];
+
+        let (_, events, _) = project_sqlite_conversations(
+            [("cli", "11111111-1111-4111-8111-111111111111", turns.as_slice())],
+            0,
+            &TimeZoneSpec::utc(),
+            &pricing,
+        );
+        assert_eq!(events.len(), 11);
+        assert_eq!(events[0].pricing_key.as_deref(), Some("gemini-4-hydrogen"));
+        assert_eq!(events[0].cost_usd, Some(1.5));
+        assert_eq!(events[1].pricing_key.as_deref(), Some("gemini-4-hydrogen"));
+        assert_eq!(events[1].cost_usd, Some(1.5));
+
+        assert_eq!(events[2].pricing_key.as_deref(), Some("gemini-4-carbon"));
+        assert_eq!(events[3].pricing_key.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(events[4].pricing_key, None);
+        assert_eq!(events[4].cost_usd, None);
+
+        assert_eq!(events[5].pricing_key.as_deref(), Some("gemini-4-carbon"));
+        assert_eq!(events[6].pricing_key, None);
+        assert_eq!(events[6].cost_usd, None);
+        assert_eq!(events[7].pricing_key, None);
+        assert_eq!(events[7].cost_usd, None);
+
+        assert_eq!(events[8].pricing_key.as_deref(), Some("gemini-4-hydrogen"));
+        assert_eq!(events[9].pricing_key, None);
+        assert_eq!(events[9].cost_usd, None);
+        assert_eq!(events[10].pricing_key, None);
+        assert_eq!(events[10].cost_usd, None);
     }
 }

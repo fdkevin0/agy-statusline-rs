@@ -26,7 +26,7 @@ use super::tz::TimeZoneSpec;
 use super::SqliteStats;
 use crate::paths::{xdg_cache_dir, xdg_data_dir};
 
-pub(super) const ARCHIVE_DB_FILENAME: &str = "stats_history.db";
+pub(crate) const ARCHIVE_DB_FILENAME: &str = "stats_history.db";
 pub(super) const SYNC_STAMP_FILENAME: &str = "stats_archive_sync.ts";
 pub(super) const DEFAULT_ARCHIVE_SYNC_INTERVAL_SECS: u64 = 1_800;
 

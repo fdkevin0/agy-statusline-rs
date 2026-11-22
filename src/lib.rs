@@ -19,6 +19,7 @@ pub mod git;
 pub mod layout;
 pub(crate) mod metrics;
 pub mod paths;
+pub(crate) mod procutil;
 pub mod protobuf;
 pub mod render;
 pub mod stats;

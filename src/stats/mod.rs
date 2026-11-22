@@ -6,8 +6,8 @@
 //!   authoritative primary source for turns, tokens, thinking tokens, model names,
 //!   timestamps, decode speed, and TTFT (retained in the local archive after AGY prunes
 //!   older sessions beyond its 500-DB startup cap).
-//! - `brain/**/transcript.jsonl` as a deduplicated fallback ONLY for conversations that
-//!   have no usable SQLite usage records (live or archived).
+//! - `brain/**/{transcript,transcript_full}.jsonl` as a deduplicated fallback ONLY for
+//!   conversations that have no usable SQLite usage records (live or archived).
 
 mod archive;
 mod metric;
@@ -25,6 +25,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) use archive::ARCHIVE_DB_FILENAME;
 pub use archive::{maybe_spawn_background_archive_sync, run_stats_sync_command};
 pub use metric::{MetricValue, StatsMetric};
 pub use pricing::{run_pricing_command, PricingCatalog, SyncMode};
