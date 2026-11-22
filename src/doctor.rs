@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::apply::read_settings_object;
-use crate::db::{is_safe_sqlite_file, is_valid_uuid};
+use crate::db::{inspect_sqlite_path, is_safe_sqlite_file, is_valid_uuid, SqlitePathStatus};
 use crate::layout::try_load_layout_config;
 use crate::paths::{resolve_agy_cli_dir, xdg_data_dir};
 use crate::procutil::{run_command_stdout_bounded, BoundedCommandError};
@@ -22,22 +22,75 @@ use crate::statusline::{sample_preview_git, sample_preview_metadata, sample_prev
 const AGY_VERSION_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_AGY_VERSION_BYTES: u64 = 4096;
 
-fn command_executable_exists_in_path(cmd: &str, path_env: Option<&OsStr>) -> bool {
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| {
+        if !meta.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    })
+}
+
+fn extract_command_executable(cmd: &str) -> Option<String> {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
-        return false;
+        return None;
     }
-    if Path::new(trimmed).is_file() {
-        return true;
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        let mut out = String::new();
+        let mut escaped = false;
+        for (idx, ch) in rest.char_indices() {
+            if escaped {
+                if ch != '"' && ch != '\\' {
+                    out.push('\\');
+                }
+                out.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                let after = &rest[idx + 1..];
+                if !after.is_empty() && !after.starts_with(char::is_whitespace) {
+                    return None;
+                }
+                return (!out.is_empty()).then_some(out);
+            } else {
+                out.push(ch);
+            }
+        }
+        return None;
     }
-    let Some(exe) = trimmed.split_whitespace().next() else {
+    if let Some(rest) = trimmed.strip_prefix('\'') {
+        let (quoted, after) = rest.split_once('\'')?;
+        if quoted.is_empty() || (!after.is_empty() && !after.starts_with(char::is_whitespace)) {
+            return None;
+        }
+        return Some(quoted.to_string());
+    }
+    let trimmed_path = Path::new(trimmed);
+    if trimmed_path.components().count() > 1 && is_executable_file(trimmed_path) {
+        return Some(trimmed.to_string());
+    }
+    trimmed.split_whitespace().next().map(str::to_string)
+}
+
+fn command_executable_exists_in_path(cmd: &str, path_env: Option<&OsStr>) -> bool {
+    let Some(exe) = extract_command_executable(cmd) else {
         return false;
     };
-    let exe_path = Path::new(exe);
+    let exe_path = Path::new(&exe);
     if exe_path.components().count() > 1 {
-        return exe_path.is_file();
+        return is_executable_file(exe_path);
     }
-    path_env.is_some_and(|paths| which::which_in(exe, Some(paths), ".").is_ok())
+    path_env.is_some_and(|paths| which::which_in(&exe, Some(paths), ".").is_ok())
 }
 
 fn format_version_output(bytes: &[u8]) -> String {
@@ -66,9 +119,17 @@ fn probe_agy_version(path_env: Option<&OsStr>, timeout: Duration) -> String {
     let mut cmd = Command::new(&agy_bin);
     cmd.arg("--version");
     match run_command_stdout_bounded(&mut cmd, timeout, MAX_AGY_VERSION_BYTES) {
-        Ok(bytes) => format_version_output(&bytes),
+        Ok(out)
+            if out.status.is_some_and(|s| s.success())
+                || (out.truncated && !out.stdout.is_empty()) =>
+        {
+            format_version_output(&out.stdout)
+        }
+        Ok(out) => match out.status {
+            Some(status) => format!("unavailable ({status})"),
+            None => "unavailable (truncated)".to_string(),
+        },
         Err(BoundedCommandError::TimedOut) => "unavailable (timed out)".to_string(),
-        Err(BoundedCommandError::NonZero(status)) => format!("unavailable ({status})"),
         Err(BoundedCommandError::Io(e)) => format!("unavailable ({e})"),
     }
 }
@@ -128,11 +189,13 @@ fn format_byte_size(bytes: u64) -> String {
 }
 
 fn inspect_archive_db(archive_path: &Path) -> String {
-    match fs::metadata(archive_path) {
-        Ok(meta) if meta.is_file() => format!("found, {}", format_byte_size(meta.len())),
-        Ok(_) => "not a file".to_string(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => "not found".to_string(),
-        Err(e) => format!("error: {e}"),
+    match inspect_sqlite_path(archive_path) {
+        SqlitePathStatus::Missing => "not found".to_string(),
+        SqlitePathStatus::Unsafe => "symlink or unsafe sidecar (ignored)".to_string(),
+        SqlitePathStatus::Valid => match fs::symlink_metadata(archive_path) {
+            Ok(meta) => format!("found, {}", format_byte_size(meta.len())),
+            Err(e) => format!("error: {e}"),
+        },
     }
 }
 
@@ -330,6 +393,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&bin_path, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&spaced_path, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
         let path_env = env::join_paths([&bin_dir]).unwrap();
@@ -438,5 +502,103 @@ mod tests {
         let sym_conv = dir.path().join("sym_conv");
         symlink(&real_conv, &sym_conv).unwrap();
         assert_eq!(inspect_conversations_dir(&sym_conv), "symlink (ignored)");
+    }
+
+    #[test]
+    fn command_executable_lookup_supports_quoted_paths_with_spaces_and_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let space_dir = dir.path().join("my tools");
+        fs::create_dir_all(&space_dir).unwrap();
+        let spaced_bin = space_dir.join(FAKE_BIN_NAME);
+        fs::write(&spaced_bin, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&spaced_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let double_quoted = format!("\"{}\" --no-color", spaced_bin.display());
+        let single_quoted = format!("'{}' --style minimal", spaced_bin.display());
+        assert!(command_executable_exists_in_path(&double_quoted, None));
+        assert!(command_executable_exists_in_path(&single_quoted, None));
+        assert_eq!(
+            extract_command_executable(r#""/tmp/a \"b\" \\c/bin" --flag"#).as_deref(),
+            Some(r#"/tmp/a "b" \c/bin"#)
+        );
+        assert_eq!(extract_command_executable("\"/unterminated"), None);
+        assert_eq!(extract_command_executable("'/unterminated"), None);
+        assert_eq!(extract_command_executable("\"\" --flag"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_executable_lookup_rejects_non_executable_files_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let space_dir = dir.path().join("dir with spaces");
+        fs::create_dir_all(&space_dir).unwrap();
+        let plain_file = space_dir.join("not-executable");
+        fs::write(&plain_file, b"data").unwrap();
+        fs::set_permissions(&plain_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(!command_executable_exists_in_path(
+            &plain_file.to_string_lossy(),
+            None
+        ));
+        assert!(!command_executable_exists_in_path(
+            &format!("\"{}\" --no-color", plain_file.display()),
+            None
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_archive_db_rejects_symlinks_and_unsafe_sidecars() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.db");
+        assert_eq!(inspect_archive_db(&missing), "not found");
+
+        let real_db = dir.path().join("real.db");
+        fs::write(&real_db, b"1234567890").unwrap();
+        assert_eq!(inspect_archive_db(&real_db), "found, 10 B");
+
+        let sym_db = dir.path().join("sym.db");
+        symlink(&real_db, &sym_db).unwrap();
+        assert_eq!(
+            inspect_archive_db(&sym_db),
+            "symlink or unsafe sidecar (ignored)"
+        );
+
+        let wal_db = dir.path().join("wal_poisoned.db");
+        fs::write(&wal_db, b"db").unwrap();
+        symlink(&real_db, dir.path().join("wal_poisoned.db-wal")).unwrap();
+        assert_eq!(
+            inspect_archive_db(&wal_db),
+            "symlink or unsafe sidecar (ignored)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_agy_version_extracts_first_line_when_output_exceeds_byte_cap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let agy_bin = dir.path().join("agy");
+        fs::write(
+            &agy_bin,
+            "#!/bin/sh\nprintf '1.9.9\\n'\nwhile printf '0123456789abcdef'; do :; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&agy_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path_env = env::join_paths([dir.path()]).unwrap();
+        assert_eq!(
+            probe_agy_version(Some(path_env.as_os_str()), Duration::from_secs(5)),
+            "1.9.9"
+        );
     }
 }

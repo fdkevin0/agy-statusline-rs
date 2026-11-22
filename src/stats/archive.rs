@@ -24,6 +24,8 @@ use super::scan::{
 };
 use super::tz::TimeZoneSpec;
 use super::SqliteStats;
+use crate::db::{inspect_sqlite_path, is_absent_or_real_file, is_real_dir, SqlitePathStatus};
+use crate::fsutil::atomic_write;
 use crate::paths::{xdg_cache_dir, xdg_data_dir};
 
 pub(crate) const ARCHIVE_DB_FILENAME: &str = "stats_history.db";
@@ -60,13 +62,27 @@ fn sqlite_io_err(context: &str, err: rusqlite::Error) -> io::Error {
     io::Error::other(format!("{context}: {err}"))
 }
 
+fn unsafe_archive_path_err() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "unsafe stats archive path or sidecar (symlink/non-regular file)",
+    )
+}
+
 fn acquire_init_lock(parent: &Path) -> io::Result<File> {
     fs::create_dir_all(parent)?;
+    let lock_path = parent.join(ARCHIVE_INIT_LOCK_FILENAME);
+    if !is_absent_or_real_file(&lock_path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsafe stats archive lock path (symlink/non-regular file)",
+        ));
+    }
     let lock = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
-        .open(parent.join(ARCHIVE_INIT_LOCK_FILENAME))?;
+        .open(lock_path)?;
     lock.lock()?;
     Ok(lock)
 }
@@ -91,35 +107,39 @@ fn configure_connection_pragmas(conn: &Connection) -> rusqlite::Result<()> {
 fn open_archive_db(db_path: &Path) -> io::Result<Option<Connection>> {
     // Inspect an existing file read-only first so a WAL-mode future-schema DB is never
     // checkpointed or modified on close, and steady-state runs avoid the init lock.
-    if db_path.is_file() {
-        let ro = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| sqlite_io_err("failed to inspect stats archive", e))?;
-        ro.busy_timeout(Duration::from_millis(ARCHIVE_BUSY_TIMEOUT_MS))
-            .map_err(|e| sqlite_io_err("failed to configure stats archive timeout", e))?;
-        let version = read_user_version(&ro)
-            .map_err(|e| sqlite_io_err("failed to read stats archive schema version", e))?;
-        if version > ARCHIVE_SCHEMA_VERSION {
-            return Ok(None);
-        }
-        let is_wal = read_journal_mode(&ro)
-            .map_err(|e| sqlite_io_err("failed to read stats archive journal mode", e))?
-            .eq_ignore_ascii_case("wal");
-        drop(ro);
-
-        if version == ARCHIVE_SCHEMA_VERSION && is_wal {
-            let conn = Connection::open_with_flags(
+    match inspect_sqlite_path(db_path) {
+        SqlitePathStatus::Unsafe => return Err(unsafe_archive_path_err()),
+        SqlitePathStatus::Missing => {}
+        SqlitePathStatus::Valid => {
+            let ro = Connection::open_with_flags(
                 db_path,
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
-            .map_err(|e| sqlite_io_err("failed to open stats archive", e))?;
-            conn.busy_timeout(Duration::from_millis(ARCHIVE_BUSY_TIMEOUT_MS))
+            .map_err(|e| sqlite_io_err("failed to inspect stats archive", e))?;
+            ro.busy_timeout(Duration::from_millis(ARCHIVE_BUSY_TIMEOUT_MS))
                 .map_err(|e| sqlite_io_err("failed to configure stats archive timeout", e))?;
-            configure_connection_pragmas(&conn)
-                .map_err(|e| sqlite_io_err("failed to configure stats archive pragmas", e))?;
-            return Ok(Some(conn));
+            let version = read_user_version(&ro)
+                .map_err(|e| sqlite_io_err("failed to read stats archive schema version", e))?;
+            if version > ARCHIVE_SCHEMA_VERSION {
+                return Ok(None);
+            }
+            let is_wal = read_journal_mode(&ro)
+                .map_err(|e| sqlite_io_err("failed to read stats archive journal mode", e))?
+                .eq_ignore_ascii_case("wal");
+            drop(ro);
+
+            if version == ARCHIVE_SCHEMA_VERSION && is_wal {
+                let conn = Connection::open_with_flags(
+                    db_path,
+                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .map_err(|e| sqlite_io_err("failed to open stats archive", e))?;
+                conn.busy_timeout(Duration::from_millis(ARCHIVE_BUSY_TIMEOUT_MS))
+                    .map_err(|e| sqlite_io_err("failed to configure stats archive timeout", e))?;
+                configure_connection_pragmas(&conn)
+                    .map_err(|e| sqlite_io_err("failed to configure stats archive pragmas", e))?;
+                return Ok(Some(conn));
+            }
         }
     }
 
@@ -132,19 +152,23 @@ fn open_archive_db(db_path: &Path) -> io::Result<Option<Connection>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "archive path has no parent"))?;
     let _init_lock = acquire_init_lock(parent)?;
 
-    if db_path.is_file() {
-        let ro = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| sqlite_io_err("failed to inspect stats archive", e))?;
-        ro.busy_timeout(Duration::from_millis(ARCHIVE_BUSY_TIMEOUT_MS))
-            .map_err(|e| sqlite_io_err("failed to configure stats archive timeout", e))?;
-        if read_user_version(&ro)
-            .map_err(|e| sqlite_io_err("failed to read stats archive schema version", e))?
-            > ARCHIVE_SCHEMA_VERSION
-        {
-            return Ok(None);
+    match inspect_sqlite_path(db_path) {
+        SqlitePathStatus::Unsafe => return Err(unsafe_archive_path_err()),
+        SqlitePathStatus::Missing => {}
+        SqlitePathStatus::Valid => {
+            let ro = Connection::open_with_flags(
+                db_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|e| sqlite_io_err("failed to inspect stats archive", e))?;
+            ro.busy_timeout(Duration::from_millis(ARCHIVE_BUSY_TIMEOUT_MS))
+                .map_err(|e| sqlite_io_err("failed to configure stats archive timeout", e))?;
+            if read_user_version(&ro)
+                .map_err(|e| sqlite_io_err("failed to read stats archive schema version", e))?
+                > ARCHIVE_SCHEMA_VERSION
+            {
+                return Ok(None);
+            }
         }
     }
 
@@ -455,8 +479,11 @@ pub(super) fn record_sync_stamp(cache_dir: Option<&Path>, now_unix_secs: u64) ->
     let Some(dir) = cache_dir else {
         return false;
     };
-    fs::create_dir_all(dir).is_ok()
-        && fs::write(dir.join(SYNC_STAMP_FILENAME), format!("{now_unix_secs}\n")).is_ok()
+    atomic_write(
+        &dir.join(SYNC_STAMP_FILENAME),
+        format!("{now_unix_secs}\n").as_bytes(),
+    )
+    .is_ok()
 }
 
 fn project_live_targets(
@@ -504,7 +531,8 @@ pub(super) fn scan_sqlite_conversations_with_archive(
     let archive_path = dir.join(ARCHIVE_DB_FILENAME);
 
     // Avoid creating an empty archive DB on a fresh home with no conversations.
-    if targets.is_empty() && !archive_path.exists() {
+    if targets.is_empty() && matches!(inspect_sqlite_path(&archive_path), SqlitePathStatus::Missing)
+    {
         return (SqliteStats::default(), Vec::new(), HashSet::new());
     }
 
@@ -543,7 +571,8 @@ pub(super) fn sync_roots_into_archive(
     let unique_roots = deduplicate_roots(roots);
     let targets = discover_sqlite_db_targets(roots);
 
-    if targets.is_empty() && !archive_path.exists() {
+    if targets.is_empty() && matches!(inspect_sqlite_path(&archive_path), SqlitePathStatus::Missing)
+    {
         record_sync_stamp(cache_dir, now_unix_secs);
         return Ok(ArchiveSyncSummary {
             archive_path,
@@ -620,10 +649,8 @@ pub fn run_stats_sync_command<W: Write>(
     Ok(())
 }
 
-/// Spawns a detached background `agy-statusline stats sync` process when any local
-/// `conversations/` directory exists and the sync stamp is missing or past the interval.
-pub fn maybe_spawn_background_archive_sync(
-    home: Option<&Path>,
+fn maybe_spawn_background_archive_sync_for_roots(
+    roots: &[(&'static str, PathBuf)],
     cache_dir: Option<&Path>,
     now_unix_secs: u64,
 ) {
@@ -633,8 +660,10 @@ pub fn maybe_spawn_background_archive_sync(
     if is_sync_fresh(dir, now_unix_secs, DEFAULT_ARCHIVE_SYNC_INTERVAL_SECS) {
         return;
     }
-    let roots = resolve_roots(home);
-    if !roots.iter().any(|(_, r)| r.join("conversations").is_dir()) {
+    if !roots
+        .iter()
+        .any(|(_, r)| is_real_dir(&r.join("conversations")))
+    {
         return;
     }
     // Skip spawning if the throttle stamp cannot be persisted so an unwritable cache dir
@@ -651,6 +680,17 @@ pub fn maybe_spawn_background_archive_sync(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+/// Spawns a detached background `agy-statusline stats sync` process when any local
+/// `conversations/` directory exists and the sync stamp is missing or past the interval.
+pub fn maybe_spawn_background_archive_sync(
+    home: Option<&Path>,
+    cache_dir: Option<&Path>,
+    now_unix_secs: u64,
+) {
+    let roots = resolve_roots(home);
+    maybe_spawn_background_archive_sync_for_roots(&roots, cache_dir, now_unix_secs);
 }
 
 #[cfg(test)]
@@ -1016,5 +1056,112 @@ mod tests {
             1_795_001_800,
             DEFAULT_ARCHIVE_SYNC_INTERVAL_SECS
         ));
+    }
+
+    #[test]
+    fn record_sync_stamp_writes_atomically_and_updates_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested_cache = dir.path().join("nested").join("cache");
+
+        assert!(record_sync_stamp(Some(&nested_cache), 1_795_000_000));
+        assert_eq!(
+            fs::read_to_string(nested_cache.join(SYNC_STAMP_FILENAME)).unwrap(),
+            "1795000000\n"
+        );
+
+        assert!(record_sync_stamp(Some(&nested_cache), 1_795_000_500));
+        assert_eq!(
+            fs::read_to_string(nested_cache.join(SYNC_STAMP_FILENAME)).unwrap(),
+            "1795000500\n"
+        );
+        // Atomic rename leaves only the stamp file, with no leftover temp files.
+        assert_eq!(fs::read_dir(&nested_cache).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_archive_db_rejects_symlinks_for_db_sidecars_and_lock() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let external = dir.path().join("external");
+        fs::create_dir_all(&external).unwrap();
+
+        // 1. Symlinked stats_history.db pointing to an existing external file.
+        let d_sym = dir.path().join("sym_db");
+        fs::create_dir_all(&d_sym).unwrap();
+        let target_db = external.join("target.db");
+        fs::write(&target_db, b"untouched-db").unwrap();
+        let sym_archive = d_sym.join(ARCHIVE_DB_FILENAME);
+        symlink(&target_db, &sym_archive).unwrap();
+        let err = open_archive_db(&sym_archive).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&target_db).unwrap(), b"untouched-db");
+
+        // 2. Dangling symlink stats_history.db must not create the target.
+        let d_dangling = dir.path().join("dangling_db");
+        fs::create_dir_all(&d_dangling).unwrap();
+        let dangling_target = external.join("must_not_create.db");
+        let dangling_archive = d_dangling.join(ARCHIVE_DB_FILENAME);
+        symlink(&dangling_target, &dangling_archive).unwrap();
+        let err = open_archive_db(&dangling_archive).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!dangling_target.exists());
+
+        // 3. Symlinked -wal sidecar (with absent archive DB) must not create DB or modify target.
+        let d_wal = dir.path().join("sym_wal");
+        fs::create_dir_all(&d_wal).unwrap();
+        let target_wal = external.join("target.wal");
+        fs::write(&target_wal, b"untouched-wal").unwrap();
+        let wal_archive = d_wal.join(ARCHIVE_DB_FILENAME);
+        symlink(&target_wal, d_wal.join(format!("{ARCHIVE_DB_FILENAME}-wal"))).unwrap();
+        let err = open_archive_db(&wal_archive).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!wal_archive.exists());
+        assert_eq!(fs::read(&target_wal).unwrap(), b"untouched-wal");
+
+        // 4. Symlinked -shm sidecar (with real archive DB) must be rejected without mutating target.
+        let d_shm = dir.path().join("sym_shm");
+        fs::create_dir_all(&d_shm).unwrap();
+        let target_shm = external.join("target.shm");
+        fs::write(&target_shm, b"untouched-shm").unwrap();
+        let shm_archive = d_shm.join(ARCHIVE_DB_FILENAME);
+        fs::write(&shm_archive, b"not-a-db").unwrap();
+        symlink(&target_shm, d_shm.join(format!("{ARCHIVE_DB_FILENAME}-shm"))).unwrap();
+        let err = open_archive_db(&shm_archive).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&target_shm).unwrap(), b"untouched-shm");
+
+        // 5. Symlinked stats_history.lock must be rejected before creating stats_history.db.
+        let d_lock = dir.path().join("sym_lock");
+        fs::create_dir_all(&d_lock).unwrap();
+        let target_lock = external.join("target.lock");
+        fs::write(&target_lock, b"untouched-lock").unwrap();
+        symlink(&target_lock, d_lock.join(ARCHIVE_INIT_LOCK_FILENAME)).unwrap();
+        let lock_archive = d_lock.join(ARCHIVE_DB_FILENAME);
+        let err = open_archive_db(&lock_archive).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!lock_archive.exists());
+        assert_eq!(fs::read(&target_lock).unwrap(), b"untouched-lock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_archive_sync_ignores_symlinked_conversations_dir() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_conv = dir.path().join("real_conversations");
+        let cli_root = dir.path().join("cli");
+        let cache_dir = dir.path().join("cache");
+        fs::create_dir_all(&real_conv).unwrap();
+        fs::create_dir_all(&cli_root).unwrap();
+        symlink(&real_conv, cli_root.join("conversations")).unwrap();
+
+        let roots = [("cli", cli_root)];
+        maybe_spawn_background_archive_sync_for_roots(&roots, Some(&cache_dir), 1_795_200_000);
+
+        // Ignored symlinked conversations/ returns before recording the throttle stamp or spawning.
+        assert!(!cache_dir.join(SYNC_STAMP_FILENAME).exists());
     }
 }
