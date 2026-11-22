@@ -8,7 +8,7 @@ use std::time::UNIX_EPOCH;
 
 use serde_json::Value;
 
-use super::pricing::{round_usd_6, PricingCatalog};
+use super::pricing::{normalize_model_key, round_usd_6, PricingCatalog};
 use super::tz::TimeZoneSpec;
 use super::SqliteStats;
 use crate::db::{
@@ -16,8 +16,8 @@ use crate::db::{
     open_readonly_db, resolve_conversation_db_path, sidecar_path,
 };
 use crate::protobuf::{
-    extract_gen_metadata_record, extract_step_created_at_secs, is_sane_decode_speed,
-    GenMetadataRecord, MAX_TTFT_SECS,
+    extract_gen_metadata_record, extract_step_metadata_record, extract_trajectory_created_at_secs,
+    is_sane_decode_speed, MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
 };
 use crate::timeutil::parse_rfc3339_unix_secs;
 
@@ -157,33 +157,38 @@ fn non_empty_str(v: Option<&Value>) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-fn extract_canonical_event_key(
-    obj: &serde_json::Map<String, Value>,
-    root_source: &str,
-    default_cascade: &str,
-    line_idx: usize,
-) -> String {
+fn extract_explicit_event_id(obj: &serde_json::Map<String, Value>) -> Option<&str> {
     let usage_obj = obj
         .get("chatModel")
         .and_then(|c| c.get("usage"))
         .and_then(Value::as_object)
         .or_else(|| obj.get("usage").and_then(Value::as_object));
 
-    let explicit = usage_obj
+    usage_obj
         .and_then(|u| {
             non_empty_str(u.get("responseId"))
                 .or_else(|| non_empty_str(u.get("response_id")))
                 .or_else(|| non_empty_str(u.get("messageId")))
                 .or_else(|| non_empty_str(u.get("message_id")))
+                .or_else(|| non_empty_str(u.get("callId")))
+                .or_else(|| non_empty_str(u.get("call_id")))
         })
         .or_else(|| non_empty_str(obj.get("responseId")))
         .or_else(|| non_empty_str(obj.get("response_id")))
         .or_else(|| non_empty_str(obj.get("messageId")))
         .or_else(|| non_empty_str(obj.get("message_id")))
         .or_else(|| non_empty_str(obj.get("callId")))
-        .or_else(|| non_empty_str(obj.get("call_id")));
+        .or_else(|| non_empty_str(obj.get("call_id")))
+}
 
-    if let Some(id) = explicit {
+fn extract_canonical_event_key(
+    obj: &serde_json::Map<String, Value>,
+    explicit_id: Option<&str>,
+    root_source: &str,
+    default_cascade: &str,
+    line_idx: usize,
+) -> String {
+    if let Some(id) = explicit_id {
         return format!("id:{id}");
     }
 
@@ -202,6 +207,13 @@ fn extract_canonical_event_key(
         .unwrap_or(line_idx as u64);
 
     format!("{source}:{cascade}#{step_idx}")
+}
+
+/// Conversations and explicit response/call IDs already covered by SQLite usage records.
+#[derive(Debug, Default)]
+pub(super) struct SqliteCoverage {
+    pub(super) conversations: HashSet<(&'static str, String)>,
+    pub(super) response_ids: HashSet<String>,
 }
 
 /// Origin of a scanned usage event (`antigravity-cli` vs desktop `antigravity`).
@@ -404,7 +416,7 @@ fn parse_transcript_line(
     line_idx: usize,
     tz: &TimeZoneSpec,
     pricing: &PricingCatalog,
-    covered_conversations: &HashSet<(&'static str, String)>,
+    covered: &SqliteCoverage,
 ) -> Option<(String, UsageEvent)> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -418,10 +430,17 @@ fn parse_transcript_line(
         non_empty_str(obj.get("cascadeId")).or_else(|| non_empty_str(obj.get("cascade_id")))
     {
         if is_valid_uuid(cid)
-            && covered_conversations.contains(&(job.source, cid.to_ascii_lowercase()))
+            && covered
+                .conversations
+                .contains(&(job.source, cid.to_ascii_lowercase()))
         {
             return None;
         }
+    }
+
+    let explicit_id = extract_explicit_event_id(&obj);
+    if explicit_id.is_some_and(|id| covered.response_ids.contains(id)) {
+        return None;
     }
 
     let created_at = non_empty_str(obj.get("created_at"))?;
@@ -515,7 +534,8 @@ fn parse_transcript_line(
         .or_else(|| parse_duration_secs(obj.get("ttftSec")))
         .filter(|&t| t > 0.0 && t < MAX_TTFT_SECS);
 
-    let event_key = extract_canonical_event_key(&obj, job.source, &job.cascade_hint, line_idx);
+    let event_key =
+        extract_canonical_event_key(&obj, explicit_id, job.source, &job.cascade_hint, line_idx);
 
     Some((
         event_key,
@@ -542,7 +562,7 @@ pub(super) fn scan_transcripts(
     roots: &[(&'static str, PathBuf)],
     tz: &TimeZoneSpec,
     pricing: &PricingCatalog,
-    covered_conversations: &HashSet<(&'static str, String)>,
+    covered: &SqliteCoverage,
 ) -> Vec<UsageEvent> {
     let mut visited_dirs = HashSet::new();
     let mut seen_files = HashSet::new();
@@ -566,7 +586,9 @@ pub(super) fn scan_transcripts(
 
     for job in &jobs {
         if is_valid_uuid(&job.cascade_hint)
-            && covered_conversations.contains(&(job.source, job.cascade_hint.to_ascii_lowercase()))
+            && covered
+                .conversations
+                .contains(&(job.source, job.cascade_hint.to_ascii_lowercase()))
         {
             continue;
         }
@@ -586,7 +608,7 @@ pub(super) fn scan_transcripts(
             }
             if let Ok(line) = std::str::from_utf8(&byte_buf) {
                 if let Some((event_key, event)) =
-                    parse_transcript_line(line, job, line_idx, tz, pricing, covered_conversations)
+                    parse_transcript_line(line, job, line_idx, tz, pricing, covered)
                 {
                     if seen_events.insert(event_key) {
                         events.push(event);
@@ -605,11 +627,15 @@ pub(super) fn scan_transcripts(
 pub(super) struct DbFileFingerprint {
     pub(super) db_mtime_secs: i64,
     pub(super) db_mtime_nanos: u32,
+    pub(super) db_ctime_secs: i64,
+    pub(super) db_ctime_nanos: u32,
     pub(super) db_size: u64,
     /// Normalized to `0` when `wal_size == 0` so AGY startup touching idle 0-byte
     /// `-wal` files does not trigger redundant re-scans.
     pub(super) wal_mtime_secs: i64,
     pub(super) wal_mtime_nanos: u32,
+    pub(super) wal_ctime_secs: i64,
+    pub(super) wal_ctime_nanos: u32,
     pub(super) wal_size: u64,
 }
 
@@ -626,6 +652,19 @@ fn modified_timestamp(meta: &fs::Metadata) -> (i64, u32) {
     }
 }
 
+#[cfg(unix)]
+fn status_change_timestamp(meta: &fs::Metadata) -> (i64, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let secs = meta.ctime();
+    let nanos = meta.ctime_nsec().clamp(0, 999_999_999) as u32;
+    (secs, nanos)
+}
+
+#[cfg(not(unix))]
+fn status_change_timestamp(_meta: &fs::Metadata) -> (i64, u32) {
+    (0, 0)
+}
+
 pub(super) fn db_file_fingerprint(db_path: &Path) -> Option<DbFileFingerprint> {
     let db_meta = fs::symlink_metadata(db_path).ok()?;
     let db_ft = db_meta.file_type();
@@ -636,9 +675,10 @@ pub(super) fn db_file_fingerprint(db_path: &Path) -> Option<DbFileFingerprint> {
         return None;
     }
     let (db_mtime_secs, db_mtime_nanos) = modified_timestamp(&db_meta);
+    let (db_ctime_secs, db_ctime_nanos) = status_change_timestamp(&db_meta);
     let db_size = db_meta.len();
 
-    let (wal_mtime_secs, wal_mtime_nanos, wal_size) =
+    let (wal_mtime_secs, wal_mtime_nanos, wal_ctime_secs, wal_ctime_nanos, wal_size) =
         match fs::symlink_metadata(sidecar_path(db_path, "-wal")) {
             Ok(wal_meta) => {
                 let wal_ft = wal_meta.file_type();
@@ -646,22 +686,33 @@ pub(super) fn db_file_fingerprint(db_path: &Path) -> Option<DbFileFingerprint> {
                     return None;
                 }
                 if wal_meta.len() > 0 {
-                    let (secs, nanos) = modified_timestamp(&wal_meta);
-                    (secs, nanos, wal_meta.len())
+                    let (mtime_secs, mtime_nanos) = modified_timestamp(&wal_meta);
+                    let (ctime_secs, ctime_nanos) = status_change_timestamp(&wal_meta);
+                    (
+                        mtime_secs,
+                        mtime_nanos,
+                        ctime_secs,
+                        ctime_nanos,
+                        wal_meta.len(),
+                    )
                 } else {
-                    (0, 0, 0)
+                    (0, 0, 0, 0, 0)
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0, 0, 0),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0, 0, 0, 0, 0),
             Err(_) => return None,
         };
 
     Some(DbFileFingerprint {
         db_mtime_secs,
         db_mtime_nanos,
+        db_ctime_secs,
+        db_ctime_nanos,
         db_size,
         wal_mtime_secs,
         wal_mtime_nanos,
+        wal_ctime_secs,
+        wal_ctime_nanos,
         wal_size,
     })
 }
@@ -679,10 +730,17 @@ pub(super) struct DbTarget {
     pub(super) fingerprint: DbFileFingerprint,
 }
 
+const TS_QUALITY_NONE: u8 = 0;
+const TS_QUALITY_DB_MTIME: u8 = 1;
+const TS_QUALITY_TRAJECTORY: u8 = 2;
+const TS_QUALITY_SECONDARY: u8 = 3;
+const TS_QUALITY_STEP_PRIMARY: u8 = 4;
+
 /// Timezone- and pricing-independent turn record extracted from a SQLite conversation DB.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct RawTurn {
     pub(super) ts_secs: Option<i64>,
+    pub(super) ts_quality: u8,
     pub(super) model_enum: u64,
     pub(super) response_model: Option<String>,
     pub(super) model_display_name: Option<String>,
@@ -694,6 +752,9 @@ pub(super) struct RawTurn {
     pub(super) native_cost_usd: Option<f64>,
     pub(super) decode_speed: Option<f64>,
     pub(super) ttft_secs: Option<f64>,
+    pub(super) id_11: Option<String>,
+    pub(super) id_12: Option<String>,
+    pub(super) id_7: Option<String>,
 }
 
 impl RawTurn {
@@ -704,6 +765,22 @@ impl RawTurn {
             || self.cache_write_tokens > 0
             || self.native_cost_usd.is_some()
     }
+
+    fn has_signal(&self) -> bool {
+        self.decode_speed.is_some() || self.ttft_secs.is_some() || self.has_billable_usage()
+    }
+
+    fn has_any_identity(&self) -> bool {
+        self.id_11.is_some() || self.id_12.is_some() || self.id_7.is_some()
+    }
+
+    fn identity_keys(&self) -> [(u8, Option<&str>); 3] {
+        [
+            (11, self.id_11.as_deref()),
+            (12, self.id_12.as_deref()),
+            (7, self.id_7.as_deref()),
+        ]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -713,6 +790,166 @@ pub(super) struct RawConversationScan {
     pub(super) uuid: String,
     pub(super) fingerprint: DbFileFingerprint,
     pub(super) turns: Vec<RawTurn>,
+}
+
+struct UnionFind {
+    parent: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+        }
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            let p = self.parent[x];
+            self.parent[x] = self.parent[p];
+            x = p;
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra != rb {
+            // Attach larger root to smaller root so component order stays deterministic.
+            if ra < rb {
+                self.parent[rb] = ra;
+            } else {
+                self.parent[ra] = rb;
+            }
+        }
+    }
+}
+
+fn display_name_rank(disp: Option<&str>) -> u8 {
+    match disp.map(str::trim).filter(|s| !s.is_empty()) {
+        None => 0,
+        Some(s) if PricingCatalog::has_specific_model_qualifier(None, Some(s)) => 2,
+        Some(_) => 1,
+    }
+}
+
+fn response_model_rank(resp: Option<&str>) -> u8 {
+    match resp.map(str::trim).filter(|s| !s.is_empty()) {
+        None => 0,
+        Some(s) if PricingCatalog::has_specific_model_qualifier(Some(s), None) => 2,
+        Some(_) => 1,
+    }
+}
+
+fn valid_decode_speed(speed: Option<f64>) -> Option<f64> {
+    speed.filter(|s| s.is_finite() && *s > 0.0 && *s < MAX_TURN_SPEED_TPS)
+}
+
+fn valid_ttft_secs(ttft: Option<f64>) -> Option<f64> {
+    ttft.filter(|t| t.is_finite() && *t > 0.0 && *t < MAX_TTFT_SECS)
+}
+
+fn valid_native_cost(cost: Option<f64>) -> Option<f64> {
+    cost.filter(|c| c.is_finite() && *c > 0.0)
+}
+
+fn merge_raw_turn(dst: &mut RawTurn, other: RawTurn) {
+    dst.input_tokens = dst.input_tokens.max(other.input_tokens);
+    dst.cache_read_tokens = dst.cache_read_tokens.max(other.cache_read_tokens);
+    dst.cache_write_tokens = dst.cache_write_tokens.max(other.cache_write_tokens);
+    dst.output_tokens = dst.output_tokens.max(other.output_tokens);
+    dst.thinking_tokens = dst
+        .output_tokens
+        .min(dst.thinking_tokens.max(other.thinking_tokens));
+
+    if response_model_rank(other.response_model.as_deref())
+        > response_model_rank(dst.response_model.as_deref())
+    {
+        dst.response_model = other.response_model;
+    }
+    if display_name_rank(other.model_display_name.as_deref())
+        > display_name_rank(dst.model_display_name.as_deref())
+    {
+        dst.model_display_name = other.model_display_name;
+    }
+    if dst.model_enum == 0 && other.model_enum != 0 {
+        dst.model_enum = other.model_enum;
+    }
+
+    match (dst.ts_secs, other.ts_secs) {
+        (None, Some(ts)) => {
+            dst.ts_secs = Some(ts);
+            dst.ts_quality = other.ts_quality;
+        }
+        (Some(dst_ts), Some(other_ts))
+            if other.ts_quality > dst.ts_quality
+                || (other.ts_quality == dst.ts_quality && other_ts < dst_ts) =>
+        {
+            dst.ts_secs = Some(other_ts);
+            dst.ts_quality = other.ts_quality;
+        }
+        _ => {}
+    }
+
+    dst.native_cost_usd = match (
+        valid_native_cost(dst.native_cost_usd),
+        valid_native_cost(other.native_cost_usd),
+    ) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    dst.decode_speed = valid_decode_speed(dst.decode_speed).or_else(|| valid_decode_speed(other.decode_speed));
+    dst.ttft_secs = valid_ttft_secs(dst.ttft_secs).or_else(|| valid_ttft_secs(other.ttft_secs));
+
+    if dst.id_11.is_none() {
+        dst.id_11 = other.id_11;
+    }
+    if dst.id_12.is_none() {
+        dst.id_12 = other.id_12;
+    }
+    if dst.id_7.is_none() {
+        dst.id_7 = other.id_7;
+    }
+}
+
+fn build_turn_union_find<'a>(turns: impl IntoIterator<Item = &'a RawTurn>, len: usize) -> UnionFind {
+    let mut uf = UnionFind::new(len);
+    let mut key_owner: HashMap<(u8, &'a str), usize> = HashMap::new();
+    for (idx, turn) in turns.into_iter().enumerate() {
+        for (tag, val_opt) in turn.identity_keys() {
+            let Some(val) = val_opt.map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if let Some(&prev) = key_owner.get(&(tag, val)) {
+                uf.union(prev, idx);
+            } else {
+                key_owner.insert((tag, val), idx);
+            }
+        }
+    }
+    uf
+}
+
+fn deduplicate_raw_turns(turns: Vec<RawTurn>) -> Vec<RawTurn> {
+    if turns.len() <= 1 {
+        return turns;
+    }
+    let mut uf = build_turn_union_find(turns.iter(), turns.len());
+    let mut root_to_slot: HashMap<usize, usize> = HashMap::new();
+    let mut merged: Vec<RawTurn> = Vec::with_capacity(turns.len());
+    for (idx, turn) in turns.into_iter().enumerate() {
+        let root = uf.find(idx);
+        if let Some(&slot) = root_to_slot.get(&root) {
+            merge_raw_turn(&mut merged[slot], turn);
+        } else {
+            root_to_slot.insert(root, merged.len());
+            merged.push(turn);
+        }
+    }
+    merged
 }
 
 pub(super) fn discover_sqlite_db_targets(roots: &[(&'static str, PathBuf)]) -> Vec<DbTarget> {
@@ -760,70 +997,257 @@ pub(super) fn discover_sqlite_db_targets(roots: &[(&'static str, PathBuf)]) -> V
     targets
 }
 
-fn scan_single_sqlite_db_raw(target: &DbTarget) -> Option<RawConversationScan> {
-    let db_mtime_secs = (target.fingerprint.db_mtime_secs > 0).then_some(target.fingerprint.db_mtime_secs);
-    let conn = open_readonly_db(&target.path).ok()?;
+fn fallback_timestamp(trajectory_ts: Option<i64>, db_mtime_secs: Option<i64>) -> (Option<i64>, u8) {
+    if let Some(ts) = trajectory_ts {
+        (Some(ts), TS_QUALITY_TRAJECTORY)
+    } else if let Some(ts) = db_mtime_secs {
+        (Some(ts), TS_QUALITY_DB_MTIME)
+    } else {
+        (None, TS_QUALITY_NONE)
+    }
+}
 
-    let mut step_timestamps: HashMap<u64, i64> = HashMap::new();
+/// Extracts and intra-DB deduplicates all turns from one SQLite conversation DB across
+/// `gen_metadata` (main + `f17` retries), `steps.metadata` (`f1`/`f8` timestamps, `f9` usage,
+/// `f24` model info, `f28` retries), and `trajectory_metadata_blob` (`f2` fallback timestamp).
+///
+/// Returns `None` only when neither `gen_metadata` nor `steps` exists in the database.
+fn extract_sqlite_db_turns(
+    conn: &rusqlite::Connection,
+    db_mtime_secs: Option<i64>,
+) -> Option<Vec<RawTurn>> {
+    let trajectory_ts = conn
+        .prepare("SELECT data FROM trajectory_metadata_blob WHERE data IS NOT NULL LIMIT 1")
+        .ok()
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, Vec<u8>>(0)).ok())
+        .and_then(|blob| extract_trajectory_created_at_secs(&blob));
+
+    let mut has_steps_table = false;
+    let mut step_timestamps: HashMap<u64, (i64, u8)> = HashMap::new();
+    let mut step_candidates: Vec<(u64, RawTurn)> = Vec::new();
     if let Ok(mut step_stmt) =
-        conn.prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL")
+        conn.prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC")
     {
         if let Ok(mut step_rows) = step_stmt.query([]) {
+            has_steps_table = true;
             while let Ok(Some(row)) = step_rows.next() {
-                if let (Ok(idx), Ok(meta_blob)) =
-                    (row.get::<_, i64>(0), row.get::<_, Vec<u8>>(1))
-                {
-                    if idx >= 0 {
-                        if let Some(secs) = extract_step_created_at_secs(&meta_blob) {
-                            step_timestamps.insert(idx as u64, secs);
-                        }
+                let Ok(idx) = row.get::<_, i64>(0) else {
+                    continue;
+                };
+                let Ok(meta_blob) = row.get::<_, Vec<u8>>(1) else {
+                    continue;
+                };
+                if idx < 0 {
+                    continue;
+                }
+                let step_idx = idx as u64;
+                let Some(step_rec) = extract_step_metadata_record(&meta_blob) else {
+                    continue;
+                };
+
+                let step_ts = if let Some(ts) = step_rec.created_at_secs {
+                    step_timestamps.insert(step_idx, (ts, TS_QUALITY_STEP_PRIMARY));
+                    (Some(ts), TS_QUALITY_STEP_PRIMARY)
+                } else if let Some(ts) = step_rec.secondary_created_at_secs {
+                    step_timestamps.insert(step_idx, (ts, TS_QUALITY_SECONDARY));
+                    (Some(ts), TS_QUALITY_SECONDARY)
+                } else {
+                    fallback_timestamp(trajectory_ts, db_mtime_secs)
+                };
+
+                if let Some(usage) = step_rec.usage {
+                    let inherits_info = usage.model_enum == 0
+                        || step_rec.model_enum == 0
+                        || usage.model_enum == step_rec.model_enum;
+                    let (response_model, model_display_name) = if inherits_info {
+                        (
+                            step_rec.response_model.clone(),
+                            step_rec.model_display_name.clone(),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let model_enum = if usage.model_enum != 0 {
+                        usage.model_enum
+                    } else {
+                        step_rec.model_enum
+                    };
+                    let turn = RawTurn {
+                        ts_secs: step_ts.0,
+                        ts_quality: step_ts.1,
+                        model_enum,
+                        response_model,
+                        model_display_name,
+                        input_tokens: usage.input_tokens,
+                        cache_read_tokens: usage.cache_read_tokens,
+                        cache_write_tokens: usage.cache_write_tokens,
+                        output_tokens: usage.output_tokens,
+                        thinking_tokens: usage.thinking_output_tokens,
+                        native_cost_usd: None,
+                        decode_speed: None,
+                        ttft_secs: None,
+                        id_11: usage.identity.id_11,
+                        id_12: usage.identity.id_12,
+                        id_7: usage.identity.id_7,
+                    };
+                    if turn.has_signal() {
+                        step_candidates.push((step_idx, turn));
+                    }
+                }
+
+                for retry in step_rec.retry_usages {
+                    let inherits_info =
+                        retry.model_enum == 0 || retry.model_enum == step_rec.model_enum;
+                    let (response_model, model_display_name) = if inherits_info {
+                        (
+                            step_rec.response_model.clone(),
+                            step_rec.model_display_name.clone(),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let model_enum = if retry.model_enum != 0 {
+                        retry.model_enum
+                    } else {
+                        step_rec.model_enum
+                    };
+                    let turn = RawTurn {
+                        ts_secs: step_ts.0,
+                        ts_quality: step_ts.1,
+                        model_enum,
+                        response_model,
+                        model_display_name,
+                        input_tokens: retry.input_tokens,
+                        cache_read_tokens: retry.cache_read_tokens,
+                        cache_write_tokens: retry.cache_write_tokens,
+                        output_tokens: retry.output_tokens,
+                        thinking_tokens: retry.thinking_output_tokens,
+                        native_cost_usd: None,
+                        decode_speed: None,
+                        ttft_secs: None,
+                        id_11: retry.identity.id_11,
+                        id_12: retry.identity.id_12,
+                        id_7: retry.identity.id_7,
+                    };
+                    if turn.has_signal() {
+                        step_candidates.push((step_idx, turn));
                     }
                 }
             }
         }
     }
 
-    let mut stmt = conn
-        .prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx ASC")
-        .ok()?;
-    let mut rows = stmt.query([]).ok()?;
-
+    let mut has_gen_table = false;
+    let mut covered_step_indices: HashSet<u64> = HashSet::new();
     let mut turns = Vec::new();
-    while let Ok(Some(row)) = rows.next() {
-        let Ok(blob) = row.get::<_, Vec<u8>>(0) else {
-            continue;
-        };
-        let Some(rec) = extract_gen_metadata_record(&blob) else {
-            continue;
-        };
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx ASC")
+    {
+        if let Ok(mut rows) = stmt.query([]) {
+            has_gen_table = true;
+            while let Ok(Some(row)) = rows.next() {
+                let Ok(blob) = row.get::<_, Vec<u8>>(0) else {
+                    continue;
+                };
+                let Some(rec) = extract_gen_metadata_record(&blob) else {
+                    continue;
+                };
+                covered_step_indices.extend(rec.step_indices.iter().copied());
 
-        let decode_speed = rec.decode_speed_tps();
-        let ttft_secs = rec.ttft_secs;
-        let ts_secs = rec
-            .first_step_index
-            .and_then(|step_idx| step_timestamps.get(&step_idx).copied())
-            .or(rec.chat_start_created_at_secs)
-            .or(db_mtime_secs);
+                let (ts_secs, ts_quality) = rec
+                    .step_indices
+                    .iter()
+                    .find_map(|idx| step_timestamps.get(idx).copied())
+                    .map(|(ts, q)| (Some(ts), q))
+                    .or_else(|| {
+                        rec.chat_start_created_at_secs
+                            .map(|ts| (Some(ts), TS_QUALITY_SECONDARY))
+                    })
+                    .unwrap_or_else(|| fallback_timestamp(trajectory_ts, db_mtime_secs));
 
-        let turn = RawTurn {
-            ts_secs,
-            model_enum: rec.model_enum,
-            response_model: rec.response_model,
-            model_display_name: rec.model_display_name,
-            input_tokens: rec.input_tokens,
-            cache_read_tokens: rec.cache_read_tokens,
-            cache_write_tokens: rec.cache_write_tokens,
-            output_tokens: rec.output_tokens,
-            thinking_tokens: rec.thinking_output_tokens,
-            native_cost_usd: rec.model_cost_usd,
-            decode_speed,
-            ttft_secs,
-        };
-        if turn.decode_speed.is_none() && turn.ttft_secs.is_none() && !turn.has_billable_usage() {
+                let decode_speed = rec.decode_speed_tps();
+                let main_turn = RawTurn {
+                    ts_secs,
+                    ts_quality,
+                    model_enum: rec.model_enum,
+                    response_model: rec.response_model.clone(),
+                    model_display_name: rec.model_display_name.clone(),
+                    input_tokens: rec.input_tokens,
+                    cache_read_tokens: rec.cache_read_tokens,
+                    cache_write_tokens: rec.cache_write_tokens,
+                    output_tokens: rec.output_tokens,
+                    thinking_tokens: rec.thinking_output_tokens,
+                    native_cost_usd: rec.model_cost_usd,
+                    decode_speed,
+                    ttft_secs: rec.ttft_secs,
+                    id_11: rec.identity.id_11,
+                    id_12: rec.identity.id_12,
+                    id_7: rec.identity.id_7,
+                };
+                if main_turn.has_signal() {
+                    turns.push(main_turn);
+                }
+
+                for retry in rec.retry_usages {
+                    // When a retry attempt ran on a different model_enum than the outer chat,
+                    // omit outer strings so the scan-time model_enum learning table resolves it.
+                    let inherits_outer =
+                        retry.model_enum == 0 || retry.model_enum == rec.model_enum;
+                    let (response_model, model_display_name) = if inherits_outer {
+                        (rec.response_model.clone(), rec.model_display_name.clone())
+                    } else {
+                        (None, None)
+                    };
+                    let model_enum = if retry.model_enum != 0 {
+                        retry.model_enum
+                    } else {
+                        rec.model_enum
+                    };
+                    let retry_turn = RawTurn {
+                        ts_secs,
+                        ts_quality,
+                        model_enum,
+                        response_model,
+                        model_display_name,
+                        input_tokens: retry.input_tokens,
+                        cache_read_tokens: retry.cache_read_tokens,
+                        cache_write_tokens: retry.cache_write_tokens,
+                        output_tokens: retry.output_tokens,
+                        thinking_tokens: retry.thinking_output_tokens,
+                        native_cost_usd: None,
+                        decode_speed: None,
+                        ttft_secs: None,
+                        id_11: retry.identity.id_11,
+                        id_12: retry.identity.id_12,
+                        id_7: retry.identity.id_7,
+                    };
+                    if retry_turn.has_signal() {
+                        turns.push(retry_turn);
+                    }
+                }
+            }
+        }
+    }
+
+    if !has_gen_table && !has_steps_table {
+        return None;
+    }
+
+    for (step_idx, turn) in step_candidates {
+        if !turn.has_any_identity() && covered_step_indices.contains(&step_idx) {
             continue;
         }
         turns.push(turn);
     }
+
+    Some(deduplicate_raw_turns(turns))
+}
+
+fn scan_single_sqlite_db_raw(target: &DbTarget) -> Option<RawConversationScan> {
+    let db_mtime_secs =
+        (target.fingerprint.db_mtime_secs > 0).then_some(target.fingerprint.db_mtime_secs);
+    let conn = open_readonly_db(&target.path).ok()?;
+    let turns = extract_sqlite_db_turns(&conn, db_mtime_secs)?;
 
     Some(RawConversationScan {
         source: target.source,
@@ -868,152 +1292,233 @@ pub(super) fn scan_sqlite_targets_raw(targets: &[DbTarget]) -> Vec<RawConversati
     }
 }
 
-pub(super) fn project_sqlite_conversations<'a>(
-    conversations: impl IntoIterator<Item = (&'static str, &'a str, &'a [RawTurn])>,
-    archived_db_files: u64,
-    tz: &TimeZoneSpec,
-    pricing: &PricingCatalog,
-) -> (
-    SqliteStats,
-    Vec<UsageEvent>,
-    HashSet<(&'static str, String)>,
-) {
-    let mut stats = SqliteStats {
-        archived_db_files,
-        ..SqliteStats::default()
-    };
-    let mut speed_samples = Vec::new();
-    let mut ttft_samples = Vec::new();
-    let mut events = Vec::new();
-    let mut covered = HashSet::new();
-    // Memoize model-group derivation and catalog entry resolution across turns so large
-    // multi-month archives avoid repeated O(catalog_size) substring scans per turn.
-    type ModelLookupKey<'b> = (Option<&'b str>, Option<&'b str>, u64);
-    let mut model_resolution_cache: HashMap<ModelLookupKey<'_>, (String, Option<usize>, bool)> =
-        HashMap::new();
-    let mut unresolved_events: Vec<(usize, &'a str)> = Vec::new();
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelEnumIdentity {
+    CatalogEntry(usize),
+    NormalizedName(String),
+}
 
-    for (source, uuid, turns) in conversations {
-        stats.db_files += 1;
-        let usage_source = UsageSource::from_root_label(source);
-        let mut has_events = false;
+enum LearnedModelEnum<'b> {
+    Generic {
+        response_model: Option<&'b str>,
+        model_display_name: Option<&'b str>,
+        quality: (u8, u8),
+    },
+    Concrete {
+        identity: ModelEnumIdentity,
+        response_model: Option<&'b str>,
+        model_display_name: Option<&'b str>,
+        quality: (u8, u8),
+    },
+    Poisoned,
+}
 
-        for turn in turns {
-            if let Some(speed) = turn.decode_speed {
-                stats.completed_turns += 1;
-                stats.total_output_tokens = stats
-                    .total_output_tokens
-                    .saturating_add(turn.output_tokens);
-                speed_samples.push(speed);
-            }
-            if let Some(ttft) = turn.ttft_secs {
-                ttft_samples.push(ttft);
-            }
-            if !turn.has_billable_usage() {
-                continue;
-            }
-            let Some(ts_secs) = turn.ts_secs else {
-                continue;
-            };
+fn normalized_fallback_model_identity(group: &str) -> String {
+    let norm = normalize_model_key(group);
+    let mut words: Vec<&str> = norm.split_whitespace().collect();
+    while words.len() > 1 && matches!(words.last().copied(), Some("trial" | "preview" | "latest"))
+    {
+        words.pop();
+    }
+    words.join(" ")
+}
 
-            let total_tokens = turn
-                .input_tokens
-                .saturating_add(turn.cache_read_tokens)
-                .saturating_add(turn.cache_write_tokens)
-                .saturating_add(turn.output_tokens);
-            let (local_day, local_date) = tz.local_day_and_date(ts_secs);
-            let cache_key = (
-                turn.response_model.as_deref(),
-                turn.model_display_name.as_deref(),
-                turn.model_enum,
-            );
-            let (model_group, entry_idx, has_specific_qualifier) = model_resolution_cache
-                .entry(cache_key)
-                .or_insert_with(|| {
-                    let group = derive_model_name(
-                        turn.model_display_name.as_deref(),
-                        turn.response_model.as_deref(),
-                        turn.model_enum,
-                    );
-                    let active: Vec<&str> = [
-                        turn.response_model.as_deref(),
-                        turn.model_display_name.as_deref(),
-                        Some(group.as_str()),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                    let idx = pricing.resolve_entry_idx(&active);
-                    let specific = PricingCatalog::has_specific_model_qualifier(
-                        turn.response_model.as_deref(),
-                        turn.model_display_name.as_deref(),
-                    );
-                    (group, idx, specific)
-                });
-            let (pricing_key, cost_usd) = if let Some(usd) = turn.native_cost_usd {
-                (Some("native".to_string()), Some(round_usd_6(usd)))
-            } else {
-                (*entry_idx)
-                    .and_then(|idx| {
-                        pricing.estimate_cost_for_entry(
-                            idx,
-                            turn.input_tokens,
-                            turn.cache_read_tokens,
-                            turn.cache_write_tokens,
-                            turn.output_tokens,
-                            true,
-                        )
-                    })
-                    .unzip()
-            };
+struct ResolvedTurnPricing {
+    model_group: String,
+    pricing_key: Option<String>,
+    cost_usd: Option<f64>,
+}
 
-            if turn.native_cost_usd.is_none() && entry_idx.is_none() && !*has_specific_qualifier {
-                if let Some(resp) = turn
-                    .response_model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    unresolved_events.push((events.len(), resp));
-                }
-            }
+type ModelLookupKey<'b> = (Option<&'b str>, Option<&'b str>, u64);
+type ResolvedModelInfo = (String, Option<usize>, bool);
 
-            has_events = true;
-            events.push(UsageEvent {
-                source: usage_source,
-                local_day,
-                local_date,
-                model_group: model_group.clone(),
-                pricing_key,
-                input_tokens: turn.input_tokens,
-                cache_read_tokens: turn.cache_read_tokens,
-                cache_write_tokens: turn.cache_write_tokens,
-                output_tokens: turn.output_tokens,
-                thinking_tokens: turn.thinking_tokens,
-                total_tokens,
-                cost_usd,
-                decode_speed: turn.decode_speed,
-                ttft_secs: turn.ttft_secs,
-            });
-        }
+/// Shared scan-time model-enum learner, memoized catalog resolver, and dynamic
+/// `response_model` pricing inferrer used by both `stats` projection and statusline cost.
+struct TurnPricer<'a, 'b> {
+    pricing: &'a PricingCatalog,
+    learned_enums: HashMap<u64, (Option<&'b str>, Option<&'b str>)>,
+    resolution_cache: HashMap<ModelLookupKey<'b>, ResolvedModelInfo>,
+    inferred_response_models: HashMap<&'b str, Option<usize>>,
+}
 
-        if has_events {
-            covered.insert((source, uuid.to_owned()));
-        }
+impl<'a, 'b> TurnPricer<'a, 'b> {
+    fn resolve_uncached(
+        pricing: &PricingCatalog,
+        resp: Option<&str>,
+        disp: Option<&str>,
+        model_enum: u64,
+    ) -> ResolvedModelInfo {
+        let group = derive_model_name(disp, resp, model_enum);
+        let active: Vec<&str> = [resp, disp, Some(group.as_str())]
+            .into_iter()
+            .flatten()
+            .collect();
+        let entry_idx = pricing.resolve_entry_idx(&active);
+        let specific = PricingCatalog::has_specific_model_qualifier(resp, disp);
+        (group, entry_idx, specific)
     }
 
-    // Dynamically infer pricing for turns whose response_model uniquely resolved to one
-    // catalog entry elsewhere in the dataset (e.g. legacy generic display names for a worker
-    // routing ID), while never inferring across ambiguous or explicitly-qualified tiers.
-    if !unresolved_events.is_empty() {
-        let mut inferred: HashMap<&str, Option<usize>> = HashMap::new();
-        for ((resp_opt, _, _), (_, entry_idx, has_specific_qualifier)) in &model_resolution_cache {
-            let Some(resp) = resp_opt.map(str::trim).filter(|s| !s.is_empty()) else {
+    fn build(pricing: &'a PricingCatalog, turns: impl IntoIterator<Item = &'b RawTurn>) -> Self {
+        let mut resolution_cache: HashMap<ModelLookupKey<'b>, ResolvedModelInfo> = HashMap::new();
+        let mut enum_states: HashMap<u64, LearnedModelEnum<'b>> = HashMap::new();
+
+        for turn in turns {
+            let resp = turn
+                .response_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let disp = turn
+                .model_display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            let (group, entry_idx, _) = resolution_cache
+                .entry((resp, disp, turn.model_enum))
+                .or_insert_with(|| Self::resolve_uncached(pricing, resp, disp, turn.model_enum));
+
+            if turn.model_enum == 0 || (resp.is_none() && disp.is_none()) {
+                continue;
+            }
+
+            let disp_rank = display_name_rank(disp);
+            let resp_rank = response_model_rank(resp);
+            let quality = (disp_rank, resp_rank);
+            let is_concrete = entry_idx.is_some()
+                || disp_rank == 2
+                || PricingCatalog::has_specific_model_qualifier(None, resp);
+
+            let new_identity = if is_concrete {
+                Some(match *entry_idx {
+                    Some(idx) => ModelEnumIdentity::CatalogEntry(idx),
+                    None => {
+                        ModelEnumIdentity::NormalizedName(normalized_fallback_model_identity(group))
+                    }
+                })
+            } else {
+                None
+            };
+
+            match enum_states.get_mut(&turn.model_enum) {
+                None => {
+                    let state = match new_identity {
+                        Some(identity) => LearnedModelEnum::Concrete {
+                            identity,
+                            response_model: resp,
+                            model_display_name: disp,
+                            quality,
+                        },
+                        None => LearnedModelEnum::Generic {
+                            response_model: resp,
+                            model_display_name: disp,
+                            quality,
+                        },
+                    };
+                    enum_states.insert(turn.model_enum, state);
+                }
+                Some(LearnedModelEnum::Poisoned) => {}
+                Some(slot @ LearnedModelEnum::Generic { .. }) => {
+                    if let Some(identity) = new_identity {
+                        *slot = LearnedModelEnum::Concrete {
+                            identity,
+                            response_model: resp,
+                            model_display_name: disp,
+                            quality,
+                        };
+                    } else if let LearnedModelEnum::Generic {
+                        response_model,
+                        model_display_name,
+                        quality: prev_q,
+                    } = slot
+                    {
+                        if quality > *prev_q {
+                            *response_model = resp;
+                            *model_display_name = disp;
+                            *prev_q = quality;
+                        }
+                    }
+                }
+                Some(slot @ LearnedModelEnum::Concrete { .. }) => {
+                    // Generic-only observations (e.g. legacy "Gemini Flash") never poison a concrete enum.
+                    let Some(identity) = new_identity else {
+                        continue;
+                    };
+                    let same_identity = matches!(
+                        slot,
+                        LearnedModelEnum::Concrete {
+                            identity: prev_id,
+                            ..
+                        } if *prev_id == identity
+                    );
+                    if !same_identity {
+                        *slot = LearnedModelEnum::Poisoned;
+                    } else if let LearnedModelEnum::Concrete {
+                        response_model,
+                        model_display_name,
+                        quality: prev_q,
+                        ..
+                    } = slot
+                    {
+                        if quality > *prev_q {
+                            if resp.is_some() {
+                                *response_model = resp;
+                            }
+                            if disp_rank >= display_name_rank(*model_display_name)
+                                && disp.is_some()
+                            {
+                                *model_display_name = disp;
+                            }
+                            *prev_q = (
+                                display_name_rank(*model_display_name),
+                                response_model_rank(*response_model),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut learned_enums = HashMap::new();
+        for (model_enum, state) in enum_states {
+            match state {
+                LearnedModelEnum::Concrete {
+                    response_model,
+                    model_display_name,
+                    ..
+                }
+                | LearnedModelEnum::Generic {
+                    response_model,
+                    model_display_name,
+                    ..
+                } => {
+                    learned_enums.insert(model_enum, (response_model, model_display_name));
+                    resolution_cache
+                        .entry((response_model, model_display_name, model_enum))
+                        .or_insert_with(|| {
+                            Self::resolve_uncached(
+                                pricing,
+                                response_model,
+                                model_display_name,
+                                model_enum,
+                            )
+                        });
+                }
+                LearnedModelEnum::Poisoned => {}
+            }
+        }
+
+        // Round 1 dynamic inference: map response_models that uniquely resolved to one
+        // catalog entry elsewhere in the dataset, poisoning ambiguous or explicitly-qualified
+        // unpriced variants.
+        let mut inferred_response_models: HashMap<&'b str, Option<usize>> = HashMap::new();
+        for ((resp_opt, _, _), (_, entry_idx, has_specific_qualifier)) in &resolution_cache {
+            let Some(resp) = *resp_opt else {
                 continue;
             };
             match (*entry_idx, *has_specific_qualifier) {
                 (Some(idx), _) => {
-                    inferred
+                    inferred_response_models
                         .entry(resp)
                         .and_modify(|slot| {
                             if *slot != Some(idx) {
@@ -1023,42 +1528,229 @@ pub(super) fn project_sqlite_conversations<'a>(
                         .or_insert(Some(idx));
                 }
                 (None, true) => {
-                    inferred.insert(resp, None);
+                    inferred_response_models.insert(resp, None);
                 }
                 (None, false) => {}
             }
         }
-        for (event_idx, resp) in unresolved_events {
-            let Some(idx) = inferred.get(resp).copied().flatten() else {
-                continue;
-            };
-            let ev = &mut events[event_idx];
-            if let Some((key, usd)) = pricing.estimate_cost_for_entry(
-                idx,
-                ev.input_tokens,
-                ev.cache_read_tokens,
-                ev.cache_write_tokens,
-                ev.output_tokens,
-                true,
-            ) {
-                ev.pricing_key = Some(key);
-                ev.cost_usd = Some(usd);
-            }
+
+        Self {
+            pricing,
+            learned_enums,
+            resolution_cache,
+            inferred_response_models,
         }
+    }
+
+    fn price_turn(&self, turn: &RawTurn) -> ResolvedTurnPricing {
+        let raw_resp = turn
+            .response_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let raw_disp = turn
+            .model_display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let (eff_resp, eff_disp) = if raw_resp.is_none() && raw_disp.is_none() && turn.model_enum > 0
+        {
+            self.learned_enums
+                .get(&turn.model_enum)
+                .copied()
+                .unwrap_or((None, None))
+        } else {
+            (raw_resp, raw_disp)
+        };
+
+        let cached = self
+            .resolution_cache
+            .get(&(eff_resp, eff_disp, turn.model_enum));
+        let owned_fallback;
+        let (model_group, direct_entry_idx, has_specific_qualifier) = match cached {
+            Some(entry) => (&entry.0, entry.1, entry.2),
+            None => {
+                owned_fallback =
+                    Self::resolve_uncached(self.pricing, eff_resp, eff_disp, turn.model_enum);
+                (&owned_fallback.0, owned_fallback.1, owned_fallback.2)
+            }
+        };
+
+        let (pricing_key, cost_usd) = if let Some(usd) = valid_native_cost(turn.native_cost_usd) {
+            (Some("native".to_string()), Some(round_usd_6(usd)))
+        } else {
+            let resolved_idx = direct_entry_idx.or_else(|| {
+                (!has_specific_qualifier)
+                    .then(|| {
+                        eff_resp
+                            .and_then(|resp| self.inferred_response_models.get(resp).copied())
+                            .flatten()
+                    })
+                    .flatten()
+            });
+            resolved_idx
+                .and_then(|idx| {
+                    self.pricing.estimate_cost_for_entry(
+                        idx,
+                        turn.input_tokens,
+                        turn.cache_read_tokens,
+                        turn.cache_write_tokens,
+                        turn.output_tokens,
+                        true,
+                    )
+                })
+                .unzip()
+        };
+
+        ResolvedTurnPricing {
+            model_group: model_group.clone(),
+            pricing_key,
+            cost_usd,
+        }
+    }
+}
+
+struct SourcedTurn<'a> {
+    source: UsageSource,
+    conv_source: &'static str,
+    conv_uuid: &'a str,
+    turn: RawTurn,
+}
+
+struct MergedSourcedTurn<'a> {
+    source: UsageSource,
+    turn: RawTurn,
+    contributors: Vec<(&'static str, &'a str)>,
+}
+
+fn deduplicate_sourced_turns<'a>(items: Vec<SourcedTurn<'a>>) -> Vec<MergedSourcedTurn<'a>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let mut uf = build_turn_union_find(items.iter().map(|i| &i.turn), items.len());
+    let mut root_to_slot: HashMap<usize, usize> = HashMap::new();
+    let mut merged: Vec<MergedSourcedTurn<'a>> = Vec::with_capacity(items.len());
+
+    for (idx, item) in items.into_iter().enumerate() {
+        let root = uf.find(idx);
+        if let Some(&slot) = root_to_slot.get(&root) {
+            let entry = &mut merged[slot];
+            entry.contributors.push((item.conv_source, item.conv_uuid));
+            // Enforce deterministic UsageSource priority (Cli > Desktop).
+            if entry.source == UsageSource::Desktop && item.source == UsageSource::Cli {
+                let prev = std::mem::replace(&mut entry.turn, item.turn);
+                entry.source = UsageSource::Cli;
+                merge_raw_turn(&mut entry.turn, prev);
+            } else {
+                merge_raw_turn(&mut entry.turn, item.turn);
+            }
+        } else {
+            root_to_slot.insert(root, merged.len());
+            merged.push(MergedSourcedTurn {
+                source: item.source,
+                turn: item.turn,
+                contributors: vec![(item.conv_source, item.conv_uuid)],
+            });
+        }
+    }
+
+    merged
+}
+
+pub(super) fn project_sqlite_conversations<'a>(
+    conversations: impl IntoIterator<Item = (&'static str, &'a str, &'a [RawTurn])>,
+    archived_db_files: u64,
+    tz: &TimeZoneSpec,
+    pricing: &PricingCatalog,
+) -> (SqliteStats, Vec<UsageEvent>, SqliteCoverage) {
+    let mut stats = SqliteStats {
+        archived_db_files,
+        ..SqliteStats::default()
+    };
+    let mut covered = SqliteCoverage::default();
+    let mut raw_items: Vec<SourcedTurn<'a>> = Vec::new();
+
+    for (source, uuid, turns) in conversations {
+        stats.db_files += 1;
+        let usage_source = UsageSource::from_root_label(source);
+        for turn in turns {
+            for (_, val_opt) in turn.identity_keys() {
+                if let Some(val) = val_opt.map(str::trim).filter(|s| !s.is_empty()) {
+                    covered.response_ids.insert(val.to_string());
+                }
+            }
+            raw_items.push(SourcedTurn {
+                source: usage_source,
+                conv_source: source,
+                conv_uuid: uuid,
+                turn: turn.clone(),
+            });
+        }
+    }
+
+    let merged_turns = deduplicate_sourced_turns(raw_items);
+    let pricer = TurnPricer::build(pricing, merged_turns.iter().map(|m| &m.turn));
+
+    let mut speed_samples = Vec::new();
+    let mut ttft_samples = Vec::new();
+    let mut events = Vec::new();
+
+    for entry in &merged_turns {
+        let turn = &entry.turn;
+        if let Some(speed) = valid_decode_speed(turn.decode_speed) {
+            stats.completed_turns += 1;
+            stats.total_output_tokens = stats
+                .total_output_tokens
+                .saturating_add(turn.output_tokens);
+            speed_samples.push(speed);
+        }
+        if let Some(ttft) = valid_ttft_secs(turn.ttft_secs) {
+            ttft_samples.push(ttft);
+        }
+        if !turn.has_billable_usage() {
+            continue;
+        }
+        let Some(ts_secs) = turn.ts_secs else {
+            continue;
+        };
+
+        for &(conv_source, conv_uuid) in &entry.contributors {
+            covered
+                .conversations
+                .insert((conv_source, conv_uuid.to_owned()));
+        }
+
+        let total_tokens = turn
+            .input_tokens
+            .saturating_add(turn.cache_read_tokens)
+            .saturating_add(turn.cache_write_tokens)
+            .saturating_add(turn.output_tokens);
+        let (local_day, local_date) = tz.local_day_and_date(ts_secs);
+        let resolved = pricer.price_turn(turn);
+
+        events.push(UsageEvent {
+            source: entry.source,
+            local_day,
+            local_date,
+            model_group: resolved.model_group,
+            pricing_key: resolved.pricing_key,
+            input_tokens: turn.input_tokens,
+            cache_read_tokens: turn.cache_read_tokens,
+            cache_write_tokens: turn.cache_write_tokens,
+            output_tokens: turn.output_tokens,
+            thinking_tokens: turn.thinking_tokens,
+            total_tokens,
+            cost_usd: resolved.cost_usd,
+            decode_speed: valid_decode_speed(turn.decode_speed),
+            ttft_secs: valid_ttft_secs(turn.ttft_secs),
+        });
     }
 
     stats.ttft_samples = ttft_samples.len();
     stats.median_tok_per_sec = compute_median(&speed_samples);
     stats.median_ttft_secs = compute_median(&ttft_samples);
     (stats, events, covered)
-}
-
-fn has_billable_usage(rec: &GenMetadataRecord) -> bool {
-    rec.input_tokens > 0
-        || rec.output_tokens > 0
-        || rec.cache_read_tokens > 0
-        || rec.cache_write_tokens > 0
-        || rec.model_cost_usd.is_some()
 }
 
 pub(crate) struct ConversationCost {
@@ -1112,55 +1804,9 @@ fn resolve_descendant_conversation_ids(cli_dir: &Path, root_id: &str) -> Vec<Str
     ids
 }
 
-fn accumulate_single_db_cost(
-    db_path: &Path,
-    pricing: &PricingCatalog,
-) -> Option<(f64, u64, u64)> {
+fn read_single_db_turns(db_path: &Path) -> Option<Vec<RawTurn>> {
     let conn = open_readonly_db(db_path).ok()?;
-    let mut stmt = conn
-        .prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL")
-        .ok()?;
-    let mut rows = stmt.query([]).ok()?;
-
-    let mut total_usd = 0.0_f64;
-    let mut priced_turns = 0_u64;
-    let mut unpriced_turns = 0_u64;
-    while let Some(row) = rows.next().ok()? {
-        let Some(blob) = row.get_ref(0).ok().and_then(|value| value.as_blob().ok()) else {
-            continue;
-        };
-        let Some(rec) = extract_gen_metadata_record(blob) else {
-            continue;
-        };
-        if !has_billable_usage(&rec) {
-            continue;
-        }
-        let model_group = derive_model_name(
-            rec.model_display_name.as_deref(),
-            rec.response_model.as_deref(),
-            rec.model_enum,
-        );
-        let (_, turn_usd) = resolve_turn_cost(
-            pricing,
-            rec.model_cost_usd,
-            &[
-                rec.response_model.as_deref(),
-                rec.model_display_name.as_deref(),
-                Some(model_group.as_str()),
-            ],
-            rec.input_tokens,
-            rec.cache_read_tokens,
-            rec.cache_write_tokens,
-            rec.output_tokens,
-        );
-        if let Some(usd) = turn_usd {
-            total_usd += usd;
-            priced_turns += 1;
-        } else {
-            unpriced_turns += 1;
-        }
-    }
-    Some((total_usd, priced_turns, unpriced_turns))
+    extract_sqlite_db_turns(&conn, None)
 }
 
 /// Estimates the subtotal for priced usage in a SQLite conversation and any descendant subagents.
@@ -1172,23 +1818,73 @@ pub(crate) fn estimate_conversation_cost_usd(
     if !is_valid_uuid(conversation_id) {
         return None;
     }
-    let (parent_usd, parent_priced, parent_unpriced) =
-        match resolve_conversation_db_path(cli_dir, conversation_id) {
-            Some(db_path) => accumulate_single_db_cost(&db_path, pricing)?,
-            None => (0.0, 0, 0),
-        };
+    let mut tagged_turns: Vec<(bool, RawTurn)> = Vec::new();
+    if let Some(db_path) = resolve_conversation_db_path(cli_dir, conversation_id) {
+        for turn in read_single_db_turns(&db_path)? {
+            tagged_turns.push((false, turn));
+        }
+    }
 
-    let mut sub_usd = 0.0_f64;
-    let mut sub_priced = 0_u64;
-    let mut sub_unpriced = 0_u64;
     for desc_id in resolve_descendant_conversation_ids(cli_dir, conversation_id) {
         let Some(db_path) = resolve_conversation_db_path(cli_dir, &desc_id) else {
             continue;
         };
-        if let Some((usd, priced, unpriced)) = accumulate_single_db_cost(&db_path, pricing) {
-            sub_usd += usd;
-            sub_priced += priced;
-            sub_unpriced += unpriced;
+        if let Some(turns) = read_single_db_turns(&db_path) {
+            for turn in turns {
+                tagged_turns.push((true, turn));
+            }
+        }
+    }
+
+    if tagged_turns.is_empty() {
+        return None;
+    }
+
+    // Deduplicate across parent + descendant DBs (preferring parent attribution if shared).
+    let mut uf = build_turn_union_find(tagged_turns.iter().map(|(_, t)| t), tagged_turns.len());
+    let mut root_to_slot: HashMap<usize, usize> = HashMap::new();
+    let mut deduped: Vec<(bool, RawTurn)> = Vec::with_capacity(tagged_turns.len());
+    for (idx, (is_sub, turn)) in tagged_turns.into_iter().enumerate() {
+        let root = uf.find(idx);
+        if let Some(&slot) = root_to_slot.get(&root) {
+            let (slot_sub, slot_turn) = &mut deduped[slot];
+            if *slot_sub && !is_sub {
+                let prev = std::mem::replace(slot_turn, turn);
+                *slot_sub = false;
+                merge_raw_turn(slot_turn, prev);
+            } else {
+                merge_raw_turn(slot_turn, turn);
+            }
+        } else {
+            root_to_slot.insert(root, deduped.len());
+            deduped.push((is_sub, turn));
+        }
+    }
+
+    let pricer = TurnPricer::build(pricing, deduped.iter().map(|(_, t)| t));
+    let mut parent_usd = 0.0_f64;
+    let mut parent_priced = 0_u64;
+    let mut parent_unpriced = 0_u64;
+    let mut sub_usd = 0.0_f64;
+    let mut sub_priced = 0_u64;
+    let mut sub_unpriced = 0_u64;
+
+    for (is_sub, turn) in &deduped {
+        if !turn.has_billable_usage() {
+            continue;
+        }
+        let resolved = pricer.price_turn(turn);
+        match (is_sub, resolved.cost_usd) {
+            (false, Some(usd)) => {
+                parent_usd += usd;
+                parent_priced += 1;
+            }
+            (false, None) => parent_unpriced += 1,
+            (true, Some(usd)) => {
+                sub_usd += usd;
+                sub_priced += 1;
+            }
+            (true, None) => sub_unpriced += 1,
         }
     }
 
@@ -1745,6 +2441,7 @@ mod tests {
         let ts = Some(1_700_000_000_i64);
         let mk_turn = |resp: &str, disp: Option<&str>| RawTurn {
             ts_secs: ts,
+            ts_quality: TS_QUALITY_STEP_PRIMARY,
             model_enum: 0,
             response_model: Some(resp.to_string()),
             model_display_name: disp.map(str::to_string),
@@ -1756,6 +2453,9 @@ mod tests {
             native_cost_usd: None,
             decode_speed: None,
             ttft_secs: None,
+            id_11: None,
+            id_12: None,
+            id_7: None,
         };
 
         let turns = vec![
@@ -1811,5 +2511,476 @@ mod tests {
         assert_eq!(events[9].cost_usd, None);
         assert_eq!(events[10].pricing_key, None);
         assert_eq!(events[10].cost_usd, None);
+    }
+
+    fn test_pricing_catalog(cache_dir: &Path) -> PricingCatalog {
+        fs::create_dir_all(cache_dir).unwrap();
+        fs::write(
+            cache_dir.join("models_dev_pricing.json"),
+            r#"{
+              "fetched_at": 1000,
+              "models": {
+                "gemini-4-hydrogen": { "input_per_mtok": 1.5, "output_per_mtok": 7.5 },
+                "gemini-4-carbon": { "input_per_mtok": 2.0, "output_per_mtok": 10.0 },
+                "gemini-4-argon": { "input_per_mtok": 4.0, "output_per_mtok": 20.0 }
+              }
+            }"#,
+        )
+        .unwrap();
+        PricingCatalog::load_effective_with(
+            Some(cache_dir),
+            crate::stats::SyncMode::Offline,
+            1000,
+            86_400,
+            |_| unreachable!(),
+        )
+    }
+
+    #[test]
+    fn extract_sqlite_db_turns_merges_steps_f9_f28_f17_and_suppresses_keyless_covered_steps() {
+        use crate::protobuf::{
+            encode_gen_blob, encode_step_blob, encode_trajectory_meta_blob, GenBlobSpec,
+            StepBlobSpec, UsageSpec,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("conv.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE trajectory_metadata_blob (data BLOB);
+             CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);
+             CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob (data) VALUES (?1)",
+            [encode_trajectory_meta_blob(1_795_000_000)],
+        )
+        .unwrap();
+
+        // Step 1 is covered by gen_metadata(1): keyless f9 must be suppressed, while f28 retry
+        // sharing id_11="r1" merges into gen_metadata(1) and lifts output_tokens to 300.
+        conn.execute(
+            "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+            [encode_step_blob(StepBlobSpec {
+                created_at_secs: Some(1_795_000_100),
+                usage: Some(UsageSpec {
+                    model_enum: 1669,
+                    input_tok: 99_999,
+                    output_tok: 999,
+                    ..Default::default()
+                }),
+                retries: vec![UsageSpec {
+                    model_enum: 1669,
+                    input_tok: 1_000,
+                    output_tok: 300,
+                    id_11: Some("r1"),
+                    id_7: Some("c1"),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+
+        // Step 2 is NOT covered by gen_metadata (e.g. step_type = 23 compaction turn) with f8 ts.
+        conn.execute(
+            "INSERT INTO steps (idx, metadata) VALUES (2, ?1)",
+            [encode_step_blob(StepBlobSpec {
+                secondary_created_at_secs: Some(1_795_000_200),
+                usage: Some(UsageSpec {
+                    model_enum: 1669,
+                    input_tok: 4_000,
+                    output_tok: 80,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+
+        // gen_metadata(1): covers step 1; has main turn id_11="r1", plus f17 retry on different
+        // model_enum=1418 (must NOT inherit outer response_model/display_name).
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [encode_gen_blob(GenBlobSpec {
+                step_indices: vec![1],
+                model_enum: 1669,
+                resp_model: Some("gemini-flash-worker-agy"),
+                disp_name: Some("Gemini 4 Hydrogen (Orchestrator)"),
+                input_tok: 1_200,
+                output_tok: 200,
+                id_11: Some("r1"),
+                dur_secs: 2,
+                ttft_nanos: 500_000_000,
+                retries: vec![UsageSpec {
+                    model_enum: 1418,
+                    input_tok: 600,
+                    output_tok: 40,
+                    id_11: Some("r-retry-other-model"),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+
+        // gen_metadata(2): no step timestamp and no chat_start -> falls back to trajectory_metadata_blob.f2.
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
+            [encode_gen_blob(GenBlobSpec {
+                step_indices: vec![99],
+                model_enum: 1418,
+                resp_model: Some("gemini-4-argon"),
+                disp_name: Some("Gemini 4 Argon"),
+                input_tok: 500,
+                output_tok: 50,
+                id_11: Some("r-traj-fallback"),
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+
+        let turns = extract_sqlite_db_turns(&conn, Some(1_795_000_999)).unwrap();
+        assert_eq!(turns.len(), 4);
+
+        // Turn 0: merged gen_metadata(1) + steps(1).f28 retry via id_11="r1".
+        assert_eq!(turns[0].ts_secs, Some(1_795_000_100));
+        assert_eq!(turns[0].ts_quality, TS_QUALITY_STEP_PRIMARY);
+        assert_eq!(turns[0].input_tokens, 1_200);
+        assert_eq!(turns[0].output_tokens, 300);
+        assert_eq!(turns[0].id_11.as_deref(), Some("r1"));
+        assert_eq!(turns[0].id_7.as_deref(), Some("c1"));
+        assert_eq!(
+            turns[0].model_display_name.as_deref(),
+            Some("Gemini 4 Hydrogen (Orchestrator)")
+        );
+        assert_eq!(turns[0].decode_speed, Some(100.0));
+        assert_eq!(turns[0].ttft_secs, Some(0.5));
+
+        // Turn 1: f17 retry on model_enum=1418 did NOT inherit outer strings.
+        assert_eq!(turns[1].model_enum, 1418);
+        assert_eq!(turns[1].response_model, None);
+        assert_eq!(turns[1].model_display_name, None);
+        assert_eq!(turns[1].input_tokens, 600);
+
+        // Turn 2: gen_metadata(2) fell back to trajectory_metadata_blob.f2 (q=2) before db_mtime.
+        assert_eq!(turns[2].ts_secs, Some(1_795_000_000));
+        assert_eq!(turns[2].ts_quality, TS_QUALITY_TRAJECTORY);
+
+        // Turn 3: uncovered compaction step(2).f9 with f8 timestamp (q=3).
+        assert_eq!(turns[3].ts_secs, Some(1_795_000_200));
+        assert_eq!(turns[3].ts_quality, TS_QUALITY_SECONDARY);
+        assert_eq!(turns[3].model_enum, 1669);
+        assert_eq!(turns[3].input_tokens, 4_000);
+        assert_eq!(turns[3].output_tokens, 80);
+    }
+
+    #[test]
+    fn project_sqlite_union_find_transitively_dedups_three_records_across_roots_and_blocks_transcript(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let pricing = test_pricing_catalog(&dir.path().join("cache"));
+
+        let desk_a = vec![RawTurn {
+            ts_secs: Some(1_795_002_000),
+            ts_quality: TS_QUALITY_DB_MTIME,
+            model_enum: 1669,
+            response_model: Some("gemini-flash-worker-agy".to_string()),
+            model_display_name: Some("Gemini Flash".to_string()),
+            input_tokens: 1_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 100,
+            thinking_tokens: 20,
+            native_cost_usd: None,
+            decode_speed: None,
+            ttft_secs: None,
+            id_11: Some("r-shared".to_string()),
+            id_12: None,
+            id_7: None,
+        }];
+        let cli_b = vec![RawTurn {
+            ts_secs: Some(1_795_001_500),
+            ts_quality: TS_QUALITY_STEP_PRIMARY,
+            model_enum: 1669,
+            response_model: Some("gemini-flash-worker-agy".to_string()),
+            model_display_name: Some("Gemini 4 Hydrogen (Orchestrator)".to_string()),
+            input_tokens: 2_000,
+            cache_read_tokens: 500,
+            cache_write_tokens: 0,
+            output_tokens: 200,
+            thinking_tokens: 50,
+            native_cost_usd: None,
+            decode_speed: Some(100.0),
+            ttft_secs: Some(0.5),
+            id_11: Some("r-shared".to_string()),
+            id_12: None,
+            id_7: Some("c-shared".to_string()),
+        }];
+        let desk_c = vec![RawTurn {
+            ts_secs: Some(1_795_001_400),
+            ts_quality: TS_QUALITY_STEP_PRIMARY,
+            model_enum: 0,
+            response_model: None,
+            model_display_name: None,
+            input_tokens: 1_500,
+            cache_read_tokens: 0,
+            cache_write_tokens: 100,
+            output_tokens: 500,
+            thinking_tokens: 120,
+            native_cost_usd: None,
+            decode_speed: Some(80.0),
+            ttft_secs: Some(0.9),
+            id_11: None,
+            id_12: Some("m-shared".to_string()),
+            id_7: Some("c-shared".to_string()),
+        }];
+
+        let (stats, events, covered) = project_sqlite_conversations(
+            [
+                ("desktop", "11111111-1111-4111-8111-111111111111", desk_a.as_slice()),
+                ("cli", "22222222-2222-4222-8222-222222222222", cli_b.as_slice()),
+                ("desktop", "33333333-3333-4333-8333-333333333333", desk_c.as_slice()),
+            ],
+            0,
+            &TimeZoneSpec::utc(),
+            &pricing,
+        );
+
+        assert_eq!(stats.db_files, 3);
+        assert_eq!(stats.completed_turns, 1);
+        assert_eq!(stats.ttft_samples, 1);
+        assert_eq!(stats.total_output_tokens, 500);
+        assert_eq!(stats.median_tok_per_sec, Some(100.0));
+        assert_eq!(stats.median_ttft_secs, Some(0.5));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, UsageSource::Cli);
+        assert_eq!(events[0].input_tokens, 2_000);
+        assert_eq!(events[0].cache_read_tokens, 500);
+        assert_eq!(events[0].cache_write_tokens, 100);
+        assert_eq!(events[0].output_tokens, 500);
+        assert_eq!(events[0].thinking_tokens, 120);
+        assert_eq!(events[0].model_group, "Gemini 4 Hydrogen (Orchestrator)");
+        assert_eq!(events[0].pricing_key.as_deref(), Some("gemini-4-hydrogen"));
+        assert!(covered.response_ids.contains("r-shared"));
+        assert!(covered.response_ids.contains("c-shared"));
+        assert!(covered.response_ids.contains("m-shared"));
+
+        // Transcript fallback in an unrelated session skips any explicit ID already covered by SQLite.
+        let cli_root = dir.path().join("cli");
+        let transcript = cli_root.join("brain/uncovered-session/transcript.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"created_at":"2026-11-18T10:00:00Z","model":"m1","input_tokens":9000,"output_tokens":90,"responseId":"r-shared"}"#,
+                "\n",
+                r#"{"created_at":"2026-11-18T10:01:00Z","model":"m1","input_tokens":8000,"output_tokens":80,"callId":"c-shared"}"#,
+                "\n",
+                r#"{"created_at":"2026-11-18T10:02:00Z","model":"m1","input_tokens":7000,"output_tokens":70,"messageId":"m-shared"}"#,
+                "\n",
+                r#"{"created_at":"2026-11-18T10:03:00Z","model":"m-kept","input_tokens":300,"output_tokens":30,"responseId":"r-unique"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let fallback = scan_transcripts(
+            &[("cli", cli_root)],
+            &TimeZoneSpec::utc(),
+            &pricing,
+            &covered,
+        );
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].model_group, "m-kept");
+        assert_eq!(fallback[0].input_tokens, 300);
+    }
+
+    #[test]
+    fn turn_pricer_learns_model_enum_without_generic_poisoning_and_poisons_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let pricing = test_pricing_catalog(&dir.path().join("cache"));
+        let ts = Some(1_795_000_000_i64);
+        let mk = |model_enum: u64, resp: Option<&str>, disp: Option<&str>| RawTurn {
+            ts_secs: ts,
+            ts_quality: TS_QUALITY_STEP_PRIMARY,
+            model_enum,
+            response_model: resp.map(str::to_string),
+            model_display_name: disp.map(str::to_string),
+            input_tokens: 1_000_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            thinking_tokens: 0,
+            native_cost_usd: None,
+            decode_speed: None,
+            ttft_secs: None,
+            id_11: None,
+            id_12: None,
+            id_7: None,
+        };
+
+        let turns = vec![
+            // Enum 1669: generic "Gemini Flash" + concrete Hydrogen must NOT poison 1669.
+            mk(1669, Some("gemini-flash-worker-agy"), Some("Gemini Flash")),
+            mk(
+                1669,
+                Some("gemini-flash-worker-agy"),
+                Some("Gemini 4 Hydrogen (Orchestrator)"),
+            ),
+            mk(1669, None, None),
+            // Enum 1418: "gemini-4-argon" + "gemini-4-argon-trial" resolve identically -> NOT poisoned.
+            mk(1418, Some("gemini-4-argon"), Some("Gemini 4 Argon (High)")),
+            mk(1418, Some("gemini-4-argon-trial"), None),
+            mk(1418, None, None),
+            // Enum 9999: genuine conflict Carbon vs Argon -> POISONED.
+            mk(9999, Some("gemini-4-carbon"), Some("Gemini 4 Carbon")),
+            mk(9999, Some("gemini-4-argon"), Some("Gemini 4 Argon")),
+            mk(9999, None, None),
+        ];
+
+        let (_, events, _) = project_sqlite_conversations(
+            [("cli", "11111111-1111-4111-8111-111111111111", turns.as_slice())],
+            0,
+            &TimeZoneSpec::utc(),
+            &pricing,
+        );
+        assert_eq!(events.len(), 9);
+
+        // Bare enum 1669 compaction turn learns Hydrogen.
+        assert_eq!(events[2].model_group, "Gemini 4 Hydrogen (Orchestrator)");
+        assert_eq!(events[2].pricing_key.as_deref(), Some("gemini-4-hydrogen"));
+        assert_eq!(events[2].cost_usd, Some(1.5));
+
+        // Bare enum 1418 turn learns Argon.
+        assert_eq!(events[5].model_group, "Gemini 4 Argon");
+        assert_eq!(events[5].pricing_key.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(events[5].cost_usd, Some(4.0));
+
+        // Poisoned enum 9999 bare turn remains unresolved and unpriced.
+        assert_eq!(events[8].model_group, "model#9999");
+        assert_eq!(events[8].pricing_key, None);
+        assert_eq!(events[8].cost_usd, None);
+    }
+
+    #[test]
+    fn estimate_conversation_cost_uses_turn_pricer_for_compaction_and_worker_inference() {
+        use crate::protobuf::{encode_gen_blob, encode_step_blob, GenBlobSpec, StepBlobSpec, UsageSpec};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cli_dir = dir.path().join(".gemini/antigravity-cli");
+        let pricing = test_pricing_catalog(&dir.path().join("cache"));
+        let parent = "11111111-1111-4111-8111-111111111111";
+        let child = "22222222-2222-4222-8222-222222222222";
+
+        // Parent DB: 1M Hydrogen turn in gen_metadata + 1M bare compaction turn in steps.metadata.f9.
+        let parent_db = cli_dir.join("conversations").join(format!("{parent}.db"));
+        fs::create_dir_all(parent_db.parent().unwrap()).unwrap();
+        let pconn = Connection::open(&parent_db).unwrap();
+        pconn
+            .execute_batch(
+                "CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);
+                 CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+            )
+            .unwrap();
+        pconn
+            .execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+                [encode_gen_blob(GenBlobSpec {
+                    step_indices: vec![1],
+                    model_enum: 1669,
+                    resp_model: Some("gemini-flash-worker-agy"),
+                    disp_name: Some("Gemini 4 Hydrogen (Orchestrator)"),
+                    input_tok: 1_000_000,
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+        pconn
+            .execute(
+                "INSERT INTO steps (idx, metadata) VALUES (2, ?1)",
+                [encode_step_blob(StepBlobSpec {
+                    created_at_secs: Some(1_795_000_000),
+                    usage: Some(UsageSpec {
+                        model_enum: 1669,
+                        input_tok: 1_000_000,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })],
+            )
+            .unwrap();
+        drop(pconn);
+
+        // Child DB: 1M turn with legacy generic display name "Gemini Flash" on same worker routing ID.
+        seed_cost_db(
+            &cli_dir,
+            child,
+            1,
+            encode_gen_blob(GenBlobSpec {
+                step_indices: vec![1],
+                model_enum: 0,
+                resp_model: Some("gemini-flash-worker-agy"),
+                disp_name: Some("Gemini Flash"),
+                input_tok: 1_000_000,
+                ..Default::default()
+            }),
+        );
+
+        let summaries = Connection::open(cli_dir.join("conversation_summaries.db")).unwrap();
+        summaries
+            .execute(
+                "CREATE TABLE conversation_summaries (
+                    conversation_id TEXT,
+                    parent_conversation_id TEXT,
+                    nesting_depth INTEGER
+                )",
+                [],
+            )
+            .unwrap();
+        summaries
+            .execute(
+                "INSERT INTO conversation_summaries VALUES (?1, ?2, 1)",
+                [child, parent],
+            )
+            .unwrap();
+        drop(summaries);
+
+        let est = estimate_conversation_cost_usd(&cli_dir, parent, &pricing).unwrap();
+        // Parent: $1.50 (main) + $1.50 (compaction) = $3.00; child: $1.50 -> total $4.50, sub $1.50.
+        assert_eq!(est.usd, Some(4.5));
+        assert_eq!(est.subagent_usd, Some(1.5));
+        assert_eq!(est.unpriced_turns, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_file_fingerprint_tracks_ctime_and_zeros_idle_wal_ctime() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let wal_path = dir.path().join("test.db-wal");
+        fs::write(&db_path, b"sqlite-bytes").unwrap();
+
+        let fp_no_wal = db_file_fingerprint(&db_path).unwrap();
+        assert!(fp_no_wal.db_ctime_secs > 0);
+        assert_eq!(fp_no_wal.wal_ctime_secs, 0);
+        assert_eq!(fp_no_wal.wal_ctime_nanos, 0);
+
+        // 0-byte WAL must keep wal_ctime zeroed.
+        fs::write(&wal_path, b"").unwrap();
+        let fp_empty_wal = db_file_fingerprint(&db_path).unwrap();
+        assert_eq!(fp_empty_wal, fp_no_wal);
+
+        // Non-empty WAL records non-zero wal_ctime and changes the fingerprint.
+        fs::write(&wal_path, b"wal-frame").unwrap();
+        let fp_active_wal = db_file_fingerprint(&db_path).unwrap();
+        assert!(fp_active_wal.wal_ctime_secs > 0);
+        assert_ne!(fp_active_wal, fp_no_wal);
+
+        // A ctime-only difference changes DbFileFingerprint equality.
+        let mut altered = fp_no_wal;
+        altered.db_ctime_secs = altered.db_ctime_secs.saturating_sub(1);
+        assert_ne!(altered, fp_no_wal);
     }
 }

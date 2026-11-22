@@ -127,6 +127,8 @@ struct ModelUsage {
     cache_read_tokens: u64,
     #[prost(uint64, tag = "9")]
     thinking_output_tokens: u64,
+    #[prost(uint64, tag = "10")]
+    response_output_tokens: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -182,6 +184,7 @@ pub struct TestGenSpec<'a> {
     pub cache_read_tok: u64,
     pub output_tok: u64,
     pub thinking_tok: u64,
+    pub resp_out_tok: u64,
     pub max_context_tokens: i64,
     pub estimated_context_tokens: i64,
     pub dur_secs: u64,
@@ -197,6 +200,7 @@ pub fn build_gen_blob(spec: TestGenSpec<'_>) -> Vec<u8> {
                 output_tokens: spec.output_tok,
                 cache_read_tokens: spec.cache_read_tok,
                 thinking_output_tokens: spec.thinking_tok,
+                response_output_tokens: spec.resp_out_tok,
             }),
             chat_start_metadata: Some(ChatStartMetadata {
                 context_window_metadata: Some(ContextWindowMetadata {

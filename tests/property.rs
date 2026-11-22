@@ -31,7 +31,8 @@ proptest! {
         cache_read_tok in 0u64..5_000_000,
         output_tok in 1u64..100_000,
         thinking_tok in 0u64..100_000,
-        dur_secs in 11u64..3_600,
+        resp_out_tok in 0u64..100_000,
+        dur_secs in 21u64..3_600,
         ttft_ms in 1u64..599_999,
         step_secs in 1u64..=(MAX_TIMESTAMP_SECS as u64),
     ) {
@@ -44,17 +45,21 @@ proptest! {
             cache_read_tok,
             output_tok,
             thinking_tok,
+            resp_out_tok,
             dur_secs,
             ttft_ms,
             ..Default::default()
         });
+        let expected_output = output_tok.max(thinking_tok.saturating_add(resp_out_tok));
+        let expected_thinking = expected_output.min(thinking_tok);
         let rec = extract_gen_metadata_record(&gen_blob).unwrap();
         prop_assert_eq!(rec.first_step_index, Some(step_idx));
+        prop_assert_eq!(rec.step_indices.as_slice(), &[step_idx]);
         prop_assert_eq!(rec.model_enum, model_enum);
         prop_assert_eq!(rec.input_tokens, input_tok);
         prop_assert_eq!(rec.cache_read_tokens, cache_read_tok);
-        prop_assert_eq!(rec.output_tokens, output_tok);
-        prop_assert_eq!(rec.thinking_output_tokens, thinking_tok);
+        prop_assert_eq!(rec.output_tokens, expected_output);
+        prop_assert_eq!(rec.thinking_output_tokens, expected_thinking);
         prop_assert_eq!(rec.response_model.as_deref(), Some("model-prop"));
         prop_assert_eq!(rec.model_display_name.as_deref(), Some("Model Prop"));
 
@@ -64,7 +69,7 @@ proptest! {
         prop_assert!(ttft_secs > 0.0 && ttft_secs < MAX_TTFT_SECS);
         prop_assert!((ttft_secs - (ttft_ms as f64) / 1_000.0).abs() < 1e-6);
 
-        let expected_tps = (output_tok as f64) / (dur_secs as f64);
+        let expected_tps = (expected_output as f64) / (dur_secs as f64);
         let speed = extract_metadata_speed(&gen_blob).unwrap();
         prop_assert!(speed > 0.0 && speed < MAX_TURN_SPEED_TPS);
         prop_assert!((speed - expected_tps).abs() < 1e-9);

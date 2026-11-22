@@ -1,19 +1,25 @@
-//! Protobuf decoder for AGY generation and step metadata backed by `prost`.
+//! Protobuf decoder for AGY generation, step, and trajectory metadata backed by `prost`.
 //!
-//! Extracts turn timing, token counts, model metadata, timestamps, and context
-//! window metadata from `CortexStepGeneratorMetadata` (`gen_metadata.data`) and
-//! `CortexStepMetadata` (`steps.metadata`).
+//! Extracts turn timing, token counts, usage identities, retry attempts, model
+//! metadata, timestamps, and context window metadata from
+//! `CortexStepGeneratorMetadata` (`gen_metadata.data`), `CortexStepMetadata`
+//! (`steps.metadata`), and `trajectory_metadata_blob.data`.
 //!
 //! Verified wire paths (from embedded `.proto` descriptors in `agy`):
 //! - `CortexStepGeneratorMetadata`:
 //!   - `chat_model` (`ChatModelMetadata`): field `1`
 //!     - `model` (`Model` enum): field `3`
 //!     - `usage` (`ModelUsageStats`): field `4`
+//!       - `model_enum`: field `1`
 //!       - `input_tokens`: field `2`
 //!       - `output_tokens`: field `3`
 //!       - `cache_write_tokens`: field `4`
 //!       - `cache_read_tokens`: field `5`
+//!       - `id_7`: field `7` (`string`)
 //!       - `thinking_output_tokens`: field `9`
+//!       - `response_output_tokens`: field `10`
+//!       - `id_11`: field `11` (`string`)
+//!       - `id_12`: field `12` (`string`)
 //!     - `model_cost`: field `5` (`float` USD)
 //!     - `chat_start_metadata` (`ChatStartMetadata`): field `9`
 //!       - `created_at` (`google.protobuf.Timestamp`): field `4` (`seconds=1`)
@@ -22,11 +28,18 @@
 //!         - `max_context_tokens`: field `4`
 //!     - `time_to_first_token` (`google.protobuf.Duration`): field `11` (`seconds=1`, `nanos=2`)
 //!     - `streaming_duration` (`google.protobuf.Duration`): field `12` (`seconds=1`, `nanos=2`)
+//!     - `retries` (repeated `RetryAttempt` -> `usage=2`): field `17`
 //!     - `response_model`: field `19` (`string`)
 //!     - `model_display_name`: field `21` (`string`)
 //!   - `step_indices`: field `2` (`repeated uint32`, packed or unpacked)
 //! - `CortexStepMetadata` (`steps.metadata`):
 //!   - `created_at` (`google.protobuf.Timestamp`): field `1` (`seconds=1`)
+//!   - `secondary_created_at` (`google.protobuf.Timestamp`): field `8` (`seconds=1`)
+//!   - `usage` (`ModelUsageStats`): field `9`
+//!   - `model_info` (`StepModelInfo`): field `24` (`model_enum=1`, `model_display_name=8`, `response_model=12`)
+//!   - `retries` (repeated `RetryAttempt` -> `usage=2`): field `28`
+//! - `TrajectoryMetadataBlob` (`trajectory_metadata_blob.data`):
+//!   - `created_at` (`google.protobuf.Timestamp`): field `2` (`seconds=1`)
 
 use prost::Message;
 
@@ -50,6 +63,12 @@ struct GenMetadataBlob {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct RetryAttempt {
+    #[prost(message, optional, tag = "2")]
+    usage: Option<ModelUsage>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct ChatModelMetadata {
     #[prost(uint64, tag = "3")]
     model: u64,
@@ -63,6 +82,8 @@ struct ChatModelMetadata {
     time_to_first_token: Option<ProtoDuration>,
     #[prost(message, optional, tag = "12")]
     streaming_duration: Option<ProtoDuration>,
+    #[prost(message, repeated, tag = "17")]
+    retries: Vec<RetryAttempt>,
     #[prost(string, optional, tag = "19")]
     response_model: Option<String>,
     #[prost(string, optional, tag = "21")]
@@ -71,6 +92,8 @@ struct ChatModelMetadata {
 
 #[derive(Clone, PartialEq, Message)]
 struct ModelUsage {
+    #[prost(uint64, tag = "1")]
+    model_enum: u64,
     #[prost(uint64, tag = "2")]
     input_tokens: u64,
     #[prost(uint64, tag = "3")]
@@ -79,8 +102,46 @@ struct ModelUsage {
     cache_write_tokens: u64,
     #[prost(uint64, tag = "5")]
     cache_read_tokens: u64,
+    #[prost(string, optional, tag = "7")]
+    id_7: Option<String>,
     #[prost(uint64, tag = "9")]
     thinking_output_tokens: u64,
+    #[prost(uint64, tag = "10")]
+    response_output_tokens: u64,
+    #[prost(string, optional, tag = "11")]
+    id_11: Option<String>,
+    #[prost(string, optional, tag = "12")]
+    id_12: Option<String>,
+}
+
+impl ModelUsage {
+    /// Resolves total output tokens and thinking tokens consistently when providers
+    /// split thinking (`f9`) and response (`f10`) output tokens or omit `f3`.
+    fn resolved_tokens(&self) -> (u64, u64) {
+        let output_tokens = self.output_tokens.max(
+            self.thinking_output_tokens
+                .saturating_add(self.response_output_tokens),
+        );
+        let thinking_output_tokens = output_tokens.min(self.thinking_output_tokens);
+        (output_tokens, thinking_output_tokens)
+    }
+
+    fn into_attempt_record(self) -> UsageAttemptRecord {
+        let (output_tokens, thinking_output_tokens) = self.resolved_tokens();
+        UsageAttemptRecord {
+            model_enum: self.model_enum,
+            input_tokens: self.input_tokens,
+            output_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            thinking_output_tokens,
+            identity: UsageIdentity {
+                id_11: trim_non_empty(self.id_11),
+                id_12: trim_non_empty(self.id_12),
+                id_7: trim_non_empty(self.id_7),
+            },
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -130,17 +191,78 @@ impl ProtoTimestamp {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct StepModelInfo {
+    #[prost(uint64, tag = "1")]
+    model_enum: u64,
+    #[prost(string, optional, tag = "8")]
+    model_display_name: Option<String>,
+    #[prost(string, optional, tag = "12")]
+    response_model: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct StepMetadataBlob {
     #[prost(message, optional, tag = "1")]
     created_at: Option<ProtoTimestamp>,
+    #[prost(message, optional, tag = "8")]
+    secondary_created_at: Option<ProtoTimestamp>,
+    #[prost(message, optional, tag = "9")]
+    usage: Option<ModelUsage>,
+    #[prost(message, optional, tag = "24")]
+    model_info: Option<StepModelInfo>,
+    #[prost(message, repeated, tag = "28")]
+    retries: Vec<RetryAttempt>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TrajectoryMetadataBlob {
+    #[prost(message, optional, tag = "2")]
+    created_at: Option<ProtoTimestamp>,
+}
+
+/// Deduplication identity keys observed on a `ModelUsageStats` protobuf message.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageIdentity {
+    /// Primary response identifier (`ModelUsageStats` field `11`).
+    pub id_11: Option<String>,
+    /// Secondary response/message identifier (`ModelUsageStats` field `12`).
+    pub id_12: Option<String>,
+    /// Fallback request/call identifier (`ModelUsageStats` field `7`).
+    pub id_7: Option<String>,
+}
+
+impl UsageIdentity {
+    /// Returns `true` when all identity keys are absent.
+    pub fn is_empty(&self) -> bool {
+        self.id_11.is_none() && self.id_12.is_none() && self.id_7.is_none()
+    }
+}
+
+/// Decoded usage and identity metrics for a single model attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageAttemptRecord {
+    /// Numeric `Model` enum reported on `ModelUsageStats` (field `1`).
+    pub model_enum: u64,
+    /// Uncached input tokens (field `2`).
+    pub input_tokens: u64,
+    /// Resolved total output tokens (`max(f3, f9 + f10)`).
+    pub output_tokens: u64,
+    /// Prompt cache write tokens (field `4`).
+    pub cache_write_tokens: u64,
+    /// Prompt cache read tokens (field `5`).
+    pub cache_read_tokens: u64,
+    /// Resolved thinking output tokens (`min(output_tokens, f9)`).
+    pub thinking_output_tokens: u64,
+    /// Non-empty trimmed deduplication identity keys (`f11`, `f12`, `f7`).
+    pub identity: UsageIdentity,
 }
 
 /// Timing and output token metrics extracted from one `gen_metadata` turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct TurnMetrics {
-    /// Total output tokens generated in the turn (`chat(1).usage(4).output_tokens(3)`).
+    /// Resolved total output tokens (`max(f3, f9 + f10)`).
     pub(crate) output_tokens: u64,
-    /// Optional thinking output tokens (`chat(1).usage(4).thinking_output_tokens(9)`).
+    /// Optional thinking output tokens (`min(output_tokens, f9)`).
     pub(crate) thinking_tokens: Option<u64>,
     /// Streaming decode duration in seconds (`chat(1).streaming_duration(12)`).
     pub(crate) decode_secs: f64,
@@ -164,17 +286,19 @@ pub(crate) struct GenMetadataSummary {
 pub struct GenMetadataRecord {
     /// First step index associated with this generation (`step_indices[0]`, field `2`).
     pub first_step_index: Option<u64>,
-    /// Numeric `Model` enum (`chat(1).model(3)`).
+    /// All step indices covered by this generation (`step_indices`, field `2`).
+    pub step_indices: Vec<u64>,
+    /// Numeric `Model` enum (prefers `usage.model_enum(1)` when non-zero, else `chat.model(3)`).
     pub model_enum: u64,
     /// Uncached input tokens (`chat(1).usage(4).input_tokens(2)`).
     pub input_tokens: u64,
-    /// Total output tokens (`chat(1).usage(4).output_tokens(3)`).
+    /// Resolved total output tokens (`max(f3, f9 + f10)`).
     pub output_tokens: u64,
     /// Prompt cache write tokens (`chat(1).usage(4).cache_write_tokens(4)`).
     pub cache_write_tokens: u64,
     /// Prompt cache read tokens (`chat(1).usage(4).cache_read_tokens(5)`).
     pub cache_read_tokens: u64,
-    /// Thinking output tokens (`chat(1).usage(4).thinking_output_tokens(9)`).
+    /// Resolved thinking output tokens (`min(output_tokens, f9)`).
     pub thinking_output_tokens: u64,
     /// Native server-recorded turn cost in USD (`chat(1).model_cost(5)`), if `> 0` and finite.
     pub model_cost_usd: Option<f64>,
@@ -188,6 +312,10 @@ pub struct GenMetadataRecord {
     pub response_model: Option<String>,
     /// Human-readable display model name (`chat(1).model_display_name(21)`).
     pub model_display_name: Option<String>,
+    /// Non-empty trimmed deduplication identity keys from `chat(1).usage(4)`.
+    pub identity: UsageIdentity,
+    /// Usage attempts recorded on `chat(1).retries(17)`.
+    pub retry_usages: Vec<UsageAttemptRecord>,
 }
 
 impl GenMetadataRecord {
@@ -200,6 +328,25 @@ impl GenMetadataRecord {
         }
         Some((self.output_tokens as f64) / secs)
     }
+}
+
+/// Decoded step timestamps, model info, and usage attempts from `CortexStepMetadata` (`steps.metadata`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepMetadataRecord {
+    /// Primary step creation timestamp (`created_at`, field `1`).
+    pub created_at_secs: Option<i64>,
+    /// Secondary step timestamp (`field 8`), used when primary `created_at` is absent.
+    pub secondary_created_at_secs: Option<i64>,
+    /// Numeric `Model` enum from `model_info(24).model_enum(1)` (falling back to `usage(9).model_enum(1)`).
+    pub model_enum: u64,
+    /// Wire response model string (`model_info(24).response_model(12)`).
+    pub response_model: Option<String>,
+    /// Human-readable display model name (`model_info(24).model_display_name(8)`).
+    pub model_display_name: Option<String>,
+    /// Step-level usage record (`field 9`), e.g. compaction turns (`step_type = 23`).
+    pub usage: Option<UsageAttemptRecord>,
+    /// Step-level retry attempts (`field 28 -> usage(2)`).
+    pub retry_usages: Vec<UsageAttemptRecord>,
 }
 
 pub(crate) fn is_sane_decode_speed(output_tokens: u64, decode_secs: f64) -> bool {
@@ -230,13 +377,11 @@ fn trim_non_empty(value: Option<String>) -> Option<String> {
 pub(crate) fn extract_gen_metadata_summary(data: &[u8]) -> Option<GenMetadataSummary> {
     let chat = GenMetadataBlob::decode(data).ok()?.chat_model?;
     let turn = match (chat.usage, chat.streaming_duration.and_then(|d| d.to_secs())) {
-        (Some(usage), Some(decode_secs))
-            if is_sane_decode_speed(usage.output_tokens, decode_secs) =>
-        {
-            Some(TurnMetrics {
-                output_tokens: usage.output_tokens,
-                thinking_tokens: (usage.thinking_output_tokens > 0)
-                    .then_some(usage.thinking_output_tokens),
+        (Some(usage), Some(decode_secs)) => {
+            let (output_tokens, thinking_output_tokens) = usage.resolved_tokens();
+            is_sane_decode_speed(output_tokens, decode_secs).then(|| TurnMetrics {
+                output_tokens,
+                thinking_tokens: (thinking_output_tokens > 0).then_some(thinking_output_tokens),
                 decode_secs,
                 ttft_secs: chat
                     .time_to_first_token
@@ -271,8 +416,22 @@ pub(crate) fn extract_gen_metadata_summary(data: &[u8]) -> Option<GenMetadataSum
 pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord> {
     let blob = GenMetadataBlob::decode(data).ok()?;
     let first_step_index = blob.step_indices.first().copied();
+    let step_indices = blob.step_indices;
     let chat = blob.chat_model?;
-    let usage = chat.usage.unwrap_or_default();
+    let usage = chat
+        .usage
+        .map(ModelUsage::into_attempt_record)
+        .unwrap_or_default();
+    let model_enum = if usage.model_enum != 0 {
+        usage.model_enum
+    } else {
+        chat.model
+    };
+    let retry_usages = chat
+        .retries
+        .into_iter()
+        .filter_map(|r| r.usage.map(ModelUsage::into_attempt_record))
+        .collect();
 
     let model_cost_usd = chat
         .model_cost
@@ -296,7 +455,8 @@ pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord> {
 
     Some(GenMetadataRecord {
         first_step_index,
-        model_enum: chat.model,
+        step_indices,
+        model_enum,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cache_write_tokens: usage.cache_write_tokens,
@@ -308,6 +468,44 @@ pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord> {
         decode_secs,
         response_model: trim_non_empty(chat.response_model),
         model_display_name: trim_non_empty(chat.model_display_name),
+        identity: usage.identity,
+        retry_usages,
+    })
+}
+
+/// Extracts [`StepMetadataRecord`] from `CortexStepMetadata` (`steps.metadata`).
+pub fn extract_step_metadata_record(data: &[u8]) -> Option<StepMetadataRecord> {
+    let blob = StepMetadataBlob::decode(data).ok()?;
+    let created_at_secs = blob.created_at.and_then(|ts| ts.valid_secs());
+    let secondary_created_at_secs = blob.secondary_created_at.and_then(|ts| ts.valid_secs());
+    let usage = blob.usage.map(ModelUsage::into_attempt_record);
+    let retry_usages = blob
+        .retries
+        .into_iter()
+        .filter_map(|r| r.usage.map(ModelUsage::into_attempt_record))
+        .collect();
+    let (info_model_enum, response_model, model_display_name) = match blob.model_info {
+        Some(info) => (
+            info.model_enum,
+            trim_non_empty(info.response_model),
+            trim_non_empty(info.model_display_name),
+        ),
+        None => (0, None, None),
+    };
+    let usage_model_enum = usage.as_ref().map_or(0, |u| u.model_enum);
+    let model_enum = if info_model_enum != 0 {
+        info_model_enum
+    } else {
+        usage_model_enum
+    };
+    Some(StepMetadataRecord {
+        created_at_secs,
+        secondary_created_at_secs,
+        model_enum,
+        response_model,
+        model_display_name,
+        usage,
+        retry_usages,
     })
 }
 
@@ -317,7 +515,13 @@ pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord> {
 /// Rejects timestamps outside proleptic UTC years `0001..=9999`
 /// (`-62_135_596_800..=253_402_300_799`).
 pub fn extract_step_created_at_secs(data: &[u8]) -> Option<i64> {
-    StepMetadataBlob::decode(data)
+    extract_step_metadata_record(data)?.created_at_secs
+}
+
+/// Extracts `TrajectoryMetadataBlob.created_at` (`field 2 -> google.protobuf.Timestamp.seconds = 1`)
+/// from a `trajectory_metadata_blob.data` Protobuf blob.
+pub fn extract_trajectory_created_at_secs(data: &[u8]) -> Option<i64> {
+    TrajectoryMetadataBlob::decode(data)
         .ok()?
         .created_at?
         .valid_secs()
@@ -343,10 +547,44 @@ pub fn extract_metadata_speed(data: &[u8]) -> Option<f64> {
 }
 
 #[cfg(test)]
+#[derive(Default, Clone)]
+pub(crate) struct UsageSpec<'a> {
+    pub(crate) model_enum: u64,
+    pub(crate) input_tok: u64,
+    pub(crate) output_tok: u64,
+    pub(crate) cache_write_tok: u64,
+    pub(crate) cache_read_tok: u64,
+    pub(crate) thinking_tok: u64,
+    pub(crate) resp_out_tok: u64,
+    pub(crate) id_11: Option<&'a str>,
+    pub(crate) id_12: Option<&'a str>,
+    pub(crate) id_7: Option<&'a str>,
+}
+
+#[cfg(test)]
+impl UsageSpec<'_> {
+    fn to_proto(&self) -> ModelUsage {
+        ModelUsage {
+            model_enum: self.model_enum,
+            input_tokens: self.input_tok,
+            output_tokens: self.output_tok,
+            cache_write_tokens: self.cache_write_tok,
+            cache_read_tokens: self.cache_read_tok,
+            id_7: self.id_7.map(str::to_string),
+            thinking_output_tokens: self.thinking_tok,
+            response_output_tokens: self.resp_out_tok,
+            id_11: self.id_11.map(str::to_string),
+            id_12: self.id_12.map(str::to_string),
+        }
+    }
+}
+
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct GenBlobSpec<'a> {
     pub(crate) step_indices: Vec<u64>,
     pub(crate) model_enum: u64,
+    pub(crate) usage_model_enum: u64,
     pub(crate) resp_model: Option<&'a str>,
     pub(crate) disp_name: Option<&'a str>,
     pub(crate) model_cost: Option<f32>,
@@ -355,6 +593,11 @@ pub(crate) struct GenBlobSpec<'a> {
     pub(crate) cache_write_tok: u64,
     pub(crate) cache_read_tok: u64,
     pub(crate) thinking_tok: u64,
+    pub(crate) resp_out_tok: u64,
+    pub(crate) id_11: Option<&'a str>,
+    pub(crate) id_12: Option<&'a str>,
+    pub(crate) id_7: Option<&'a str>,
+    pub(crate) retries: Vec<UsageSpec<'a>>,
     pub(crate) created_at_secs: Option<i64>,
     pub(crate) estimated_context_tokens: i64,
     pub(crate) max_context_tokens: i64,
@@ -370,11 +613,16 @@ pub(crate) fn encode_gen_blob(spec: GenBlobSpec<'_>) -> Vec<u8> {
         chat_model: Some(ChatModelMetadata {
             model: spec.model_enum,
             usage: Some(ModelUsage {
+                model_enum: spec.usage_model_enum,
                 input_tokens: spec.input_tok,
                 output_tokens: spec.output_tok,
                 cache_write_tokens: spec.cache_write_tok,
                 cache_read_tokens: spec.cache_read_tok,
+                id_7: spec.id_7.map(str::to_string),
                 thinking_output_tokens: spec.thinking_tok,
+                response_output_tokens: spec.resp_out_tok,
+                id_11: spec.id_11.map(str::to_string),
+                id_12: spec.id_12.map(str::to_string),
             }),
             model_cost: spec.model_cost,
             chat_start_metadata: Some(ChatStartMetadata {
@@ -394,6 +642,13 @@ pub(crate) fn encode_gen_blob(spec: GenBlobSpec<'_>) -> Vec<u8> {
                 seconds: spec.dur_secs,
                 nanos: spec.dur_nanos,
             }),
+            retries: spec
+                .retries
+                .iter()
+                .map(|u| RetryAttempt {
+                    usage: Some(u.to_proto()),
+                })
+                .collect(),
             response_model: spec.resp_model.map(str::to_string),
             model_display_name: spec.disp_name.map(str::to_string),
         }),
@@ -403,8 +658,57 @@ pub(crate) fn encode_gen_blob(spec: GenBlobSpec<'_>) -> Vec<u8> {
 }
 
 #[cfg(test)]
-pub(crate) fn encode_step_meta_blob(created_at_secs: i64) -> Vec<u8> {
+#[derive(Default)]
+pub(crate) struct StepBlobSpec<'a> {
+    pub(crate) created_at_secs: Option<i64>,
+    pub(crate) secondary_created_at_secs: Option<i64>,
+    pub(crate) usage: Option<UsageSpec<'a>>,
+    pub(crate) model_info_enum: u64,
+    pub(crate) model_display_name: Option<&'a str>,
+    pub(crate) response_model: Option<&'a str>,
+    pub(crate) retries: Vec<UsageSpec<'a>>,
+}
+
+#[cfg(test)]
+pub(crate) fn encode_step_blob(spec: StepBlobSpec<'_>) -> Vec<u8> {
+    let has_info = spec.model_info_enum != 0
+        || spec.model_display_name.is_some()
+        || spec.response_model.is_some();
     StepMetadataBlob {
+        created_at: spec
+            .created_at_secs
+            .map(|seconds| ProtoTimestamp { seconds }),
+        secondary_created_at: spec
+            .secondary_created_at_secs
+            .map(|seconds| ProtoTimestamp { seconds }),
+        usage: spec.usage.map(|u| u.to_proto()),
+        model_info: has_info.then(|| StepModelInfo {
+            model_enum: spec.model_info_enum,
+            model_display_name: spec.model_display_name.map(str::to_string),
+            response_model: spec.response_model.map(str::to_string),
+        }),
+        retries: spec
+            .retries
+            .iter()
+            .map(|u| RetryAttempt {
+                usage: Some(u.to_proto()),
+            })
+            .collect(),
+    }
+    .encode_to_vec()
+}
+
+#[cfg(test)]
+pub(crate) fn encode_step_meta_blob(created_at_secs: i64) -> Vec<u8> {
+    encode_step_blob(StepBlobSpec {
+        created_at_secs: Some(created_at_secs),
+        ..Default::default()
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn encode_trajectory_meta_blob(created_at_secs: i64) -> Vec<u8> {
+    TrajectoryMetadataBlob {
         created_at: Some(ProtoTimestamp {
             seconds: created_at_secs,
         }),
@@ -476,15 +780,49 @@ mod tests {
     #[test]
     fn turn_metrics_extracts_thinking_tokens() {
         let blob = encode_gen_blob(GenBlobSpec {
-            output_tok: 100,
+            output_tok: 350,
             thinking_tok: 250,
             dur_secs: 2,
             ..Default::default()
         });
         let m = extract_gen_metadata_summary(&blob).unwrap().turn.unwrap();
-        assert_eq!(m.output_tokens, 100);
+        assert_eq!(m.output_tokens, 350);
         assert_eq!(m.thinking_tokens, Some(250));
         assert!((m.decode_secs - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resolved_output_uses_max_of_f3_and_f9_plus_f10() {
+        let split_only = encode_gen_blob(GenBlobSpec {
+            output_tok: 0,
+            thinking_tok: 40,
+            resp_out_tok: 60,
+            dur_secs: 2,
+            ..Default::default()
+        });
+        let summary = extract_gen_metadata_summary(&split_only)
+            .unwrap()
+            .turn
+            .unwrap();
+        assert_eq!(summary.output_tokens, 100);
+        assert_eq!(summary.thinking_tokens, Some(40));
+        assert_eq!(extract_metadata_speed(&split_only), Some(50.0));
+
+        let rec = extract_gen_metadata_record(&split_only).unwrap();
+        assert_eq!(rec.output_tokens, 100);
+        assert_eq!(rec.thinking_output_tokens, 40);
+        assert_eq!(rec.decode_speed_tps(), Some(50.0));
+
+        let larger_f3 = encode_gen_blob(GenBlobSpec {
+            output_tok: 150,
+            thinking_tok: 40,
+            resp_out_tok: 60,
+            dur_secs: 2,
+            ..Default::default()
+        });
+        let rec_larger = extract_gen_metadata_record(&larger_f3).unwrap();
+        assert_eq!(rec_larger.output_tokens, 150);
+        assert_eq!(rec_larger.thinking_output_tokens, 40);
     }
 
     #[test]
@@ -565,6 +903,7 @@ mod tests {
 
         let rec = extract_gen_metadata_record(&root_packed).unwrap();
         assert_eq!(rec.first_step_index, Some(7));
+        assert_eq!(rec.step_indices, vec![7, 8]);
         assert_eq!(rec.model_enum, 1526);
         assert_eq!(rec.input_tokens, 12_000);
         assert_eq!(rec.output_tokens, 600);
@@ -580,13 +919,128 @@ mod tests {
             rec.model_display_name.as_deref(),
             Some("Model Alpha (Medium)")
         );
+        assert!(rec.identity.is_empty());
+        assert!(rec.retry_usages.is_empty());
 
         // Wire-compatibility: unpacked repeated step_indices = [14, 15] (prost emits packed by default).
         // chat(1) -> { model(3)=1 }, step_indices(2)=14, step_indices(2)=15
         let root_unpacked: &[u8] = &[0x0a, 0x02, 0x18, 0x01, 0x10, 0x0e, 0x10, 0x0f];
         let rec_unpacked = extract_gen_metadata_record(root_unpacked).unwrap();
         assert_eq!(rec_unpacked.first_step_index, Some(14));
+        assert_eq!(rec_unpacked.step_indices, vec![14, 15]);
         assert_eq!(rec_unpacked.model_enum, 1);
+    }
+
+    #[test]
+    fn gen_metadata_decodes_usage_model_enum_identities_and_f17_retries() {
+        let blob = encode_gen_blob(GenBlobSpec {
+            step_indices: vec![3, 4],
+            model_enum: 1500,
+            usage_model_enum: 1669,
+            resp_model: Some("gemini-flash-worker-agy"),
+            disp_name: Some("Gemini 4 Hydrogen (Orchestrator)"),
+            input_tok: 5_000,
+            output_tok: 200,
+            id_11: Some("  resp-main-11  "),
+            id_12: Some("   "),
+            id_7: Some("call-main-7"),
+            retries: vec![UsageSpec {
+                model_enum: 1418,
+                input_tok: 2_000,
+                output_tok: 0,
+                thinking_tok: 30,
+                resp_out_tok: 50,
+                id_11: Some("resp-retry-11"),
+                id_12: Some("msg-retry-12"),
+                ..Default::default()
+            }],
+            dur_secs: 2,
+            ..Default::default()
+        });
+
+        let rec = extract_gen_metadata_record(&blob).unwrap();
+        assert_eq!(rec.model_enum, 1669);
+        assert_eq!(rec.identity.id_11.as_deref(), Some("resp-main-11"));
+        assert_eq!(rec.identity.id_12, None);
+        assert_eq!(rec.identity.id_7.as_deref(), Some("call-main-7"));
+        assert!(!rec.identity.is_empty());
+        assert_eq!(rec.retry_usages.len(), 1);
+        assert_eq!(rec.retry_usages[0].model_enum, 1418);
+        assert_eq!(rec.retry_usages[0].input_tokens, 2_000);
+        assert_eq!(rec.retry_usages[0].output_tokens, 80);
+        assert_eq!(rec.retry_usages[0].thinking_output_tokens, 30);
+        assert_eq!(
+            rec.retry_usages[0].identity.id_11.as_deref(),
+            Some("resp-retry-11")
+        );
+        assert_eq!(
+            rec.retry_usages[0].identity.id_12.as_deref(),
+            Some("msg-retry-12")
+        );
+    }
+
+    #[test]
+    fn step_metadata_decodes_f1_f8_f9_f24_f28_and_trajectory_f2() {
+        let step_blob = encode_step_blob(StepBlobSpec {
+            created_at_secs: None,
+            secondary_created_at_secs: Some(1_795_000_050),
+            usage: Some(UsageSpec {
+                model_enum: 1669,
+                input_tok: 8_000,
+                cache_read_tok: 12_000,
+                output_tok: 0,
+                thinking_tok: 25,
+                resp_out_tok: 75,
+                id_11: Some("step-id-11"),
+                id_7: Some("step-id-7"),
+                ..Default::default()
+            }),
+            model_info_enum: 1669,
+            model_display_name: Some("Gemini 4 Hydrogen (Orchestrator)"),
+            response_model: Some("gemini-flash-worker-agy"),
+            retries: vec![UsageSpec {
+                model_enum: 1418,
+                input_tok: 1_500,
+                output_tok: 40,
+                id_12: Some("step-retry-12"),
+                ..Default::default()
+            }],
+        });
+
+        let step = extract_step_metadata_record(&step_blob).unwrap();
+        assert_eq!(step.created_at_secs, None);
+        assert_eq!(step.secondary_created_at_secs, Some(1_795_000_050));
+        assert_eq!(step.model_enum, 1669);
+        assert_eq!(
+            step.model_display_name.as_deref(),
+            Some("Gemini 4 Hydrogen (Orchestrator)")
+        );
+        assert_eq!(
+            step.response_model.as_deref(),
+            Some("gemini-flash-worker-agy")
+        );
+        let usage = step.usage.unwrap();
+        assert_eq!(usage.input_tokens, 8_000);
+        assert_eq!(usage.cache_read_tokens, 12_000);
+        assert_eq!(usage.output_tokens, 100);
+        assert_eq!(usage.thinking_output_tokens, 25);
+        assert_eq!(usage.identity.id_11.as_deref(), Some("step-id-11"));
+        assert_eq!(usage.identity.id_7.as_deref(), Some("step-id-7"));
+        assert_eq!(step.retry_usages.len(), 1);
+        assert_eq!(step.retry_usages[0].model_enum, 1418);
+        assert_eq!(step.retry_usages[0].output_tokens, 40);
+        assert_eq!(
+            step.retry_usages[0].identity.id_12.as_deref(),
+            Some("step-retry-12")
+        );
+
+        let traj_valid = encode_trajectory_meta_blob(1_795_000_000);
+        assert_eq!(
+            extract_trajectory_created_at_secs(&traj_valid),
+            Some(1_795_000_000)
+        );
+        let traj_oob = encode_trajectory_meta_blob(253_402_300_800);
+        assert_eq!(extract_trajectory_created_at_secs(&traj_oob), None);
     }
 
     #[test]

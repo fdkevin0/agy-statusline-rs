@@ -385,7 +385,7 @@ mod tests {
     fn populates_estimated_context_and_thinking_tokens() {
         let (dir, conn, uuid) = create_temp_conv_db();
         let turn_with_thinking = encode_gen_blob(GenBlobSpec {
-            output_tok: 100,
+            output_tok: 350,
             thinking_tok: 250,
             dur_secs: 2,
             ..Default::default()
@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(meta.estimated_context_tokens, Some(64_000));
         assert_eq!(meta.max_context_tokens, Some(512_000));
         assert_eq!(meta.thinking_tokens, Some(250));
-        assert_eq!(meta.speed, Some(50.0));
+        assert_eq!(meta.speed, Some(175.0));
     }
 
     #[test]

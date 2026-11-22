@@ -160,7 +160,7 @@ fn tier2_cli_reads_real_sqlite_gen_metadata_thinking_tokens() {
         uuid,
         1,
         TestGenSpec {
-            output_tok: 100,
+            output_tok: 4_300,
             thinking_tok: 4_200,
             dur_secs: 2,
             ..Default::default()
