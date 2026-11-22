@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::apply::read_settings_object;
-use crate::db::is_valid_uuid;
+use crate::db::{is_safe_sqlite_file, is_valid_uuid};
 use crate::layout::try_load_layout_config;
 use crate::paths::{resolve_agy_cli_dir, xdg_data_dir};
 use crate::procutil::{run_command_stdout_bounded, BoundedCommandError};
@@ -68,7 +68,7 @@ fn probe_agy_version(path_env: Option<&OsStr>, timeout: Duration) -> String {
     match run_command_stdout_bounded(&mut cmd, timeout, MAX_AGY_VERSION_BYTES) {
         Ok(bytes) => format_version_output(&bytes),
         Err(BoundedCommandError::TimedOut) => "unavailable (timed out)".to_string(),
-        Err(BoundedCommandError::NonZero(status)) => format!("unavailable (exit {status})"),
+        Err(BoundedCommandError::NonZero(status)) => format!("unavailable ({status})"),
         Err(BoundedCommandError::Io(e)) => format!("unavailable ({e})"),
     }
 }
@@ -103,6 +103,7 @@ fn inspect_conversations_dir(conv_dir: &Path) -> String {
         if entry
             .file_type()
             .is_ok_and(|ft| !ft.is_symlink() && ft.is_file())
+            && is_safe_sqlite_file(&entry.path())
         {
             db_count += 1;
         }
@@ -416,6 +417,17 @@ mod tests {
         symlink(
             &external,
             real_conv.join("22222222-2222-4222-8222-222222222222.db"),
+        )
+        .unwrap();
+        // Real .db with symlinked -wal sidecar is also excluded, matching db/stats policy.
+        fs::write(
+            real_conv.join("33333333-3333-4333-8333-333333333333.db"),
+            b"real-with-sym-wal",
+        )
+        .unwrap();
+        symlink(
+            &external,
+            real_conv.join("33333333-3333-4333-8333-333333333333.db-wal"),
         )
         .unwrap();
         assert_eq!(
