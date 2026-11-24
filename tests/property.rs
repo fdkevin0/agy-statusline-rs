@@ -8,14 +8,14 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 use unicode_width::UnicodeWidthStr;
 
-use agy_statusline::db::SessionMetadata;
-use agy_statusline::git::GitInfo;
-use agy_statusline::layout::{GlyphMode, LayoutConfig, ThemeStyle, VisualStyle, WidgetId};
-use agy_statusline::protobuf::{
+use agy_statusline::agy::db::SessionMetadata;
+use agy_statusline::agy::protobuf::{
     extract_gen_metadata_record, extract_metadata_speed, extract_step_created_at_secs,
     MAX_TIMESTAMP_SECS, MAX_TTFT_SECS, MAX_TURN_SPEED_TPS, MIN_TIMESTAMP_SECS,
 };
-use agy_statusline::render::{build_progress_bar, write_statusline};
+use agy_statusline::config::layout::{GlyphMode, LayoutConfig, ThemeStyle, VisualStyle, WidgetId};
+use agy_statusline::statusline::git::GitInfo;
+use agy_statusline::statusline::render::{build_progress_bar, write_statusline};
 use agy_statusline::statusline::{
     ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket, StatuslinePayload, WorkspaceInfo,
 };

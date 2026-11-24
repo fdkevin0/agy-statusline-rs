@@ -4,8 +4,8 @@ use std::io::{self, Write as IoWrite};
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::layout::{GlyphMode, LayoutConfig, ThemeStyle, VisualStyle};
-use crate::theme::GlyphSet;
+use crate::config::layout::{GlyphMode, LayoutConfig, ThemeStyle, VisualStyle};
+use crate::statusline::theme::GlyphSet;
 
 use super::fit::slice_visible_width;
 use super::{Renderer, Segment};
@@ -149,7 +149,11 @@ impl Renderer<'_> {
                             seg.text
                         )?;
                     } else {
-                        write!(out, "\x1b[48;5;{bg}m\x1b[38;5;{fg}m{bold} {} \x1b[0m", seg.text)?;
+                        write!(
+                            out,
+                            "\x1b[48;5;{bg}m\x1b[38;5;{fg}m{bold} {} \x1b[0m",
+                            seg.text
+                        )?;
                     }
                 }
                 Ok(())
@@ -176,11 +180,7 @@ impl Renderer<'_> {
                     prev_bg = Some(bg);
                 }
                 if let Some(last_bg) = prev_bg {
-                    write!(
-                        out,
-                        "\x1b[0m\x1b[38;5;{last_bg}m{}\x1b[0m",
-                        glyphs.pl_right
-                    )?;
+                    write!(out, "\x1b[0m\x1b[38;5;{last_bg}m{}\x1b[0m", glyphs.pl_right)?;
                 }
                 Ok(())
             }

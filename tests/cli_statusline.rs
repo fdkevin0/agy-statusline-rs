@@ -11,13 +11,11 @@ use std::process::{Command, Stdio};
 
 use rusqlite::Connection;
 
-use agy_statusline::layout::{
+use agy_statusline::config::layout::{
     save_layout_config, GlyphMode, LayoutConfig, ThemeStyle, WidgetId,
 };
 
-use common::{
-    build_gen_blob, isolated_agy_cmd, run_statusline_stdin, unix_now_secs, TestGenSpec,
-};
+use common::{build_gen_blob, isolated_agy_cmd, run_statusline_stdin, unix_now_secs, TestGenSpec};
 
 fn seed_alpha_rate(home: &Path) {
     let cache_path = home.join("cache/agy-statusline/models_dev_pricing.json");

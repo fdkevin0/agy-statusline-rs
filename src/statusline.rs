@@ -1,23 +1,29 @@
 //! Null-safe AGY statusline JSON schema and pipeline orchestration.
 
+pub mod format;
+pub mod git;
+pub(crate) mod metrics;
+pub mod render;
+pub(crate) mod theme;
+
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::db::{
+use crate::agy::db::{
     open_readonly_db, query_session_metadata_from_conn, query_session_metadata_in,
     resolve_conversation_db_path, SessionMetadata, SpeedReader,
 };
-use crate::git::{GitInfo, GitProbe};
-use crate::layout::{LayoutConfig, WidgetId};
-use crate::render::write_statusline_at;
+use crate::config::layout::{LayoutConfig, WidgetId};
 use crate::stats::{
     estimate_conversation_cost_usd_with_parent_conn, is_pricing_fingerprint_fresh,
-    lookup_cached_conversation_cost, maybe_spawn_pricing_sync_if_stale,
-    pricing_cache_fingerprint, PricingCatalog, SyncMode,
+    lookup_cached_conversation_cost, maybe_spawn_pricing_sync_if_stale, pricing_cache_fingerprint,
+    PricingCatalog, SyncMode,
 };
+use crate::statusline::git::{GitInfo, GitProbe};
+use crate::statusline::render::write_statusline_at;
 
 /// Active AI model metadata (`"model": null` before a model is selected).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -242,7 +248,13 @@ impl StatuslinePayload {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .or_else(|| first.name.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+            .or_else(|| {
+                first
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
     }
 
     fn active_subagents(&self) -> impl Iterator<Item = &SubagentInfo> {
@@ -488,7 +500,11 @@ fn layout_needs_session_metadata(cfg: &LayoutConfig) -> bool {
 }
 
 fn probe_git(payload: &StatuslinePayload, git_probe: &dyn GitProbe, cfg: &LayoutConfig) -> GitInfo {
-    let has_vcs = cfg.rows.iter().flatten().any(|w| matches!(w, WidgetId::Vcs));
+    let has_vcs = cfg
+        .rows
+        .iter()
+        .flatten()
+        .any(|w| matches!(w, WidgetId::Vcs));
     let has_wt = cfg
         .rows
         .iter()
@@ -525,9 +541,9 @@ fn probe_git(payload: &StatuslinePayload, git_probe: &dyn GitProbe, cfg: &Layout
 ///
 /// ```
 /// use std::path::Path;
-/// use agy_statusline::db::{SessionMetadata, SpeedReader};
-/// use agy_statusline::git::{GitInfo, GitProbe};
-/// use agy_statusline::layout::LayoutConfig;
+/// use agy_statusline::agy::db::{SessionMetadata, SpeedReader};
+/// use agy_statusline::statusline::git::{GitInfo, GitProbe};
+/// use agy_statusline::config::layout::LayoutConfig;
 /// use agy_statusline::statusline::{process_statusline, StatuslineRuntime};
 ///
 /// struct FixedSpeed(Option<f64>);
@@ -568,7 +584,11 @@ pub fn process_statusline<W: Write>(
     let git_info = probe_git(&payload, runtime.git_probe, cfg);
 
     let needs_meta = layout_needs_session_metadata(cfg);
-    let needs_cost = cfg.rows.iter().flatten().any(|w| matches!(w, WidgetId::Cost))
+    let needs_cost = cfg
+        .rows
+        .iter()
+        .flatten()
+        .any(|w| matches!(w, WidgetId::Cost))
         && payload.valid_cost_usd().is_none()
         && !matches!(runtime.pricing, PricingSource::Disabled);
 
@@ -698,13 +718,18 @@ mod tests {
     #[test]
     fn empty_and_invalid_json_degrades_gracefully() {
         let mut cfg = LayoutConfig::preset_addon();
-        cfg.theme = crate::layout::ThemeStyle::Mono;
+        cfg.theme = crate::config::layout::ThemeStyle::Mono;
         let git = NoopGit;
 
         let reader_none = StubReader(None);
         let mut out = Vec::new();
-        process_statusline("", &StatuslineRuntime::minimal(&reader_none, &git), &cfg, &mut out)
-            .unwrap();
+        process_statusline(
+            "",
+            &StatuslineRuntime::minimal(&reader_none, &git),
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "◈ cache -- ⚡ --\n");
 
         let reader_some = StubReader(Some(100.0));
@@ -766,7 +791,7 @@ mod tests {
 
         let calls = Cell::new(0usize);
         let mut cfg = LayoutConfig::preset_minimal();
-        cfg.theme = crate::layout::ThemeStyle::Mono;
+        cfg.theme = crate::config::layout::ThemeStyle::Mono;
         cfg.show_git_diff = true;
         cfg.rows = vec![vec![WidgetId::Vcs, WidgetId::Worktree]];
         let reader = StubReader(None);
@@ -856,10 +881,8 @@ mod tests {
         .unwrap();
         assert_eq!(p2.workspace_basename(), Some("fallback-cwd"));
 
-        let p3: StatuslinePayload = serde_json::from_str(
-            r#"{"workspace": {"project_dir": "  "}, "cwd": "  "}"#,
-        )
-        .unwrap();
+        let p3: StatuslinePayload =
+            serde_json::from_str(r#"{"workspace": {"project_dir": "  "}, "cwd": "  "}"#).unwrap();
         assert_eq!(p3.workspace_basename(), None);
     }
 
@@ -883,10 +906,8 @@ mod tests {
         .unwrap();
         assert_eq!(p2.workspace_path(), Some("/tmp/fallback-cwd"));
 
-        let p3: StatuslinePayload = serde_json::from_str(
-            r#"{"workspace": {"current_dir": "  "}, "cwd": "  "}"#,
-        )
-        .unwrap();
+        let p3: StatuslinePayload =
+            serde_json::from_str(r#"{"workspace": {"current_dir": "  "}, "cwd": "  "}"#).unwrap();
         assert_eq!(p3.workspace_path(), None);
     }
 
@@ -902,13 +923,16 @@ mod tests {
             [],
         )
         .unwrap();
-        let blob = crate::protobuf::encode_gen_blob(crate::protobuf::GenBlobSpec {
+        let blob = crate::agy::protobuf::encode_gen_blob(crate::agy::protobuf::GenBlobSpec {
             output_tok: 100,
             model_cost: Some(0.25),
             ..Default::default()
         });
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [blob])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [blob],
+        )
+        .unwrap();
         drop(conn);
 
         let git = NoopGit;
@@ -921,7 +945,7 @@ mod tests {
             now_unix_secs: 0,
         };
         let mut cfg = LayoutConfig::preset_minimal();
-        cfg.theme = crate::layout::ThemeStyle::Mono;
+        cfg.theme = crate::config::layout::ThemeStyle::Mono;
         cfg.rows = vec![vec![WidgetId::Cost]];
 
         let json = format!(
@@ -936,7 +960,7 @@ mod tests {
         cli_dir: &Path,
         uuid: &str,
         idx: i64,
-        spec: crate::protobuf::GenBlobSpec<'_>,
+        spec: crate::agy::protobuf::GenBlobSpec<'_>,
     ) -> std::path::PathBuf {
         let db_path = cli_dir.join("conversations").join(format!("{uuid}.db"));
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -948,7 +972,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO gen_metadata (idx, data) VALUES (?1, ?2)",
-            rusqlite::params![idx, crate::protobuf::encode_gen_blob(spec)],
+            rusqlite::params![idx, crate::agy::protobuf::encode_gen_blob(spec)],
         )
         .unwrap();
         db_path
@@ -986,7 +1010,7 @@ mod tests {
             &cli_dir,
             parent,
             1,
-            crate::protobuf::GenBlobSpec {
+            crate::agy::protobuf::GenBlobSpec {
                 resp_model: Some("gemini-4-carbon"),
                 input_tok: 1_000_000,
                 output_tok: 100,
@@ -998,7 +1022,7 @@ mod tests {
             &cli_dir,
             child,
             1,
-            crate::protobuf::GenBlobSpec {
+            crate::agy::protobuf::GenBlobSpec {
                 resp_model: Some("gemini-4-carbon"),
                 input_tok: 1_000_000,
                 ..Default::default()
@@ -1033,7 +1057,7 @@ mod tests {
             now_unix_secs: 1_700_000_000,
         };
         let mut cfg = LayoutConfig::preset_minimal();
-        cfg.theme = crate::layout::ThemeStyle::Mono;
+        cfg.theme = crate::config::layout::ThemeStyle::Mono;
         cfg.rows = vec![vec![WidgetId::Speed, WidgetId::Cost]];
         let json = format!(r#"{{"conversation_id":"{parent}"}}"#);
 
@@ -1085,7 +1109,7 @@ mod tests {
             &cli_dir,
             parent,
             2,
-            crate::protobuf::GenBlobSpec {
+            crate::agy::protobuf::GenBlobSpec {
                 resp_model: Some("gemini-4-carbon"),
                 input_tok: 1_000_000,
                 output_tok: 100,
@@ -1107,7 +1131,7 @@ mod tests {
             &cli_dir,
             child,
             2,
-            crate::protobuf::GenBlobSpec {
+            crate::agy::protobuf::GenBlobSpec {
                 resp_model: Some("gemini-4-carbon"),
                 input_tok: 1_000_000,
                 ..Default::default()
@@ -1127,7 +1151,7 @@ mod tests {
             &cli_dir,
             child2,
             1,
-            crate::protobuf::GenBlobSpec {
+            crate::agy::protobuf::GenBlobSpec {
                 resp_model: Some("gemini-4-carbon"),
                 input_tok: 1_000_000,
                 ..Default::default()

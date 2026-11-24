@@ -2,17 +2,13 @@
 
 use std::io::{self, IsTerminal};
 use std::path::Path;
-use std::sync::Arc;
 
 use ansi_to_tui::IntoText;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEvent,
-    MouseEventKind,
+    self, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -21,50 +17,13 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthStr;
 
-use crate::apply::{apply_statusline_config, resolve_invoked_binary_path};
-use crate::editor::{ActivePane, ExitOutcome, PreviewWidth, SettingField, TuiEditorState};
-use crate::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
-use crate::paths::agy_settings_path;
-use crate::render::write_statusline;
+use super::editor::{ActivePane, ExitOutcome, PreviewWidth, SettingField, TuiEditorState};
+use super::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
+use crate::agy::paths::agy_settings_path;
+use crate::cli::apply::{apply_statusline_config, resolve_invoked_binary_path};
+use crate::statusline::render::write_statusline;
 use crate::statusline::{sample_preview_git, sample_preview_metadata, sample_preview_payload};
-
-type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
-
-fn restore_terminal() {
-    let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
-}
-
-pub(crate) struct TerminalGuard {
-    prev_hook: Option<Arc<PanicHook>>,
-}
-
-impl TerminalGuard {
-    pub(crate) fn enter() -> Self {
-        let prev = Arc::new(std::panic::take_hook());
-        let hook_prev = Arc::clone(&prev);
-        std::panic::set_hook(Box::new(move |info| {
-            restore_terminal();
-            hook_prev(info);
-        }));
-        Self {
-            prev_hook: Some(prev),
-        }
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        restore_terminal();
-        if let Some(prev) = self.prev_hook.take() {
-            let _ = std::panic::take_hook();
-            match Arc::try_unwrap(prev) {
-                Ok(original) => std::panic::set_hook(original),
-                Err(shared) => std::panic::set_hook(Box::new(move |info| shared(info))),
-            }
-        }
-    }
-}
+use crate::sys::terminal::TerminalGuard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PillHit {
@@ -291,7 +250,9 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiEditorState) -> UiHitMap {
                 .border_style(Style::default().fg(Color::DarkGray))
                 .title(Span::styled(
                     preview_title,
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 )),
         )
         .wrap(Wrap { trim: false });
@@ -312,7 +273,11 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiEditorState) -> UiHitMap {
         "Tab/Click Pane  ·  ↑↓←→/Scroll Nav  ·  Enter/Click Grab/Toggle  ·  RightClick Remove  ·  1-4 Preset  ·  w Width  ·  s Save+Apply  ·  q Quit"
     };
     let help = Paragraph::new(help_text)
-        .style(Style::default().fg(if state.grabbed { Color::Yellow } else { Color::Gray }))
+        .style(Style::default().fg(if state.grabbed {
+            Color::Yellow
+        } else {
+            Color::Gray
+        }))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -355,7 +320,9 @@ fn layout_canvas_lines(
         }
         let row_focused = active && state.canvas_row == r;
         let label_style = if row_focused {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -435,8 +402,11 @@ fn draw_canvas_pane(
 ) -> ([u16; MAX_ROWS], Vec<PillHit>) {
     let active = state.active_pane == ActivePane::Canvas;
     let (lines, line_y, pills) = layout_canvas_lines(area, state);
-    let panel = Paragraph::new(lines)
-        .block(pane_block(" 1. Layout Lines ".to_string(), active, state.grabbed));
+    let panel = Paragraph::new(lines).block(pane_block(
+        " 1. Layout Lines ".to_string(),
+        active,
+        state.grabbed,
+    ));
     frame.render_widget(panel, area);
     (line_y, pills)
 }
@@ -444,9 +414,7 @@ fn draw_canvas_pane(
 fn draw_catalog_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState) -> usize {
     let active = state.active_pane == ActivePane::Catalog;
     let inner_h = usize::from(area.height.saturating_sub(2)).max(1);
-    let offset = state
-        .catalog_idx
-        .saturating_sub(inner_h.saturating_sub(1));
+    let offset = state.catalog_idx.saturating_sub(inner_h.saturating_sub(1));
     let mut lines = Vec::new();
     for (idx, &w) in WidgetId::ALL.iter().enumerate().skip(offset).take(inner_h) {
         let placed = if w == WidgetId::Spacer {
@@ -502,7 +470,12 @@ fn setting_row(state: &TuiEditorState, field: SettingField) -> (&'static str, St
         SettingField::SpeedMode => ("Speed mode", cfg.speed_mode.name().to_string()),
         SettingField::CtxMode => (
             "Ctx mode",
-            if cfg.ctx_remaining { "Remaining %" } else { "Used %" }.to_string(),
+            if cfg.ctx_remaining {
+                "Remaining %"
+            } else {
+                "Used %"
+            }
+            .to_string(),
         ),
         SettingField::SmartHide => (
             "Smart hide",
@@ -562,7 +535,8 @@ fn draw_settings_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState)
         })
         .collect();
 
-    let panel = Paragraph::new(lines).block(pane_block(" 3. Style & AGY ".to_string(), active, false));
+    let panel =
+        Paragraph::new(lines).block(pane_block(" 3. Style & AGY ".to_string(), active, false));
     frame.render_widget(panel, area);
     offset
 }
@@ -570,7 +544,7 @@ fn draw_settings_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::LayoutConfig;
+    use crate::config::layout::LayoutConfig;
 
     #[test]
     fn canvas_wrapping_updates_line_y_and_pill_hit_coordinates() {
@@ -588,7 +562,7 @@ mod tests {
     #[test]
     fn settings_pane_and_preview_reflect_median_speed_mode() {
         let mut cfg = LayoutConfig::preset_minimal();
-        cfg.speed_mode = crate::layout::SpeedMode::Median;
+        cfg.speed_mode = crate::config::layout::SpeedMode::Median;
         let state = TuiEditorState::new(cfg);
 
         let (preview_lines, _) = build_preview_lines(&state, 80);

@@ -5,9 +5,7 @@ use jiff::tz::Offset;
 use jiff::tz::TimeZone;
 use jiff::Timestamp;
 
-use crate::timeutil::{
-    civil_date_from_unix_day, unix_day_from_civil_date, SECS_PER_DAY,
-};
+use crate::sys::time::{civil_date_from_unix_day, unix_day_from_civil_date, SECS_PER_DAY};
 
 pub(super) fn format_day(day_idx: i64) -> String {
     civil_date_from_unix_day(day_idx).to_string()
@@ -15,7 +13,7 @@ pub(super) fn format_day(day_idx: i64) -> String {
 
 /// Formats a Unix epoch timestamp (seconds) as a UTC `YYYY-MM-DD` date string.
 pub fn unix_secs_to_utc_date(unix_secs: u64) -> String {
-    crate::timeutil::unix_secs_to_utc_date(unix_secs as i64)
+    crate::sys::time::unix_secs_to_utc_date(unix_secs as i64)
 }
 
 /// Timezone specification used to map UTC timestamps to local calendar days.
@@ -81,12 +79,35 @@ impl TimeZoneSpec {
             .unwrap_or_else(|_| civil_date_from_unix_day(unix_secs.div_euclid(SECS_PER_DAY)));
         (unix_day_from_civil_date(date), date.to_string())
     }
+
+    /// Formats a UTC Unix timestamp (seconds) as a local `YYYY-MM-DD HH:MM:SS` timestamp.
+    pub(super) fn local_datetime_string(&self, unix_secs: i64) -> String {
+        Timestamp::from_second(unix_secs)
+            .map(|ts| {
+                let dt = self.inner.to_datetime(ts);
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    dt.year(),
+                    dt.month(),
+                    dt.day(),
+                    dt.hour(),
+                    dt.minute(),
+                    dt.second()
+                )
+            })
+            .unwrap_or_else(|_| {
+                format!(
+                    "{} 00:00:00",
+                    format_day(unix_secs.div_euclid(SECS_PER_DAY))
+                )
+            })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timeutil::parse_rfc3339_unix_secs;
+    use crate::sys::time::parse_rfc3339_unix_secs;
 
     #[test]
     fn fixed_offset_and_posix_dst_timezone_bucketing() {

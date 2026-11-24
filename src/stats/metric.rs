@@ -10,13 +10,11 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::{DailyUsage, ModelStats, PeriodSummary};
-use crate::format::format_tokens_string as fmt_tok;
+use crate::statusline::format::format_tokens_string as fmt_tok;
 
 /// Computes prompt cache hit percentage in `0.0..=100.0`, or `None` when no prompt tokens exist.
 pub(super) fn cache_hit_pct(input: u64, cache_read: u64, cache_write: u64) -> Option<f64> {
-    let denom = input
-        .saturating_add(cache_read)
-        .saturating_add(cache_write);
+    let denom = input.saturating_add(cache_read).saturating_add(cache_write);
     (denom > 0).then(|| (cache_read as f64) * 100.0 / (denom as f64))
 }
 
@@ -50,39 +48,93 @@ pub(super) trait UsageCounters {
 }
 
 impl UsageCounters for PeriodSummary {
-    fn requests(&self) -> u64 { self.requests }
-    fn input_tokens(&self) -> u64 { self.input_tokens }
-    fn cache_read_tokens(&self) -> u64 { self.cache_read_tokens }
-    fn cache_write_tokens(&self) -> u64 { self.cache_write_tokens }
-    fn output_tokens(&self) -> u64 { self.output_tokens }
-    fn total_tokens(&self) -> u64 { self.total_tokens }
-    fn priced_usd(&self) -> f64 { self.priced_usd }
-    fn priced_requests(&self) -> u64 { self.priced_requests }
-    fn unpriced_requests(&self) -> u64 { self.unpriced_requests }
+    fn requests(&self) -> u64 {
+        self.requests
+    }
+    fn input_tokens(&self) -> u64 {
+        self.input_tokens
+    }
+    fn cache_read_tokens(&self) -> u64 {
+        self.cache_read_tokens
+    }
+    fn cache_write_tokens(&self) -> u64 {
+        self.cache_write_tokens
+    }
+    fn output_tokens(&self) -> u64 {
+        self.output_tokens
+    }
+    fn total_tokens(&self) -> u64 {
+        self.total_tokens
+    }
+    fn priced_usd(&self) -> f64 {
+        self.priced_usd
+    }
+    fn priced_requests(&self) -> u64 {
+        self.priced_requests
+    }
+    fn unpriced_requests(&self) -> u64 {
+        self.unpriced_requests
+    }
 }
 
 impl UsageCounters for DailyUsage {
-    fn requests(&self) -> u64 { self.requests }
-    fn input_tokens(&self) -> u64 { self.input_tokens }
-    fn cache_read_tokens(&self) -> u64 { self.cache_read_tokens }
-    fn cache_write_tokens(&self) -> u64 { self.cache_write_tokens }
-    fn output_tokens(&self) -> u64 { self.output_tokens }
-    fn total_tokens(&self) -> u64 { self.total_tokens }
-    fn priced_usd(&self) -> f64 { self.priced_usd }
-    fn priced_requests(&self) -> u64 { self.requests.saturating_sub(self.unpriced_requests) }
-    fn unpriced_requests(&self) -> u64 { self.unpriced_requests }
+    fn requests(&self) -> u64 {
+        self.requests
+    }
+    fn input_tokens(&self) -> u64 {
+        self.input_tokens
+    }
+    fn cache_read_tokens(&self) -> u64 {
+        self.cache_read_tokens
+    }
+    fn cache_write_tokens(&self) -> u64 {
+        self.cache_write_tokens
+    }
+    fn output_tokens(&self) -> u64 {
+        self.output_tokens
+    }
+    fn total_tokens(&self) -> u64 {
+        self.total_tokens
+    }
+    fn priced_usd(&self) -> f64 {
+        self.priced_usd
+    }
+    fn priced_requests(&self) -> u64 {
+        self.requests.saturating_sub(self.unpriced_requests)
+    }
+    fn unpriced_requests(&self) -> u64 {
+        self.unpriced_requests
+    }
 }
 
 impl UsageCounters for ModelStats {
-    fn requests(&self) -> u64 { self.requests }
-    fn input_tokens(&self) -> u64 { self.input_tokens }
-    fn cache_read_tokens(&self) -> u64 { self.cache_read_tokens }
-    fn cache_write_tokens(&self) -> u64 { self.cache_write_tokens }
-    fn output_tokens(&self) -> u64 { self.output_tokens }
-    fn total_tokens(&self) -> u64 { self.total_tokens }
-    fn priced_usd(&self) -> f64 { self.priced_usd }
-    fn priced_requests(&self) -> u64 { self.requests.saturating_sub(self.unpriced_requests) }
-    fn unpriced_requests(&self) -> u64 { self.unpriced_requests }
+    fn requests(&self) -> u64 {
+        self.requests
+    }
+    fn input_tokens(&self) -> u64 {
+        self.input_tokens
+    }
+    fn cache_read_tokens(&self) -> u64 {
+        self.cache_read_tokens
+    }
+    fn cache_write_tokens(&self) -> u64 {
+        self.cache_write_tokens
+    }
+    fn output_tokens(&self) -> u64 {
+        self.output_tokens
+    }
+    fn total_tokens(&self) -> u64 {
+        self.total_tokens
+    }
+    fn priced_usd(&self) -> f64 {
+        self.priced_usd
+    }
+    fn priced_requests(&self) -> u64 {
+        self.requests.saturating_sub(self.unpriced_requests)
+    }
+    fn unpriced_requests(&self) -> u64 {
+        self.unpriced_requests
+    }
 }
 
 /// Active additive aggregation metric for daily usage, heatmap, KPIs, and model rankings.
@@ -108,10 +160,7 @@ impl StatsMetric {
 
     /// Cycles forward (`dir = 1`) or backward (`dir = -1`) across [`Self::PRESETS`].
     pub fn step(self, dir: isize) -> Self {
-        let idx = Self::PRESETS
-            .iter()
-            .position(|&m| m == self)
-            .unwrap_or(0) as isize;
+        let idx = Self::PRESETS.iter().position(|&m| m == self).unwrap_or(0) as isize;
         let next = (idx + dir).rem_euclid(Self::PRESETS.len() as isize) as usize;
         Self::PRESETS[next]
     }
@@ -365,7 +414,10 @@ mod tests {
         assert_eq!("total".parse::<StatsMetric>().unwrap(), StatsMetric::Total);
         assert_eq!("cost".parse::<StatsMetric>().unwrap(), StatsMetric::Cost);
         assert_eq!("usd".parse::<StatsMetric>().unwrap(), StatsMetric::Cost);
-        assert_eq!("io".parse::<StatsMetric>().unwrap(), StatsMetric::InputOutput);
+        assert_eq!(
+            "io".parse::<StatsMetric>().unwrap(),
+            StatsMetric::InputOutput
+        );
         assert_eq!(
             "input+output".parse::<StatsMetric>().unwrap(),
             StatsMetric::InputOutput
@@ -400,12 +452,18 @@ mod tests {
             unpriced_requests: 2,
         };
 
-        assert_eq!(StatsMetric::Total.extract(&summary), MetricValue::Count(10_900));
+        assert_eq!(
+            StatsMetric::Total.extract(&summary),
+            MetricValue::Count(10_900)
+        );
         assert_eq!(
             StatsMetric::InputOutput.extract(&summary),
             MetricValue::Count(1_400)
         );
-        assert_eq!(StatsMetric::Output.extract(&summary), MetricValue::Count(400));
+        assert_eq!(
+            StatsMetric::Output.extract(&summary),
+            MetricValue::Count(400)
+        );
         assert_eq!(StatsMetric::Turns.extract(&summary), MetricValue::Count(12));
         assert_eq!(
             StatsMetric::Cost.format_display(StatsMetric::Cost.extract(&summary), false),

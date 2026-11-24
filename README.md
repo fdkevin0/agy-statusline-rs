@@ -50,6 +50,8 @@ agy-statusline doctor
 ```sh
 agy-statusline stats
 agy-statusline stats --plain --metric cost --days 30
+agy-statusline conversations
+agy-statusline stats <conversation-id>
 ```
 
 ![agy-statusline interactive usage dashboard](docs/assets/stats-tui.png)

@@ -1,23 +1,31 @@
 //! Read-only SQLite `gen_metadata` and `steps.metadata` scanner.
 
+mod conversation;
+mod cost_cache;
+
+pub(in crate::stats) use conversation::{
+    collect_conversation_stats_report, filter_and_rank_conversations, list_conversations,
+};
+pub(crate) use cost_cache::{
+    estimate_conversation_cost_usd_with_parent_conn, lookup_cached_conversation_cost,
+};
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
-use super::pricing::{normalize_model_key, round_usd_6, PricingCatalog, PricingFileFingerprint};
+use super::pricing::{normalize_model_key, round_usd_6, PricingCatalog};
 use super::tz::TimeZoneSpec;
 use super::SqliteStats;
-use crate::db::{
-    compute_median, is_absent_or_real_file, is_real_dir, is_safe_sqlite_file, is_valid_uuid,
-    open_readonly_db, resolve_conversation_db_path, safe_sqlite_metadata, sidecar_path,
+use crate::agy::db::{
+    compute_median, is_real_dir, is_safe_sqlite_file, is_valid_uuid, open_readonly_db,
+    safe_sqlite_metadata,
 };
-use crate::fsutil::{atomic_write, modified_timestamp};
-use crate::protobuf::{
+use crate::agy::protobuf::{
     extract_gen_metadata_record, extract_step_metadata_record, extract_trajectory_created_at_secs,
     MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
 };
+use crate::sys::fs::modified_timestamp;
 
 pub(super) fn is_effort_token(word: &str) -> bool {
     matches!(
@@ -118,88 +126,6 @@ fn canonical_or_self(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// File-level change fingerprint for a SQLite conversation DB and its `-wal` sidecar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct DbFileFingerprint {
-    db_mtime_secs: i64,
-    db_mtime_nanos: u32,
-    db_ctime_secs: i64,
-    db_ctime_nanos: u32,
-    db_size: u64,
-    /// Normalized to `0` when `wal_size == 0` so AGY startup touching idle 0-byte
-    /// `-wal` files does not trigger redundant re-scans.
-    wal_mtime_secs: i64,
-    wal_mtime_nanos: u32,
-    wal_ctime_secs: i64,
-    wal_ctime_nanos: u32,
-    wal_size: u64,
-}
-
-#[cfg(unix)]
-fn status_change_timestamp(meta: &fs::Metadata) -> (i64, u32) {
-    use std::os::unix::fs::MetadataExt;
-    let secs = meta.ctime();
-    let nanos = meta.ctime_nsec().clamp(0, 999_999_999) as u32;
-    (secs, nanos)
-}
-
-#[cfg(not(unix))]
-fn status_change_timestamp(_meta: &fs::Metadata) -> (i64, u32) {
-    (0, 0)
-}
-
-fn db_file_fingerprint(db_path: &Path) -> Option<DbFileFingerprint> {
-    let db_meta = fs::symlink_metadata(db_path).ok()?;
-    let db_ft = db_meta.file_type();
-    if db_ft.is_symlink() || !db_ft.is_file() {
-        return None;
-    }
-    if !is_absent_or_real_file(&sidecar_path(db_path, "-shm")) {
-        return None;
-    }
-    let (db_mtime_secs, db_mtime_nanos) = modified_timestamp(&db_meta);
-    let (db_ctime_secs, db_ctime_nanos) = status_change_timestamp(&db_meta);
-    let db_size = db_meta.len();
-
-    let (wal_mtime_secs, wal_mtime_nanos, wal_ctime_secs, wal_ctime_nanos, wal_size) =
-        match fs::symlink_metadata(sidecar_path(db_path, "-wal")) {
-            Ok(wal_meta) => {
-                let wal_ft = wal_meta.file_type();
-                if wal_ft.is_symlink() || !wal_ft.is_file() {
-                    return None;
-                }
-                if wal_meta.len() > 0 {
-                    let (mtime_secs, mtime_nanos) = modified_timestamp(&wal_meta);
-                    let (ctime_secs, ctime_nanos) = status_change_timestamp(&wal_meta);
-                    (
-                        mtime_secs,
-                        mtime_nanos,
-                        ctime_secs,
-                        ctime_nanos,
-                        wal_meta.len(),
-                    )
-                } else {
-                    (0, 0, 0, 0, 0)
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0, 0, 0, 0, 0),
-            Err(_) => return None,
-        };
-
-    Some(DbFileFingerprint {
-        db_mtime_secs,
-        db_mtime_nanos,
-        db_ctime_secs,
-        db_ctime_nanos,
-        db_size,
-        wal_mtime_secs,
-        wal_mtime_nanos,
-        wal_ctime_secs,
-        wal_ctime_nanos,
-        wal_size,
-    })
-}
-
 fn root_path_key(root: &Path) -> String {
     canonical_or_self(root).to_string_lossy().into_owned()
 }
@@ -207,8 +133,11 @@ fn root_path_key(root: &Path) -> String {
 #[derive(Debug, Clone)]
 struct DbTarget {
     source: &'static str,
+    root: PathBuf,
+    conversation_id: String,
     path: PathBuf,
     db_mtime_secs: Option<i64>,
+    db_size_bytes: u64,
 }
 
 const TS_QUALITY_NONE: u8 = 0;
@@ -373,7 +302,8 @@ fn merge_raw_turn(dst: &mut RawTurn, other: RawTurn) {
         (None, Some(b)) => Some(b),
         (None, None) => None,
     };
-    dst.decode_speed = valid_decode_speed(dst.decode_speed).or_else(|| valid_decode_speed(other.decode_speed));
+    dst.decode_speed =
+        valid_decode_speed(dst.decode_speed).or_else(|| valid_decode_speed(other.decode_speed));
     dst.ttft_secs = valid_ttft_secs(dst.ttft_secs).or_else(|| valid_ttft_secs(other.ttft_secs));
 
     if dst.id_11.is_none() {
@@ -387,7 +317,10 @@ fn merge_raw_turn(dst: &mut RawTurn, other: RawTurn) {
     }
 }
 
-fn build_turn_union_find<'a>(turns: impl IntoIterator<Item = &'a RawTurn>, len: usize) -> UnionFind {
+fn build_turn_union_find<'a>(
+    turns: impl IntoIterator<Item = &'a RawTurn>,
+    len: usize,
+) -> UnionFind {
     let mut uf = UnionFind::new(len);
     let mut key_owner: HashMap<(u8, &'a str), usize> = HashMap::new();
     for (idx, turn) in turns.into_iter().enumerate() {
@@ -426,6 +359,7 @@ fn deduplicate_raw_turns(turns: Vec<RawTurn>) -> Vec<RawTurn> {
 
 fn discover_sqlite_db_targets(roots: &[(&'static str, PathBuf)]) -> Vec<DbTarget> {
     let mut seen_dbs = HashSet::new();
+    let mut seen_ids = HashSet::new();
     let mut targets = Vec::new();
 
     for (source, root) in roots {
@@ -451,15 +385,20 @@ fn discover_sqlite_db_targets(roots: &[(&'static str, PathBuf)]) -> Vec<DbTarget
             let Some(meta) = safe_sqlite_metadata(&path) else {
                 continue;
             };
-            let db_mtime_secs = Some(modified_timestamp(&meta).0).filter(|&secs| secs > 0);
             let real = canonical_or_self(&path);
-            if seen_dbs.insert(real) {
-                targets.push(DbTarget {
-                    source,
-                    path,
-                    db_mtime_secs,
-                });
+            let conversation_id = stem.to_ascii_lowercase();
+            if !seen_dbs.insert(real) || !seen_ids.insert(conversation_id.clone()) {
+                continue;
             }
+            let db_mtime_secs = Some(modified_timestamp(&meta).0).filter(|&secs| secs > 0);
+            targets.push(DbTarget {
+                source,
+                root: root.clone(),
+                conversation_id,
+                path,
+                db_mtime_secs,
+                db_size_bytes: meta.len(),
+            });
         }
     }
 
@@ -776,8 +715,7 @@ enum LearnedModelEnum<'b> {
 fn normalized_fallback_model_identity(group: &str) -> String {
     let norm = normalize_model_key(group);
     let mut words: Vec<&str> = norm.split_whitespace().collect();
-    while words.len() > 1 && matches!(words.last().copied(), Some("trial" | "preview" | "latest"))
-    {
+    while words.len() > 1 && matches!(words.last().copied(), Some("trial" | "preview" | "latest")) {
         words.pop();
     }
     words.join(" ")
@@ -924,8 +862,7 @@ impl<'a, 'b> TurnPricer<'a, 'b> {
                             if resp.is_some() {
                                 *response_model = resp;
                             }
-                            if disp_rank >= display_name_rank(*model_display_name)
-                                && disp.is_some()
+                            if disp_rank >= display_name_rank(*model_display_name) && disp.is_some()
                             {
                                 *model_display_name = disp;
                             }
@@ -1014,15 +951,15 @@ impl<'a, 'b> TurnPricer<'a, 'b> {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let (eff_resp, eff_disp) = if raw_resp.is_none() && raw_disp.is_none() && turn.model_enum > 0
-        {
-            self.learned_enums
-                .get(&turn.model_enum)
-                .copied()
-                .unwrap_or((None, None))
-        } else {
-            (raw_resp, raw_disp)
-        };
+        let (eff_resp, eff_disp) =
+            if raw_resp.is_none() && raw_disp.is_none() && turn.model_enum > 0 {
+                self.learned_enums
+                    .get(&turn.model_enum)
+                    .copied()
+                    .unwrap_or((None, None))
+            } else {
+                (raw_resp, raw_disp)
+            };
 
         let cached = self
             .resolution_cache
@@ -1134,9 +1071,8 @@ fn project_sqlite_conversations<'a>(
         let turn = &entry.turn;
         if let Some(speed) = valid_decode_speed(turn.decode_speed) {
             stats.completed_turns += 1;
-            stats.total_output_tokens = stats
-                .total_output_tokens
-                .saturating_add(turn.output_tokens);
+            stats.total_output_tokens =
+                stats.total_output_tokens.saturating_add(turn.output_tokens);
             speed_samples.push(speed);
         }
         if let Some(ttft) = valid_ttft_secs(turn.ttft_secs) {
@@ -1189,137 +1125,12 @@ pub(super) fn scan_sqlite_conversations(
     let targets = discover_sqlite_db_targets(roots);
     let scanned = scan_sqlite_targets_raw(&targets);
     project_sqlite_conversations(
-        scanned.iter().map(|(source, turns)| (*source, turns.as_slice())),
+        scanned
+            .iter()
+            .map(|(source, turns)| (*source, turns.as_slice())),
         tz,
         pricing,
     )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct ConversationCost {
-    pub(crate) usd: Option<f64>,
-    pub(crate) subagent_usd: Option<f64>,
-    pub(crate) unpriced_turns: u64,
-}
-
-const CONV_COST_CACHE_FILE: &str = "conv_cost_cache.json";
-const CONV_COST_CACHE_SCHEMA_VERSION: u32 = 1;
-const CONV_COST_CACHE_MAX_ENTRIES: usize = 32;
-const MAX_CONV_COST_CACHE_BYTES: u64 = 512 * 1024;
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct CachedConversationCost {
-    usd: Option<f64>,
-    subagent_usd: Option<f64>,
-    unpriced_turns: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct ConvCostCacheEntry {
-    cli_dir: String,
-    conversation_id: String,
-    parent_fp: Option<DbFileFingerprint>,
-    summaries_fp: Option<DbFileFingerprint>,
-    descendants: Vec<(String, Option<DbFileFingerprint>)>,
-    pricing_fp: PricingFileFingerprint,
-    cost: CachedConversationCost,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct ConvCostCacheFile {
-    schema_version: u32,
-    #[serde(default)]
-    entries: Vec<ConvCostCacheEntry>,
-}
-
-fn conversation_db_fingerprint(cli_dir: &Path, conversation_id: &str) -> Option<DbFileFingerprint> {
-    let db_path = resolve_conversation_db_path(cli_dir, conversation_id)?;
-    db_file_fingerprint(&db_path)
-}
-
-fn summaries_db_fingerprint(cli_dir: &Path) -> Option<DbFileFingerprint> {
-    db_file_fingerprint(&cli_dir.join("conversation_summaries.db"))
-}
-
-fn read_conv_cost_cache_file(cache_dir: &Path) -> Option<ConvCostCacheFile> {
-    let path = cache_dir.join(CONV_COST_CACHE_FILE);
-    let meta = fs::symlink_metadata(&path).ok()?;
-    let ft = meta.file_type();
-    if ft.is_symlink() || !ft.is_file() || meta.len() > MAX_CONV_COST_CACHE_BYTES {
-        return None;
-    }
-    let bytes = fs::read(&path).ok()?;
-    let parsed = serde_json::from_slice::<ConvCostCacheFile>(&bytes).ok()?;
-    (parsed.schema_version == CONV_COST_CACHE_SCHEMA_VERSION).then_some(parsed)
-}
-
-fn write_conv_cost_cache_entry_with_limit(
-    cache_dir: &Path,
-    entry: ConvCostCacheEntry,
-    max_entries: usize,
-) {
-    let mut file = read_conv_cost_cache_file(cache_dir).unwrap_or(ConvCostCacheFile {
-        schema_version: CONV_COST_CACHE_SCHEMA_VERSION,
-        entries: Vec::new(),
-    });
-    file.entries
-        .retain(|e| !(e.cli_dir == entry.cli_dir && e.conversation_id == entry.conversation_id));
-    file.entries.insert(0, entry);
-    file.entries.truncate(max_entries);
-    if let Ok(bytes) = serde_json::to_vec(&file) {
-        let _ = atomic_write(&cache_dir.join(CONV_COST_CACHE_FILE), &bytes);
-    }
-}
-
-/// Fast `lstat`-only lookup in `conv_cost_cache.json` before parsing `models_dev_pricing.json`
-/// or opening any SQLite DB for cost scanning.
-pub(crate) fn lookup_cached_conversation_cost(
-    cache_dir: &Path,
-    cli_dir: &Path,
-    conversation_id: &str,
-    pricing_fp: PricingFileFingerprint,
-) -> Option<ConversationCost> {
-    if !is_valid_uuid(conversation_id) {
-        return None;
-    }
-    let parent_fp = conversation_db_fingerprint(cli_dir, conversation_id);
-    let summaries_fp = summaries_db_fingerprint(cli_dir);
-    if parent_fp.is_none() && summaries_fp.is_none() {
-        return None;
-    }
-    let cache = read_conv_cost_cache_file(cache_dir)?;
-    let cli_dir_key = root_path_key(cli_dir);
-    let conv_id_lower = conversation_id.to_ascii_lowercase();
-    let entry = cache
-        .entries
-        .iter()
-        .find(|e| e.cli_dir == cli_dir_key && e.conversation_id == conv_id_lower)?;
-    if entry.parent_fp != parent_fp
-        || entry.summaries_fp != summaries_fp
-        || entry.pricing_fp != pricing_fp
-    {
-        return None;
-    }
-    let descendants_match = entry
-        .descendants
-        .iter()
-        .all(|(desc_id, desc_fp)| conversation_db_fingerprint(cli_dir, desc_id) == *desc_fp);
-    if !descendants_match {
-        return None;
-    }
-    if !entry.cost.usd.is_none_or(|v| v.is_finite() && v >= 0.0)
-        || !entry
-            .cost
-            .subagent_usd
-            .is_none_or(|v| v.is_finite() && v >= 0.0)
-    {
-        return None;
-    }
-    Some(ConversationCost {
-        usd: entry.cost.usd,
-        subagent_usd: entry.cost.subagent_usd,
-        unpriced_turns: entry.cost.unpriced_turns,
-    })
 }
 
 fn resolve_descendant_conversation_ids(cli_dir: &Path, root_id: &str) -> Vec<String> {
@@ -1372,146 +1183,36 @@ fn read_single_db_turns(db_path: &Path) -> Option<Vec<RawTurn>> {
     extract_sqlite_db_turns(&conn, None)
 }
 
-fn compute_conversation_cost_from_turns(
-    tagged_turns: Vec<(bool, RawTurn)>,
-    pricing: &PricingCatalog,
-) -> Option<ConversationCost> {
-    if tagged_turns.is_empty() {
-        return None;
+/// Deduplicates tagged turns across parent + descendant DBs via Union-Find, preferring
+/// parent (`is_subagent == false`) attribution when the same turn appears in both.
+fn deduplicate_parent_priority_turns<T>(
+    items: Vec<T>,
+    turn_ref: impl Fn(&T) -> &RawTurn,
+    is_sub: impl Fn(&T) -> bool,
+    mut merge_into: impl FnMut(&mut T, T),
+) -> Vec<T> {
+    if items.len() <= 1 {
+        return items;
     }
-
-    // Deduplicate across parent + descendant DBs (preferring parent attribution if shared).
-    let mut uf = build_turn_union_find(tagged_turns.iter().map(|(_, t)| t), tagged_turns.len());
+    let mut uf = build_turn_union_find(items.iter().map(&turn_ref), items.len());
     let mut root_to_slot: HashMap<usize, usize> = HashMap::new();
-    let mut deduped: Vec<(bool, RawTurn)> = Vec::with_capacity(tagged_turns.len());
-    for (idx, (is_sub, turn)) in tagged_turns.into_iter().enumerate() {
+    let mut deduped: Vec<T> = Vec::with_capacity(items.len());
+    for (idx, item) in items.into_iter().enumerate() {
         let root = uf.find(idx);
         if let Some(&slot) = root_to_slot.get(&root) {
-            let (slot_sub, slot_turn) = &mut deduped[slot];
-            if *slot_sub && !is_sub {
-                let prev = std::mem::replace(slot_turn, turn);
-                *slot_sub = false;
-                merge_raw_turn(slot_turn, prev);
+            let existing = &mut deduped[slot];
+            if is_sub(existing) && !is_sub(&item) {
+                let prev = std::mem::replace(existing, item);
+                merge_into(existing, prev);
             } else {
-                merge_raw_turn(slot_turn, turn);
+                merge_into(existing, item);
             }
         } else {
             root_to_slot.insert(root, deduped.len());
-            deduped.push((is_sub, turn));
+            deduped.push(item);
         }
     }
-
-    let pricer = TurnPricer::build(pricing, deduped.iter().map(|(_, t)| t));
-    let mut parent_usd = 0.0_f64;
-    let mut parent_priced = 0_u64;
-    let mut parent_unpriced = 0_u64;
-    let mut sub_usd = 0.0_f64;
-    let mut sub_priced = 0_u64;
-    let mut sub_unpriced = 0_u64;
-
-    for (is_sub, turn) in &deduped {
-        if !turn.has_billable_usage() {
-            continue;
-        }
-        let resolved = pricer.price_turn(turn);
-        match (is_sub, resolved.cost_usd) {
-            (false, Some(usd)) => {
-                parent_usd += usd;
-                parent_priced += 1;
-            }
-            (false, None) => parent_unpriced += 1,
-            (true, Some(usd)) => {
-                sub_usd += usd;
-                sub_priced += 1;
-            }
-            (true, None) => sub_unpriced += 1,
-        }
-    }
-
-    let total_priced = parent_priced + sub_priced;
-    let total_unpriced = parent_unpriced + sub_unpriced;
-    let total_usd = parent_usd + sub_usd;
-    (total_priced > 0 || total_unpriced > 0).then(|| ConversationCost {
-        usd: (total_priced > 0 && total_usd.is_finite()).then(|| round_usd_6(total_usd)),
-        subagent_usd: (sub_priced > 0 && sub_usd.is_finite()).then(|| round_usd_6(sub_usd)),
-        unpriced_turns: total_unpriced,
-    })
-}
-
-/// Estimates the subtotal for priced usage in a SQLite conversation and any descendant subagents,
-/// optionally reusing an already-open read-only parent connection and persisting the result into
-/// the bounded LRU `conv_cost_cache.json` cache.
-pub(crate) fn estimate_conversation_cost_usd_with_parent_conn(
-    cli_dir: &Path,
-    conversation_id: &str,
-    pricing: &PricingCatalog,
-    parent_conn: Option<&rusqlite::Connection>,
-    cache_target: Option<(&Path, PricingFileFingerprint)>,
-) -> Option<ConversationCost> {
-    if !is_valid_uuid(conversation_id) {
-        return None;
-    }
-
-    let parent_db_path = resolve_conversation_db_path(cli_dir, conversation_id);
-    // Stat before reading so concurrent SQLite commits invalidate on the next tick.
-    let parent_fp = parent_db_path.as_deref().and_then(db_file_fingerprint);
-
-    let mut tagged_turns: Vec<(bool, RawTurn)> = Vec::new();
-    if let Some(conn) = parent_conn {
-        for turn in extract_sqlite_db_turns(conn, None)? {
-            tagged_turns.push((false, turn));
-        }
-    } else if let Some(db_path) = parent_db_path.as_deref() {
-        for turn in read_single_db_turns(db_path)? {
-            tagged_turns.push((false, turn));
-        }
-    }
-
-    let summaries_fp = summaries_db_fingerprint(cli_dir);
-    let desc_ids = resolve_descendant_conversation_ids(cli_dir, conversation_id);
-    let mut descendants = Vec::with_capacity(desc_ids.len());
-    for desc_id in desc_ids {
-        let desc_db_path = resolve_conversation_db_path(cli_dir, &desc_id);
-        let desc_fp = desc_db_path.as_deref().and_then(db_file_fingerprint);
-        descendants.push((desc_id.to_ascii_lowercase(), desc_fp));
-        if let Some(turns) = desc_db_path.as_deref().and_then(read_single_db_turns) {
-            for turn in turns {
-                tagged_turns.push((true, turn));
-            }
-        }
-    }
-
-    let cost = compute_conversation_cost_from_turns(tagged_turns, pricing)?;
-    if let Some((cache_dir, pricing_fp)) = cache_target {
-        write_conv_cost_cache_entry_with_limit(
-            cache_dir,
-            ConvCostCacheEntry {
-                cli_dir: root_path_key(cli_dir),
-                conversation_id: conversation_id.to_ascii_lowercase(),
-                parent_fp,
-                summaries_fp,
-                descendants,
-                pricing_fp,
-                cost: CachedConversationCost {
-                    usd: cost.usd,
-                    subagent_usd: cost.subagent_usd,
-                    unpriced_turns: cost.unpriced_turns,
-                },
-            },
-            CONV_COST_CACHE_MAX_ENTRIES,
-        );
-    }
-    Some(cost)
-}
-
-/// Estimates the subtotal for priced usage in a SQLite conversation and any descendant subagents.
-#[cfg(test)]
-fn estimate_conversation_cost_usd(
-    cli_dir: &Path,
-    conversation_id: &str,
-    pricing: &PricingCatalog,
-) -> Option<ConversationCost> {
-    estimate_conversation_cost_usd_with_parent_conn(cli_dir, conversation_id, pricing, None, None)
+    deduped
 }
 
 #[cfg(test)]
@@ -1520,9 +1221,10 @@ mod tests {
 
     use super::*;
     use crate::stats::collect_stats_with_tz;
-    use crate::stats::render::render_stats_report;
+    use crate::stats::metric::StatsMetric;
+    use crate::stats::render::render_stats_report_with_metric;
     use crate::stats::test_helpers::build_gen_blob;
-    use crate::timeutil::parse_rfc3339_unix_secs;
+    use crate::sys::time::parse_rfc3339_unix_secs;
 
     #[test]
     fn derive_model_name_is_dynamic_and_strips_only_effort_suffixes() {
@@ -1590,7 +1292,15 @@ mod tests {
         assert_eq!(empty.totals.requests, 0);
         assert_eq!(empty.sqlite.db_files, 0);
         let mut empty_out = Vec::new();
-        render_stats_report(&empty, true, true, &mut empty_out).unwrap();
+        render_stats_report_with_metric(
+            &empty,
+            StatsMetric::Total,
+            None,
+            true,
+            true,
+            &mut empty_out,
+        )
+        .unwrap();
         let empty_text = String::from_utf8(empty_out).unwrap();
         assert!(!empty_text.contains('\x1b'));
         assert!(
@@ -1638,134 +1348,9 @@ mod tests {
         assert_eq!(populated.models[0].model, "tiny-model");
     }
 
-    fn seed_cost_db(cli_dir: &Path, uuid: &str, idx: i64, blob: Vec<u8>) {
-        let db_path = cli_dir.join("conversations").join(format!("{uuid}.db"));
-        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO gen_metadata (idx, data) VALUES (?1, ?2)",
-            rusqlite::params![idx, blob],
-        )
-        .unwrap();
-    }
-
     #[test]
-    fn estimate_conversation_cost_aggregates_descendant_subagents_and_guards_cycles() {
-        let dir = tempfile::tempdir().unwrap();
-        let cli_dir = dir.path().join(".gemini/antigravity-cli");
-        let parent = "11111111-1111-4111-8111-111111111111";
-        let child = "22222222-2222-4222-8222-222222222222";
-        let grandchild = "33333333-3333-4333-8333-333333333333";
-        let missing_child = "44444444-4444-4444-8444-444444444444";
-        let unrelated = "55555555-5555-4555-8555-555555555555";
-        let pricing = PricingCatalog::default();
-
-        seed_cost_db(
-            &cli_dir,
-            parent,
-            1,
-            build_gen_blob(None, 10, "m-parent", "", 100, 0, 50, 0, 1, 100, Some(0.10)),
-        );
-        seed_cost_db(
-            &cli_dir,
-            child,
-            1,
-            build_gen_blob(None, 10, "m-child", "", 100, 0, 50, 0, 1, 100, Some(0.20)),
-        );
-        seed_cost_db(
-            &cli_dir,
-            grandchild,
-            1,
-            build_gen_blob(None, 10, "m-grand", "", 100, 0, 50, 0, 1, 100, Some(0.15)),
-        );
-        seed_cost_db(
-            &cli_dir,
-            grandchild,
-            2,
-            build_gen_blob(None, 10, "m-unpriced", "", 100, 0, 50, 0, 1, 100, None),
-        );
-        seed_cost_db(
-            &cli_dir,
-            unrelated,
-            1,
-            build_gen_blob(None, 10, "m-other", "", 100, 0, 50, 0, 1, 100, Some(9.99)),
-        );
-
-        // Without conversation_summaries.db, only parent is attributed.
-        let parent_only = estimate_conversation_cost_usd(&cli_dir, parent, &pricing).unwrap();
-        assert_eq!(parent_only.usd, Some(0.1));
-        assert_eq!(parent_only.subagent_usd, None);
-        assert_eq!(parent_only.unpriced_turns, 0);
-
-        let summaries = Connection::open(cli_dir.join("conversation_summaries.db")).unwrap();
-        summaries
-            .execute(
-                "CREATE TABLE conversation_summaries (
-                    conversation_id TEXT,
-                    parent_conversation_id TEXT,
-                    nesting_depth INTEGER
-                )",
-                [],
-            )
-            .unwrap();
-        summaries
-            .execute(
-                "INSERT INTO conversation_summaries VALUES (?1, ?2, 1)",
-                [child, parent],
-            )
-            .unwrap();
-        summaries
-            .execute(
-                "INSERT INTO conversation_summaries VALUES (?1, ?2, 2)",
-                [grandchild, child],
-            )
-            .unwrap();
-        summaries
-            .execute(
-                "INSERT INTO conversation_summaries VALUES (?1, ?2, 1)",
-                [missing_child, parent],
-            )
-            .unwrap();
-        summaries
-            .execute(
-                "INSERT INTO conversation_summaries VALUES (?1, ?2, 1)",
-                [parent, parent],
-            )
-            .unwrap();
-        summaries
-            .execute(
-                "INSERT INTO conversation_summaries VALUES (?1, ?2, 3)",
-                [parent, grandchild],
-            )
-            .unwrap();
-        summaries
-            .execute(
-                "INSERT INTO conversation_summaries VALUES ('not-a-uuid', ?1, 1)",
-                [parent],
-            )
-            .unwrap();
-        summaries
-            .execute(
-                "INSERT INTO conversation_summaries VALUES (?1, NULL, 0)",
-                [unrelated],
-            )
-            .unwrap();
-        drop(summaries);
-
-        let combined = estimate_conversation_cost_usd(&cli_dir, parent, &pricing).unwrap();
-        assert_eq!(combined.usd, Some(0.45));
-        assert_eq!(combined.subagent_usd, Some(0.35));
-        assert_eq!(combined.unpriced_turns, 1);
-    }
-
-    #[test]
-    fn project_sqlite_infers_unambiguous_response_model_without_crossing_ambiguous_or_explicit_tiers()
-    {
+    fn project_sqlite_infers_unambiguous_response_model_without_crossing_ambiguous_or_explicit_tiers(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
         fs::create_dir_all(&cache_dir).unwrap();
@@ -1826,10 +1411,7 @@ mod tests {
             mk_turn("custom-orchestrator", None),
             // Shared worker routing ID upgraded to a newer unpriced model whose name precedes
             // `(Orchestrator)`: turn 9 and generic turn 10 must stay unpriced (never mispriced as Hydrogen).
-            mk_turn(
-                "shared-worker-id",
-                Some("Gemini 4 Hydrogen (Orchestrator)"),
-            ),
+            mk_turn("shared-worker-id", Some("Gemini 4 Hydrogen (Orchestrator)")),
             mk_turn("shared-worker-id", Some("Gemini 5 Plasma (Orchestrator)")),
             mk_turn("shared-worker-id", Some("Gemini Flash")),
         ];
@@ -1863,7 +1445,7 @@ mod tests {
         assert_eq!(events[10].cost_usd, None);
     }
 
-    fn test_pricing_catalog(cache_dir: &Path) -> PricingCatalog {
+    pub(super) fn test_pricing_catalog(cache_dir: &Path) -> PricingCatalog {
         fs::create_dir_all(cache_dir).unwrap();
         fs::write(
             cache_dir.join("models_dev_pricing.json"),
@@ -1888,7 +1470,7 @@ mod tests {
 
     #[test]
     fn extract_sqlite_db_turns_merges_steps_f9_f28_f17_and_suppresses_keyless_covered_steps() {
-        use crate::protobuf::{
+        use crate::agy::protobuf::{
             encode_gen_blob, encode_step_blob, encode_trajectory_meta_blob, GenBlobSpec,
             StepBlobSpec, UsageSpec,
         };
@@ -2178,195 +1760,5 @@ mod tests {
         assert_eq!(events[8].model_group, "model#9999");
         assert_eq!(events[8].pricing_key, None);
         assert_eq!(events[8].cost_usd, None);
-    }
-
-    #[test]
-    fn estimate_conversation_cost_uses_turn_pricer_for_compaction_and_worker_inference() {
-        use crate::protobuf::{encode_gen_blob, encode_step_blob, GenBlobSpec, StepBlobSpec, UsageSpec};
-
-        let dir = tempfile::tempdir().unwrap();
-        let cli_dir = dir.path().join(".gemini/antigravity-cli");
-        let pricing = test_pricing_catalog(&dir.path().join("cache"));
-        let parent = "11111111-1111-4111-8111-111111111111";
-        let child = "22222222-2222-4222-8222-222222222222";
-
-        // Parent DB: 1M Hydrogen turn in gen_metadata + 1M bare compaction turn in steps.metadata.f9.
-        let parent_db = cli_dir.join("conversations").join(format!("{parent}.db"));
-        fs::create_dir_all(parent_db.parent().unwrap()).unwrap();
-        let pconn = Connection::open(&parent_db).unwrap();
-        pconn
-            .execute_batch(
-                "CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);
-                 CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
-            )
-            .unwrap();
-        pconn
-            .execute(
-                "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
-                [encode_gen_blob(GenBlobSpec {
-                    step_indices: vec![1],
-                    model_enum: 1669,
-                    resp_model: Some("gemini-flash-worker-agy"),
-                    disp_name: Some("Gemini 4 Hydrogen (Orchestrator)"),
-                    input_tok: 1_000_000,
-                    ..Default::default()
-                })],
-            )
-            .unwrap();
-        pconn
-            .execute(
-                "INSERT INTO steps (idx, metadata) VALUES (2, ?1)",
-                [encode_step_blob(StepBlobSpec {
-                    created_at_secs: Some(1_795_000_000),
-                    usage: Some(UsageSpec {
-                        model_enum: 1669,
-                        input_tok: 1_000_000,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                })],
-            )
-            .unwrap();
-        drop(pconn);
-
-        // Child DB: 1M turn with legacy generic display name "Gemini Flash" on same worker routing ID.
-        seed_cost_db(
-            &cli_dir,
-            child,
-            1,
-            encode_gen_blob(GenBlobSpec {
-                step_indices: vec![1],
-                model_enum: 0,
-                resp_model: Some("gemini-flash-worker-agy"),
-                disp_name: Some("Gemini Flash"),
-                input_tok: 1_000_000,
-                ..Default::default()
-            }),
-        );
-
-        let summaries = Connection::open(cli_dir.join("conversation_summaries.db")).unwrap();
-        summaries
-            .execute(
-                "CREATE TABLE conversation_summaries (
-                    conversation_id TEXT,
-                    parent_conversation_id TEXT,
-                    nesting_depth INTEGER
-                )",
-                [],
-            )
-            .unwrap();
-        summaries
-            .execute(
-                "INSERT INTO conversation_summaries VALUES (?1, ?2, 1)",
-                [child, parent],
-            )
-            .unwrap();
-        drop(summaries);
-
-        let est = estimate_conversation_cost_usd(&cli_dir, parent, &pricing).unwrap();
-        // Parent: $1.50 (main) + $1.50 (compaction) = $3.00; child: $1.50 -> total $4.50, sub $1.50.
-        assert_eq!(est.usd, Some(4.5));
-        assert_eq!(est.subagent_usd, Some(1.5));
-        assert_eq!(est.unpriced_turns, 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn db_file_fingerprint_tracks_ctime_and_zeros_idle_wal_ctime() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let wal_path = dir.path().join("test.db-wal");
-        fs::write(&db_path, b"sqlite-bytes").unwrap();
-
-        let fp_no_wal = db_file_fingerprint(&db_path).unwrap();
-        assert!(fp_no_wal.db_ctime_secs > 0);
-        assert_eq!(fp_no_wal.wal_ctime_secs, 0);
-        assert_eq!(fp_no_wal.wal_ctime_nanos, 0);
-
-        // 0-byte WAL must keep wal_ctime zeroed.
-        fs::write(&wal_path, b"").unwrap();
-        let fp_empty_wal = db_file_fingerprint(&db_path).unwrap();
-        assert_eq!(fp_empty_wal, fp_no_wal);
-
-        // Non-empty WAL records non-zero wal_ctime and changes the fingerprint.
-        fs::write(&wal_path, b"wal-frame").unwrap();
-        let fp_active_wal = db_file_fingerprint(&db_path).unwrap();
-        assert!(fp_active_wal.wal_ctime_secs > 0);
-        assert_ne!(fp_active_wal, fp_no_wal);
-
-        // A ctime-only difference changes DbFileFingerprint equality.
-        let mut altered = fp_no_wal;
-        altered.db_ctime_secs = altered.db_ctime_secs.saturating_sub(1);
-        assert_ne!(altered, fp_no_wal);
-    }
-
-    #[test]
-    fn conv_cost_cache_bounds_lru_entries_and_promotes_updated_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache_dir = dir.path();
-        let mk_entry = |id: &str, usd: f64| ConvCostCacheEntry {
-            cli_dir: "/isolated/cli".to_string(),
-            conversation_id: id.to_string(),
-            parent_fp: None,
-            summaries_fp: None,
-            descendants: Vec::new(),
-            pricing_fp: PricingFileFingerprint::default(),
-            cost: CachedConversationCost {
-                usd: Some(usd),
-                subagent_usd: None,
-                unpriced_turns: 0,
-            },
-        };
-
-        write_conv_cost_cache_entry_with_limit(
-            cache_dir,
-            mk_entry("11111111-1111-4111-8111-111111111111", 1.0),
-            2,
-        );
-        write_conv_cost_cache_entry_with_limit(
-            cache_dir,
-            mk_entry("22222222-2222-4222-8222-222222222222", 2.0),
-            2,
-        );
-        write_conv_cost_cache_entry_with_limit(
-            cache_dir,
-            mk_entry("33333333-3333-4333-8333-333333333333", 3.0),
-            2,
-        );
-
-        let after_evict = read_conv_cost_cache_file(cache_dir).unwrap();
-        assert_eq!(after_evict.entries.len(), 2);
-        assert_eq!(
-            after_evict.entries[0].conversation_id,
-            "33333333-3333-4333-8333-333333333333"
-        );
-        assert_eq!(
-            after_evict.entries[1].conversation_id,
-            "22222222-2222-4222-8222-222222222222"
-        );
-
-        // Updating entry 2 promotes it to MRU so entry 3 is evicted next.
-        write_conv_cost_cache_entry_with_limit(
-            cache_dir,
-            mk_entry("22222222-2222-4222-8222-222222222222", 2.5),
-            2,
-        );
-        write_conv_cost_cache_entry_with_limit(
-            cache_dir,
-            mk_entry("44444444-4444-4444-8444-444444444444", 4.0),
-            2,
-        );
-
-        let after_promote = read_conv_cost_cache_file(cache_dir).unwrap();
-        assert_eq!(after_promote.entries.len(), 2);
-        assert_eq!(
-            after_promote.entries[0].conversation_id,
-            "44444444-4444-4444-8444-444444444444"
-        );
-        assert_eq!(
-            after_promote.entries[1].conversation_id,
-            "22222222-2222-4222-8222-222222222222"
-        );
-        assert_eq!(after_promote.entries[1].cost.usd, Some(2.5));
     }
 }

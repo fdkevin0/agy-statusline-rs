@@ -18,8 +18,8 @@ use super::{
     accumulate_period, activity_week_mondays, build_weekly_usage, DailyUsage, ModelAccumulator,
     ModelStats, PeriodSummary, SqliteStats, StatsReport, WindowSummaries, DAYS_PER_WEEK,
 };
-use crate::db::compute_median;
-use crate::timeutil::civil_date_from_unix_day;
+use crate::agy::db::compute_median;
+use crate::sys::time::civil_date_from_unix_day;
 
 pub(super) const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 /// Upper bound on calendar gap-fill span to prevent pathological allocations on huge `--days` or outlier timestamps.
@@ -285,7 +285,7 @@ struct DayAccumulator {
     ttfts: Vec<f64>,
 }
 
-fn finalize_models(
+pub(super) fn finalize_models(
     model_map: HashMap<String, ModelAccumulator>,
     sort_metric: StatsMetric,
 ) -> Vec<ModelStats> {
@@ -320,7 +320,7 @@ fn finalize_models(
     models
 }
 
-fn accumulate_model(model_map: &mut HashMap<String, ModelAccumulator>, ev: &UsageEvent) {
+pub(super) fn accumulate_model(model_map: &mut HashMap<String, ModelAccumulator>, ev: &UsageEvent) {
     let entry = model_map.entry(ev.model_group.clone()).or_default();
     if entry.pricing_key.is_none() {
         entry.pricing_key.clone_from(&ev.pricing_key);
@@ -442,7 +442,11 @@ impl StatsDataset {
     }
 
     /// Builds a [`StatsReport`] whose `models` leaderboard is sorted by `sort_metric`.
-    pub fn to_report_with_metric(&self, days: Option<u32>, sort_metric: StatsMetric) -> StatsReport {
+    pub fn to_report_with_metric(
+        &self,
+        days: Option<u32>,
+        sort_metric: StatsMetric,
+    ) -> StatsReport {
         let filter_days = days.filter(|&d| d > 0);
         let filter_cutoff = filter_days.map(|d| self.today_day_idx - i64::from(d - 1));
 
@@ -537,7 +541,10 @@ impl StatsDataset {
         metric: StatsMetric,
         source_filter: SourceFilter,
         model_filter: Option<&str>,
-    ) -> (Vec<HeatmapWeek>, Option<(String, &'static str, MetricValue)>) {
+    ) -> (
+        Vec<HeatmapWeek>,
+        Option<(String, &'static str, MetricValue)>,
+    ) {
         let mut by_day: HashMap<i64, PeriodSummary> = HashMap::new();
         for ev in &self.events {
             if !source_filter.matches(ev.source) {
@@ -565,9 +572,7 @@ impl StatsDataset {
                     let day_idx = week_mon + (d as i64);
                     if day_idx <= self.today_day_idx {
                         let date = format_day(day_idx);
-                        let val = by_day
-                            .get(&day_idx)
-                            .map_or(zero_val, |s| metric.extract(s));
+                        let val = by_day.get(&day_idx).map_or(zero_val, |s| metric.extract(s));
                         if val.is_positive()
                             && peak
                                 .as_ref()
@@ -626,10 +631,12 @@ impl StatsDataset {
                 window_ttfts.push(ttft);
             }
 
-            let day_acc = day_map.entry(ev.local_day).or_insert_with(|| DayAccumulator {
-                date: ev.local_date.clone(),
-                ..Default::default()
-            });
+            let day_acc = day_map
+                .entry(ev.local_day)
+                .or_insert_with(|| DayAccumulator {
+                    date: ev.local_date.clone(),
+                    ..Default::default()
+                });
             accumulate_period(&mut day_acc.summary, ev);
             if let Some(speed) = ev.decode_speed {
                 day_acc.speeds.push(speed);
@@ -751,7 +758,7 @@ impl StatsDataset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timeutil::unix_day_from_civil_date;
+    use crate::sys::time::unix_day_from_civil_date;
 
     fn sample_dataset() -> StatsDataset {
         let d1 = unix_day_from_civil_date("2026-11-18".parse().unwrap());

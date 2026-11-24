@@ -10,8 +10,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::fsutil::atomic_write;
 use crate::stats::StatsMetric;
+use crate::sys::fs::atomic_write;
 
 /// Maximum number of configurable statusline rows.
 pub const MAX_ROWS: usize = 3;

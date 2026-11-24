@@ -7,7 +7,7 @@ use std::path::{self, Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use crate::fsutil::atomic_write_preserving_mode;
+use crate::sys::fs::atomic_write_preserving_mode;
 
 /// Resolves the preferred binary path to register in AGY `settings.json`.
 ///
@@ -169,7 +169,7 @@ pub fn run_apply_command<R: BufRead, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paths::agy_settings_path_for_home;
+    use crate::agy::paths::agy_settings_path_for_home;
     use std::io::Cursor;
 
     #[test]
@@ -243,7 +243,10 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(after_disable["statusLine"]["enabled"], false);
         assert_eq!(after_disable["statusLine"]["padding"], 1);
-        assert_eq!(after_disable["statusLine"]["command"], "/opt/agy-statusline");
+        assert_eq!(
+            after_disable["statusLine"]["command"],
+            "/opt/agy-statusline"
+        );
     }
 
     #[test]
@@ -253,8 +256,8 @@ mod tests {
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
         fs::write(&settings, "{not json").unwrap();
 
-        let err =
-            apply_statusline_config(&settings, Path::new("/bin/agy-statusline"), false).unwrap_err();
+        let err = apply_statusline_config(&settings, Path::new("/bin/agy-statusline"), false)
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

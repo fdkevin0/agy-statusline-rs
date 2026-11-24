@@ -376,7 +376,10 @@ fn trim_non_empty(value: Option<String>) -> Option<String> {
 /// and `0.0 < output_tokens / decode_secs < 10_000.0`.
 pub(crate) fn extract_gen_metadata_summary(data: &[u8]) -> Option<GenMetadataSummary> {
     let chat = GenMetadataBlob::decode(data).ok()?.chat_model?;
-    let turn = match (chat.usage, chat.streaming_duration.and_then(|d| d.to_secs())) {
+    let turn = match (
+        chat.usage,
+        chat.streaming_duration.and_then(|d| d.to_secs()),
+    ) {
         (Some(usage), Some(decode_secs)) => {
             let (output_tokens, thinking_output_tokens) = usage.resolved_tokens();
             is_sane_decode_speed(output_tokens, decode_secs).then(|| TurnMetrics {
@@ -535,7 +538,7 @@ pub fn extract_trajectory_created_at_secs(data: &[u8]) -> Option<i64> {
 /// # Examples
 ///
 /// ```
-/// use agy_statusline::protobuf::extract_metadata_speed;
+/// use agy_statusline::agy::protobuf::extract_metadata_speed;
 ///
 /// // chat(1) -> { usage(4) -> { output(3)=100 }, duration(12) -> { seconds(1)=2 } }
 /// let blob = [0x0a, 0x08, 0x22, 0x02, 0x18, 0x64, 0x62, 0x02, 0x08, 0x02];
@@ -1070,7 +1073,10 @@ mod tests {
             nanos: 0,
         }
         .encode_to_vec();
-        assert_eq!(ProtoDuration::decode(&neg_secs[..]).unwrap().to_secs(), None);
+        assert_eq!(
+            ProtoDuration::decode(&neg_secs[..]).unwrap().to_secs(),
+            None
+        );
 
         let neg_nanos = ProtoDuration {
             seconds: 1,
@@ -1096,7 +1102,10 @@ mod tests {
             dur_secs: -1,
             ..Default::default()
         });
-        assert_eq!(extract_gen_metadata_record(&root).unwrap().decode_secs, None);
+        assert_eq!(
+            extract_gen_metadata_record(&root).unwrap().decode_secs,
+            None
+        );
     }
 
     #[test]

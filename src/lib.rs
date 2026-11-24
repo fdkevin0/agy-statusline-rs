@@ -1,30 +1,19 @@
 #![forbid(unsafe_code)]
-//! Safe Rust statusline for Antigravity CLI (`agy`).
+//! Safe Rust statusline and local usage analytics for Antigravity CLI (`agy`).
 //!
-//! Reads AGY statusline JSON from stdin, inspects local SQLite conversation
-//! metadata for decode/e2e speed, TTFT, thinking tokens, and compaction limits,
-//! and renders a customizable multi-row statusline (`Plain`, `Pill`, or
-//! `Powerline`) alongside local usage stats (`agy-statusline stats`), pricing
-//! sync (`agy-statusline pricing`), and an interactive `ratatui` configurator
-//! (`agy-statusline config`).
+//! Architecture pillars:
+//! - [`agy`] — local Antigravity storage paths, read-only SQLite sniffing, and protobuf decoding
+//! - [`cli`] — non-TUI CLI command handlers (`apply`, `doctor`)
+//! - [`config`] — layout configuration, built-in presets, and the 3-pane `config` TUI
+//! - [`statusline`] — stdin JSON pipeline, git/quota/speed metrics, and multi-row ANSI renderer
+//! - [`stats`] — local usage analytics, `models.dev` pricing sync, and unified `stats`/`conversations` TUI
+//! - [`sys`] — OS, filesystem, subprocess, terminal guard, and civil-time helpers
 
-pub mod apply;
-pub mod db;
-pub mod doctor;
-pub(crate) mod editor;
-pub mod format;
-pub(crate) mod fsutil;
-pub mod git;
-pub mod layout;
-pub(crate) mod metrics;
-pub mod paths;
-pub(crate) mod procutil;
-pub mod protobuf;
-pub mod render;
+pub mod agy;
+pub mod cli;
+pub mod config;
 pub mod stats;
 pub mod statusline;
-pub(crate) mod theme;
-pub(crate) mod timeutil;
-pub mod tui;
+pub mod sys;
 
-pub use timeutil::unix_now_secs;
+pub use sys::time::unix_now_secs;

@@ -2,9 +2,9 @@
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::metric::StatsMetric;
-use super::query::{ModelScope, RangePreset, StatsQuery, StatsView};
-use super::ModelStats;
+use crate::stats::metric::StatsMetric;
+use crate::stats::query::{ModelScope, RangePreset, StatsQuery, StatsView};
+use crate::stats::ModelStats;
 
 /// Focused interactive pane inside the `stats` TUI.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -30,6 +30,7 @@ impl StatsPane {
 pub enum StatsAction {
     Continue,
     Refresh,
+    OpenConversations,
     Quit,
 }
 
@@ -252,6 +253,7 @@ impl StatsTuiState {
                 return StatsAction::Quit;
             }
             KeyCode::Char('r') => return StatsAction::Refresh,
+            KeyCode::Char('c') => return StatsAction::OpenConversations,
             _ => {}
         }
 

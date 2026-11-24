@@ -11,14 +11,14 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::apply::read_settings_object;
-use crate::db::{is_absent_or_real_file, is_safe_sqlite_file, is_valid_uuid};
-use crate::layout::try_load_layout_config;
-use crate::procutil::{run_command_stdout_bounded, BoundedCommandError};
-use crate::render::write_statusline;
+use crate::agy::db::{is_absent_or_real_file, is_safe_sqlite_file, is_valid_uuid};
+use crate::cli::apply::read_settings_object;
+use crate::config::layout::try_load_layout_config;
 use crate::stats::{DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE};
+use crate::statusline::render::write_statusline;
 use crate::statusline::{sample_preview_git, sample_preview_metadata, sample_preview_payload};
-use crate::timeutil::unix_now_secs;
+use crate::sys::process::{run_command_stdout_bounded, BoundedCommandError};
+use crate::sys::time::unix_now_secs;
 
 const AGY_VERSION_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_AGY_VERSION_BYTES: u64 = 4096;
@@ -310,10 +310,7 @@ fn run_doctor_with<W: Write>(
             Some(sl) => {
                 let cmd_opt = sl.get("command").and_then(Value::as_str);
                 let cmd = cmd_opt.unwrap_or("<missing>");
-                let enabled = sl
-                    .get("enabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
+                let enabled = sl.get("enabled").and_then(Value::as_bool).unwrap_or(true);
                 let stack = sl
                     .get("stack_with_default")
                     .and_then(Value::as_bool)
@@ -354,7 +351,11 @@ fn run_doctor_with<W: Write>(
         Some(dir) => {
             let pricing_path = dir.join(MODELS_DEV_CACHE_FILE);
             let pricing_state = inspect_pricing_cache(dir, env.now_unix_secs);
-            writeln!(out, "Pricing:  {} [{pricing_state}]", pricing_path.display())?;
+            writeln!(
+                out,
+                "Pricing:  {} [{pricing_state}]",
+                pricing_path.display()
+            )?;
         }
         None => {
             writeln!(
@@ -402,8 +403,8 @@ mod tests {
 
     use super::*;
 
-    use crate::apply::apply_statusline_config;
-    use crate::paths::agy_settings_path_for_home;
+    use crate::agy::paths::agy_settings_path_for_home;
+    use crate::cli::apply::apply_statusline_config;
 
     #[cfg(windows)]
     const FAKE_BIN_NAME: &str = "agy-statusline-fake.exe";
@@ -417,7 +418,8 @@ mod tests {
         let settings = agy_settings_path_for_home(home.path());
         let conv_dir = settings.parent().unwrap().join("conversations");
         let cache_dir = home.path().join("cache");
-        apply_statusline_config(&settings, Path::new("/nonexistent/agy-statusline"), false).unwrap();
+        apply_statusline_config(&settings, Path::new("/nonexistent/agy-statusline"), false)
+            .unwrap();
 
         let doctor_env = DoctorEnv {
             conv_dir: Some(&conv_dir),
@@ -517,7 +519,10 @@ mod tests {
             format_version_output(b"\n\x1b[32m1.5.16\x07\x1b[0m\nignored line\n"),
             "1.5.16"
         );
-        assert_eq!(format_version_output(b"   \n\t\r\n"), "unknown (empty output)");
+        assert_eq!(
+            format_version_output(b"   \n\t\r\n"),
+            "unknown (empty output)"
+        );
     }
 
     #[cfg(unix)]

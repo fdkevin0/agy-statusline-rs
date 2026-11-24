@@ -27,7 +27,7 @@ fn push_tenths_with_suffix(tenths: u64, suffix: char, out: &mut String) {
 /// # Examples
 ///
 /// ```
-/// use agy_statusline::format::format_tokens;
+/// use agy_statusline::statusline::format::format_tokens;
 ///
 /// let mut buf = String::new();
 /// format_tokens(1_338_000_000, &mut buf);

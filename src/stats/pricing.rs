@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::scan::is_effort_token;
-use crate::fsutil::{atomic_write, modified_timestamp};
-use crate::procutil::{run_command_stdout_bounded, BoundedCommandError};
-use crate::timeutil::{unix_now_secs, SECS_PER_DAY};
+use crate::sys::fs::{atomic_write, modified_timestamp};
+use crate::sys::process::{run_command_stdout_bounded, BoundedCommandError};
+use crate::sys::time::{unix_now_secs, SECS_PER_DAY};
 
 /// Default cache TTL for auto-fetched `models.dev` pricing data (24 hours).
 pub(crate) const DEFAULT_PRICING_TTL_SECS: u64 = SECS_PER_DAY as u64;
@@ -410,10 +410,7 @@ impl PricingCatalog {
             .is_some_and(|norm| extract_orchestrator_codename(&norm).is_some());
         let disp_is_specific = model_display_name
             .map(|s| normalize_model_key(s.trim()))
-            .is_some_and(|norm| {
-                norm.split_whitespace()
-                    .any(|w| !is_generic_family_token(w))
-            });
+            .is_some_and(|norm| norm.split_whitespace().any(|w| !is_generic_family_token(w)));
         resp_has_codename || disp_is_specific
     }
 
@@ -474,7 +471,15 @@ fn is_generic_orchestrator_token(word: &str) -> bool {
     is_effort_token(word)
         || matches!(
             word,
-            "pro" | "flash" | "agy" | "g1" | "worker" | "tiered" | "thinking" | "preview" | "latest"
+            "pro"
+                | "flash"
+                | "agy"
+                | "g1"
+                | "worker"
+                | "tiered"
+                | "thinking"
+                | "preview"
+                | "latest"
         )
 }
 
@@ -497,9 +502,7 @@ fn extract_orchestrator_codename(norm: &str) -> Option<&str> {
 fn extract_explicit_version(norm: &str) -> Option<(u32, u32)> {
     // Only inspect tokens before `orchestrator` so trailing date/build suffixes
     // (e.g. `gemini-pro-orchestrator-2026-04`) are never misread as generation numbers.
-    let mut words = norm
-        .split_whitespace()
-        .take_while(|&w| w != "orchestrator");
+    let mut words = norm.split_whitespace().take_while(|&w| w != "orchestrator");
     while let Some(w) = words.next() {
         if let Ok(major) = w.parse::<u32>() {
             let minor = words
@@ -614,20 +617,18 @@ fn spawn_background_pricing_sync() {
 pub(super) fn fetch_models_dev_via_curl(url: &str) -> io::Result<String> {
     let mut cmd = Command::new("curl");
     cmd.args(["-fsSL", "--connect-timeout", "5", "--max-time", "15", url]);
-    let out = match run_command_stdout_bounded(
-        &mut cmd,
-        Duration::from_secs(16),
-        MAX_PRICING_JSON_BYTES,
-    ) {
-        Ok(out) => out,
-        Err(BoundedCommandError::TimedOut) => {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "curl timed out fetching models.dev pricing",
-            ));
-        }
-        Err(BoundedCommandError::Io(err)) => return Err(err),
-    };
+    let out =
+        match run_command_stdout_bounded(&mut cmd, Duration::from_secs(16), MAX_PRICING_JSON_BYTES)
+        {
+            Ok(out) => out,
+            Err(BoundedCommandError::TimedOut) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "curl timed out fetching models.dev pricing",
+                ));
+            }
+            Err(BoundedCommandError::Io(err)) => return Err(err),
+        };
     if out.truncated {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -682,7 +683,10 @@ fn extract_context_tier(
 
 fn extract_rate_from_cost(cost_obj: &serde_json::Map<String, Value>) -> Option<ModelPricingRate> {
     let input = cost_obj.get("input").and_then(Value::as_f64).unwrap_or(0.0);
-    let output = cost_obj.get("output").and_then(Value::as_f64).unwrap_or(0.0);
+    let output = cost_obj
+        .get("output")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let cache_read = cost_obj
         .get("cache_read")
         .and_then(Value::as_f64)
@@ -1280,7 +1284,13 @@ mod tests {
             None
         );
         assert_eq!(
-            catalog.estimate_cost(&["gemini-flash-worker-agy", "Gemini Flash"], 1_000_000, 0, 0, 0),
+            catalog.estimate_cost(
+                &["gemini-flash-worker-agy", "Gemini Flash"],
+                1_000_000,
+                0,
+                0,
+                0
+            ),
             None
         );
         assert_eq!(

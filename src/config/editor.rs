@@ -2,7 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::layout::{LayoutConfig, Preset, WidgetId, MAX_ROWS};
+use crate::config::layout::{LayoutConfig, Preset, WidgetId, MAX_ROWS};
 
 /// Ordered entries in the Settings pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,7 +453,9 @@ impl TuiEditorState {
 
         if !self.grabbed {
             match code {
-                KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => return ExitOutcome::SaveOnly,
+                KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => {
+                    return ExitOutcome::SaveOnly
+                }
                 KeyCode::Char('S') => return ExitOutcome::SaveOnly,
                 KeyCode::Char('s') => return ExitOutcome::SaveAndApply,
                 KeyCode::Char('q') | KeyCode::Esc => return ExitOutcome::Quit,
@@ -483,12 +485,15 @@ impl TuiEditorState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{GlyphMode, SpeedMode, ThemeStyle, VisualStyle};
+    use crate::config::layout::{GlyphMode, SpeedMode, ThemeStyle, VisualStyle};
 
     #[test]
     fn move_mode_swaps_within_and_across_rows() {
         let mut ed = TuiEditorState::new(LayoutConfig::preset_full());
-        assert_eq!(ed.handle_key(KeyCode::Enter, KeyModifiers::NONE), ExitOutcome::Continue);
+        assert_eq!(
+            ed.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            ExitOutcome::Continue
+        );
         assert!(ed.grabbed);
         ed.handle_key(KeyCode::Right, KeyModifiers::NONE);
         assert_eq!(ed.config.rows[0][1], WidgetId::State);
@@ -543,7 +548,10 @@ mod tests {
         ed.adjust_setting_at(12, 1);
         assert!((ed.config.speed_warn_threshold - 40.0).abs() < 1e-6);
 
-        assert_eq!(ed.handle_key(KeyCode::Char('s'), KeyModifiers::NONE), ExitOutcome::SaveAndApply);
+        assert_eq!(
+            ed.handle_key(KeyCode::Char('s'), KeyModifiers::NONE),
+            ExitOutcome::SaveAndApply
+        );
     }
 
     #[test]
