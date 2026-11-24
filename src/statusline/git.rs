@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::fsutil::atomic_write;
-use crate::procutil::run_command_stdout_bounded;
-use crate::timeutil::unix_now_secs;
+use crate::sys::fs::atomic_write;
+use crate::sys::process::run_command_stdout_bounded;
+use crate::sys::time::unix_now_secs;
 
 const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_millis(250);
 const DEFAULT_DIFF_CACHE_TTL_SECS: u64 = 3;
@@ -196,8 +196,14 @@ fn parse_numstat(bytes: &[u8]) -> (u64, u64) {
     let mut deleted = 0u64;
     for line in text.lines() {
         let mut parts = line.split('\t');
-        let a = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        let d = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let a = parts
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let d = parts
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
         added = added.saturating_add(a);
         deleted = deleted.saturating_add(d);
     }
@@ -307,7 +313,10 @@ mod tests {
         assert_eq!(calls.get(), 2);
 
         // Changing .git/index mtime invalidates cache even within TTL.
-        let idx_file = fs::OpenOptions::new().write(true).open(gitdir.join("index")).unwrap();
+        let idx_file = fs::OpenOptions::new()
+            .write(true)
+            .open(gitdir.join("index"))
+            .unwrap();
         idx_file
             .set_modified(UNIX_EPOCH + Duration::from_secs(500))
             .unwrap();

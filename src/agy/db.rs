@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::protobuf::{extract_gen_metadata_summary, TurnMetrics};
+use crate::agy::protobuf::{extract_gen_metadata_summary, TurnMetrics};
 
 /// Session generation metadata sniffed from `gen_metadata`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -139,7 +139,10 @@ pub(crate) fn is_safe_sqlite_file(db_path: &Path) -> bool {
 ///
 /// Rejects symlinks and non-regular files for `conversations/`, the target `.db`,
 /// and any existing `-wal`/`-shm` sidecars.
-pub(crate) fn resolve_conversation_db_path(cli_dir: &Path, conversation_id: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_conversation_db_path(
+    cli_dir: &Path,
+    conversation_id: &str,
+) -> Option<PathBuf> {
     if !is_valid_uuid(conversation_id) {
         return None;
     }
@@ -168,7 +171,7 @@ pub(crate) fn resolve_conversation_db_path(cli_dir: &Path, conversation_id: &str
 /// # Examples
 ///
 /// ```
-/// use agy_statusline::db::is_valid_uuid;
+/// use agy_statusline::agy::db::is_valid_uuid;
 ///
 /// assert!(is_valid_uuid("8d0371e1-5a05-423b-a8bc-ed75995f9a8b"));
 /// assert!(!is_valid_uuid("------------------------------------"));
@@ -218,8 +221,8 @@ pub(crate) fn compute_median(values: &[f64]) -> Option<f64> {
 /// Extracts speed, TTFT, and context window metadata from an already-open read-only connection.
 pub(crate) fn query_session_metadata_from_conn(conn: &Connection) -> SessionMetadata {
     let mut meta = SessionMetadata::default();
-    let Ok(mut stmt) =
-        conn.prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx DESC LIMIT 9")
+    let Ok(mut stmt) = conn
+        .prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx DESC LIMIT 9")
     else {
         return meta;
     };
@@ -283,7 +286,7 @@ pub(crate) fn query_session_metadata_in(cli_dir: &Path, conversation_id: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protobuf::{encode_gen_blob, encode_speed_1s_blob, GenBlobSpec};
+    use crate::agy::protobuf::{encode_gen_blob, encode_speed_1s_blob, GenBlobSpec};
 
     #[test]
     fn uuid_validation() {
@@ -302,8 +305,11 @@ mod tests {
             dur_secs: 2,
             ..Default::default()
         });
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [blob])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [blob],
+        )
+        .unwrap();
         drop(conn);
 
         let reader = SqliteSpeedReader::new(dir.path());
@@ -320,8 +326,11 @@ mod tests {
             ..Default::default()
         });
         let incomplete: &[u8] = &[0x12, 0x00];
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [valid])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [valid],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
             [incomplete],
@@ -351,16 +360,56 @@ mod tests {
     #[test]
     fn median_speed_odd_nine_turns_and_weighted_five_turns() {
         let (dir, conn, uuid) = create_temp_conv_db();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (0, ?1)", [encode_speed_1s_blob(5)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [encode_speed_1s_blob(10)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [encode_speed_1s_blob(20)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (3, ?1)", [encode_speed_1s_blob(30)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (4, ?1)", [encode_speed_1s_blob(40)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (5, ?1)", [encode_speed_1s_blob(80)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (6, ?1)", [encode_speed_1s_blob(90)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (7, ?1)", [encode_speed_1s_blob(100)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (8, ?1)", [encode_speed_1s_blob(110)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (9, ?1)", [encode_speed_1s_blob(120)]).unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (0, ?1)",
+            [encode_speed_1s_blob(5)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [encode_speed_1s_blob(10)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
+            [encode_speed_1s_blob(20)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (3, ?1)",
+            [encode_speed_1s_blob(30)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (4, ?1)",
+            [encode_speed_1s_blob(40)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (5, ?1)",
+            [encode_speed_1s_blob(80)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (6, ?1)",
+            [encode_speed_1s_blob(90)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (7, ?1)",
+            [encode_speed_1s_blob(100)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (8, ?1)",
+            [encode_speed_1s_blob(110)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (9, ?1)",
+            [encode_speed_1s_blob(120)],
+        )
+        .unwrap();
         drop(conn);
 
         let reader = SqliteSpeedReader::new(dir.path());
@@ -373,10 +422,26 @@ mod tests {
     #[test]
     fn median_speed_even_turns_averages_middle_two() {
         let (dir, conn, uuid) = create_temp_conv_db();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [encode_speed_1s_blob(100)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [encode_speed_1s_blob(20)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (3, ?1)", [encode_speed_1s_blob(60)]).unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (4, ?1)", [encode_speed_1s_blob(40)]).unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [encode_speed_1s_blob(100)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
+            [encode_speed_1s_blob(20)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (3, ?1)",
+            [encode_speed_1s_blob(60)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (4, ?1)",
+            [encode_speed_1s_blob(40)],
+        )
+        .unwrap();
         drop(conn);
 
         let reader = SqliteSpeedReader::new(dir.path());
@@ -399,10 +464,16 @@ mod tests {
             max_context_tokens: 512_000,
             ..Default::default()
         });
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)", [turn_with_thinking])
-            .unwrap();
-        conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)", [ctx_start])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [turn_with_thinking],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
+            [ctx_start],
+        )
+        .unwrap();
         drop(conn);
 
         let reader = SqliteSpeedReader::new(dir.path());

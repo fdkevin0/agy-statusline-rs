@@ -4,13 +4,12 @@ use std::path::Path;
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::format::{format_tokens, format_tokens_string as format_tok_str};
-use crate::layout::{GlyphMode, WidgetId};
-use crate::metrics::QuotaView;
+use crate::config::layout::{GlyphMode, WidgetId};
+use crate::statusline::metrics::QuotaView;
+use crate::statusline::theme::Palette;
 use crate::statusline::StatuslinePayload;
-use crate::theme::Palette;
+use crate::sys::fmt::{format_tokens, format_tokens_string as format_tok_str, truncate_to_width};
 
-use super::fit::truncate_to_width;
 use super::{
     build_progress_bar_with_chars, CompactStage, RenderContext, Renderer, ResolvedCost, Segment,
 };
@@ -326,8 +325,7 @@ impl Renderer<'_> {
                 } else {
                     format!("{prefix} {branch}")
                 };
-                let has_diff =
-                    self.cfg.show_git_diff && (ctx.git.added > 0 || ctx.git.deleted > 0);
+                let has_diff = self.cfg.show_git_diff && (ctx.git.added > 0 || ctx.git.deleted > 0);
                 let full = if has_diff {
                     format!("{base} +{} -{}", ctx.git.added, ctx.git.deleted)
                 } else {
@@ -590,9 +588,8 @@ impl Renderer<'_> {
         let glyphs = self.glyphs;
 
         let Some(q) = view else {
-            return (!self.cfg.smart_hide).then(|| {
-                Segment::plain(widget, format!("{fallback_label} --"), pal.muted, false)
-            });
+            return (!self.cfg.smart_hide)
+                .then(|| Segment::plain(widget, format!("{fallback_label} --"), pal.muted, false));
         };
         let label = &q.label;
         let (core, fg, bold) = if let Some(amt) = q.remaining_amount {
@@ -605,7 +602,7 @@ impl Renderer<'_> {
         } else {
             let core = format!(
                 "{label} {}",
-                crate::metrics::format_quota_pct(q.remaining_pct)
+                crate::statusline::metrics::format_quota_pct(q.remaining_pct)
             );
             let (fg, bold) = if q.remaining_pct <= 10.0 {
                 (pal.ctx_crit, true)
@@ -849,7 +846,11 @@ fn abbreviate_leading_word(text: &str) -> String {
     if let Some((first, rest)) = text.split_once(' ') {
         if first.len() >= 4 && first.bytes().all(|b| b.is_ascii_alphabetic()) {
             if let Some(ch) = first.chars().next() {
-                if rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                if rest
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                {
                     return format!("{}{rest}", ch.to_ascii_uppercase());
                 }
                 if rest.starts_with('(') {
@@ -861,39 +862,7 @@ fn abbreviate_leading_word(text: &str) -> String {
     text.to_string()
 }
 
-pub(super) fn sanitize_inline_text(raw: &str) -> String {
-    // Normalize non-CR/LF whitespace (such as `\t` and NEL) before `strip_ansi_escapes`,
-    // whose VTE parser drops C0/C1 control characters other than `\n` and `\r`.
-    let normalized: String = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_whitespace() && !matches!(ch, ' ' | '\n' | '\r') {
-                ' '
-            } else {
-                ch
-            }
-        })
-        .collect();
-    let stripped = strip_ansi_escapes::strip_str(&normalized);
-    let mut out = String::with_capacity(stripped.len());
-    let mut pending_space = false;
-
-    for ch in stripped.chars() {
-        if ch.is_whitespace() {
-            if !out.is_empty() {
-                pending_space = true;
-            }
-        } else if !ch.is_control() {
-            if pending_space {
-                out.push(' ');
-                pending_space = false;
-            }
-            out.push(ch);
-        }
-    }
-
-    out
-}
+use crate::sys::fmt::sanitize_inline_text;
 
 #[cfg(test)]
 mod tests {
@@ -901,23 +870,14 @@ mod tests {
 
     #[test]
     fn abbreviate_leading_word_is_vendor_agnostic() {
-        assert_eq!(
-            abbreviate_leading_word("AlphaModel M2 · max"),
-            "AM2 · max"
-        );
-        assert_eq!(
-            abbreviate_leading_word("VendorName 3.1 Pro"),
-            "V3.1 Pro"
-        );
+        assert_eq!(abbreviate_leading_word("AlphaModel M2 · max"), "AM2 · max");
+        assert_eq!(abbreviate_leading_word("VendorName 3.1 Pro"), "V3.1 Pro");
         assert_eq!(
             abbreviate_leading_word("Orchestrator (Carbon) · high"),
             "O (Carbon) · high"
         );
         assert_eq!(abbreviate_leading_word("M2 · max"), "M2 · max");
-        assert_eq!(
-            abbreviate_leading_word("Model-X 120B"),
-            "Model-X 120B"
-        );
+        assert_eq!(abbreviate_leading_word("Model-X 120B"), "Model-X 120B");
     }
 
     #[test]

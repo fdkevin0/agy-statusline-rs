@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use crate::statusline::{QuotaBucket, StatuslinePayload};
-use crate::timeutil::{parse_rfc3339_unix_secs, SECS_PER_DAY as SECS_PER_DAY_I64};
+use crate::sys::time::{parse_rfc3339_unix_secs, SECS_PER_DAY as SECS_PER_DAY_I64};
 
 const SECS_PER_HOUR: u64 = 3_600;
 const SECS_PER_DAY: u64 = SECS_PER_DAY_I64 as u64;
@@ -69,31 +69,7 @@ pub(crate) fn current_context_tokens(payload: &StatuslinePayload) -> Option<u64>
     Some(inp.saturating_add(read).saturating_add(create))
 }
 
-/// Formats a duration in seconds into a compact human-readable string (`45s`, `12m`, `3h10m`, `5d12h`).
-fn format_duration_compact(secs: u64) -> String {
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    if secs < SECS_PER_HOUR {
-        return format!("{}m", secs / 60);
-    }
-    if secs < SECS_PER_DAY {
-        let h = secs / SECS_PER_HOUR;
-        let m = (secs % SECS_PER_HOUR) / 60;
-        return if m == 0 {
-            format!("{h}h")
-        } else {
-            format!("{h}h{m}m")
-        };
-    }
-    let d = secs / SECS_PER_DAY;
-    let h = (secs % SECS_PER_DAY) / SECS_PER_HOUR;
-    if h == 0 {
-        format!("{d}d")
-    } else {
-        format!("{d}d{h}h")
-    }
-}
+use crate::sys::fmt::format_duration_compact;
 
 /// Formats a validated remaining quota percentage (`0.0..=100.0`) without rounding sub-1% values to `0%`.
 ///
@@ -763,10 +739,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resolve_quota_weekly_at(&qualified_display, 0).unwrap().label,
+            resolve_quota_weekly_at(&qualified_display, 0)
+                .unwrap()
+                .label,
             "tier1"
         );
-        assert_eq!(resolve_quota_5h_at(&qualified_display, 0).unwrap().label, "5h");
+        assert_eq!(
+            resolve_quota_5h_at(&qualified_display, 0).unwrap().label,
+            "5h"
+        );
 
         // Arbitrary unknown third-party model picks 3p buckets automatically.
         let unknown_3p = StatuslinePayload {
@@ -781,7 +762,10 @@ mod tests {
         let g5 = resolve_quota_5h_at(&unknown_3p, 0).unwrap();
         assert_eq!(g5.label, "3p 5h");
         assert_eq!(format_quota_pct(g5.remaining_pct), "0.4%");
-        assert_eq!(resolve_quota_weekly_at(&unknown_3p, 0).unwrap().label, "3p 7d");
+        assert_eq!(
+            resolve_quota_weekly_at(&unknown_3p, 0).unwrap().label,
+            "3p 7d"
+        );
 
         // Custom 24h / 1h / credit-only buckets work dynamically.
         let mut custom_quota = BTreeMap::new();

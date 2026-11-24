@@ -6,12 +6,10 @@ mod common;
 use std::fs;
 use std::path::Path;
 
-use agy_statusline::stats::{unix_secs_to_utc_date, StatsReport};
+use agy_statusline::stats::{unix_secs_to_utc_date, ConversationStatsReport, StatsReport};
 use rusqlite::Connection;
 
-use common::{
-    build_gen_blob, build_step_meta_blob, isolated_agy_cmd, unix_now_secs, TestGenSpec,
-};
+use common::{build_gen_blob, build_step_meta_blob, isolated_agy_cmd, unix_now_secs, TestGenSpec};
 
 fn seed_sqlite_fixtures(cli_root: &Path, today_secs: u64, old_secs: u64) {
     let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
@@ -100,7 +98,8 @@ fn cli_stats_renders_text_no_color_and_json_in_isolated_home() {
     assert!(text_out.status.success());
     let text = String::from_utf8(text_out.stdout).unwrap();
     assert!(!text.contains('\x1b'));
-    assert!(text.contains("agy-statusline stats · Local"));
+    assert!(text.is_ascii(), "expected pure 7-bit ASCII output:\n{text}");
+    assert!(text.contains("agy-statusline stats | Local"));
     assert!(text.contains("(UTC)"));
     assert!(text.contains("Model Alpha"));
     assert!(text.contains("Model Beta"));
@@ -262,4 +261,352 @@ fn cli_stats_tui_persists_selected_metric_in_config_across_runs() {
     let next_text = String::from_utf8(next_out.stdout).unwrap();
     assert!(next_text.contains("Metric Cost ($)"), "{next_text}");
     assert!(next_text.contains("Daily (2d | Cost ($)):"), "{next_text}");
+}
+
+#[test]
+fn cli_stats_conversation_positional_reports_parent_subagent_and_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let cli_root = home.join(".gemini/antigravity-cli");
+    let now_secs = unix_now_secs();
+    let earlier_secs = now_secs.saturating_sub(120);
+    let root_uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
+    let sub_uuid = "9a1482f2-6b16-434c-99cd-fe86aa60ab9c";
+
+    seed_sqlite_fixtures(&cli_root, now_secs, earlier_secs);
+    seed_alpha_rate(home);
+
+    // Seed a child subagent conversation and link it via conversation_summaries.db.
+    let sub_db = cli_root
+        .join("conversations")
+        .join(format!("{sub_uuid}.db"));
+    let sub_conn = Connection::open(&sub_db).unwrap();
+    sub_conn
+        .execute(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB)",
+            [],
+        )
+        .unwrap();
+    sub_conn
+        .execute(
+            "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+            [],
+        )
+        .unwrap();
+    sub_conn
+        .execute(
+            "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+            [build_step_meta_blob(now_secs.saturating_sub(60))],
+        )
+        .unwrap();
+    sub_conn
+        .execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [build_gen_blob(TestGenSpec {
+                step_idx: 1,
+                model_enum: 1526,
+                resp_model: "model-alpha",
+                disp_name: "Model Alpha (Medium)",
+                input_tok: 2_000,
+                cache_read_tok: 8_000,
+                output_tok: 150,
+                thinking_tok: 50,
+                dur_secs: 1,
+                ttft_ms: 300,
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+    drop(sub_conn);
+
+    let sum_conn = Connection::open(cli_root.join("conversation_summaries.db")).unwrap();
+    sum_conn
+        .execute(
+            "CREATE TABLE conversation_summaries (\
+                conversation_id TEXT PRIMARY KEY,\
+                title TEXT NOT NULL DEFAULT '',\
+                parent_conversation_id TEXT NOT NULL DEFAULT '',\
+                agent_name TEXT NOT NULL DEFAULT ''\
+            )",
+            [],
+        )
+        .unwrap();
+    sum_conn
+        .execute(
+            "INSERT INTO conversation_summaries (conversation_id, title, parent_conversation_id, agent_name) VALUES (?1, ?2, '', '')",
+            [root_uuid, "Cache Rate Investigation"],
+        )
+        .unwrap();
+    sum_conn
+        .execute(
+            "INSERT INTO conversation_summaries (conversation_id, title, parent_conversation_id, agent_name) VALUES (?1, '', ?2, 'research')",
+            [sub_uuid, root_uuid],
+        )
+        .unwrap();
+    drop(sum_conn);
+
+    // Full UUID positional argument (plain ASCII output).
+    let text_out = isolated_agy_cmd(home)
+        .env("NO_COLOR", "1")
+        .args(["stats", root_uuid, "--ascii"])
+        .output()
+        .unwrap();
+    assert!(text_out.status.success(), "{text_out:?}");
+    let text = String::from_utf8(text_out.stdout).unwrap();
+    assert!(
+        text.contains(&format!("Conversation {root_uuid} | cli | UTC")),
+        "{text}"
+    );
+    assert!(text.contains("Cache Rate Investigation"), "{text}");
+    assert!(text.contains("peak ctx 30K"), "{text}");
+    assert!(text.contains("Sub (1)"), "{text}");
+    assert!(text.contains("Subagents (1):"), "{text}");
+    assert!(text.contains("9a1482f2 [research]"), "{text}");
+    assert!(text.contains("Models (2):"), "{text}");
+    assert!(text.contains("Turns (3):"), "{text}");
+    assert!(text.contains("sub:Model Alpha"), "{text}");
+    assert!(
+        text.contains("SQLite: 3 speed samples across 2 DBs"),
+        "{text}"
+    );
+
+    // Unique prefix positional argument (JSON output).
+    let json_out = isolated_agy_cmd(home)
+        .args(["stats", "8D0371E1", "--json"])
+        .output()
+        .unwrap();
+    assert!(json_out.status.success(), "{json_out:?}");
+    let report: ConversationStatsReport = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(report.conversation_id, root_uuid);
+    assert_eq!(report.title.as_deref(), Some("Cache Rate Investigation"));
+    assert_eq!(report.duration_secs, Some(120));
+    assert_eq!(report.peak_context_tokens, Some(30_000));
+    assert_eq!(report.mid_session_misses, 0);
+    assert_eq!(report.totals.requests, 3);
+    assert_eq!(report.main.requests, 2);
+    assert_eq!(report.subagents_summary.requests, 1);
+    assert_eq!(report.subagents.len(), 1);
+    assert_eq!(report.subagents[0].agent_name.as_deref(), Some("research"));
+    assert_eq!(report.turns.len(), 3);
+    assert!(!report.turns[0].is_subagent);
+    assert!(report.turns[1].is_subagent);
+    assert!(!report.turns[2].is_subagent);
+    assert_eq!(report.totals.cache_read_tokens, 28_000);
+    assert_eq!(report.totals.input_tokens, 17_000);
+    assert_eq!(report.totals.priced_usd, 0.012);
+
+    // Missing conversation returns a clean non-zero error.
+    let missing_out = isolated_agy_cmd(home)
+        .args(["stats", "00000000-0000-4000-8000-000000000000"])
+        .output()
+        .unwrap();
+    assert!(!missing_out.status.success());
+    let stderr = String::from_utf8_lossy(&missing_out.stderr);
+    assert!(stderr.contains("not found"), "{stderr}");
+
+    // Forcing --tui on a non-TTY fails cleanly without entering raw mode.
+    let tui_err = isolated_agy_cmd(home)
+        .env("NO_COLOR", "1")
+        .args(["stats", "8d0371e1", "--tui"])
+        .output()
+        .unwrap();
+    assert!(!tui_err.status.success());
+    let tui_stderr = String::from_utf8_lossy(&tui_err.stderr);
+    assert!(tui_stderr.contains("requires a TTY"), "{tui_stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_stats_conversation_tui_renders_and_exits_cleanly_in_pty() {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let now_secs = unix_now_secs();
+    seed_sqlite_fixtures(
+        &home.join(".gemini/antigravity-cli"),
+        now_secs,
+        now_secs.saturating_sub(120),
+    );
+    seed_alpha_rate(&home);
+
+    let bin = common::BIN;
+    let cmd_str = format!("stty rows 32 cols 120 && exec '{bin}' stats 8d0371e1 --ascii");
+    let mut tui = common::isolated_cmd("/usr/bin/script", &home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("SHELL", "/bin/sh")
+        .args(["-qec", &cmd_str, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // First byte confirms alternate-screen raw mode started; 's' cycles sort, 'c' opens picker,
+    // Enter selects the conversation, 'q' exits cleanly.
+    tui.stdout.as_mut().unwrap().read_exact(&mut [0]).unwrap();
+    tui.stdin.as_mut().unwrap().write_all(b"sc\rq").unwrap();
+    let output = tui.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("Conversation 8d0371e1"), "{rendered}");
+    assert!(rendered.contains("1. Turns"), "{rendered}");
+
+    // Global `stats` TUI also supports opening the conversation picker ('c'), drilling in (Enter),
+    // returning back ('b'), and exiting ('q').
+    let global_cmd = format!("stty rows 32 cols 120 && exec '{bin}' stats --ascii");
+    let mut global_tui = common::isolated_cmd("/usr/bin/script", &home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("SHELL", "/bin/sh")
+        .args(["-qec", &global_cmd, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    global_tui
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut [0])
+        .unwrap();
+    global_tui
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"c\rbq")
+        .unwrap();
+    let global_out = global_tui.wait_with_output().unwrap();
+    assert!(global_out.status.success(), "{global_out:?}");
+    let global_rendered = String::from_utf8_lossy(&global_out.stdout);
+    assert!(
+        global_rendered.contains("agy-statusline conversations | 1/1"),
+        "{global_rendered}"
+    );
+    assert!(global_rendered.contains("1. Turns (2"), "{global_rendered}");
+    assert!(global_rendered.contains("b Back"), "{global_rendered}");
+
+    // Direct `conversations` (`conv`) entry opens full-screen picker -> Enter drills in -> b returns -> q exits.
+    let conv_cmd = format!("stty rows 32 cols 120 && exec '{bin}' conv --ascii");
+    let mut conv_tui = common::isolated_cmd("/usr/bin/script", &home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("SHELL", "/bin/sh")
+        .args(["-qec", &conv_cmd, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    conv_tui
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut [0])
+        .unwrap();
+    conv_tui.stdin.as_mut().unwrap().write_all(b"\rbq").unwrap();
+    let conv_out = conv_tui.wait_with_output().unwrap();
+    assert!(conv_out.status.success(), "{conv_out:?}");
+    let conv_rendered = String::from_utf8_lossy(&conv_out.stdout);
+    assert!(
+        conv_rendered.contains("agy-statusline conversations | 1/1"),
+        "{conv_rendered}"
+    );
+    assert!(conv_rendered.contains("1. Turns (2"), "{conv_rendered}");
+    assert!(conv_rendered.contains("Loaded 8d0371e1"), "{conv_rendered}");
+    assert!(conv_rendered.contains("* 8d0371e1"), "{conv_rendered}");
+}
+
+#[test]
+fn cli_conversations_lists_filters_json_and_rejects_non_tty_tui() {
+    use agy_statusline::stats::ConversationListItem;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let cli_root = home.join(".gemini/antigravity-cli");
+    let now_secs = unix_now_secs();
+    let root_uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
+    let sub_uuid = "9a1482f2-6b16-434c-99cd-fe86aa60ab9c";
+
+    seed_sqlite_fixtures(&cli_root, now_secs, now_secs.saturating_sub(120));
+    let _ = Connection::open(
+        cli_root
+            .join("conversations")
+            .join(format!("{sub_uuid}.db")),
+    )
+    .unwrap();
+
+    let sum_conn = Connection::open(cli_root.join("conversation_summaries.db")).unwrap();
+    sum_conn
+        .execute(
+            "CREATE TABLE conversation_summaries (\
+                conversation_id TEXT PRIMARY KEY,\
+                title TEXT NOT NULL DEFAULT '',\
+                parent_conversation_id TEXT NOT NULL DEFAULT '',\
+                agent_name TEXT NOT NULL DEFAULT ''\
+            )",
+            [],
+        )
+        .unwrap();
+    sum_conn
+        .execute(
+            "INSERT INTO conversation_summaries VALUES (?1, 'Cache Rate Audit', '', '')",
+            [root_uuid],
+        )
+        .unwrap();
+    sum_conn
+        .execute(
+            "INSERT INTO conversation_summaries VALUES (?1, 'Helper', ?2, 'research')",
+            [sub_uuid, root_uuid],
+        )
+        .unwrap();
+    drop(sum_conn);
+
+    // Default static/piped listing hides subagents and prints clean ASCII table.
+    let plain_out = isolated_agy_cmd(home)
+        .env("NO_COLOR", "1")
+        .args(["conversations", "--ascii"])
+        .output()
+        .unwrap();
+    assert!(plain_out.status.success(), "{plain_out:?}");
+    let plain_text = String::from_utf8(plain_out.stdout).unwrap();
+    assert!(
+        plain_text.contains("agy-statusline conversations | 1 found"),
+        "{plain_text}"
+    );
+    assert!(plain_text.contains("8d0371e1"), "{plain_text}");
+    assert!(plain_text.contains("Cache Rate Audit"), "{plain_text}");
+    assert!(plain_text.contains("+1"), "{plain_text}");
+    assert!(!plain_text.contains("9a1482f2"), "{plain_text}");
+
+    // Alias `sessions --subagents --json` includes subagents and deserializes cleanly.
+    let json_out = isolated_agy_cmd(home)
+        .args(["sessions", "--subagents", "--json"])
+        .output()
+        .unwrap();
+    assert!(json_out.status.success(), "{json_out:?}");
+    let items: Vec<ConversationListItem> = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(items.len(), 2);
+
+    // Query filter matches specific conversation via `conv` alias.
+    let filtered_out = isolated_agy_cmd(home)
+        .args(["conv", "research", "--subagents", "--json"])
+        .output()
+        .unwrap();
+    assert!(filtered_out.status.success(), "{filtered_out:?}");
+    let filtered: Vec<ConversationListItem> = serde_json::from_slice(&filtered_out.stdout).unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].conversation_id, sub_uuid);
+
+    // Non-TTY `--tui` fails cleanly.
+    let tui_err = isolated_agy_cmd(home)
+        .args(["conversations", "--tui"])
+        .output()
+        .unwrap();
+    assert!(!tui_err.status.success());
+    let stderr = String::from_utf8_lossy(&tui_err.stderr);
+    assert!(stderr.contains("requires a TTY"), "{stderr}");
 }

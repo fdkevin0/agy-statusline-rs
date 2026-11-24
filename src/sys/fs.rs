@@ -41,13 +41,13 @@ fn atomic_write_impl(
 }
 
 /// Atomically writes `bytes` to `path`, creating parent directories as needed.
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     atomic_write_impl(path, bytes, None)
 }
 
 /// Atomically writes `bytes` to `path`, preserving existing file permissions and
 /// replacing the canonical target when `path` is a symlink.
-pub fn atomic_write_preserving_mode(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write_preserving_mode(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let (target, permissions) = match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             let target = fs::canonicalize(path)?;

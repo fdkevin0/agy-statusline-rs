@@ -1,4 +1,8 @@
-//! Stack-allocated token count formatting utilities.
+//! Shared low-level formatting, width truncation, duration, and single-line text sanitization.
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use super::time::{SECS_PER_DAY, SECS_PER_HOUR};
 
 fn push_tenths_with_suffix(tenths: u64, suffix: char, out: &mut String) {
     if tenths == 100 {
@@ -27,7 +31,7 @@ fn push_tenths_with_suffix(tenths: u64, suffix: char, out: &mut String) {
 /// # Examples
 ///
 /// ```
-/// use agy_statusline::format::format_tokens;
+/// use agy_statusline::statusline::format::format_tokens;
 ///
 /// let mut buf = String::new();
 /// format_tokens(1_338_000_000, &mut buf);
@@ -111,6 +115,98 @@ pub(crate) fn format_tokens_string(value: u64) -> String {
     let mut buf = String::with_capacity(8);
     format_tokens(value, &mut buf);
     buf
+}
+
+/// Formats a duration in seconds into a compact human-readable string (`45s`, `12m`, `3h10m`, `5d12h`).
+pub(crate) fn format_duration_compact(secs: u64) -> String {
+    let day = SECS_PER_DAY as u64;
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    if secs < SECS_PER_HOUR {
+        return format!("{}m", secs / 60);
+    }
+    if secs < day {
+        let h = secs / SECS_PER_HOUR;
+        let m = (secs % SECS_PER_HOUR) / 60;
+        return if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{m}m")
+        };
+    }
+    let d = secs / day;
+    let h = (secs % day) / SECS_PER_HOUR;
+    if h == 0 {
+        format!("{d}d")
+    } else {
+        format!("{d}d{h}h")
+    }
+}
+
+/// Truncates `s` to at most `max_cols` terminal display columns, appending `ellipsis` when truncated.
+pub(crate) fn truncate_to_width(s: &str, max_cols: usize, ellipsis: &str) -> String {
+    if s.width() <= max_cols {
+        return s.to_string();
+    }
+    let ell_w = ellipsis.width();
+    if max_cols == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    let budget = if max_cols > ell_w {
+        max_cols - ell_w
+    } else {
+        max_cols
+    };
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    if max_cols > ell_w {
+        out.push_str(ellipsis);
+    }
+    out
+}
+
+/// Strips ANSI escapes and control characters, collapsing runs of whitespace into single spaces.
+pub(crate) fn sanitize_inline_text(raw: &str) -> String {
+    // Normalize non-CR/LF whitespace (such as `\t` and NEL) before `strip_ansi_escapes`,
+    // whose VTE parser drops C0/C1 control characters other than `\n` and `\r`.
+    let normalized: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_whitespace() && !matches!(ch, ' ' | '\n' | '\r') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let stripped = strip_ansi_escapes::strip_str(&normalized);
+    let mut out = String::with_capacity(stripped.len());
+    let mut pending_space = false;
+
+    for ch in stripped.chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() {
+                pending_space = true;
+            }
+        } else if !ch.is_control() {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]

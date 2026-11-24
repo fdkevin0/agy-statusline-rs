@@ -13,13 +13,12 @@ use super::pricing::{
     fetch_models_dev_via_curl, round_usd_6, PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS,
 };
 use super::scan::{scan_sqlite_conversations, UsageEvent, UsageSource};
-use super::tz::{format_day, unix_secs_to_utc_date, TimeZoneSpec};
 use super::{
     accumulate_period, activity_week_mondays, build_weekly_usage, DailyUsage, ModelAccumulator,
     ModelStats, PeriodSummary, SqliteStats, StatsReport, WindowSummaries, DAYS_PER_WEEK,
 };
-use crate::db::compute_median;
-use crate::timeutil::civil_date_from_unix_day;
+use crate::agy::db::compute_median;
+use crate::sys::time::{civil_date_from_unix_day, format_day, unix_secs_to_utc_date, TimeZoneSpec};
 
 pub(super) const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 /// Upper bound on calendar gap-fill span to prevent pathological allocations on huge `--days` or outlier timestamps.
@@ -34,7 +33,7 @@ pub(super) fn weekday_name(day_idx: i64) -> &'static str {
 
 /// Time window preset for interactive stats queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RangePreset {
+pub(super) enum RangePreset {
     /// Rolling last `N` local calendar days including today (`N >= 1`).
     Days(u32),
     /// All recorded history.
@@ -43,7 +42,7 @@ pub enum RangePreset {
 
 impl RangePreset {
     /// Standard time window options in display order.
-    pub const STANDARD: &'static [Self] = &[
+    pub(super) const STANDARD: &'static [Self] = &[
         Self::Days(7),
         Self::Days(14),
         Self::Days(30),
@@ -52,7 +51,7 @@ impl RangePreset {
     ];
 
     /// Builds the ordered range options list, inserting a custom `--days N` in ascending order when needed.
-    pub fn options_with_custom(custom_days: Option<u32>) -> Vec<Self> {
+    pub(super) fn options_with_custom(custom_days: Option<u32>) -> Vec<Self> {
         let mut opts = Self::STANDARD.to_vec();
         if let Some(d) = custom_days.filter(|&d| d > 0) {
             let preset = Self::Days(d);
@@ -71,7 +70,7 @@ impl RangePreset {
     }
 
     /// Short pill label (e.g. `7d`, `30d`, `All`).
-    pub fn label(self) -> String {
+    pub(super) fn label(self) -> String {
         match self {
             Self::Days(d) => format!("{d}d"),
             Self::All => "All".to_string(),
@@ -79,7 +78,7 @@ impl RangePreset {
     }
 
     /// Inclusive lower bound day index (`None` for `All`).
-    pub fn cutoff_day(self, today_day_idx: i64) -> Option<i64> {
+    pub(super) fn cutoff_day(self, today_day_idx: i64) -> Option<i64> {
         match self {
             Self::Days(d) if d > 0 => Some(today_day_idx - i64::from(d - 1)),
             _ => None,
@@ -89,7 +88,7 @@ impl RangePreset {
 
 /// Sort order for the daily usage list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum DailySort {
+pub(super) enum DailySort {
     /// Newest date first (default).
     #[default]
     DateDesc,
@@ -102,7 +101,7 @@ pub enum DailySort {
 }
 
 impl DailySort {
-    pub const fn next(self) -> Self {
+    pub(super) const fn next(self) -> Self {
         match self {
             Self::DateDesc => Self::DateAsc,
             Self::DateAsc => Self::MetricDesc,
@@ -111,7 +110,7 @@ impl DailySort {
         }
     }
 
-    pub const fn label(self, ascii: bool) -> &'static str {
+    pub(super) const fn label(self, ascii: bool) -> &'static str {
         match (self, ascii) {
             (Self::DateDesc, false) => "Date ↓",
             (Self::DateAsc, false) => "Date ↑",
@@ -127,7 +126,7 @@ impl DailySort {
 
 /// Event origin filter (`All`, `CLI`, or `Desktop`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum SourceFilter {
+pub(super) enum SourceFilter {
     #[default]
     All,
     Cli,
@@ -135,7 +134,7 @@ pub enum SourceFilter {
 }
 
 impl SourceFilter {
-    pub const fn next(self) -> Self {
+    pub(super) const fn next(self) -> Self {
         match self {
             Self::All => Self::Cli,
             Self::Cli => Self::Desktop,
@@ -143,7 +142,7 @@ impl SourceFilter {
         }
     }
 
-    pub const fn label(self) -> &'static str {
+    pub(super) const fn label(self) -> &'static str {
         match self {
             Self::All => "All",
             Self::Cli => "CLI",
@@ -162,7 +161,7 @@ impl SourceFilter {
 
 /// Scope displayed in the TUI Models pane.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ModelScope {
+pub(super) enum ModelScope {
     /// Models used on the currently highlighted date.
     #[default]
     SelectedDay,
@@ -171,14 +170,14 @@ pub enum ModelScope {
 }
 
 impl ModelScope {
-    pub const fn toggle(self) -> Self {
+    pub(super) const fn toggle(self) -> Self {
         match self {
             Self::SelectedDay => Self::Window,
             Self::Window => Self::SelectedDay,
         }
     }
 
-    pub const fn label(self) -> &'static str {
+    pub(super) const fn label(self) -> &'static str {
         match self {
             Self::SelectedDay => "Day",
             Self::Window => "Window",
@@ -188,14 +187,14 @@ impl ModelScope {
 
 /// Active interactive query parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatsQuery {
-    pub range: RangePreset,
-    pub metric: StatsMetric,
-    pub sort: DailySort,
-    pub model_filter: Option<String>,
-    pub source_filter: SourceFilter,
-    pub fill_empty_days: bool,
-    pub model_scope: ModelScope,
+pub(super) struct StatsQuery {
+    pub(super) range: RangePreset,
+    pub(super) metric: StatsMetric,
+    pub(super) sort: DailySort,
+    pub(super) model_filter: Option<String>,
+    pub(super) source_filter: SourceFilter,
+    pub(super) fill_empty_days: bool,
+    pub(super) model_scope: ModelScope,
 }
 
 impl Default for StatsQuery {
@@ -214,78 +213,77 @@ impl Default for StatsQuery {
 
 /// Single day row rendered in the Daily Usage table.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DailyRow {
-    pub day_idx: i64,
-    pub date: String,
-    pub weekday: &'static str,
-    pub summary: PeriodSummary,
-    pub metric_value: MetricValue,
-    pub median_tok_per_sec: Option<f64>,
-    pub median_ttft_secs: Option<f64>,
+pub(super) struct DailyRow {
+    pub(super) day_idx: i64,
+    pub(super) date: String,
+    pub(super) weekday: &'static str,
+    pub(super) summary: PeriodSummary,
+    pub(super) metric_value: MetricValue,
+    pub(super) median_tok_per_sec: Option<f64>,
+    pub(super) median_ttft_secs: Option<f64>,
 }
 
 /// One Monday–Sunday week of metric-aware 20-week activity heatmap cells.
 #[derive(Debug, Clone, PartialEq)]
-pub struct HeatmapWeek {
-    pub week_start: String,
-    pub week_end: String,
+pub(super) struct HeatmapWeek {
+    pub(super) week_start: String,
+    pub(super) week_end: String,
     /// `(YYYY-MM-DD, MetricValue)` for Mon (`0`)..Sun (`6`); `None` for future days after `today_local`.
-    pub daily: [Option<(String, MetricValue)>; 7],
+    pub(super) daily: [Option<(String, MetricValue)>; 7],
 }
 
 /// Detailed breakdown for the currently selected date.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DayDetail {
-    pub date: String,
-    pub weekday: &'static str,
-    pub summary: PeriodSummary,
-    pub metric_value: MetricValue,
-    pub median_tok_per_sec: Option<f64>,
-    pub median_ttft_secs: Option<f64>,
-    pub models: Vec<ModelStats>,
+pub(super) struct DayDetail {
+    pub(super) date: String,
+    pub(super) weekday: &'static str,
+    pub(super) summary: PeriodSummary,
+    pub(super) metric_value: MetricValue,
+    pub(super) median_tok_per_sec: Option<f64>,
+    pub(super) median_ttft_secs: Option<f64>,
+    pub(super) models: Vec<ModelStats>,
 }
 
 /// Computed view backing one frame of the interactive TUI (or metric-aware static heatmap).
 #[derive(Debug, Clone, PartialEq)]
-pub struct StatsView {
-    pub summary: PeriodSummary,
-    pub total_value: MetricValue,
-    pub active_days: usize,
-    pub span_days: usize,
-    pub peak_day: Option<(String, &'static str, MetricValue)>,
-    pub median_tok_per_sec: Option<f64>,
-    pub median_ttft_secs: Option<f64>,
-    pub daily_rows: Vec<DailyRow>,
-    pub daily_max: f64,
-    pub heatmap_weeks: Vec<HeatmapWeek>,
-    pub heatmap_peak: Option<(String, &'static str, MetricValue)>,
-    pub window_models: Vec<ModelStats>,
-    pub selected_day: Option<DayDetail>,
+pub(super) struct StatsView {
+    pub(super) summary: PeriodSummary,
+    pub(super) total_value: MetricValue,
+    pub(super) active_days: usize,
+    pub(super) span_days: usize,
+    pub(super) peak_day: Option<(String, &'static str, MetricValue)>,
+    pub(super) median_tok_per_sec: Option<f64>,
+    pub(super) median_ttft_secs: Option<f64>,
+    pub(super) daily_rows: Vec<DailyRow>,
+    pub(super) daily_max: f64,
+    pub(super) heatmap_weeks: Vec<HeatmapWeek>,
+    pub(super) heatmap_peak: Option<(String, &'static str, MetricValue)>,
+    pub(super) window_models: Vec<ModelStats>,
+    pub(super) selected_day: Option<DayDetail>,
 }
 
 /// In-memory snapshot of all locally scanned usage events and environment metadata.
 #[derive(Debug, Clone)]
-pub struct StatsDataset {
-    pub today_day_idx: i64,
-    pub today_local: String,
-    pub timezone: String,
-    pub today_utc: String,
-    pub first_active_date: Option<String>,
-    pub sqlite: SqliteStats,
+pub(super) struct StatsDataset {
+    pub(super) today_day_idx: i64,
+    pub(super) today_local: String,
+    pub(super) timezone: String,
+    pub(super) today_utc: String,
+    pub(super) first_active_date: Option<String>,
+    pub(super) sqlite: SqliteStats,
     pub(super) events: Vec<UsageEvent>,
-    pub has_cli: bool,
-    pub has_desktop: bool,
+    pub(super) has_cli: bool,
+    pub(super) has_desktop: bool,
 }
 
 #[derive(Default)]
 struct DayAccumulator {
-    date: String,
     summary: PeriodSummary,
     speeds: Vec<f64>,
     ttfts: Vec<f64>,
 }
 
-fn finalize_models(
+pub(super) fn finalize_models(
     model_map: HashMap<String, ModelAccumulator>,
     sort_metric: StatsMetric,
 ) -> Vec<ModelStats> {
@@ -320,7 +318,7 @@ fn finalize_models(
     models
 }
 
-fn accumulate_model(model_map: &mut HashMap<String, ModelAccumulator>, ev: &UsageEvent) {
+pub(super) fn accumulate_model(model_map: &mut HashMap<String, ModelAccumulator>, ev: &UsageEvent) {
     let entry = model_map.entry(ev.model_group.clone()).or_default();
     if entry.pricing_key.is_none() {
         entry.pricing_key.clone_from(&ev.pricing_key);
@@ -341,6 +339,7 @@ fn finish_day_row(
     peak_day: &mut Option<(String, &'static str, MetricValue)>,
 ) -> DailyRow {
     let wd = weekday_name(day_idx);
+    let date = format_day(day_idx);
     match acc {
         Some(mut acc) => {
             acc.summary.priced_usd = round_usd_6(acc.summary.priced_usd);
@@ -350,11 +349,11 @@ fn finish_day_row(
                     .as_ref()
                     .is_none_or(|(_, _, prev)| val.magnitude() > prev.magnitude())
             {
-                *peak_day = Some((acc.date.clone(), wd, val));
+                *peak_day = Some((date.clone(), wd, val));
             }
             DailyRow {
                 day_idx,
-                date: acc.date,
+                date,
                 weekday: wd,
                 summary: acc.summary,
                 metric_value: val,
@@ -366,7 +365,7 @@ fn finish_day_row(
             let zero = PeriodSummary::default();
             DailyRow {
                 day_idx,
-                date: format_day(day_idx),
+                date,
                 weekday: wd,
                 metric_value: metric.extract(&zero),
                 summary: zero,
@@ -379,7 +378,7 @@ fn finish_day_row(
 
 impl StatsDataset {
     /// Scans the given AGY SQLite roots using the local timezone and `models.dev` pricing cache.
-    pub fn collect(
+    pub(super) fn collect(
         roots: &[(&'static str, PathBuf)],
         cache_dir: Option<&Path>,
         now_unix_secs: u64,
@@ -403,9 +402,10 @@ impl StatsDataset {
         pricing: &PricingCatalog,
     ) -> Self {
         let now_i64 = now_unix_secs as i64;
-        let (today_day_idx, today_local) = tz.local_day_and_date(now_i64);
+        let today_day_idx = tz.local_day(now_i64);
+        let today_local = format_day(today_day_idx);
         let timezone = tz.format_offset_at(now_i64);
-        let today_utc = unix_secs_to_utc_date(now_unix_secs);
+        let today_utc = unix_secs_to_utc_date(now_i64);
 
         let (sqlite, events) = scan_sqlite_conversations(roots, tz, pricing);
 
@@ -436,26 +436,23 @@ impl StatsDataset {
         }
     }
 
-    /// Builds a backward-compatible [`StatsReport`] for `--json` and static report rendering.
-    pub fn to_report(&self, days: Option<u32>) -> StatsReport {
-        self.to_report_with_metric(days, StatsMetric::Total)
-    }
-
     /// Builds a [`StatsReport`] whose `models` leaderboard is sorted by `sort_metric`.
-    pub fn to_report_with_metric(&self, days: Option<u32>, sort_metric: StatsMetric) -> StatsReport {
+    pub(super) fn to_report_with_metric(
+        &self,
+        days: Option<u32>,
+        sort_metric: StatsMetric,
+    ) -> StatsReport {
         let filter_days = days.filter(|&d| d > 0);
         let filter_cutoff = filter_days.map(|d| self.today_day_idx - i64::from(d - 1));
 
         let mut windows = WindowSummaries::default();
         let mut totals = PeriodSummary::default();
-        let mut daily_map: BTreeMap<i64, (String, PeriodSummary)> = BTreeMap::new();
-        let mut unfiltered_daily_tokens: BTreeMap<String, u64> = BTreeMap::new();
+        let mut daily_map: BTreeMap<i64, PeriodSummary> = BTreeMap::new();
+        let mut unfiltered_daily_tokens: HashMap<i64, u64> = HashMap::new();
         let mut model_map: HashMap<String, ModelAccumulator> = HashMap::new();
 
         for ev in &self.events {
-            let day_tok = unfiltered_daily_tokens
-                .entry(ev.local_date.clone())
-                .or_insert(0);
+            let day_tok = unfiltered_daily_tokens.entry(ev.local_day).or_insert(0);
             *day_tok = day_tok.saturating_add(ev.total_tokens);
 
             accumulate_period(&mut windows.all_time, ev);
@@ -476,9 +473,7 @@ impl StatsDataset {
             }
 
             accumulate_period(&mut totals, ev);
-            let (_, day_summary) = daily_map
-                .entry(ev.local_day)
-                .or_insert_with(|| (ev.local_date.clone(), PeriodSummary::default()));
+            let day_summary = daily_map.entry(ev.local_day).or_default();
             accumulate_period(day_summary, ev);
             accumulate_model(&mut model_map, ev);
         }
@@ -494,9 +489,9 @@ impl StatsDataset {
         }
 
         let daily: Vec<DailyUsage> = daily_map
-            .into_values()
-            .map(|(date, s)| DailyUsage {
-                date,
+            .into_iter()
+            .map(|(day_idx, s)| DailyUsage {
+                date: format_day(day_idx),
                 requests: s.requests,
                 input_tokens: s.input_tokens,
                 cache_read_tokens: s.cache_read_tokens,
@@ -510,11 +505,7 @@ impl StatsDataset {
             .collect();
 
         let models = finalize_models(model_map, sort_metric);
-        let unfiltered_lookup: HashMap<&str, u64> = unfiltered_daily_tokens
-            .iter()
-            .map(|(date, tokens)| (date.as_str(), *tokens))
-            .collect();
-        let weekly = build_weekly_usage(self.today_day_idx, &unfiltered_lookup);
+        let weekly = build_weekly_usage(self.today_day_idx, &unfiltered_daily_tokens);
 
         StatsReport {
             today_local: self.today_local.clone(),
@@ -532,12 +523,15 @@ impl StatsDataset {
     }
 
     /// Computes a metric-aware 20-week heatmap for the active `source_filter` and `model_filter`.
-    pub fn build_metric_heatmap(
+    pub(super) fn build_metric_heatmap(
         &self,
         metric: StatsMetric,
         source_filter: SourceFilter,
         model_filter: Option<&str>,
-    ) -> (Vec<HeatmapWeek>, Option<(String, &'static str, MetricValue)>) {
+    ) -> (
+        Vec<HeatmapWeek>,
+        Option<(String, &'static str, MetricValue)>,
+    ) {
         let mut by_day: HashMap<i64, PeriodSummary> = HashMap::new();
         for ev in &self.events {
             if !source_filter.matches(ev.source) {
@@ -565,9 +559,7 @@ impl StatsDataset {
                     let day_idx = week_mon + (d as i64);
                     if day_idx <= self.today_day_idx {
                         let date = format_day(day_idx);
-                        let val = by_day
-                            .get(&day_idx)
-                            .map_or(zero_val, |s| metric.extract(s));
+                        let val = by_day.get(&day_idx).map_or(zero_val, |s| metric.extract(s));
                         if val.is_positive()
                             && peak
                                 .as_ref()
@@ -590,7 +582,11 @@ impl StatsDataset {
     }
 
     /// Evaluates an interactive [`StatsQuery`] in memory without re-scanning disk.
-    pub fn compute_view(&self, query: &StatsQuery, selected_date: Option<&str>) -> StatsView {
+    pub(super) fn compute_view(
+        &self,
+        query: &StatsQuery,
+        selected_date: Option<&str>,
+    ) -> StatsView {
         let cutoff = query.range.cutoff_day(self.today_day_idx);
 
         let mut summary = PeriodSummary::default();
@@ -626,10 +622,7 @@ impl StatsDataset {
                 window_ttfts.push(ttft);
             }
 
-            let day_acc = day_map.entry(ev.local_day).or_insert_with(|| DayAccumulator {
-                date: ev.local_date.clone(),
-                ..Default::default()
-            });
+            let day_acc = day_map.entry(ev.local_day).or_default();
             accumulate_period(&mut day_acc.summary, ev);
             if let Some(speed) = ev.decode_speed {
                 day_acc.speeds.push(speed);
@@ -751,7 +744,7 @@ impl StatsDataset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timeutil::unix_day_from_civil_date;
+    use crate::sys::time::unix_day_from_civil_date;
 
     fn sample_dataset() -> StatsDataset {
         let d1 = unix_day_from_civil_date("2026-11-18".parse().unwrap());
@@ -772,7 +765,6 @@ mod tests {
                 UsageEvent {
                     source: UsageSource::Cli,
                     local_day: d1,
-                    local_date: "2026-11-18".to_string(),
                     model_group: "Model Fast".to_string(),
                     pricing_key: Some("model-fast".to_string()),
                     input_tokens: 1_000,
@@ -789,7 +781,6 @@ mod tests {
                 UsageEvent {
                     source: UsageSource::Cli,
                     local_day: d2,
-                    local_date: "2026-11-19".to_string(),
                     model_group: "Model Pro".to_string(),
                     pricing_key: Some("model-pro".to_string()),
                     input_tokens: 5_000,
@@ -806,7 +797,6 @@ mod tests {
                 UsageEvent {
                     source: UsageSource::Desktop,
                     local_day: d3,
-                    local_date: "2026-11-20".to_string(),
                     model_group: "Model Fast".to_string(),
                     pricing_key: Some("model-fast".to_string()),
                     input_tokens: 2_000,

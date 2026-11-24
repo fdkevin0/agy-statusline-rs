@@ -6,17 +6,15 @@ mod widgets;
 
 use std::io::{self, Write as IoWrite};
 
-use crate::db::SessionMetadata;
-use crate::git::GitInfo;
-use crate::layout::{LayoutConfig, SpeedMode, WidgetId, DEFAULT_SPEED_WARN_THRESHOLD};
-use crate::metrics::{
+use crate::agy::db::SessionMetadata;
+use crate::config::layout::{LayoutConfig, SpeedMode, WidgetId, DEFAULT_SPEED_WARN_THRESHOLD};
+use crate::statusline::git::GitInfo;
+use crate::statusline::metrics::{
     current_context_tokens, resolve_quota_views, valid_cache_usage, QuotaView,
 };
+use crate::statusline::theme::{glyphs_for, palette_for, GlyphSet, Palette};
 use crate::statusline::StatuslinePayload;
-use crate::theme::{glyphs_for, palette_for, GlyphSet, Palette};
-use crate::timeutil::unix_now_secs;
-
-pub(crate) use fit::truncate_to_width;
+use crate::sys::time::unix_now_secs;
 
 use emit::{compute_geometry, StyleGeometry};
 
@@ -270,6 +268,34 @@ pub fn write_statusline<W: IoWrite>(
     write_statusline_at(payload, meta, git, 0, unix_now_secs(), cfg, out)
 }
 
+fn layout_statusline_rows<'a>(
+    payload: &StatuslinePayload,
+    meta: &SessionMetadata,
+    git: &'a GitInfo,
+    unpriced_turns: u64,
+    now_unix_secs: u64,
+    cfg: &'a LayoutConfig,
+) -> (Renderer<'a>, Vec<Vec<Vec<Segment>>>) {
+    let quotas = resolve_quota_views(payload, now_unix_secs);
+    let renderer = Renderer::new(cfg);
+    let ctx = RenderContext::build(payload, meta, git, quotas, unpriced_turns, cfg);
+    let max_width = cfg.responsive.then_some(payload.terminal_width).flatten();
+
+    let rows = cfg
+        .rows
+        .iter()
+        .map(|row| {
+            let segs: Vec<Segment> = row
+                .iter()
+                .filter_map(|&w| renderer.render_widget(w, payload, &ctx))
+                .collect();
+            let groups = fit::split_into_groups(segs);
+            fit::fit_row_groups(groups, max_width, renderer.geom, renderer.glyphs.ellipsis)
+        })
+        .collect();
+    (renderer, rows)
+}
+
 /// Renders all non-empty configured rows using an explicit unpriced-turn count and timestamp.
 pub(crate) fn write_statusline_at<W: IoWrite>(
     payload: &StatuslinePayload,
@@ -280,21 +306,25 @@ pub(crate) fn write_statusline_at<W: IoWrite>(
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
-    let quotas = resolve_quota_views(payload, now_unix_secs);
-    let renderer = Renderer::new(cfg);
-    let ctx = RenderContext::build(payload, meta, git, quotas, unpriced_turns, cfg);
-    let max_width = cfg.responsive.then_some(payload.terminal_width).flatten();
-
-    for row in &cfg.rows {
-        let segs: Vec<Segment> = row
-            .iter()
-            .filter_map(|&w| renderer.render_widget(w, payload, &ctx))
-            .collect();
-        let groups = fit::split_into_groups(segs);
-        let fitted = fit::fit_row_groups(groups, max_width, renderer.geom, renderer.glyphs.ellipsis);
-        renderer.write_row_groups(&fitted, payload.terminal_width, out)?;
+    let (renderer, rows) =
+        layout_statusline_rows(payload, meta, git, unpriced_turns, now_unix_secs, cfg);
+    for fitted in &rows {
+        renderer.write_row_groups(fitted, payload.terminal_width, out)?;
     }
     Ok(())
+}
+
+/// Renders all non-empty configured rows directly into styled [`ratatui::text::Line`] values.
+pub(crate) fn render_statusline_lines(
+    payload: &StatuslinePayload,
+    meta: &SessionMetadata,
+    git: &GitInfo,
+    cfg: &LayoutConfig,
+) -> Vec<ratatui::text::Line<'static>> {
+    let (renderer, rows) = layout_statusline_rows(payload, meta, git, 0, unix_now_secs(), cfg);
+    rows.iter()
+        .filter_map(|fitted| renderer.render_row_groups_line(fitted, payload.terminal_width))
+        .collect()
 }
 
 #[cfg(test)]
@@ -304,7 +334,7 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use super::*;
-    use crate::layout::{GlyphMode, ThemeStyle, VisualStyle};
+    use crate::config::layout::{GlyphMode, ThemeStyle, VisualStyle};
     use crate::statusline::{
         AgentInfo, BattleInfo, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket,
         SandboxInfo, SubagentInfo, VcsInfo, VimInfo, WorkspaceInfo,
@@ -805,7 +835,14 @@ mod tests {
         cfg_used.bar_length = 8;
         cfg_used.rows = vec![vec![WidgetId::CtxBar, WidgetId::CtxPct]];
         let mut out_used = Vec::new();
-        write_statusline(&payload, &meta, &GitInfo::default(), &cfg_used, &mut out_used).unwrap();
+        write_statusline(
+            &payload,
+            &meta,
+            &GitInfo::default(),
+            &cfg_used,
+            &mut out_used,
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8(out_used).unwrap(),
             "ctx ████████ 104.7% (536K/512K) · ctx 104.7% (512K)\n"
@@ -1374,11 +1411,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            render_single(WidgetId::State, &pending, &empty_meta, GlyphMode::Unicode, true),
+            render_single(
+                WidgetId::State,
+                &pending,
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            ),
             "◎ CONFIRM\n"
         );
         assert_eq!(
-            render_single(WidgetId::State, &pending, &empty_meta, GlyphMode::Ascii, true),
+            render_single(
+                WidgetId::State,
+                &pending,
+                &empty_meta,
+                GlyphMode::Ascii,
+                true
+            ),
             "@ CONFIRM\n"
         );
 
@@ -1409,7 +1458,13 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            render_single(WidgetId::Vim, &payload, &empty_meta, GlyphMode::Unicode, smart_hide)
+            render_single(
+                WidgetId::Vim,
+                &payload,
+                &empty_meta,
+                GlyphMode::Unicode,
+                smart_hide,
+            )
         };
 
         assert_eq!(render_vim(Some("insert"), true), "vim INSERT\n");
@@ -1431,7 +1486,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            render_single(WidgetId::Queue, &active, &empty_meta, GlyphMode::Unicode, true),
+            render_single(
+                WidgetId::Queue,
+                &active,
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            ),
             "queue 3\n"
         );
 
@@ -1440,7 +1501,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            render_single(WidgetId::Queue, &zero, &empty_meta, GlyphMode::Unicode, true),
+            render_single(
+                WidgetId::Queue,
+                &zero,
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            ),
             ""
         );
         assert_eq!(
@@ -1466,7 +1533,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            render_single(WidgetId::Battle, &with_arm, &empty_meta, GlyphMode::Unicode, true),
+            render_single(
+                WidgetId::Battle,
+                &with_arm,
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            ),
             "battle ACTIVE #2\n"
         );
 
@@ -1478,7 +1551,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            render_single(WidgetId::Battle, &no_arm, &empty_meta, GlyphMode::Unicode, true),
+            render_single(
+                WidgetId::Battle,
+                &no_arm,
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            ),
             "battle TIE\n"
         );
         assert_eq!(
@@ -1514,7 +1593,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            render_single(WidgetId::Sandbox, &on_net, &empty_meta, GlyphMode::Unicode, true),
+            render_single(
+                WidgetId::Sandbox,
+                &on_net,
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            ),
             "sandbox ON+net\n"
         );
 
@@ -1526,7 +1611,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            render_single(WidgetId::Sandbox, &on_no_net, &empty_meta, GlyphMode::Unicode, true),
+            render_single(
+                WidgetId::Sandbox,
+                &on_no_net,
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            ),
             "sandbox ON\n"
         );
 
@@ -1583,8 +1674,14 @@ mod tests {
         let payload: StatuslinePayload =
             serde_json::from_str(r#"{"agent_state":"idle","version":"1.5.11"}"#).unwrap();
         assert_eq!(
-            render_single(WidgetId::Version, &payload, &empty_meta, GlyphMode::Unicode, true)
-                .trim(),
+            render_single(
+                WidgetId::Version,
+                &payload,
+                &empty_meta,
+                GlyphMode::Unicode,
+                true
+            )
+            .trim(),
             "v1.5.11"
         );
 
@@ -1645,7 +1742,10 @@ mod tests {
             r(WidgetId::Title, &payload, true),
             "Refactor statusline payload wi.."
         );
-        assert_eq!(r(WidgetId::Directory, &payload, true), "dir: agy-statusline");
+        assert_eq!(
+            r(WidgetId::Directory, &payload, true),
+            "dir: agy-statusline"
+        );
         assert_eq!(r(WidgetId::Agent, &payload, true), "agent researcher");
         assert_eq!(r(WidgetId::Session, &payload, true), "sid:8d0371e1");
         assert_eq!(
@@ -1691,9 +1791,17 @@ mod tests {
         cfg.no_color = true;
         cfg.responsive = true;
 
-        let rendered = render_mono(&payload, &SessionMetadata::default(), &GitInfo::default(), &cfg);
+        let rendered = render_mono(
+            &payload,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+        );
         assert!(rendered.contains("READY"), "rendered: {rendered}");
-        assert!(rendered.contains("Implement full.."), "rendered: {rendered}");
+        assert!(
+            rendered.contains("Implement full.."),
+            "rendered: {rendered}"
+        );
         assert!(rendered.contains("alice"), "rendered: {rendered}");
         assert!(!rendered.contains("@example.com"), "rendered: {rendered}");
         assert!(rendered.contains("sub 1"), "rendered: {rendered}");
@@ -1781,7 +1889,11 @@ mod tests {
     fn cache_hit_outlives_directory_on_narrow_row() {
         let mut cfg = LayoutConfig::preset_minimal();
         cfg.theme = ThemeStyle::Mono;
-        cfg.rows = vec![vec![WidgetId::State, WidgetId::Directory, WidgetId::CacheHit]];
+        cfg.rows = vec![vec![
+            WidgetId::State,
+            WidgetId::Directory,
+            WidgetId::CacheHit,
+        ]];
 
         let payload = StatuslinePayload {
             agent_state: Some("idle".to_string()),
@@ -1804,7 +1916,12 @@ mod tests {
 
         // Full: "● READY · ⌂ agy-statusline · ◈ cache 80.0%" (42 cols).
         // Even though CacheHit is rightmost, Directory (p2) drops before CacheHit (p3).
-        let out = render_mono(&payload, &SessionMetadata::default(), &GitInfo::default(), &cfg);
+        let out = render_mono(
+            &payload,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+        );
         assert_eq!(out, "● READY · ◈ cache 80.0%\n");
     }
 
@@ -1833,16 +1950,30 @@ mod tests {
         let row2 = lines.next().unwrap();
         assert!(lines.next().is_none(), "expected 2 rows: {plain:?}");
 
-        assert!(row1.width() <= 120, "row1 width {} > 120: {row1:?}", row1.width());
+        assert!(
+            row1.width() <= 120,
+            "row1 width {} > 120: {row1:?}",
+            row1.width()
+        );
         assert!(row1.contains("THINKING"), "row1: {row1:?}");
         assert!(row1.contains("PLAN"), "row1: {row1:?}");
-        assert!(row1.contains("Gemini 3.1 Pro Preview · high"), "row1: {row1:?}");
+        assert!(
+            row1.contains("Gemini 3.1 Pro Preview · high"),
+            "row1: {row1:?}"
+        );
         assert!(row1.contains("agy-statusline"), "row1: {row1:?}");
         assert!(row1.contains("feat/ui* +12 -3"), "row1: {row1:?}");
         assert!(row1.contains("v1.5.16"), "row1: {row1:?}");
 
-        assert!(row2.width() <= 120, "row2 width {} > 120: {row2:?}", row2.width());
-        assert!(row2.contains("ctx ████···· 50.0% (256K/512K)"), "row2: {row2:?}");
+        assert!(
+            row2.width() <= 120,
+            "row2 width {} > 120: {row2:?}",
+            row2.width()
+        );
+        assert!(
+            row2.contains("ctx ████···· 50.0% (256K/512K)"),
+            "row2: {row2:?}"
+        );
         assert!(row2.contains("cache 78.1%"), "row2: {row2:?}");
         assert!(row2.contains("82 tok/s"), "row2: {row2:?}");
         assert!(row2.contains("~$0.42"), "row2: {row2:?}");

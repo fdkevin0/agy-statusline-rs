@@ -2,13 +2,13 @@
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::metric::StatsMetric;
-use super::query::{ModelScope, RangePreset, StatsQuery, StatsView};
-use super::ModelStats;
+use crate::stats::metric::StatsMetric;
+use crate::stats::query::{ModelScope, RangePreset, StatsQuery, StatsView};
+use crate::stats::ModelStats;
 
 /// Focused interactive pane inside the `stats` TUI.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum StatsPane {
+pub(super) enum StatsPane {
     /// Scrollable daily usage table with per-day `Cache%` and proportional bar.
     #[default]
     Daily,
@@ -17,7 +17,7 @@ pub enum StatsPane {
 }
 
 impl StatsPane {
-    pub const fn toggle(self) -> Self {
+    pub(super) const fn toggle(self) -> Self {
         match self {
             Self::Daily => Self::Models,
             Self::Models => Self::Daily,
@@ -27,31 +27,32 @@ impl StatsPane {
 
 /// Action emitted by [`StatsTuiState::handle_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatsAction {
+pub(super) enum StatsAction {
     Continue,
     Refresh,
+    OpenConversations,
     Quit,
 }
 
 /// Complete mutable UI state for the interactive stats dashboard.
 #[derive(Debug, Clone)]
-pub struct StatsTuiState {
-    pub query: StatsQuery,
-    pub range_options: Vec<RangePreset>,
-    pub active_pane: StatsPane,
-    pub daily_idx: usize,
-    pub selected_date: Option<String>,
-    pub model_idx: usize,
+pub(super) struct StatsTuiState {
+    pub(super) query: StatsQuery,
+    pub(super) range_options: Vec<RangePreset>,
+    pub(super) active_pane: StatsPane,
+    pub(super) daily_idx: usize,
+    pub(super) selected_date: Option<String>,
+    pub(super) model_idx: usize,
     /// `None` = auto based on terminal height (`>= 32`), `Some(v)` = manual override via `g`.
-    pub show_heatmap: Option<bool>,
-    pub status_msg: Option<String>,
-    pub loading: bool,
-    pub view_dirty: bool,
+    pub(super) show_heatmap: Option<bool>,
+    pub(super) status_msg: Option<String>,
+    pub(super) loading: bool,
+    pub(super) view_dirty: bool,
 }
 
 impl StatsTuiState {
     /// Initializes state from CLI arguments and any persisted `stats_metric`.
-    pub fn new(initial_days: Option<u32>, initial_metric: StatsMetric) -> Self {
+    pub(super) fn new(initial_days: Option<u32>, initial_metric: StatsMetric) -> Self {
         let range_options = RangePreset::options_with_custom(initial_days);
         let range = initial_days
             .filter(|&d| d > 0)
@@ -252,6 +253,7 @@ impl StatsTuiState {
                 return StatsAction::Quit;
             }
             KeyCode::Char('r') => return StatsAction::Refresh,
+            KeyCode::Char('c') => return StatsAction::OpenConversations,
             _ => {}
         }
 

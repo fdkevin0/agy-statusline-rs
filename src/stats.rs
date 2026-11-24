@@ -5,221 +5,91 @@
 //! tokens, thinking tokens, model names, timestamps, decode speed, and TTFT.
 
 mod metric;
+mod model;
 mod pricing;
 mod query;
 mod render;
 mod scan;
-mod state;
 mod tui;
-mod tz;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
 pub use metric::{MetricValue, StatsMetric};
+pub use model::*;
 pub(crate) use pricing::{
-    is_pricing_fingerprint_fresh, maybe_spawn_pricing_sync_if_stale, pricing_cache_fingerprint,
-    DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE,
+    inspect_pricing_cache, is_pricing_fingerprint_fresh, maybe_spawn_pricing_sync_if_stale,
+    pricing_cache_fingerprint, DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE,
 };
 pub use pricing::{run_pricing_command, PricingCatalog, SyncMode};
 pub(crate) use scan::{
     estimate_conversation_cost_usd_with_parent_conn, lookup_cached_conversation_cost,
 };
-pub use tui::run_stats_tui;
-pub use tz::unix_secs_to_utc_date;
+pub use tui::{run_conversation_stats_tui, run_conversations_tui, run_stats_tui};
 
-use crate::timeutil::civil_date_from_unix_day;
+use crate::sys::time::{civil_date_from_unix_day, format_day, TimeZoneSpec};
 use query::{SourceFilter, StatsDataset};
-use render::render_stats_report_with_metric;
-#[cfg(test)]
-use render::render_stats_report;
-use scan::UsageEvent;
-use tz::format_day;
-#[cfg(test)]
-use tz::TimeZoneSpec;
+use render::{
+    render_conversation_stats_report, render_conversations_list, render_stats_report_with_metric,
+};
+use scan::{
+    collect_conversation_stats_report, filter_and_rank_conversations, list_conversations,
+    UsageEvent,
+};
+
+/// Formats a Unix epoch timestamp (seconds) as a UTC `YYYY-MM-DD` date string.
+pub fn unix_secs_to_utc_date(unix_secs: u64) -> String {
+    crate::sys::time::unix_secs_to_utc_date(unix_secs as i64)
+}
 
 const DAYS_PER_WEEK: i64 = 7;
 const ACTIVITY_WEEKS: usize = 20;
 
-/// Aggregated token and optional cost totals for a time window.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct PeriodSummary {
-    /// Total deduplicated turns/requests with non-zero token usage.
-    pub requests: u64,
-    /// Uncached input tokens.
-    pub input_tokens: u64,
-    /// Prompt cache read tokens.
-    pub cache_read_tokens: u64,
-    /// Prompt cache write tokens.
-    pub cache_write_tokens: u64,
-    /// Output tokens (includes thinking tokens when reported by AGY).
-    pub output_tokens: u64,
-    /// Thinking/reasoning output tokens (subset of `output_tokens`).
-    pub thinking_tokens: u64,
-    /// Total tokens (`input_tokens + cache_read_tokens + cache_write_tokens + output_tokens`).
-    pub total_tokens: u64,
-    /// Estimated cost in USD across priced turns (from native `model_cost` or `models.dev` rates).
-    pub priced_usd: f64,
-    /// Count of turns with a price entry or native cost.
-    pub priced_requests: u64,
-    /// Count of turns without a price entry or native cost.
-    pub unpriced_requests: u64,
+#[derive(Clone, Copy)]
+pub(super) struct UsageDelta {
+    pub(super) input_tokens: u64,
+    pub(super) cache_read_tokens: u64,
+    pub(super) cache_write_tokens: u64,
+    pub(super) output_tokens: u64,
+    pub(super) thinking_tokens: u64,
+    pub(super) total_tokens: u64,
+    pub(super) cost_usd: Option<f64>,
 }
 
-/// Standard fixed-window summaries (`today`, `last_7d`, `last_30d`, `all_time`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct WindowSummaries {
-    /// Local today (`now_unix_secs` date in the active timezone).
-    pub today: PeriodSummary,
-    /// Last 7 local calendar days including today.
-    pub last_7d: PeriodSummary,
-    /// Last 30 local calendar days including today.
-    pub last_30d: PeriodSummary,
-    /// All recorded turns regardless of date.
-    pub all_time: PeriodSummary,
-}
-
-/// Daily local-calendar token and optional cost aggregate.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct DailyUsage {
-    /// Local calendar date in `YYYY-MM-DD` format.
-    pub date: String,
-    /// Turn/request count on this date.
-    pub requests: u64,
-    /// Uncached input tokens.
-    pub input_tokens: u64,
-    /// Cache read tokens.
-    pub cache_read_tokens: u64,
-    /// Cache write tokens.
-    pub cache_write_tokens: u64,
-    /// Output tokens.
-    pub output_tokens: u64,
-    /// Thinking tokens.
-    pub thinking_tokens: u64,
-    /// Total tokens (`input + cache_read + cache_write + output`).
-    pub total_tokens: u64,
-    /// Estimated cost in USD for priced turns.
-    pub priced_usd: f64,
-    /// Count of unpriced turns on this date.
-    pub unpriced_requests: u64,
-}
-
-/// Monday-anchored local calendar week aggregate for the 20-week activity tile grid.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct WeeklyUsage {
-    /// Monday start date in `YYYY-MM-DD` format.
-    pub week_start: String,
-    /// Sunday end date in `YYYY-MM-DD` format.
-    pub week_end: String,
-    /// Per-day token totals from Monday (`0`) through Sunday (`6`), `None` for future days after `today_local`.
-    pub daily_tokens: [Option<u64>; 7],
-    /// Total tokens across non-future days in this week.
-    pub total_tokens: u64,
-}
-
-/// Per-model usage, optional cost, and speed/TTFT leaderboard entry.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ModelStats {
-    /// Display model name derived dynamically from AGY metadata.
-    pub model: String,
-    /// Matched catalog model key (or `"native"`) when priced.
-    pub pricing_key: Option<String>,
-    /// Total turns attributed to this model.
-    pub requests: u64,
-    /// Uncached input tokens.
-    pub input_tokens: u64,
-    /// Cache read tokens.
-    pub cache_read_tokens: u64,
-    /// Cache write tokens.
-    pub cache_write_tokens: u64,
-    /// Output tokens.
-    pub output_tokens: u64,
-    /// Thinking tokens.
-    pub thinking_tokens: u64,
-    /// Total tokens (`input + cache_read + cache_write + output`).
-    pub total_tokens: u64,
-    /// Estimated cost in USD.
-    pub priced_usd: f64,
-    /// Count of unpriced turns in this model bucket.
-    pub unpriced_requests: u64,
-    /// Number of valid decode speed samples.
-    pub speed_samples: usize,
-    /// Median decode throughput in tokens/second, if speed samples exist.
-    pub median_tok_per_sec: Option<f64>,
-    /// Number of valid TTFT samples.
-    pub ttft_samples: usize,
-    /// Median time-to-first-token in seconds, if TTFT samples exist.
-    pub median_ttft_secs: Option<f64>,
-}
-
-/// Aggregate speed and TTFT statistics from `conversations/*.db`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct SqliteStats {
-    /// Total valid UUID `.db` conversations scanned.
-    pub db_files: u64,
-    /// Completed turns decoded from `gen_metadata` passing speed sanity bounds.
-    pub completed_turns: u64,
-    /// Sum of output tokens across completed speed turns.
-    pub total_output_tokens: u64,
-    /// Median decode speed across completed turns (tokens/second).
-    pub median_tok_per_sec: Option<f64>,
-    /// Count of turns with valid TTFT (`chat.11`).
-    pub ttft_samples: usize,
-    /// Median time-to-first-token across decoded turns (seconds).
-    pub median_ttft_secs: Option<f64>,
-}
-
-/// Complete usage report computed by `agy-statusline stats` and serialized by `--json`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct StatsReport {
-    /// Reference local calendar date (`YYYY-MM-DD`) derived from `now_unix_secs` and `timezone`.
-    pub today_local: String,
-    /// Active timezone label (e.g., `"UTC+08:00"` or `"UTC"`).
-    pub timezone: String,
-    /// Reference UTC date (`YYYY-MM-DD`) derived from `now_unix_secs`.
-    pub today_utc: String,
-    /// Active `--days` filter (`None` for all-time).
-    pub filter_days: Option<u32>,
-    /// Earliest local calendar date observed across active usage events.
-    pub first_active_date: Option<String>,
-    /// Fixed comparison windows (`today`, `last_7d`, `last_30d`, `all_time`).
-    pub windows: WindowSummaries,
-    /// Active summary totals (filtered by `filter_days` when set).
-    pub totals: PeriodSummary,
-    /// Daily usage entries sorted chronologically (filtered by `filter_days` when set).
-    pub daily: Vec<DailyUsage>,
-    /// Unfiltered 20-week Monday-anchored calendar activity (oldest week first, ending with current week).
-    pub weekly: Vec<WeeklyUsage>,
-    /// Per-model breakdown sorted by `total_tokens` descending.
-    pub models: Vec<ModelStats>,
-    /// Aggregate statistics from `conversations/*.db` (`gen_metadata`).
-    pub sqlite: SqliteStats,
+impl PeriodSummary {
+    pub(super) fn record_usage(&mut self, delta: UsageDelta) {
+        self.requests += 1;
+        self.input_tokens = self.input_tokens.saturating_add(delta.input_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(delta.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(delta.cache_write_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(delta.output_tokens);
+        self.thinking_tokens = self.thinking_tokens.saturating_add(delta.thinking_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(delta.total_tokens);
+        match delta.cost_usd {
+            Some(usd) => {
+                self.priced_usd += usd;
+                self.priced_requests += 1;
+            }
+            None => self.unpriced_requests += 1,
+        }
+    }
 }
 
 fn accumulate_period(summary: &mut PeriodSummary, ev: &UsageEvent) {
-    summary.requests += 1;
-    summary.input_tokens = summary.input_tokens.saturating_add(ev.input_tokens);
-    summary.cache_read_tokens = summary
-        .cache_read_tokens
-        .saturating_add(ev.cache_read_tokens);
-    summary.cache_write_tokens = summary
-        .cache_write_tokens
-        .saturating_add(ev.cache_write_tokens);
-    summary.output_tokens = summary.output_tokens.saturating_add(ev.output_tokens);
-    summary.thinking_tokens = summary.thinking_tokens.saturating_add(ev.thinking_tokens);
-    summary.total_tokens = summary.total_tokens.saturating_add(ev.total_tokens);
-    match ev.cost_usd {
-        Some(usd) => {
-            summary.priced_usd += usd;
-            summary.priced_requests += 1;
-        }
-        None => {
-            summary.unpriced_requests += 1;
-        }
-    }
+    summary.record_usage(UsageDelta {
+        input_tokens: ev.input_tokens,
+        cache_read_tokens: ev.cache_read_tokens,
+        cache_write_tokens: ev.cache_write_tokens,
+        output_tokens: ev.output_tokens,
+        thinking_tokens: ev.thinking_tokens,
+        total_tokens: ev.total_tokens,
+        cost_usd: ev.cost_usd,
+    });
 }
 
 #[derive(Default)]
@@ -241,10 +111,7 @@ pub(super) fn activity_week_mondays(today_idx: i64) -> impl Iterator<Item = i64>
     (0..ACTIVITY_WEEKS).map(move |w| first_monday + (w as i64) * DAYS_PER_WEEK)
 }
 
-fn build_weekly_usage(
-    today_idx: i64,
-    daily_by_date: &HashMap<&str, u64>,
-) -> Vec<WeeklyUsage> {
+fn build_weekly_usage(today_idx: i64, daily_by_day: &HashMap<i64, u64>) -> Vec<WeeklyUsage> {
     activity_week_mondays(today_idx)
         .map(|week_mon| {
             let mut daily_tokens = [None; 7];
@@ -252,8 +119,7 @@ fn build_weekly_usage(
             for (d, slot) in daily_tokens.iter_mut().enumerate() {
                 let day_idx = week_mon + (d as i64);
                 if day_idx <= today_idx {
-                    let date = format_day(day_idx);
-                    let tok = daily_by_date.get(date.as_str()).copied().unwrap_or(0);
+                    let tok = daily_by_day.get(&day_idx).copied().unwrap_or(0);
                     *slot = Some(tok);
                     total_tokens = total_tokens.saturating_add(tok);
                 }
@@ -286,7 +152,8 @@ fn collect_stats_with_tz(
         DEFAULT_PRICING_TTL_SECS,
         |_| unreachable!(),
     );
-    StatsDataset::collect_for_roots(&roots, now_unix_secs, tz, &pricing).to_report(days)
+    StatsDataset::collect_for_roots(&roots, now_unix_secs, tz, &pricing)
+        .to_report_with_metric(days, StatsMetric::Total)
 }
 
 /// Shared runtime options for `agy-statusline stats` (static output and interactive TUI).
@@ -314,11 +181,14 @@ pub fn run_stats_command<W: Write>(
     out: &mut W,
 ) -> io::Result<()> {
     let dataset = StatsDataset::collect(roots, opts.cache_dir, opts.now_unix_secs);
-    let report = if json {
-        dataset.to_report(opts.days)
-    } else {
-        dataset.to_report_with_metric(opts.days, opts.metric)
-    };
+    let report = dataset.to_report_with_metric(
+        opts.days,
+        if json {
+            StatsMetric::Total
+        } else {
+            opts.metric
+        },
+    );
 
     if json {
         let formatted = serde_json::to_string_pretty(&report)
@@ -342,9 +212,94 @@ pub fn run_stats_command<W: Write>(
     )
 }
 
+/// Runs single-conversation stats (`agy-statusline stats <CONVERSATION_ID>`).
+pub fn run_conversation_stats_command<W: Write>(
+    roots: &[(&'static str, PathBuf)],
+    conversation_query: &str,
+    show_all_turns: bool,
+    opts: &StatsOptions<'_>,
+    json: bool,
+    out: &mut W,
+) -> io::Result<()> {
+    let pricing = PricingCatalog::load_effective_with(
+        opts.cache_dir,
+        SyncMode::BlockingIfStale,
+        opts.now_unix_secs,
+        DEFAULT_PRICING_TTL_SECS,
+        pricing::fetch_models_dev_via_curl,
+    );
+    let tz = TimeZoneSpec::local();
+    let sort_metric = if json {
+        StatsMetric::Total
+    } else {
+        opts.metric
+    };
+    let report = collect_conversation_stats_report(
+        roots,
+        conversation_query,
+        opts.now_unix_secs,
+        &tz,
+        &pricing,
+        sort_metric,
+    )?;
+
+    if json {
+        let formatted = serde_json::to_string_pretty(&report).map_err(|e| {
+            io::Error::other(format!("failed to serialize conversation stats JSON: {e}"))
+        })?;
+        writeln!(out, "{formatted}")?;
+        return Ok(());
+    }
+
+    render_conversation_stats_report(
+        &report,
+        opts.metric,
+        show_all_turns,
+        opts.no_color,
+        opts.ascii,
+        out,
+    )
+}
+
+/// Runs the non-interactive `agy-statusline conversations` listing (`--plain` / `--json` / piped).
+pub fn run_conversations_command<W: Write>(
+    roots: &[(&'static str, PathBuf)],
+    query: Option<&str>,
+    show_subagents: bool,
+    limit: Option<usize>,
+    opts: &StatsOptions<'_>,
+    json: bool,
+    out: &mut W,
+) -> io::Result<()> {
+    let tz = TimeZoneSpec::local();
+    let timezone = tz.format_offset_at(opts.now_unix_secs as i64);
+    let all_items = list_conversations(roots, &tz);
+    let indices = filter_and_rank_conversations(
+        &all_items,
+        query.unwrap_or(""),
+        show_subagents,
+        SourceFilter::All,
+    );
+    let mut matched: Vec<ConversationListItem> =
+        indices.into_iter().map(|i| all_items[i].clone()).collect();
+
+    if json {
+        if let Some(max_n) = limit {
+            matched.truncate(max_n);
+        }
+        let formatted = serde_json::to_string_pretty(&matched).map_err(|e| {
+            io::Error::other(format!("failed to serialize conversations JSON: {e}"))
+        })?;
+        writeln!(out, "{formatted}")?;
+        return Ok(());
+    }
+
+    render_conversations_list(&matched, &timezone, query, show_subagents, limit, opts, out)
+}
+
 #[cfg(test)]
 pub(super) mod test_helpers {
-    use crate::protobuf::{encode_gen_blob, GenBlobSpec};
+    use crate::agy::protobuf::{encode_gen_blob, GenBlobSpec};
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_gen_blob(
@@ -384,8 +339,8 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::protobuf::{encode_gen_blob, encode_step_meta_blob, GenBlobSpec};
-    use crate::timeutil::parse_rfc3339_unix_secs;
+    use crate::agy::protobuf::{encode_gen_blob, encode_step_meta_blob, GenBlobSpec};
+    use crate::sys::time::parse_rfc3339_unix_secs;
 
     fn create_conv_db_tables(db_path: &Path) -> Connection {
         fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -543,7 +498,15 @@ mod tests {
 
         // No cost column when no turns are priced
         let mut rendered = Vec::new();
-        render_stats_report(&report, true, true, &mut rendered).unwrap();
+        render_stats_report_with_metric(
+            &report,
+            StatsMetric::Total,
+            None,
+            true,
+            true,
+            &mut rendered,
+        )
+        .unwrap();
         let text = String::from_utf8(rendered).unwrap();
         assert!(text.contains("Local 2026-11-18 (UTC+08:00)"));
         assert!(!text.contains("Est. Cost"));
@@ -611,7 +574,15 @@ mod tests {
         assert!((report.windows.all_time.priced_usd - 10.25).abs() < 1e-6);
 
         let mut rendered = Vec::new();
-        render_stats_report(&report, true, true, &mut rendered).unwrap();
+        render_stats_report_with_metric(
+            &report,
+            StatsMetric::Total,
+            None,
+            true,
+            true,
+            &mut rendered,
+        )
+        .unwrap();
         let text = String::from_utf8(rendered).unwrap();
         assert!(text.contains("Est. Cost"));
         assert!(text.contains("~$10.25"));
@@ -658,7 +629,8 @@ mod tests {
         assert_eq!(report.weekly[17].total_tokens, 3_000);
 
         let mut out = Vec::new();
-        render_stats_report(&report, true, true, &mut out).unwrap();
+        render_stats_report_with_metric(&report, StatsMetric::Total, None, true, true, &mut out)
+            .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("no activity"), "unexpected text:\n{text}");
         assert!(

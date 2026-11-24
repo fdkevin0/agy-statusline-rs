@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -12,9 +12,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::scan::is_effort_token;
-use crate::fsutil::{atomic_write, modified_timestamp};
-use crate::procutil::{run_command_stdout_bounded, BoundedCommandError};
-use crate::timeutil::{unix_now_secs, SECS_PER_DAY};
+use crate::agy::db::is_absent_or_real_file;
+use crate::sys::fmt::sanitize_inline_text;
+use crate::sys::fs::{atomic_write, modified_timestamp};
+use crate::sys::process::{run_command_stdout_bounded, BoundedCommandError};
+use crate::sys::time::{unix_now_secs, SECS_PER_DAY};
 
 /// Default cache TTL for auto-fetched `models.dev` pricing data (24 hours).
 pub(crate) const DEFAULT_PRICING_TTL_SECS: u64 = SECS_PER_DAY as u64;
@@ -410,10 +412,7 @@ impl PricingCatalog {
             .is_some_and(|norm| extract_orchestrator_codename(&norm).is_some());
         let disp_is_specific = model_display_name
             .map(|s| normalize_model_key(s.trim()))
-            .is_some_and(|norm| {
-                norm.split_whitespace()
-                    .any(|w| !is_generic_family_token(w))
-            });
+            .is_some_and(|norm| norm.split_whitespace().any(|w| !is_generic_family_token(w)));
         resp_has_codename || disp_is_specific
     }
 
@@ -474,7 +473,15 @@ fn is_generic_orchestrator_token(word: &str) -> bool {
     is_effort_token(word)
         || matches!(
             word,
-            "pro" | "flash" | "agy" | "g1" | "worker" | "tiered" | "thinking" | "preview" | "latest"
+            "pro"
+                | "flash"
+                | "agy"
+                | "g1"
+                | "worker"
+                | "tiered"
+                | "thinking"
+                | "preview"
+                | "latest"
         )
 }
 
@@ -497,9 +504,7 @@ fn extract_orchestrator_codename(norm: &str) -> Option<&str> {
 fn extract_explicit_version(norm: &str) -> Option<(u32, u32)> {
     // Only inspect tokens before `orchestrator` so trailing date/build suffixes
     // (e.g. `gemini-pro-orchestrator-2026-04`) are never misread as generation numbers.
-    let mut words = norm
-        .split_whitespace()
-        .take_while(|&w| w != "orchestrator");
+    let mut words = norm.split_whitespace().take_while(|&w| w != "orchestrator");
     while let Some(w) = words.next() {
         if let Ok(major) = w.parse::<u32>() {
             let minor = words
@@ -576,9 +581,70 @@ fn is_valid_tier_rate(tier: &ContextPricingTier) -> bool {
         .all(|v| v.is_finite() && *v >= 0.0)
 }
 
+fn read_cache_bytes_bounded(path: &Path) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(MAX_PRICING_JSON_BYTES.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if (buf.len() as u64) > MAX_PRICING_JSON_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exceeds maximum inspected size",
+        ));
+    }
+    Ok(buf)
+}
+
 fn load_cached_file(path: &Path) -> Option<CachedPricingFile> {
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<CachedPricingFile>(&raw).ok()
+    if !is_absent_or_real_file(path) {
+        return None;
+    }
+    let bytes = read_cache_bytes_bounded(path).ok()?;
+    serde_json::from_slice::<CachedPricingFile>(&bytes).ok()
+}
+
+/// Inspects `models_dev_pricing.json` under `cache_dir` and returns a concise diagnostic status.
+pub(crate) fn inspect_pricing_cache(cache_dir: &Path, now_unix_secs: u64) -> String {
+    let path = cache_dir.join(MODELS_DEV_CACHE_FILE);
+    if !is_absent_or_real_file(&path) {
+        let is_symlink = fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+        return if is_symlink {
+            "symlink (ignored)".to_string()
+        } else {
+            "not a regular file (ignored)".to_string()
+        };
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return "not found".to_string(),
+        Err(e) => return format!("unreadable ({e})"),
+    }
+    let bytes = match read_cache_bytes_bounded(&path) {
+        Ok(b) => b,
+        Err(e) => return format!("corrupt ({e})"),
+    };
+    #[derive(Deserialize)]
+    struct Summary {
+        fetched_at: u64,
+        #[serde(default)]
+        models: BTreeMap<String, Value>,
+    }
+    let parsed: Summary = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            let reason: String = sanitize_inline_text(&e.to_string())
+                .chars()
+                .take(80)
+                .collect();
+            return format!("corrupt ({reason})");
+        }
+    };
+    let freshness = if now_unix_secs.saturating_sub(parsed.fetched_at) < DEFAULT_PRICING_TTL_SECS {
+        "fresh"
+    } else {
+        "stale"
+    };
+    format!("found, {} models ({freshness})", parsed.models.len())
 }
 
 fn in_retry_cooldown(cache_dir: &Path, now_secs: u64) -> bool {
@@ -614,20 +680,18 @@ fn spawn_background_pricing_sync() {
 pub(super) fn fetch_models_dev_via_curl(url: &str) -> io::Result<String> {
     let mut cmd = Command::new("curl");
     cmd.args(["-fsSL", "--connect-timeout", "5", "--max-time", "15", url]);
-    let out = match run_command_stdout_bounded(
-        &mut cmd,
-        Duration::from_secs(16),
-        MAX_PRICING_JSON_BYTES,
-    ) {
-        Ok(out) => out,
-        Err(BoundedCommandError::TimedOut) => {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "curl timed out fetching models.dev pricing",
-            ));
-        }
-        Err(BoundedCommandError::Io(err)) => return Err(err),
-    };
+    let out =
+        match run_command_stdout_bounded(&mut cmd, Duration::from_secs(16), MAX_PRICING_JSON_BYTES)
+        {
+            Ok(out) => out,
+            Err(BoundedCommandError::TimedOut) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "curl timed out fetching models.dev pricing",
+                ));
+            }
+            Err(BoundedCommandError::Io(err)) => return Err(err),
+        };
     if out.truncated {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -682,7 +746,10 @@ fn extract_context_tier(
 
 fn extract_rate_from_cost(cost_obj: &serde_json::Map<String, Value>) -> Option<ModelPricingRate> {
     let input = cost_obj.get("input").and_then(Value::as_f64).unwrap_or(0.0);
-    let output = cost_obj.get("output").and_then(Value::as_f64).unwrap_or(0.0);
+    let output = cost_obj
+        .get("output")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let cache_read = cost_obj
         .get("cache_read")
         .and_then(Value::as_f64)
@@ -1280,7 +1347,13 @@ mod tests {
             None
         );
         assert_eq!(
-            catalog.estimate_cost(&["gemini-flash-worker-agy", "Gemini Flash"], 1_000_000, 0, 0, 0),
+            catalog.estimate_cost(
+                &["gemini-flash-worker-agy", "Gemini Flash"],
+                1_000_000,
+                0,
+                0,
+                0
+            ),
             None
         );
         assert_eq!(

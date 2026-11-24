@@ -1,6 +1,8 @@
 //! Responsive width measurement, spacer group splitting, and staged compaction.
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
+
+use crate::sys::fmt::truncate_to_width;
 
 use super::emit::StyleGeometry;
 use super::{CompactStage, Segment};
@@ -37,35 +39,6 @@ fn groups_visible_width(groups: &[Vec<Segment>], geom: StyleGeometry) -> usize {
     }
     let sum: usize = groups.iter().map(|g| slice_visible_width(g, geom)).sum();
     sum + groups.len().saturating_sub(1)
-}
-
-pub(crate) fn truncate_to_width(s: &str, max_cols: usize, ellipsis: &str) -> String {
-    if s.width() <= max_cols {
-        return s.to_string();
-    }
-    let ell_w = ellipsis.width();
-    if max_cols == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut used = 0usize;
-    let budget = if max_cols > ell_w {
-        max_cols - ell_w
-    } else {
-        max_cols
-    };
-    for ch in s.chars() {
-        let w = ch.width().unwrap_or(0);
-        if used + w > budget {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    if max_cols > ell_w {
-        out.push_str(ellipsis);
-    }
-    out
 }
 
 pub(super) fn split_into_groups(segs: Vec<Segment>) -> Vec<Vec<Segment>> {
