@@ -271,7 +271,7 @@ pub fn run_stats_tui(
                         if pending_scan.is_none() {
                             state.loading = true;
                             state.status_msg = Some("Refreshing local AGY usage...".to_string());
-                            let now = jiff::Timestamp::now().as_second().max(0) as u64;
+                            let now = crate::timeutil::unix_now_secs();
                             pending_scan =
                                 Some(spawn_dataset_scan(roots.clone(), cache_owned.clone(), now));
                         }

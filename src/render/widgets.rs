@@ -12,8 +12,7 @@ use crate::theme::Palette;
 
 use super::fit::truncate_to_width;
 use super::{
-    build_progress_bar_with_chars, CompactStage, CostCoverage, RenderContext, Renderer,
-    ResolvedCost, Segment,
+    build_progress_bar_with_chars, CompactStage, RenderContext, Renderer, ResolvedCost, Segment,
 };
 
 impl Renderer<'_> {
@@ -558,23 +557,14 @@ impl Renderer<'_> {
                     ResolvedCost::Estimated {
                         total_usd,
                         subagent_usd,
-                        coverage,
+                        unpriced_turns,
                     } => {
                         let base = format!("~${total_usd:.2}");
-                        let full = match (coverage, subagent_usd) {
-                            (CostCoverage::Session, None) => base.clone(),
-                            (CostCoverage::Session, Some(sub)) => {
-                                format!("{base} (sub ${sub:.2})")
-                            }
-                            (CostCoverage::Partial(n), None) => {
-                                format!("{base} ({n} unpriced)")
-                            }
-                            (CostCoverage::Partial(n), Some(sub)) => {
-                                format!("{base} (sub ${sub:.2}, {n} unpriced)")
-                            }
-                            (CostCoverage::LatestTurn, _) => {
-                                format!("{base} (latest turn)")
-                            }
+                        let full = match (unpriced_turns, subagent_usd) {
+                            (0, None) => base.clone(),
+                            (0, Some(sub)) => format!("{base} (sub ${sub:.2})"),
+                            (n, None) => format!("{base} ({n} unpriced)"),
+                            (n, Some(sub)) => format!("{base} (sub ${sub:.2}, {n} unpriced)"),
                         };
                         (base, full)
                     }

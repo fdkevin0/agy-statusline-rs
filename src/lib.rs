@@ -26,3 +26,5 @@ pub mod statusline;
 pub(crate) mod theme;
 pub(crate) mod timeutil;
 pub mod tui;
+
+pub use timeutil::unix_now_secs;

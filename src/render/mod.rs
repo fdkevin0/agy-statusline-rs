@@ -116,13 +116,6 @@ impl<'a> Renderer<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum CostCoverage {
-    Session,
-    Partial(u64),
-    LatestTurn,
-}
-
-#[derive(Clone, Copy)]
 enum ResolvedCost {
     Payload {
         total_usd: f64,
@@ -132,7 +125,7 @@ enum ResolvedCost {
     Estimated {
         total_usd: f64,
         subagent_usd: Option<f64>,
-        coverage: CostCoverage,
+        unpriced_turns: u64,
     },
 }
 
@@ -157,7 +150,7 @@ impl<'a> RenderContext<'a> {
         meta: &SessionMetadata,
         git: &'a GitInfo,
         (quota_5h, quota_weekly): (Option<QuotaView>, Option<QuotaView>),
-        cost_coverage: CostCoverage,
+        unpriced_turns: u64,
         cfg: &LayoutConfig,
     ) -> Self {
         let cache = valid_cache_usage(payload);
@@ -209,7 +202,7 @@ impl<'a> RenderContext<'a> {
                     subagent_usd: meta
                         .estimated_subagent_cost_usd
                         .filter(|&s| s.is_finite() && s >= 0.01),
-                    coverage: cost_coverage,
+                    unpriced_turns,
                 })
         };
         Self {
@@ -274,30 +267,22 @@ pub fn write_statusline<W: IoWrite>(
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
-    write_statusline_at(
-        payload,
-        meta,
-        git,
-        CostCoverage::Session,
-        unix_now_secs(),
-        cfg,
-        out,
-    )
+    write_statusline_at(payload, meta, git, 0, unix_now_secs(), cfg, out)
 }
 
-/// Renders all non-empty configured rows using an explicit cost coverage label and timestamp.
+/// Renders all non-empty configured rows using an explicit unpriced-turn count and timestamp.
 pub(crate) fn write_statusline_at<W: IoWrite>(
     payload: &StatuslinePayload,
     meta: &SessionMetadata,
     git: &GitInfo,
-    cost_coverage: CostCoverage,
+    unpriced_turns: u64,
     now_unix_secs: u64,
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
     let quotas = resolve_quota_views(payload, now_unix_secs);
     let renderer = Renderer::new(cfg);
-    let ctx = RenderContext::build(payload, meta, git, quotas, cost_coverage, cfg);
+    let ctx = RenderContext::build(payload, meta, git, quotas, unpriced_turns, cfg);
     let max_width = cfg.responsive.then_some(payload.terminal_width).flatten();
 
     for row in &cfg.rows {
@@ -322,7 +307,7 @@ mod tests {
     use crate::layout::{GlyphMode, ThemeStyle, VisualStyle};
     use crate::statusline::{
         AgentInfo, BattleInfo, ContextWindow, CostInfo, JsonUsage, ModelInfo, QuotaBucket,
-        SandboxInfo, VcsInfo, VimInfo, WorkspaceInfo,
+        SandboxInfo, SubagentInfo, VcsInfo, VimInfo, WorkspaceInfo,
     };
 
     fn render_mono(
@@ -975,7 +960,7 @@ mod tests {
             &payload,
             &meta_sub,
             &GitInfo::default(),
-            CostCoverage::Partial(2),
+            2,
             0,
             &cfg,
             &mut out_partial_sub,
@@ -991,7 +976,7 @@ mod tests {
             &payload,
             &meta,
             &GitInfo::default(),
-            CostCoverage::Partial(2),
+            2,
             0,
             &cfg,
             &mut out_partial_only,
@@ -1763,9 +1748,11 @@ mod tests {
         let render_at = |width: usize| {
             let payload = StatuslinePayload {
                 quota: Some(quota.clone()),
-                subagents: Some(serde_json::json!([
-                    {"role": "Codebase Researcher", "status": "running"}
-                ])),
+                subagents: Some(vec![SubagentInfo {
+                    name: None,
+                    role: Some("Codebase Researcher".to_string()),
+                    status: Some("running".to_string()),
+                }]),
                 terminal_width: Some(width),
                 ..Default::default()
             };
@@ -1774,7 +1761,7 @@ mod tests {
                 &payload,
                 &SessionMetadata::default(),
                 &GitInfo::default(),
-                CostCoverage::Session,
+                0,
                 0,
                 &cfg,
                 &mut out,

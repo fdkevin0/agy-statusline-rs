@@ -1057,7 +1057,6 @@ impl<'a, 'b> TurnPricer<'a, 'b> {
                         turn.cache_read_tokens,
                         turn.cache_write_tokens,
                         turn.output_tokens,
-                        true,
                     )
                 })
                 .unzip()

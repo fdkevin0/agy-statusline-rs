@@ -1,7 +1,6 @@
 //! Configuration, runtime environment, AGY hook, storage, and live preview diagnostics (`doctor`).
 
 use std::collections::BTreeMap;
-use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -15,7 +14,6 @@ use serde_json::Value;
 use crate::apply::read_settings_object;
 use crate::db::{is_absent_or_real_file, is_safe_sqlite_file, is_valid_uuid};
 use crate::layout::try_load_layout_config;
-use crate::paths::{resolve_agy_cli_dir, xdg_cache_dir};
 use crate::procutil::{run_command_stdout_bounded, BoundedCommandError};
 use crate::render::write_statusline;
 use crate::stats::{DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE};
@@ -379,20 +377,19 @@ fn run_doctor_with<W: Write>(
 pub fn run_doctor<W: Write>(
     config_path: &Path,
     settings_path: &Path,
+    cache_dir: Option<&Path>,
+    path_env: Option<&OsStr>,
     no_color: bool,
     out: &mut W,
 ) -> io::Result<()> {
     let conv_dir: Option<PathBuf> = settings_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.join("conversations"))
-        .or_else(|| resolve_agy_cli_dir().map(|d| d.join("conversations")));
-    let cache_dir = xdg_cache_dir();
-    let path_env = env::var_os("PATH");
+        .map(|p| p.join("conversations"));
     let doctor_env = DoctorEnv {
         conv_dir: conv_dir.as_deref(),
-        cache_dir: cache_dir.as_deref(),
-        path_env: path_env.as_deref(),
+        cache_dir,
+        path_env,
         now_unix_secs: unix_now_secs(),
         no_color,
     };
@@ -401,6 +398,8 @@ pub fn run_doctor<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
     use super::*;
 
     use crate::apply::apply_statusline_config;
@@ -515,8 +514,8 @@ mod tests {
         assert_eq!(inspect_conversations_dir(&file_as_dir), "not a directory");
 
         assert_eq!(
-            format_version_output(b"\n\x1b[32m1.5.14\x07\x1b[0m\nignored line\n"),
-            "1.5.14"
+            format_version_output(b"\n\x1b[32m1.5.16\x07\x1b[0m\nignored line\n"),
+            "1.5.16"
         );
         assert_eq!(format_version_output(b"   \n\t\r\n"), "unknown (empty output)");
     }

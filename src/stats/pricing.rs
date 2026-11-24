@@ -3,16 +3,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::scan::is_effort_token;
 use crate::fsutil::{atomic_write, modified_timestamp};
-use crate::paths::xdg_cache_dir;
+use crate::procutil::{run_command_stdout_bounded, BoundedCommandError};
 use crate::timeutil::{unix_now_secs, SECS_PER_DAY};
 
 /// Default cache TTL for auto-fetched `models.dev` pricing data (24 hours).
@@ -274,7 +275,8 @@ impl PricingCatalog {
     }
 
     /// Estimates USD cost for one turn if any candidate model string matches a valid entry.
-    pub(crate) fn estimate_cost(
+    #[cfg(test)]
+    fn estimate_cost(
         &self,
         candidates: &[&str],
         input_tokens: u64,
@@ -282,33 +284,13 @@ impl PricingCatalog {
         cache_write_tokens: u64,
         output_tokens: u64,
     ) -> Option<(String, f64)> {
-        self.estimate_cost_inner(
-            candidates,
+        let entry_idx = self.resolve_entry_idx(candidates)?;
+        self.estimate_cost_for_entry(
+            entry_idx,
             input_tokens,
             cache_read_tokens,
             cache_write_tokens,
             output_tokens,
-            true,
-        )
-    }
-
-    /// Estimates USD cost using base rates only (for cumulative multi-turn token totals
-    /// where per-turn prompt context length is unknown).
-    pub(crate) fn estimate_cost_base_rate(
-        &self,
-        candidates: &[&str],
-        input_tokens: u64,
-        cache_read_tokens: u64,
-        cache_write_tokens: u64,
-        output_tokens: u64,
-    ) -> Option<(String, f64)> {
-        self.estimate_cost_inner(
-            candidates,
-            input_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            output_tokens,
-            false,
         )
     }
 
@@ -381,21 +363,16 @@ impl PricingCatalog {
         cache_read_tokens: u64,
         cache_write_tokens: u64,
         output_tokens: u64,
-        apply_context_tiers: bool,
     ) -> Option<(String, f64)> {
         let entry = self.entries.get(entry_idx)?;
         let prompt_context_tokens = input_tokens
             .saturating_add(cache_read_tokens)
             .saturating_add(cache_write_tokens);
-        let active_tier = apply_context_tiers
-            .then(|| {
-                entry
-                    .rate
-                    .context_tiers
-                    .iter()
-                    .rfind(|tier| prompt_context_tokens > tier.min_context_tokens)
-            })
-            .flatten();
+        let active_tier = entry
+            .rate
+            .context_tiers
+            .iter()
+            .rfind(|tier| prompt_context_tokens > tier.min_context_tokens);
         let (input_rate, cache_read_rate, cache_write_rate, output_rate) = match active_tier {
             Some(tier) => (
                 tier.input_per_mtok,
@@ -419,26 +396,6 @@ impl PricingCatalog {
             return None;
         }
         Some((entry.key.clone(), round_usd_6(cost)))
-    }
-
-    fn estimate_cost_inner(
-        &self,
-        candidates: &[&str],
-        input_tokens: u64,
-        cache_read_tokens: u64,
-        cache_write_tokens: u64,
-        output_tokens: u64,
-        apply_context_tiers: bool,
-    ) -> Option<(String, f64)> {
-        let entry_idx = self.resolve_entry_idx(candidates)?;
-        self.estimate_cost_for_entry(
-            entry_idx,
-            input_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            output_tokens,
-            apply_context_tiers,
-        )
     }
 
     /// Returns `true` when `response_model` carries an explicit orchestrator codename or
@@ -655,49 +612,35 @@ fn spawn_background_pricing_sync() {
 
 /// Fetches `url` using `curl` with bounded connect/total timeouts and response size limit.
 pub(super) fn fetch_models_dev_via_curl(url: &str) -> io::Result<String> {
-    let mut child = Command::new("curl")
-        .args(["-fsSL", "--connect-timeout", "5", "--max-time", "15", url])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let mut stdout_buf = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        if let Err(err) = stdout
-            .take(MAX_PRICING_JSON_BYTES + 1)
-            .read_to_end(&mut stdout_buf)
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(err);
+    let mut cmd = Command::new("curl");
+    cmd.args(["-fsSL", "--connect-timeout", "5", "--max-time", "15", url]);
+    let out = match run_command_stdout_bounded(
+        &mut cmd,
+        Duration::from_secs(16),
+        MAX_PRICING_JSON_BYTES,
+    ) {
+        Ok(out) => out,
+        Err(BoundedCommandError::TimedOut) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "curl timed out fetching models.dev pricing",
+            ));
         }
-    }
-
-    if stdout_buf.len() as u64 > MAX_PRICING_JSON_BYTES {
-        let _ = child.kill();
-        let _ = child.wait();
+        Err(BoundedCommandError::Io(err)) => return Err(err),
+    };
+    if out.truncated {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "models.dev response exceeded size limit",
         ));
     }
-
-    let mut stderr_buf = Vec::new();
-    if let Some(stderr) = child.stderr.take() {
-        let _ = stderr.take(4096).read_to_end(&mut stderr_buf);
+    if !out.status.is_some_and(|s| s.success()) {
+        return Err(io::Error::other(match out.status {
+            Some(status) => format!("curl failed ({status})"),
+            None => "curl failed".to_string(),
+        }));
     }
-
-    let status = child.wait()?;
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr_buf);
-        return Err(io::Error::other(format!(
-            "curl failed ({status}): {}",
-            stderr.trim()
-        )));
-    }
-
-    String::from_utf8(stdout_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    String::from_utf8(out.stdout).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 const CANONICAL_PROVIDERS: &[&str] = &[
@@ -950,21 +893,16 @@ fn pricing_cache_status(cache_dir: &Path, now_secs: u64) -> PricingCacheStatus {
 
 /// Runs the `agy-statusline pricing` subcommand (`status` or `sync [--if-stale]`).
 pub fn run_pricing_command<W: io::Write>(
+    cache_dir: &Path,
     sync: bool,
     if_stale: bool,
     out: &mut W,
 ) -> io::Result<()> {
     let now_secs = unix_now_secs();
-    let cache_dir = xdg_cache_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "unable to resolve pricing cache directory",
-        )
-    })?;
 
     if sync {
         let (status, did_fetch) = sync_models_dev_pricing_with(
-            &cache_dir,
+            cache_dir,
             if_stale,
             now_secs,
             DEFAULT_PRICING_TTL_SECS,
@@ -989,7 +927,7 @@ pub fn run_pricing_command<W: io::Write>(
         return Ok(());
     }
 
-    let status = pricing_cache_status(&cache_dir, now_secs);
+    let status = pricing_cache_status(cache_dir, now_secs);
     let age_desc = match status.fetched_at {
         Some(ts) => {
             let age = now_secs.saturating_sub(ts);

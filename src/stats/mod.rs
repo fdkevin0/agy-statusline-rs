@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 pub use metric::{MetricValue, StatsMetric};
 pub(crate) use pricing::{
     is_pricing_fingerprint_fresh, maybe_spawn_pricing_sync_if_stale, pricing_cache_fingerprint,
-    PricingFileFingerprint, DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE,
+    DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE,
 };
 pub use pricing::{run_pricing_command, PricingCatalog, SyncMode};
 pub(crate) use scan::{

@@ -18,7 +18,7 @@ fn resolve_home_dir_from(home: Option<OsString>, userprofile: Option<OsString>) 
 /// Expands a leading `~` or `~/` (and `~\` on Windows) against `home`.
 ///
 /// Leaves empty strings, `~user/...` paths, and inputs with `home == None` unchanged.
-pub fn expand_tilde(raw: &str, home: Option<&Path>) -> PathBuf {
+fn expand_tilde(raw: &str, home: Option<&Path>) -> PathBuf {
     let Some(home) = home else {
         return PathBuf::from(raw);
     };
@@ -65,7 +65,7 @@ fn push_unique_root(
 /// Resolves all official AGY CLI, Desktop, and explicit custom data roots from explicit inputs,
 /// deduplicating canonical/identical paths while preserving first-seen source priority
 /// (`"cli"` before `"desktop"`).
-pub fn resolve_agy_roots_from(
+fn resolve_agy_roots_from(
     home: Option<&Path>,
     antigravity_data_dir: Option<&OsStr>,
     antigravity_cli_home: Option<&OsStr>,
@@ -165,7 +165,7 @@ fn agy_settings_path_from(cli_dir: Option<PathBuf>) -> io::Result<PathBuf> {
 }
 
 /// Resolves the user's home directory from `HOME` or `USERPROFILE`.
-pub fn resolve_home_dir() -> Option<PathBuf> {
+fn resolve_home_dir() -> Option<PathBuf> {
     resolve_home_dir_from(env::var_os("HOME"), env::var_os("USERPROFILE"))
 }
 

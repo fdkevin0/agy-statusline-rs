@@ -25,6 +25,7 @@ use agy_statusline::statusline::{
     process_statusline, PricingSource, SessionSource, StatuslineRuntime,
 };
 use agy_statusline::tui::run_tui_config;
+use agy_statusline::unix_now_secs;
 
 const MAX_STDIN_BYTES: u64 = 1024 * 1024;
 
@@ -141,10 +142,6 @@ enum PricingCommand {
     },
 }
 
-fn unix_now_secs() -> u64 {
-    jiff::Timestamp::now().as_second().max(0) as u64
-}
-
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let no_color = env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
@@ -190,8 +187,17 @@ fn main() -> io::Result<()> {
             Command::Doctor => {
                 let config_path = xdg_config_dir()?.join("config.json");
                 let settings_path = agy_settings_path()?;
+                let cache_dir = xdg_cache_dir();
+                let path_env = env::var_os("PATH");
                 let mut stdout = io::stdout().lock();
-                return run_doctor(&config_path, &settings_path, no_color, &mut stdout);
+                return run_doctor(
+                    &config_path,
+                    &settings_path,
+                    cache_dir.as_deref(),
+                    path_env.as_deref(),
+                    no_color,
+                    &mut stdout,
+                );
             }
             Command::Stats {
                 days,
@@ -261,12 +267,18 @@ fn main() -> io::Result<()> {
                 return run_tui_config(&config_path);
             }
             Command::Pricing { action } => {
+                let cache_dir = xdg_cache_dir().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "unable to resolve pricing cache directory",
+                    )
+                })?;
                 let (sync, if_stale) = match action {
                     None | Some(PricingCommand::Status) => (false, false),
                     Some(PricingCommand::Sync { if_stale }) => (true, if_stale),
                 };
                 let mut stdout = io::stdout().lock();
-                return run_pricing_command(sync, if_stale, &mut stdout);
+                return run_pricing_command(&cache_dir, sync, if_stale, &mut stdout);
             }
             Command::Version => {
                 println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -298,8 +310,10 @@ fn main() -> io::Result<()> {
     let _ = io::stdin()
         .take(MAX_STDIN_BYTES)
         .read_to_string(&mut input);
-    let git_probe = SystemGitProbe::with_default_cache();
     let cache_dir = xdg_cache_dir();
+    let git_probe = SystemGitProbe {
+        cache_dir: cache_dir.clone(),
+    };
     let agy_cli_dir = resolve_agy_cli_dir();
     let runtime = StatuslineRuntime {
         session: agy_cli_dir

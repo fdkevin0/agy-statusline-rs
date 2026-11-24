@@ -135,7 +135,7 @@ define_widgets! {
     Battle => ("battle", "Battle Mode", 1),
     /// Sandbox status (`sandbox ON` / `sandbox ON+net` / `sandbox off`).
     Sandbox => ("sandbox", "Sandbox Status", 1),
-    /// AGY CLI version (`v1.5.11`).
+    /// AGY CLI version (`v1.5.16`).
     Version => ("version", "AGY Version", 1),
     /// Account subscription tier (`Pro`, `Ultra`, etc.).
     Plan => ("plan", "Plan Tier", 1),

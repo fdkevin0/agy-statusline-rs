@@ -1,9 +1,8 @@
 //! In-memory dataset and dynamic multi-metric query engine for `agy-statusline stats`.
 //!
 //! Scans local SQLite conversation DBs once into [`StatsDataset`], then serves
-//! both backward-compatible [`StatsReport`] generation and sub-millisecond
-//! interactive TUI queries across arbitrary metrics, time ranges, sort orders,
-//! sources, and model filters.
+//! [`StatsReport`] generation and sub-millisecond interactive TUI queries across
+//! arbitrary metrics, time ranges, sort orders, sources, and model filters.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};

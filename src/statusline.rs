@@ -5,7 +5,6 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use serde::Deserialize;
-use serde_json::Value;
 
 use crate::db::{
     open_readonly_db, query_session_metadata_from_conn, query_session_metadata_in,
@@ -13,11 +12,11 @@ use crate::db::{
 };
 use crate::git::{GitInfo, GitProbe};
 use crate::layout::{LayoutConfig, WidgetId};
-use crate::render::{write_statusline_at, CostCoverage};
+use crate::render::write_statusline_at;
 use crate::stats::{
     estimate_conversation_cost_usd_with_parent_conn, is_pricing_fingerprint_fresh,
     lookup_cached_conversation_cost, maybe_spawn_pricing_sync_if_stale,
-    pricing_cache_fingerprint, PricingCatalog, PricingFileFingerprint, SyncMode,
+    pricing_cache_fingerprint, PricingCatalog, SyncMode,
 };
 
 /// Active AI model metadata (`"model": null` before a model is selected).
@@ -135,6 +134,18 @@ pub struct CostInfo {
     pub estimated: Option<bool>,
 }
 
+/// Subagent entry reported in AGY `subagents`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SubagentInfo {
+    /// Subagent name.
+    pub name: Option<String>,
+    /// Subagent role label.
+    pub role: Option<String>,
+    /// Subagent lifecycle status (`running`, `completed`, etc.).
+    pub status: Option<String>,
+}
+
 /// Rolling rate-limit bucket from AGY `quota`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -191,8 +202,8 @@ pub struct StatuslinePayload {
     pub tool_confirmation_pending: Option<bool>,
     /// Number of queued user inputs waiting to be processed.
     pub pending_input_count: Option<u64>,
-    /// Subagent array or null.
-    pub subagents: Option<Value>,
+    /// Active and completed subagents.
+    pub subagents: Option<Vec<SubagentInfo>>,
     /// Active model info (`null` when unset).
     pub model: Option<ModelInfo>,
     /// Git / VCS status (`null` outside repos).
@@ -214,10 +225,7 @@ pub struct StatuslinePayload {
 }
 
 impl StatuslinePayload {
-    /// Returns the number of active subagents when `subagents` is a JSON array.
-    ///
-    /// For objects containing a string `"status"` field, counts only entries where
-    /// `status != "completed"`; entries lacking `"status"` fall back to direct counting.
+    /// Returns the number of active subagents (`status != "completed"`).
     pub(crate) fn subagent_count(&self) -> usize {
         self.active_subagents().count()
     }
@@ -229,31 +237,20 @@ impl StatuslinePayload {
         if iter.next().is_some() {
             return None;
         }
-        let obj = first.as_object()?;
-        obj.get("role")
-            .and_then(Value::as_str)
+        first
+            .role
+            .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .or_else(|| {
-                obj.get("name")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-            })
+            .or_else(|| first.name.as_deref().map(str::trim).filter(|s| !s.is_empty()))
     }
 
-    fn active_subagents(&self) -> impl Iterator<Item = &Value> {
-        self.subagents
-            .as_ref()
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|item| {
-                item.as_object()
-                    .and_then(|obj| obj.get("status"))
-                    .and_then(Value::as_str)
-                    .is_none_or(|status| !status.eq_ignore_ascii_case("completed"))
-            })
+    fn active_subagents(&self) -> impl Iterator<Item = &SubagentInfo> {
+        self.subagents.iter().flatten().filter(|item| {
+            item.status
+                .as_deref()
+                .is_none_or(|status| !status.eq_ignore_ascii_case("completed"))
+        })
     }
 
     /// Returns the trimmed workspace directory path preferring `workspace.current_dir`,
@@ -367,7 +364,7 @@ pub(crate) fn sample_preview_payload(width: usize) -> StatuslinePayload {
         }),
         pending_input_count: Some(1),
         artifact_count: Some(2),
-        subagents: Some(serde_json::json!([1, 2])),
+        subagents: Some(vec![SubagentInfo::default(), SubagentInfo::default()]),
         task_count: Some(3),
         context_window: Some(ContextWindow {
             used_percentage: Some(42.5),
@@ -522,51 +519,6 @@ fn probe_git(payload: &StatuslinePayload, git_probe: &dyn GitProbe, cfg: &Layout
     }
 }
 
-fn estimate_payload_cost_usd(
-    payload: &StatuslinePayload,
-    pricing: &PricingCatalog,
-) -> Option<(f64, CostCoverage)> {
-    let model = payload.model.as_ref()?;
-    let mut candidates = Vec::with_capacity(2);
-    if let Some(id) = model.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        candidates.push(id);
-    }
-    if let Some(disp) = model
-        .display_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        candidates.push(disp);
-    }
-    if candidates.is_empty() {
-        return None;
-    }
-
-    let cw = payload.context_window.as_ref()?;
-    if cw.total_input_tokens.is_some() || cw.total_output_tokens.is_some() {
-        let inp = cw.total_input_tokens.unwrap_or(0);
-        let out = cw.total_output_tokens.unwrap_or(0);
-        if inp > 0 || out > 0 {
-            return pricing
-                .estimate_cost_base_rate(&candidates, inp, 0, 0, out)
-                .map(|(_, usd)| (usd, CostCoverage::Session));
-        }
-    }
-
-    let usage = cw.current_usage.as_ref()?;
-    let inp = usage.input_tokens.unwrap_or(0).max(0) as u64;
-    let cache_read = usage.cache_read_input_tokens.unwrap_or(0).max(0) as u64;
-    let cache_write = usage.cache_creation_input_tokens.unwrap_or(0).max(0) as u64;
-    let out = usage.output_tokens.unwrap_or(0).max(0) as u64;
-    if inp == 0 && cache_read == 0 && cache_write == 0 && out == 0 {
-        return None;
-    }
-    pricing
-        .estimate_cost(&candidates, inp, cache_read, cache_write, out)
-        .map(|(_, usd)| (usd, CostCoverage::LatestTurn))
-}
-
 /// Parses `input` JSON and writes the statusline according to `runtime` and `cfg`.
 ///
 /// # Examples
@@ -620,7 +572,7 @@ pub fn process_statusline<W: Write>(
         && payload.valid_cost_usd().is_none()
         && !matches!(runtime.pricing, PricingSource::Disabled);
 
-    let mut coverage = CostCoverage::Session;
+    let mut unpriced_turns = 0u64;
 
     // Fast path: check bounded LRU conversation cost cache via lstat before parsing pricing JSON
     // or opening any SQLite DB for cost scanning.
@@ -669,44 +621,18 @@ pub fn process_statusline<W: Write>(
     };
 
     if needs_cost {
-        if let Some(cost) = cached_cost {
-            if cost.unpriced_turns > 0 {
-                coverage = CostCoverage::Partial(cost.unpriced_turns);
-            }
-            meta.estimated_cost_usd = cost.usd;
-            meta.estimated_subagent_cost_usd = cost.subagent_usd;
-        } else {
-            let mut estimate_with =
-                |pricing: &PricingCatalog,
-                 cache_target: Option<(&Path, PricingFileFingerprint)>|
-                 -> (Option<f64>, Option<f64>) {
-                    if let Some(cost) = conv_id.and_then(|cid| {
-                        cli_dir.and_then(|dir| {
-                            estimate_conversation_cost_usd_with_parent_conn(
-                                dir,
-                                cid,
-                                pricing,
-                                shared_parent_conn.as_ref(),
-                                cache_target,
-                            )
-                        })
-                    }) {
-                        if cost.unpriced_turns > 0 {
-                            coverage = CostCoverage::Partial(cost.unpriced_turns);
-                        }
-                        return (cost.usd, cost.subagent_usd);
-                    }
-                    match estimate_payload_cost_usd(&payload, pricing) {
-                        Some((usd, source)) => {
-                            coverage = source;
-                            (Some(usd), None)
-                        }
-                        None => (None, None),
-                    }
-                };
-            (meta.estimated_cost_usd, meta.estimated_subagent_cost_usd) = match runtime.pricing {
-                PricingSource::Disabled => (None, None),
-                PricingSource::Catalog(pricing) => estimate_with(pricing, None),
+        let resolved = if let Some(cost) = cached_cost {
+            Some(cost)
+        } else if let (Some(dir), Some(cid)) = (cli_dir, conv_id) {
+            match runtime.pricing {
+                PricingSource::Disabled => None,
+                PricingSource::Catalog(pricing) => estimate_conversation_cost_usd_with_parent_conn(
+                    dir,
+                    cid,
+                    pricing,
+                    shared_parent_conn.as_ref(),
+                    None,
+                ),
                 PricingSource::Effective(mode) => {
                     let pricing = PricingCatalog::load_effective_in(
                         runtime.cache_dir,
@@ -715,10 +641,23 @@ pub fn process_statusline<W: Write>(
                     );
                     let cache_target = runtime
                         .cache_dir
-                        .map(|dir| (dir, pricing_cache_fingerprint(Some(dir))));
-                    estimate_with(&pricing, cache_target)
+                        .map(|cdir| (cdir, pricing_cache_fingerprint(Some(cdir))));
+                    estimate_conversation_cost_usd_with_parent_conn(
+                        dir,
+                        cid,
+                        &pricing,
+                        shared_parent_conn.as_ref(),
+                        cache_target,
+                    )
                 }
-            };
+            }
+        } else {
+            None
+        };
+        if let Some(cost) = resolved {
+            unpriced_turns = cost.unpriced_turns;
+            meta.estimated_cost_usd = cost.usd;
+            meta.estimated_subagent_cost_usd = cost.subagent_usd;
         }
     }
 
@@ -726,7 +665,7 @@ pub fn process_statusline<W: Write>(
         &payload,
         &meta,
         &git_info,
-        coverage,
+        unpriced_turns,
         runtime.now_unix_secs,
         cfg,
         out,
@@ -808,10 +747,6 @@ mod tests {
         assert_eq!(quota["pool-5h"].reset_in_seconds, Some(-15));
         assert_eq!(quota["pool-5h"].disabled, Some(false));
         assert_eq!(quota["pool-7d"].disabled, Some(true));
-
-        let legacy: StatuslinePayload =
-            serde_json::from_str(r#"{"subagents":[1,2,3]}"#).unwrap();
-        assert_eq!(legacy.subagent_count(), 3);
     }
 
     #[test]
