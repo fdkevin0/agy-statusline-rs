@@ -41,7 +41,7 @@ Catalog lookup checks exact model names case-insensitively, then names with norm
 ## Presets & Defaults
 
 - **`full`** *(default, replaces AGY's built-in bar)*: 2-row `Plain` layout (`Default` theme)
-  - **Row 1**: `state`, `mode`, `model`, `directory`, `vcs`, `worktree`, `queue`, `vim`, `battle`
+  - **Row 1**: `state`, `mode`, `model`, `directory`, `vcs`, `worktree`, `queue`, `vim`, `battle`, `version`
   - **Row 2**: `ctx_bar`, `cache_hit`, `speed`, `cost`, `quota_5h`, `quota_weekly`, `subagents`
 - **`powerline`**: 2-row `Powerline` layout (`Catppuccin` theme) — Row 1: `state`, `mode`, `model`, `directory`, `vcs`; Row 2: `ctx_bar`, `cache_hit`, `speed`, `cost`, `quota_5h`.
 - **`minimal`**: 1-row `Plain` layout — `state`, `model`, `vcs`, `ctx_pct`, `cache_hit`, `speed`.

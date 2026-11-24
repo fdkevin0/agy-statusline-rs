@@ -1811,7 +1811,8 @@ mod tests {
     #[test]
     fn preset_full_fits_realistic_session_uncompacted_at_120_cols() {
         let cfg = LayoutConfig::preset_full();
-        let payload = base_compaction_payload(120);
+        let mut payload = base_compaction_payload(120);
+        payload.version = Some("1.5.16".to_string());
         let meta = SessionMetadata {
             speed: Some(82.0),
             max_context_tokens: Some(512_000),
@@ -1838,6 +1839,7 @@ mod tests {
         assert!(row1.contains("Gemini 3.1 Pro Preview · high"), "row1: {row1:?}");
         assert!(row1.contains("agy-statusline"), "row1: {row1:?}");
         assert!(row1.contains("feat/ui* +12 -3"), "row1: {row1:?}");
+        assert!(row1.contains("v1.5.16"), "row1: {row1:?}");
 
         assert!(row2.width() <= 120, "row2 width {} > 120: {row2:?}", row2.width());
         assert!(row2.contains("ctx ████···· 50.0% (256K/512K)"), "row2: {row2:?}");
