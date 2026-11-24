@@ -10,20 +10,20 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use agy_statusline::apply::{
     resolve_invoked_binary_path, run_apply_command, set_statusline_enabled,
 };
-use agy_statusline::db::SqliteSpeedReader;
 use agy_statusline::doctor::run_doctor;
 use agy_statusline::git::SystemGitProbe;
 use agy_statusline::layout::{
     load_layout_config, load_saved_stats_metric, save_layout_config, LayoutConfig, Preset,
 };
 use agy_statusline::paths::{
-    agy_settings_path, resolve_agy_cli_dir, resolve_agy_roots, resolve_home_dir, xdg_cache_dir,
-    xdg_config_dir,
+    agy_settings_path, resolve_agy_cli_dir, resolve_agy_roots, xdg_cache_dir, xdg_config_dir,
 };
 use agy_statusline::stats::{
-    run_pricing_command, run_stats_command_with_metric, run_stats_tui, StatsMetric, SyncMode,
+    run_pricing_command, run_stats_command, run_stats_tui, StatsMetric, StatsOptions, SyncMode,
 };
-use agy_statusline::statusline::{process_statusline, PricingSource, StatuslineRuntime};
+use agy_statusline::statusline::{
+    process_statusline, PricingSource, SessionSource, StatuslineRuntime,
+};
 use agy_statusline::tui::run_tui_config;
 
 const MAX_STDIN_BYTES: u64 = 1024 * 1024;
@@ -201,41 +201,33 @@ fn main() -> io::Result<()> {
                 json,
                 ascii,
             } => {
-                let home = resolve_home_dir();
-                if resolve_agy_roots(home.as_deref()).is_empty() {
+                let roots = resolve_agy_roots();
+                if roots.is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
                         "no AGY data roots found (set HOME, USERPROFILE, ANTIGRAVITY_CLI_HOME, or ANTIGRAVITY_DATA_DIR)",
                     ));
                 }
+                let cache_dir = xdg_cache_dir();
                 let config_path = xdg_config_dir().ok().map(|d| d.join("config.json"));
                 let effective_metric = metric
                     .or_else(|| config_path.as_deref().and_then(load_saved_stats_metric))
                     .unwrap_or_default();
+                let opts = StatsOptions {
+                    cache_dir: cache_dir.as_deref(),
+                    days,
+                    metric: effective_metric,
+                    no_color,
+                    ascii,
+                    now_unix_secs: unix_now_secs(),
+                };
                 let interactive =
                     tui || (!plain && !json && io::stdin().is_terminal() && io::stdout().is_terminal());
                 if interactive {
-                    return run_stats_tui(
-                        home.as_deref(),
-                        config_path.as_deref(),
-                        days,
-                        effective_metric,
-                        no_color,
-                        ascii,
-                        unix_now_secs(),
-                    );
+                    return run_stats_tui(roots, config_path.as_deref(), &opts);
                 }
                 let mut stdout = io::stdout().lock();
-                return run_stats_command_with_metric(
-                    home.as_deref(),
-                    days,
-                    effective_metric,
-                    json,
-                    no_color,
-                    ascii,
-                    unix_now_secs(),
-                    &mut stdout,
-                );
+                return run_stats_command(&roots, &opts, json, &mut stdout);
             }
             Command::Config(args) => {
                 let config_path = xdg_config_dir()?.join("config.json");
@@ -306,15 +298,15 @@ fn main() -> io::Result<()> {
     let _ = io::stdin()
         .take(MAX_STDIN_BYTES)
         .read_to_string(&mut input);
-    let reader = SqliteSpeedReader::default();
     let git_probe = SystemGitProbe::with_default_cache();
     let cache_dir = xdg_cache_dir();
     let agy_cli_dir = resolve_agy_cli_dir();
     let runtime = StatuslineRuntime {
-        reader: &reader,
+        session: agy_cli_dir
+            .as_deref()
+            .map_or(SessionSource::None, SessionSource::LocalDir),
         git_probe: &git_probe,
         cache_dir: cache_dir.as_deref(),
-        agy_cli_dir: agy_cli_dir.as_deref(),
         pricing: PricingSource::Effective(SyncMode::SpawnIfStale),
         now_unix_secs: unix_now_secs(),
     };

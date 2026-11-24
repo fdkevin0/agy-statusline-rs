@@ -606,7 +606,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let raw = Option::<String>::deserialize(deserializer)?;
-    // Ignore removed legacy metric strings (e.g. pre-0.5 custom masks) instead of invalidating config.json.
+    // Ignore unknown metric strings instead of invalidating config.json.
     Ok(raw.and_then(|s| s.parse::<StatsMetric>().ok()))
 }
 

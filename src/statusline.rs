@@ -8,8 +8,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::db::{
-    open_readonly_db, query_session_metadata_from_conn, resolve_conversation_db_path,
-    SessionMetadata, SpeedReader,
+    open_readonly_db, query_session_metadata_from_conn, query_session_metadata_in,
+    resolve_conversation_db_path, SessionMetadata, SpeedReader,
 };
 use crate::git::{GitInfo, GitProbe};
 use crate::layout::{LayoutConfig, WidgetId};
@@ -165,7 +165,7 @@ pub struct StatuslinePayload {
     pub conversation_title: Option<String>,
     /// Filesystem path to the active conversation transcript (`transcript.jsonl`).
     pub transcript_path: Option<String>,
-    /// AGY CLI version string (`"1.5.11"`).
+    /// AGY CLI version string (`"1.5.16"`).
     pub version: Option<String>,
     /// Product name string (e.g. `"Antigravity"`).
     pub product: Option<String>,
@@ -335,7 +335,7 @@ pub(crate) fn sample_preview_payload(width: usize) -> StatuslinePayload {
         session_id: Some("8d0371e1-5a05-423b-a8bc-ed75995f9a8b".to_string()),
         conversation_title: Some("Add AGY payload widgets".to_string()),
         transcript_path: Some("/tmp/agy/logs/transcript.jsonl".to_string()),
-        version: Some("1.5.11".to_string()),
+        version: Some("1.5.16".to_string()),
         product: Some("Antigravity".to_string()),
         cycle_mode: Some("plan".to_string()),
         plan_tier: Some("Pro".to_string()),
@@ -428,16 +428,35 @@ pub enum PricingSource<'a> {
     Effective(SyncMode),
 }
 
+/// Source of session SQLite metadata and conversation cost estimation.
+#[derive(Clone, Copy, Default)]
+pub enum SessionSource<'a> {
+    /// Isolated mode with no local session database.
+    #[default]
+    None,
+    /// Local AGY CLI directory (`~/.gemini/antigravity-cli`) owning `conversations/*.db`.
+    LocalDir(&'a Path),
+    /// Custom [`SpeedReader`] override for isolated unit tests.
+    Reader(&'a dyn SpeedReader),
+}
+
+impl<'a> SessionSource<'a> {
+    fn local_cli_dir(self) -> Option<&'a Path> {
+        match self {
+            Self::LocalDir(dir) => Some(dir),
+            Self::None | Self::Reader(_) => None,
+        }
+    }
+}
+
 /// Explicit runtime dependencies for [`process_statusline`].
 pub struct StatuslineRuntime<'a> {
-    /// Session SQLite metadata reader.
-    pub reader: &'a dyn SpeedReader,
+    /// Session SQLite directory or custom metadata reader.
+    pub session: SessionSource<'a>,
     /// Git branch/worktree/diff probe.
     pub git_probe: &'a dyn GitProbe,
     /// Optional statusline cache directory (`models_dev_pricing.json`, `conv_cost_cache.json`).
     pub cache_dir: Option<&'a Path>,
-    /// Optional AGY CLI directory (`~/.gemini/antigravity-cli`) for session sniffing and cost estimation.
-    pub agy_cli_dir: Option<&'a Path>,
     /// Pricing source for fallback cost estimation when `cost.total_usd` is absent.
     pub pricing: PricingSource<'a>,
     /// Current Unix epoch timestamp in seconds.
@@ -445,13 +464,12 @@ pub struct StatuslineRuntime<'a> {
 }
 
 impl<'a> StatuslineRuntime<'a> {
-    /// Constructs an isolated runtime with no disk caches, no global AGY directory, and pricing disabled.
+    /// Constructs an isolated runtime with a custom reader, no disk caches, and pricing disabled.
     pub fn minimal(reader: &'a dyn SpeedReader, git_probe: &'a dyn GitProbe) -> Self {
         Self {
-            reader,
+            session: SessionSource::Reader(reader),
             git_probe,
             cache_dir: None,
-            agy_cli_dir: None,
             pricing: PricingSource::Disabled,
             now_unix_secs: 0,
         }
@@ -470,18 +488,6 @@ fn layout_needs_session_metadata(cfg: &LayoutConfig) -> bool {
                 | WidgetId::CtxTokens
         )
     })
-}
-
-fn read_session_metadata(
-    conv_id: Option<&str>,
-    cli_dir: Option<&Path>,
-    reader: &dyn SpeedReader,
-) -> SessionMetadata {
-    match (conv_id, cli_dir) {
-        (Some(id), Some(dir)) => reader.session_metadata_in(dir, id),
-        (Some(id), None) => reader.session_metadata(id),
-        (None, _) => SessionMetadata::default(),
-    }
 }
 
 fn probe_git(payload: &StatuslinePayload, git_probe: &dyn GitProbe, cfg: &LayoutConfig) -> GitInfo {
@@ -606,7 +612,7 @@ pub fn process_statusline<W: Write>(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let cli_dir = runtime.agy_cli_dir;
+    let cli_dir = runtime.session.local_cli_dir();
     let git_info = probe_git(&payload, runtime.git_probe, cfg);
 
     let needs_meta = layout_needs_session_metadata(cfg);
@@ -639,12 +645,8 @@ pub fn process_statusline<W: Write>(
     };
 
     // Reuse a single read-only parent SQLite connection when both metadata and uncached SQLite
-    // cost read the same local conversation DB via SqliteSpeedReader.
-    let shared_parent_conn = if needs_meta
-        && needs_cost
-        && cached_cost.is_none()
-        && runtime.reader.uses_local_sqlite()
-    {
+    // cost read the same local conversation DB.
+    let shared_parent_conn = if needs_meta && needs_cost && cached_cost.is_none() {
         match (cli_dir, conv_id) {
             (Some(cli_dir), Some(cid)) => resolve_conversation_db_path(cli_dir, cid)
                 .and_then(|db_path| open_readonly_db(&db_path).ok()),
@@ -657,7 +659,11 @@ pub fn process_statusline<W: Write>(
     let mut meta = if let Some(conn) = shared_parent_conn.as_ref() {
         query_session_metadata_from_conn(conn)
     } else if needs_meta {
-        read_session_metadata(conv_id, cli_dir, runtime.reader)
+        match (runtime.session, conv_id) {
+            (SessionSource::LocalDir(dir), Some(id)) => query_session_metadata_in(dir, id),
+            (SessionSource::Reader(reader), Some(id)) => reader.session_metadata(id),
+            _ => SessionMetadata::default(),
+        }
     } else {
         SessionMetadata::default()
     };
@@ -970,14 +976,12 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let reader = StubReader(None);
         let git = NoopGit;
         let pricing = PricingCatalog::default();
         let runtime = StatuslineRuntime {
-            reader: &reader,
+            session: SessionSource::LocalDir(dir.path()),
             git_probe: &git,
             cache_dir: None,
-            agy_cli_dir: Some(dir.path()),
             pricing: PricingSource::Catalog(&pricing),
             now_unix_secs: 0,
         };
@@ -1085,13 +1089,11 @@ mod tests {
             .unwrap();
         drop(summaries);
 
-        let reader = crate::db::SqliteSpeedReader::default();
         let git = NoopGit;
         let runtime = StatuslineRuntime {
-            reader: &reader,
+            session: SessionSource::LocalDir(&cli_dir),
             git_probe: &git,
             cache_dir: Some(&cache_dir),
-            agy_cli_dir: Some(&cli_dir),
             pricing: PricingSource::Effective(SyncMode::Offline),
             now_unix_secs: 1_700_000_000,
         };

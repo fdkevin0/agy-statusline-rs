@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,9 +11,9 @@ use super::tz::TimeZoneSpec;
 use super::SqliteStats;
 use crate::db::{
     compute_median, is_absent_or_real_file, is_real_dir, is_safe_sqlite_file, is_valid_uuid,
-    open_readonly_db, resolve_conversation_db_path, sidecar_path,
+    open_readonly_db, resolve_conversation_db_path, safe_sqlite_metadata, sidecar_path,
 };
-use crate::fsutil::atomic_write;
+use crate::fsutil::{atomic_write, modified_timestamp};
 use crate::protobuf::{
     extract_gen_metadata_record, extract_step_metadata_record, extract_trajectory_created_at_secs,
     MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
@@ -134,19 +133,6 @@ struct DbFileFingerprint {
     wal_ctime_secs: i64,
     wal_ctime_nanos: u32,
     wal_size: u64,
-}
-
-fn modified_timestamp(meta: &fs::Metadata) -> (i64, u32) {
-    match meta.modified() {
-        Ok(t) => match t.duration_since(UNIX_EPOCH) {
-            Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
-            Err(e) => {
-                let d = e.duration();
-                (-(d.as_secs() as i64), d.subsec_nanos())
-            }
-        },
-        Err(_) => (0, 0),
-    }
 }
 
 #[cfg(unix)]
@@ -276,12 +262,6 @@ impl RawTurn {
             (7, self.id_7.as_deref()),
         ]
     }
-}
-
-#[derive(Debug, Clone)]
-struct RawConversationScan {
-    source: &'static str,
-    turns: Vec<RawTurn>,
 }
 
 struct UnionFind {
@@ -468,13 +448,10 @@ fn discover_sqlite_db_targets(roots: &[(&'static str, PathBuf)]) -> Vec<DbTarget
                 continue;
             }
             let path = entry.path();
-            if !is_safe_sqlite_file(&path) {
+            let Some(meta) = safe_sqlite_metadata(&path) else {
                 continue;
-            }
-            let db_mtime_secs = fs::symlink_metadata(&path)
-                .ok()
-                .map(|m| modified_timestamp(&m).0)
-                .filter(|&secs| secs > 0);
+            };
+            let db_mtime_secs = Some(modified_timestamp(&meta).0).filter(|&secs| secs > 0);
             let real = canonical_or_self(&path);
             if seen_dbs.insert(real) {
                 targets.push(DbTarget {
@@ -735,17 +712,13 @@ fn extract_sqlite_db_turns(
     Some(deduplicate_raw_turns(turns))
 }
 
-fn scan_single_sqlite_db_raw(target: &DbTarget) -> Option<RawConversationScan> {
+fn scan_single_sqlite_db_raw(target: &DbTarget) -> Option<(&'static str, Vec<RawTurn>)> {
     let conn = open_readonly_db(&target.path).ok()?;
     let turns = extract_sqlite_db_turns(&conn, target.db_mtime_secs)?;
-
-    Some(RawConversationScan {
-        source: target.source,
-        turns,
-    })
+    Some((target.source, turns))
 }
 
-fn scan_sqlite_targets_raw(targets: &[DbTarget]) -> Vec<RawConversationScan> {
+fn scan_sqlite_targets_raw(targets: &[DbTarget]) -> Vec<(&'static str, Vec<RawTurn>)> {
     let workers = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .clamp(1, 8);
@@ -1217,7 +1190,7 @@ pub(super) fn scan_sqlite_conversations(
     let targets = discover_sqlite_db_targets(roots);
     let scanned = scan_sqlite_targets_raw(&targets);
     project_sqlite_conversations(
-        scanned.iter().map(|s| (s.source, s.turns.as_slice())),
+        scanned.iter().map(|(source, turns)| (*source, turns.as_slice())),
         tz,
         pricing,
     )

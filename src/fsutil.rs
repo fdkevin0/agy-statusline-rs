@@ -3,6 +3,21 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
+use std::time::UNIX_EPOCH;
+
+/// Extracts a file's modification time as signed Unix `(secs, nanos)`.
+pub(crate) fn modified_timestamp(meta: &fs::Metadata) -> (i64, u32) {
+    match meta.modified() {
+        Ok(t) => match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+            Err(e) => {
+                let d = e.duration();
+                (-(d.as_secs() as i64), d.subsec_nanos())
+            }
+        },
+        Err(_) => (0, 0),
+    }
+}
 
 fn atomic_write_impl(
     target: &Path,

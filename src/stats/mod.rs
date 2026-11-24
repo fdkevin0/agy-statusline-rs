@@ -15,7 +15,7 @@ mod tz;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -289,45 +289,35 @@ fn collect_stats_with_tz(
     StatsDataset::collect_for_roots(&roots, now_unix_secs, tz, &pricing).to_report(days)
 }
 
-/// Runs the non-interactive `agy-statusline stats` subcommand (`--plain` / `--json` / piped).
-pub fn run_stats_command<W: Write>(
-    home: Option<&Path>,
-    days: Option<u32>,
-    json: bool,
-    no_color: bool,
-    ascii: bool,
-    now_unix_secs: u64,
-    out: &mut W,
-) -> io::Result<()> {
-    run_stats_command_with_metric(
-        home,
-        days,
-        StatsMetric::Total,
-        json,
-        no_color,
-        ascii,
-        now_unix_secs,
-        out,
-    )
+/// Shared runtime options for `agy-statusline stats` (static output and interactive TUI).
+#[derive(Debug, Clone, Copy)]
+pub struct StatsOptions<'a> {
+    /// Optional XDG cache directory for `models_dev_pricing.json`.
+    pub cache_dir: Option<&'a Path>,
+    /// Optional trailing day window (`--days N`).
+    pub days: Option<u32>,
+    /// Primary aggregation metric (`--metric`).
+    pub metric: StatsMetric,
+    /// Disable ANSI color escapes (`NO_COLOR`).
+    pub no_color: bool,
+    /// Use pure 7-bit ASCII characters (`--ascii`).
+    pub ascii: bool,
+    /// Reference Unix epoch timestamp in seconds.
+    pub now_unix_secs: u64,
 }
 
-/// Runs the non-interactive `agy-statusline stats` subcommand with an explicit [`StatsMetric`].
-#[allow(clippy::too_many_arguments)]
-pub fn run_stats_command_with_metric<W: Write>(
-    home: Option<&Path>,
-    days: Option<u32>,
-    metric: StatsMetric,
+/// Runs the non-interactive `agy-statusline stats` subcommand (`--plain` / `--json` / piped).
+pub fn run_stats_command<W: Write>(
+    roots: &[(&'static str, PathBuf)],
+    opts: &StatsOptions<'_>,
     json: bool,
-    no_color: bool,
-    ascii: bool,
-    now_unix_secs: u64,
     out: &mut W,
 ) -> io::Result<()> {
-    let dataset = StatsDataset::collect_from_env(home, now_unix_secs);
+    let dataset = StatsDataset::collect(roots, opts.cache_dir, opts.now_unix_secs);
     let report = if json {
-        dataset.to_report(days)
+        dataset.to_report(opts.days)
     } else {
-        dataset.to_report_with_metric(days, metric)
+        dataset.to_report_with_metric(opts.days, opts.metric)
     };
 
     if json {
@@ -337,14 +327,17 @@ pub fn run_stats_command_with_metric<W: Write>(
         return Ok(());
     }
 
-    let metric_heatmap = (metric != StatsMetric::Total)
-        .then(|| dataset.build_metric_heatmap(metric, SourceFilter::All, None).0);
+    let metric_heatmap = (opts.metric != StatsMetric::Total).then(|| {
+        dataset
+            .build_metric_heatmap(opts.metric, SourceFilter::All, None)
+            .0
+    });
     render_stats_report_with_metric(
         &report,
-        metric,
+        opts.metric,
         metric_heatmap.as_deref(),
-        no_color,
-        ascii,
+        opts.no_color,
+        opts.ascii,
         out,
     )
 }

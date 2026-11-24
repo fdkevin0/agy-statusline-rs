@@ -19,12 +19,6 @@ const STRUCTURAL_NOISE_TOKENS: &[&str] = &["wtu", "quota", "pool", "limit"];
 pub(crate) struct QuotaView {
     /// Dynamic bucket label (e.g. `"5h"`, `"3p 5h"`, `"7d"`, `"3p 7d"`, `"24h"`).
     pub(crate) label: String,
-    /// Raw bucket identifier key from `payload.quota`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) bucket_key: String,
-    /// Parsed rolling window duration in seconds.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) window_secs: u64,
     /// Remaining quota percentage (`0.0..=100.0`).
     pub(crate) remaining_pct: f64,
     /// Remaining credit units when `remaining_fraction` is absent and `remaining_amount >= 0`.
@@ -243,7 +237,6 @@ fn resolve_remaining_reset_secs(
 }
 
 fn build_quota_view(
-    key: &str,
     desc: &BucketDescriptor,
     bucket: &QuotaBucket,
     now_unix_secs: u64,
@@ -270,8 +263,6 @@ fn build_quota_view(
     Some((
         QuotaView {
             label: synthesize_label(desc),
-            bucket_key: key.to_string(),
-            window_secs: desc.window_secs,
             remaining_pct,
             remaining_amount,
             reset_compact,
@@ -294,7 +285,7 @@ enum ModelAffinity {
 
 fn resolve_model_affinity(
     model_tokens: &BTreeSet<String>,
-    all_descriptors: &[(&str, BucketDescriptor, &QuotaBucket)],
+    all_descriptors: &[(BucketDescriptor, &QuotaBucket)],
 ) -> ModelAffinity {
     if model_tokens.is_empty() {
         return ModelAffinity::Unknown;
@@ -303,7 +294,7 @@ fn resolve_model_affinity(
     // Infer 1p provider affinity across both active and disabled buckets so disabling all
     // 1p buckets for a model still identifies it as 1p instead of falling back to `3p-*`.
     let mut effective_providers = BTreeSet::new();
-    for (_, desc, _) in all_descriptors {
+    for (desc, _) in all_descriptors {
         let Some(ref p) = desc.provider else {
             continue;
         };
@@ -446,24 +437,22 @@ pub(crate) fn resolve_quota_views(
     };
     let model_tokens = collect_model_tokens(payload);
 
-    let all_descriptors: Vec<(&str, BucketDescriptor, &QuotaBucket)> = quota
+    let all_descriptors: Vec<(BucketDescriptor, &QuotaBucket)> = quota
         .iter()
-        .filter_map(|(key, bucket)| {
-            parse_bucket_descriptor(key).map(|desc| (key.as_str(), desc, bucket))
-        })
+        .filter_map(|(key, bucket)| parse_bucket_descriptor(key).map(|desc| (desc, bucket)))
         .collect();
     let affinity = resolve_model_affinity(&model_tokens, &all_descriptors);
 
     let mut best_short: Option<Candidate> = None;
     let mut best_multi: Option<Candidate> = None;
-    for (key, desc, bucket) in all_descriptors {
+    for (desc, bucket) in all_descriptors {
         if bucket.disabled == Some(true) {
             continue;
         }
         let Some(score) = score_bucket(&desc, &model_tokens, &affinity) else {
             continue;
         };
-        let Some((view, has_frac)) = build_quota_view(key, &desc, bucket, now_unix_secs) else {
+        let Some((view, has_frac)) = build_quota_view(&desc, bucket, now_unix_secs) else {
             continue;
         };
         let cand = Candidate {
@@ -568,16 +557,12 @@ mod tests {
         };
         let q5 = resolve_quota_5h_at(&acme_payload, 0).unwrap();
         assert_eq!(q5.label, "5h");
-        assert_eq!(q5.bucket_key, "acme-5h");
-        assert_eq!(q5.window_secs, 18_000);
         assert!((q5.remaining_pct - 40.0).abs() < 1e-6);
         assert_eq!(q5.reset_compact.as_deref(), Some("4h"));
         assert!(q5.pace_behind);
 
         let qw = resolve_quota_weekly_at(&acme_payload, 0).unwrap();
         assert_eq!(qw.label, "tier1");
-        assert_eq!(qw.bucket_key, "acme-tier1-wtu-weekly");
-        assert_eq!(qw.window_secs, 604_800);
         assert_eq!(qw.reset_compact.as_deref(), Some("6d11h"));
         assert!(!qw.pace_behind);
 
@@ -700,7 +685,8 @@ mod tests {
         };
 
         let q5 = resolve_quota_5h_at(&payload, now).unwrap();
-        assert_eq!(q5.bucket_key, "acme-5h");
+        assert_eq!(q5.label, "5h");
+        assert!((q5.remaining_pct - 10.0).abs() < 1e-6);
         assert_eq!(q5.reset_compact, None);
         assert!(!q5.pace_behind);
 
@@ -826,13 +812,11 @@ mod tests {
         };
         let c_short = resolve_quota_5h_at(&custom_payload, 0).unwrap();
         assert_eq!(c_short.label, "1h");
-        assert_eq!(c_short.window_secs, 3_600);
         assert_eq!(c_short.remaining_amount, Some(450));
         assert!(!c_short.pace_behind);
 
         let c_day = resolve_quota_weekly_at(&custom_payload, 0).unwrap();
         assert_eq!(c_day.label, "24h");
-        assert_eq!(c_day.window_secs, 86_400);
     }
 
     #[test]
@@ -909,7 +893,6 @@ mod tests {
         };
         let tw = resolve_quota_weekly_at(&third_party, 0).unwrap();
         assert_eq!(tw.label, "3p 7d");
-        assert_eq!(tw.bucket_key, "3p-beta-weekly");
         assert!((tw.remaining_pct - 55.0).abs() < 1e-6);
     }
 
@@ -1071,8 +1054,7 @@ mod tests {
         };
         let qm = resolve_quota_weekly_at(&acme_monthly, 0).unwrap();
         assert_eq!(qm.label, "mo");
-        assert_eq!(qm.window_secs, 30 * SECS_PER_DAY);
-        assert_eq!(qm.bucket_key, "acme-monthly");
+        assert!((qm.remaining_pct - 75.0).abs() < 1e-6);
 
         let third_party_month = StatuslinePayload {
             model: Some(ModelInfo {
@@ -1091,7 +1073,7 @@ mod tests {
         };
         let q3m = resolve_quota_weekly_at(&third_party_month, 0).unwrap();
         assert_eq!(q3m.label, "3p mo");
-        assert_eq!(q3m.window_secs, 30 * SECS_PER_DAY);
+        assert!((q3m.remaining_pct - 50.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1168,10 +1150,10 @@ mod tests {
             ..Default::default()
         };
         let q5 = resolve_quota_5h_at(&third_party, 0).unwrap();
-        assert_eq!(q5.bucket_key, "3p-5h");
         assert_eq!(q5.label, "3p 5h");
+        assert!((q5.remaining_pct - 80.0).abs() < 1e-6);
         let qw = resolve_quota_weekly_at(&third_party, 0).unwrap();
-        assert_eq!(qw.bucket_key, "3p-weekly");
         assert_eq!(qw.label, "3p 7d");
+        assert!((qw.remaining_pct - 75.0).abs() < 1e-6);
     }
 }

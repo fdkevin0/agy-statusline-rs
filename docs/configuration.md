@@ -20,7 +20,7 @@ Requires **Antigravity CLI `>= 1.5.15`** (and **Antigravity Desktop `>= 2.35.0`*
 
 ## Usage Pricing
 
-Native AGY costs take precedence. For estimates, the CLI uses the `models.dev` catalog cached for 24 hours. `stats` refreshes stale rates before reporting, and the statusline can refresh them in the background. Existing hand-written `pricing.json` files are ignored.
+Native AGY costs take precedence. For estimates, the CLI uses the `models.dev` catalog cached for 24 hours. `stats` refreshes stale rates before reporting, and the statusline can refresh them in the background.
 
 Catalog lookup checks exact model names case-insensitively, then names with normalized punctuation and spacing, then the longest matching substring. Within each exact-match stage, the model ID precedes the display name, and canonical provider rates take precedence over reseller punctuation variants. When prompt context tokens exceed a `models.dev` context-length tier threshold (`tiers` / `context_over_200k`), the corresponding tier rates are applied. When direct matching finds no rate for an Orchestrator name, explicit post-`orchestrator` codenames are resolved dynamically against canonical unprefixed `gemini-<major>[.<minor>]-<codename>` catalog entries (honoring any explicit pre-`orchestrator` generation or selecting the latest generation, without cross-tier fallback). In `stats`, turns with generic display names can additionally inherit a rate when the same `response_model` unambiguously resolves to a single catalog entry elsewhere in the dataset.
 

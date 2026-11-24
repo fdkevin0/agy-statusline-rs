@@ -15,17 +15,6 @@ use common::{
 
 fn seed_sqlite_fixtures(cli_root: &Path, today_secs: u64, old_secs: u64) {
     let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
-    let transcript_path = cli_root
-        .join("brain")
-        .join(uuid)
-        .join(".system_generated/logs/transcript.jsonl");
-    fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
-    let today_date = unix_secs_to_utc_date(today_secs);
-    let covered_dup = format!(
-        r#"{{"created_at":"{today_date}T00:01:00Z","step_index":1,"input_tokens":99999,"output_tokens":999,"cache_read_tokens":0}}"#
-    );
-    fs::write(&transcript_path, format!("{covered_dup}\n")).unwrap();
-
     let db_path = cli_root.join("conversations").join(format!("{uuid}.db"));
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let conn = Connection::open(&db_path).unwrap();
@@ -139,20 +128,12 @@ fn cli_stats_renders_text_no_color_and_json_in_isolated_home() {
 }
 
 #[test]
-fn cli_stats_prices_custom_agy_home_from_cache_and_ignores_legacy_rates() {
+fn cli_stats_prices_custom_cli_home_from_cache() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let custom_cli = home.join("custom-agy-cli");
     let now_secs = unix_now_secs();
     seed_sqlite_fixtures(&custom_cli, now_secs, now_secs.saturating_sub(15 * 86_400));
-
-    let pricing_file = home.join("config/agy-statusline/pricing.json");
-    fs::create_dir_all(pricing_file.parent().unwrap()).unwrap();
-    fs::write(
-        &pricing_file,
-        r#"{"models":{"model-alpha":{"input_per_mtok":2.0,"cache_read_per_mtok":0.2,"output_per_mtok":10.0},"model-beta":{"input_per_mtok":5.0,"output_per_mtok":20.0}}}"#,
-    )
-    .unwrap();
 
     seed_alpha_rate(home);
     let out = isolated_agy_cmd(home)

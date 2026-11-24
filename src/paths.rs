@@ -15,16 +15,6 @@ fn resolve_home_dir_from(home: Option<OsString>, userprofile: Option<OsString>) 
     non_empty_path(home).or_else(|| non_empty_path(userprofile))
 }
 
-fn resolve_effective_home(
-    explicit: Option<&Path>,
-    env_home: Option<OsString>,
-    env_userprofile: Option<OsString>,
-) -> Option<PathBuf> {
-    explicit
-        .map(Path::to_path_buf)
-        .or_else(|| resolve_home_dir_from(env_home, env_userprofile))
-}
-
 /// Expands a leading `~` or `~/` (and `~\` on Windows) against `home`.
 ///
 /// Leaves empty strings, `~user/...` paths, and inputs with `home == None` unchanged.
@@ -120,16 +110,10 @@ pub fn resolve_agy_roots_from(
     roots
 }
 
-/// Resolves the effective home directory, never letting ambient `HOME`/`USERPROFILE`
-/// preempt an explicit `Some(home)` override.
-pub(crate) fn resolve_effective_home_env(home: Option<&Path>) -> Option<PathBuf> {
-    resolve_effective_home(home, env::var_os("HOME"), env::var_os("USERPROFILE"))
-}
-
-/// Resolves all AGY data roots for `home` (falling back to `HOME`/`USERPROFILE` only when
-/// `home` is `None`) together with `ANTIGRAVITY_CLI_HOME` and `ANTIGRAVITY_DATA_DIR`.
-pub fn resolve_agy_roots(home: Option<&Path>) -> Vec<(&'static str, PathBuf)> {
-    let resolved_home = resolve_effective_home_env(home);
+/// Resolves all AGY data roots from `HOME`/`USERPROFILE`, `ANTIGRAVITY_CLI_HOME`,
+/// and `ANTIGRAVITY_DATA_DIR`.
+pub fn resolve_agy_roots() -> Vec<(&'static str, PathBuf)> {
+    let resolved_home = resolve_home_dir();
     let data_dir = env::var_os("ANTIGRAVITY_DATA_DIR");
     let cli_home = env::var_os("ANTIGRAVITY_CLI_HOME");
     resolve_agy_roots_from(
@@ -298,24 +282,6 @@ mod tests {
             PathBuf::from("/abs/path")
         );
         assert_eq!(expand_tilde("~/sub/dir", None), PathBuf::from("~/sub/dir"));
-    }
-
-    #[test]
-    fn resolve_effective_home_never_lets_ambient_env_preempt_explicit_home() {
-        let explicit = Path::new("/isolated/home");
-        assert_eq!(
-            resolve_effective_home(Some(explicit), os("/ambient/home"), os("/ambient/user")),
-            Some(PathBuf::from("/isolated/home"))
-        );
-        assert_eq!(
-            resolve_effective_home(None, os("/ambient/home"), os("/ambient/user")),
-            Some(PathBuf::from("/ambient/home"))
-        );
-        assert_eq!(
-            resolve_effective_home(None, os(""), os("/ambient/user")),
-            Some(PathBuf::from("/ambient/user"))
-        );
-        assert_eq!(resolve_effective_home(None, None, None), None);
     }
 
     #[test]

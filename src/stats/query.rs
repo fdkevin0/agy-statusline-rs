@@ -20,7 +20,6 @@ use super::{
     ModelStats, PeriodSummary, SqliteStats, StatsReport, WindowSummaries, DAYS_PER_WEEK,
 };
 use crate::db::compute_median;
-use crate::paths::{resolve_agy_roots, resolve_effective_home_env, xdg_cache_dir};
 use crate::timeutil::civil_date_from_unix_day;
 
 pub(super) const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -380,21 +379,21 @@ fn finish_day_row(
 }
 
 impl StatsDataset {
-    /// Scans all AGY SQLite conversation roots resolved from the ambient environment and `home`.
-    pub fn collect_from_env(home: Option<&Path>, now_unix_secs: u64) -> Self {
-        let effective_home = resolve_effective_home_env(home);
-        let roots = resolve_agy_roots(effective_home.as_deref());
-        let cache_dir =
-            xdg_cache_dir().or_else(|| home.map(|h| h.join(".cache").join("agy-statusline")));
+    /// Scans the given AGY SQLite roots using the local timezone and `models.dev` pricing cache.
+    pub fn collect(
+        roots: &[(&'static str, PathBuf)],
+        cache_dir: Option<&Path>,
+        now_unix_secs: u64,
+    ) -> Self {
         let pricing = PricingCatalog::load_effective_with(
-            cache_dir.as_deref(),
+            cache_dir,
             SyncMode::BlockingIfStale,
             now_unix_secs,
             DEFAULT_PRICING_TTL_SECS,
             fetch_models_dev_via_curl,
         );
         let tz = TimeZoneSpec::local();
-        Self::collect_for_roots(&roots, now_unix_secs, &tz, &pricing)
+        Self::collect_for_roots(roots, now_unix_secs, &tz, &pricing)
     }
 
     /// Scans explicit SQLite roots with an explicit timezone and pricing catalog.

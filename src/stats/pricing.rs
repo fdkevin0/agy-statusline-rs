@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::scan::is_effort_token;
-use crate::fsutil::atomic_write;
+use crate::fsutil::{atomic_write, modified_timestamp};
 use crate::paths::xdg_cache_dir;
 use crate::timeutil::{unix_now_secs, SECS_PER_DAY};
 
@@ -45,16 +45,7 @@ pub(crate) fn pricing_cache_fingerprint(cache_dir: Option<&Path>) -> PricingFile
     if !meta.is_file() {
         return PricingFileFingerprint::default();
     }
-    let (mtime_secs, mtime_nanos) = match meta.modified() {
-        Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
-            Err(e) => {
-                let d = e.duration();
-                (-(d.as_secs() as i64), d.subsec_nanos())
-            }
-        },
-        Err(_) => (0, 0),
-    };
+    let (mtime_secs, mtime_nanos) = modified_timestamp(&meta);
     PricingFileFingerprint {
         exists: true,
         mtime_secs,
@@ -211,22 +202,14 @@ impl PricingCatalog {
         }
     }
 
-    /// Loads rates from `cache_dir` (falling back to the XDG cache dir when `None`) using `mode`.
+    /// Loads rates from an explicit `cache_dir` using `mode` (returns empty catalog when `None`).
     pub(crate) fn load_effective_in(
         cache_dir: Option<&Path>,
         mode: SyncMode,
         now_secs: u64,
     ) -> Self {
-        let fallback_dir;
-        let effective_dir = match cache_dir {
-            Some(dir) => Some(dir),
-            None => {
-                fallback_dir = xdg_cache_dir();
-                fallback_dir.as_deref()
-            }
-        };
         Self::load_effective_with(
-            effective_dir,
+            cache_dir,
             mode,
             now_secs,
             DEFAULT_PRICING_TTL_SECS,
