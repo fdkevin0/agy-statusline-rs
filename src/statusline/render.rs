@@ -13,7 +13,7 @@ use crate::statusline::metrics::{
     current_context_tokens, resolve_quota_views, valid_cache_usage, QuotaView,
 };
 use crate::statusline::theme::{glyphs_for, palette_for, GlyphSet, Palette};
-use crate::statusline::StatuslinePayload;
+use crate::statusline::{valid_cost_usd, StatuslinePayload};
 use crate::sys::time::unix_now_secs;
 
 use emit::{compute_geometry, StyleGeometry};
@@ -183,7 +183,7 @@ impl<'a> RenderContext<'a> {
             } else {
                 DEFAULT_SPEED_WARN_THRESHOLD
             };
-        let cost = if let Some(total_usd) = payload.valid_cost_usd() {
+        let cost = if let Some(total_usd) = valid_cost_usd(payload) {
             let payload_cost = payload.cost.as_ref();
             Some(ResolvedCost::Payload {
                 total_usd,

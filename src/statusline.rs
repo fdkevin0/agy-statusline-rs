@@ -230,94 +230,106 @@ pub struct StatuslinePayload {
     pub quota: Option<BTreeMap<String, QuotaBucket>>,
 }
 
-impl StatuslinePayload {
-    /// Returns the number of active subagents (`status != "completed"`).
-    pub(crate) fn subagent_count(&self) -> usize {
-        self.active_subagents().count()
-    }
+/// Returns the number of active subagents (`status != "completed"`).
+pub(crate) fn subagent_count(payload: &StatuslinePayload) -> usize {
+    active_subagents(payload).count()
+}
 
-    /// Returns the role or name of the sole active subagent when `subagent_count() == 1`.
-    pub(crate) fn single_active_subagent_label(&self) -> Option<&str> {
-        let mut iter = self.active_subagents();
-        let first = iter.next()?;
-        if iter.next().is_some() {
-            return None;
-        }
-        first
-            .role
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                first
-                    .name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-            })
+/// Returns the role or name of the sole active subagent when `subagent_count() == 1`.
+pub(crate) fn single_active_subagent_label(payload: &StatuslinePayload) -> Option<&str> {
+    let mut iter = active_subagents(payload);
+    let first = iter.next()?;
+    if iter.next().is_some() {
+        return None;
     }
-
-    fn active_subagents(&self) -> impl Iterator<Item = &SubagentInfo> {
-        self.subagents.iter().flatten().filter(|item| {
-            item.status
+    first
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            first
+                .name
                 .as_deref()
-                .is_none_or(|status| !status.eq_ignore_ascii_case("completed"))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
         })
-    }
+}
 
-    /// Returns the trimmed workspace directory path preferring `workspace.current_dir`,
-    /// then `workspace.project_dir`, then top-level `cwd`.
-    fn workspace_path(&self) -> Option<&str> {
-        self.workspace
-            .as_ref()
-            .and_then(|ws| {
-                ws.current_dir
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        ws.project_dir
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                    })
-            })
-            .or_else(|| self.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()))
-    }
+fn active_subagents(payload: &StatuslinePayload) -> impl Iterator<Item = &SubagentInfo> {
+    payload.subagents.iter().flatten().filter(|item| {
+        item.status
+            .as_deref()
+            .is_none_or(|status| !status.eq_ignore_ascii_case("completed"))
+    })
+}
 
-    /// Returns a validated non-negative finite `cost.total_usd`, if present.
-    pub(crate) fn valid_cost_usd(&self) -> Option<f64> {
-        self.cost
-            .as_ref()?
-            .total_usd
-            .filter(|v| v.is_finite() && *v >= 0.0)
-    }
+/// Returns the trimmed workspace directory path preferring `workspace.current_dir`,
+/// then `workspace.project_dir`, then top-level `cwd`.
+fn workspace_path(payload: &StatuslinePayload) -> Option<&str> {
+    payload
+        .workspace
+        .as_ref()
+        .and_then(|ws| {
+            ws.current_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    ws.project_dir
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+        })
+        .or_else(|| {
+            payload
+                .cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+}
 
-    /// Returns the directory basename preferring `workspace.project_dir`,
-    /// then `workspace.current_dir`, then top-level `cwd`.
-    pub(crate) fn workspace_basename(&self) -> Option<&str> {
-        let raw = self
-            .workspace
-            .as_ref()
-            .and_then(|ws| {
-                ws.project_dir
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        ws.current_dir
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                    })
-            })
-            .or_else(|| self.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()))?;
-        Path::new(raw)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|s| !s.is_empty())
-            .or(Some(raw))
-    }
+/// Returns a validated non-negative finite `cost.total_usd`, if present.
+pub(crate) fn valid_cost_usd(payload: &StatuslinePayload) -> Option<f64> {
+    payload
+        .cost
+        .as_ref()?
+        .total_usd
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// Returns the directory basename preferring `workspace.project_dir`,
+/// then `workspace.current_dir`, then top-level `cwd`.
+pub(crate) fn workspace_basename(payload: &StatuslinePayload) -> Option<&str> {
+    let raw = payload
+        .workspace
+        .as_ref()
+        .and_then(|ws| {
+            ws.project_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    ws.current_dir
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+        })
+        .or_else(|| {
+            payload
+                .cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })?;
+    Path::new(raw)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .or(Some(raw))
 }
 
 /// Builds a rich sample payload used for live preview and `doctor`.
@@ -523,8 +535,7 @@ fn probe_git(payload: &StatuslinePayload, git_probe: &dyn GitProbe, cfg: &Layout
     let needs_git = !explicit_non_git_vcs
         && (has_wt || (has_vcs && (cfg.show_git_diff || !payload_has_vcs_ref)));
     if needs_git {
-        payload
-            .workspace_path()
+        workspace_path(payload)
             .map(|dir| {
                 let want_diff = cfg.show_git_diff && has_vcs;
                 git_probe.probe(Path::new(dir), want_diff)
@@ -589,7 +600,7 @@ pub fn process_statusline<W: Write>(
         .iter()
         .flatten()
         .any(|w| matches!(w, WidgetId::Cost))
-        && payload.valid_cost_usd().is_none()
+        && valid_cost_usd(&payload).is_none()
         && !matches!(runtime.pricing, PricingSource::Disabled);
 
     let mut unpriced_turns = 0u64;
@@ -765,7 +776,7 @@ mod tests {
             }
         }"#;
         let payload: StatuslinePayload = serde_json::from_str(json).unwrap();
-        assert_eq!(payload.subagent_count(), 2);
+        assert_eq!(subagent_count(&payload), 2);
 
         let quota = payload.quota.unwrap();
         assert_eq!(quota["pool-5h"].remaining_amount, Some(420));
@@ -870,7 +881,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(p1.workspace_basename(), Some("active-dir"));
+        assert_eq!(workspace_basename(&p1), Some("active-dir"));
 
         let p2: StatuslinePayload = serde_json::from_str(
             r#"{
@@ -879,11 +890,11 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(p2.workspace_basename(), Some("fallback-cwd"));
+        assert_eq!(workspace_basename(&p2), Some("fallback-cwd"));
 
         let p3: StatuslinePayload =
             serde_json::from_str(r#"{"workspace": {"project_dir": "  "}, "cwd": "  "}"#).unwrap();
-        assert_eq!(p3.workspace_basename(), None);
+        assert_eq!(workspace_basename(&p3), None);
     }
 
     #[test]
@@ -895,7 +906,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(p1.workspace_path(), Some("/tmp/proj-dir"));
+        assert_eq!(workspace_path(&p1), Some("/tmp/proj-dir"));
 
         let p2: StatuslinePayload = serde_json::from_str(
             r#"{
@@ -904,11 +915,11 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(p2.workspace_path(), Some("/tmp/fallback-cwd"));
+        assert_eq!(workspace_path(&p2), Some("/tmp/fallback-cwd"));
 
         let p3: StatuslinePayload =
             serde_json::from_str(r#"{"workspace": {"current_dir": "  "}, "cwd": "  "}"#).unwrap();
-        assert_eq!(p3.workspace_path(), None);
+        assert_eq!(workspace_path(&p3), None);
     }
 
     #[test]
