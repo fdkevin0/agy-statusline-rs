@@ -217,22 +217,13 @@ pub fn run_stats_tui(
             match rx.try_recv() {
                 Ok((ds, elapsed)) => {
                     let is_refresh = dataset.is_some();
-                    let (turns, dbs, archived) = (
-                        ds.events.len(),
-                        ds.sqlite.db_files,
-                        ds.sqlite.archived_db_files,
-                    );
+                    let (turns, dbs) = (ds.events.len(), ds.sqlite.db_files);
                     dataset = Some(ds);
                     state.loading = false;
                     state.view_dirty = true;
                     if is_refresh {
-                        let archived_note = if archived > 0 {
-                            format!(" ({archived} archived)")
-                        } else {
-                            String::new()
-                        };
                         state.status_msg = Some(format!(
-                            "Refreshed {turns} turns across {dbs} DBs{archived_note} in {:.2}s",
+                            "Refreshed {turns} turns across {dbs} DBs in {:.2}s",
                             elapsed.as_secs_f64()
                         ));
                     }

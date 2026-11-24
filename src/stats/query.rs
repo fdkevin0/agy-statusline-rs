@@ -1,6 +1,6 @@
 //! In-memory dataset and dynamic multi-metric query engine for `agy-statusline stats`.
 //!
-//! Scans local SQLite/transcript sources once into [`StatsDataset`], then serves
+//! Scans local SQLite conversation DBs once into [`StatsDataset`], then serves
 //! both backward-compatible [`StatsReport`] generation and sub-millisecond
 //! interactive TUI queries across arbitrary metrics, time ranges, sort orders,
 //! sources, and model filters.
@@ -9,17 +9,18 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use super::archive::scan_sqlite_conversations_with_archive;
 use super::metric::{MetricValue, StatsMetric, UsageCounters};
-use super::pricing::{fetch_models_dev_via_curl, round_usd_6, PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS};
-use super::scan::{scan_transcripts, UsageEvent, UsageSource};
+use super::pricing::{
+    fetch_models_dev_via_curl, round_usd_6, PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS,
+};
+use super::scan::{scan_sqlite_conversations, UsageEvent, UsageSource};
 use super::tz::{format_day, unix_secs_to_utc_date, TimeZoneSpec};
 use super::{
     accumulate_period, activity_week_mondays, build_weekly_usage, DailyUsage, ModelAccumulator,
     ModelStats, PeriodSummary, SqliteStats, StatsReport, WindowSummaries, DAYS_PER_WEEK,
 };
 use crate::db::compute_median;
-use crate::paths::{resolve_agy_roots, resolve_effective_home_env, xdg_cache_dir, xdg_data_dir};
+use crate::paths::{resolve_agy_roots, resolve_effective_home_env, xdg_cache_dir};
 use crate::timeutil::civil_date_from_unix_day;
 
 pub(super) const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -379,15 +380,12 @@ fn finish_day_row(
 }
 
 impl StatsDataset {
-    /// Scans all AGY roots resolved from the ambient environment and `home`,
-    /// incrementally syncing and loading persistent history from the XDG data archive.
+    /// Scans all AGY SQLite conversation roots resolved from the ambient environment and `home`.
     pub fn collect_from_env(home: Option<&Path>, now_unix_secs: u64) -> Self {
         let effective_home = resolve_effective_home_env(home);
         let roots = resolve_agy_roots(effective_home.as_deref());
         let cache_dir =
             xdg_cache_dir().or_else(|| home.map(|h| h.join(".cache").join("agy-statusline")));
-        let data_dir = xdg_data_dir()
-            .or_else(|| home.map(|h| h.join(".local").join("share").join("agy-statusline")));
         let pricing = PricingCatalog::load_effective_with(
             cache_dir.as_deref(),
             SyncMode::BlockingIfStale,
@@ -396,35 +394,12 @@ impl StatsDataset {
             fetch_models_dev_via_curl,
         );
         let tz = TimeZoneSpec::local();
-        Self::collect_for_roots_inner(
-            &roots,
-            effective_home.as_deref(),
-            data_dir.as_deref(),
-            cache_dir.as_deref(),
-            now_unix_secs,
-            &tz,
-            &pricing,
-        )
+        Self::collect_for_roots(&roots, now_unix_secs, &tz, &pricing)
     }
 
-    /// Scans explicit roots with optional persistent archive sync, timezone, and pricing catalog.
-    #[cfg(test)]
-    pub(super) fn collect_for_roots_with_archive(
+    /// Scans explicit SQLite roots with an explicit timezone and pricing catalog.
+    pub(super) fn collect_for_roots(
         roots: &[(&'static str, PathBuf)],
-        data_dir: Option<&Path>,
-        cache_dir: Option<&Path>,
-        now_unix_secs: u64,
-        tz: &TimeZoneSpec,
-        pricing: &PricingCatalog,
-    ) -> Self {
-        Self::collect_for_roots_inner(roots, None, data_dir, cache_dir, now_unix_secs, tz, pricing)
-    }
-
-    fn collect_for_roots_inner(
-        roots: &[(&'static str, PathBuf)],
-        ephemeral_home: Option<&Path>,
-        data_dir: Option<&Path>,
-        cache_dir: Option<&Path>,
         now_unix_secs: u64,
         tz: &TimeZoneSpec,
         pricing: &PricingCatalog,
@@ -434,17 +409,7 @@ impl StatsDataset {
         let timezone = tz.format_offset_at(now_i64);
         let today_utc = unix_secs_to_utc_date(now_unix_secs);
 
-        let (sqlite, mut events, covered) = scan_sqlite_conversations_with_archive(
-            roots,
-            ephemeral_home,
-            data_dir,
-            cache_dir,
-            now_unix_secs,
-            tz,
-            pricing,
-        );
-        let fallback_events = scan_transcripts(roots, tz, pricing, &covered);
-        events.extend(fallback_events);
+        let (sqlite, events) = scan_sqlite_conversations(roots, tz, pricing);
 
         let mut first_day: Option<i64> = None;
         let mut has_cli = false;

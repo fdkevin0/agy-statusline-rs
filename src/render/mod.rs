@@ -10,7 +10,7 @@ use crate::db::SessionMetadata;
 use crate::git::GitInfo;
 use crate::layout::{LayoutConfig, SpeedMode, WidgetId, DEFAULT_SPEED_WARN_THRESHOLD};
 use crate::metrics::{
-    current_context_tokens, resolve_quota_views_with_reset_at, valid_cache_usage, QuotaView,
+    current_context_tokens, resolve_quota_views, valid_cache_usage, QuotaView,
 };
 use crate::statusline::StatuslinePayload;
 use crate::theme::{glyphs_for, palette_for, GlyphSet, Palette};
@@ -26,7 +26,6 @@ enum CompactStage {
     VcsTruncate,
     SubagentsDropLabel,
     CostStripSuffix,
-    QuotaStripTokens,
     QuotaStripReset,
     CtxDropLimit,
     CtxCollapseBar,
@@ -275,28 +274,28 @@ pub fn write_statusline<W: IoWrite>(
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
-    let (quota_5h, quota_weekly) = resolve_quota_views_with_reset_at(payload, unix_now_secs());
-    write_statusline_with_quotas(
+    write_statusline_at(
         payload,
         meta,
         git,
-        (quota_5h.map(|(v, _)| v), quota_weekly.map(|(v, _)| v)),
         CostCoverage::Session,
+        unix_now_secs(),
         cfg,
         out,
     )
 }
 
-/// Renders all non-empty configured rows using pre-resolved (e.g. calibrated) quota views.
-pub(crate) fn write_statusline_with_quotas<W: IoWrite>(
+/// Renders all non-empty configured rows using an explicit cost coverage label and timestamp.
+pub(crate) fn write_statusline_at<W: IoWrite>(
     payload: &StatuslinePayload,
     meta: &SessionMetadata,
     git: &GitInfo,
-    quotas: (Option<QuotaView>, Option<QuotaView>),
     cost_coverage: CostCoverage,
+    now_unix_secs: u64,
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
+    let quotas = resolve_quota_views(payload, now_unix_secs);
     let renderer = Renderer::new(cfg);
     let ctx = RenderContext::build(payload, meta, git, quotas, cost_coverage, cfg);
     let max_width = cfg.responsive.then_some(payload.terminal_width).flatten();
@@ -972,12 +971,12 @@ mod tests {
         assert_eq!(String::from_utf8(out_tiny).unwrap(), "~$1.23\n");
 
         let mut out_partial_sub = Vec::new();
-        write_statusline_with_quotas(
+        write_statusline_at(
             &payload,
             &meta_sub,
             &GitInfo::default(),
-            (None, None),
             CostCoverage::Partial(2),
+            0,
             &cfg,
             &mut out_partial_sub,
         )
@@ -988,12 +987,12 @@ mod tests {
         );
 
         let mut out_partial_only = Vec::new();
-        write_statusline_with_quotas(
+        write_statusline_at(
             &payload,
             &meta,
             &GitInfo::default(),
-            (None, None),
             CostCoverage::Partial(2),
+            0,
             &cfg,
             &mut out_partial_only,
         )
@@ -1748,23 +1747,22 @@ mod tests {
     }
 
     #[test]
-    fn quota_two_step_compaction_and_subagents_label_order() {
+    fn subagents_label_drops_before_quota_reset_timer() {
         let mut cfg = LayoutConfig::preset_minimal();
         cfg.theme = ThemeStyle::Mono;
         cfg.rows = vec![vec![WidgetId::Quota5h, WidgetId::Subagents]];
 
-        let quota_5h = QuotaView {
-            label: "5h".to_string(),
-            bucket_key: "gemini-5h".to_string(),
-            window_secs: 18_000,
-            remaining_pct: 84.0,
-            remaining_amount: None,
-            reset_compact: Some("2h45m".to_string()),
-            pace_behind: false,
-            est_remaining_tokens: Some(130_000),
-        };
+        let quota = BTreeMap::from([(
+            "gemini-5h".to_string(),
+            QuotaBucket {
+                remaining_fraction: Some(0.84),
+                reset_in_seconds: Some(9_900),
+                ..Default::default()
+            },
+        )]);
         let render_at = |width: usize| {
             let payload = StatuslinePayload {
+                quota: Some(quota.clone()),
                 subagents: Some(serde_json::json!([
                     {"role": "Codebase Researcher", "status": "running"}
                 ])),
@@ -1772,12 +1770,12 @@ mod tests {
                 ..Default::default()
             };
             let mut out = Vec::new();
-            write_statusline_with_quotas(
+            write_statusline_at(
                 &payload,
                 &SessionMetadata::default(),
                 &GitInfo::default(),
-                (Some(quota_5h.clone()), None),
                 CostCoverage::Session,
+                0,
                 &cfg,
                 &mut out,
             )
@@ -1785,10 +1783,8 @@ mod tests {
             String::from_utf8(out).unwrap()
         };
 
-        // Full (51 cols): "5h 84% (~130K) ↻2h45m · sub 1 (Codebase Researcher)"
-        // SubagentsDropLabel runs before QuotaStripTokens / QuotaStripReset (29 cols):
-        assert_eq!(render_at(30), "5h 84% (~130K) ↻2h45m · sub 1\n");
-        // QuotaStripTokens drops (~130K) while keeping ↻2h45m (21 cols):
+        // Full (42 cols): "5h 84% ↻2h45m · sub 1 (Codebase Researcher)"
+        // SubagentsDropLabel runs before QuotaStripReset (21 cols):
         assert_eq!(render_at(22), "5h 84% ↻2h45m · sub 1\n");
         // QuotaStripReset drops ↻2h45m when narrower (14 cols):
         assert_eq!(render_at(15), "5h 84% · sub 1\n");

@@ -16,9 +16,9 @@ pub fn unix_now_secs() -> u64 {
     jiff::Timestamp::now().as_second().max(0) as u64
 }
 
-/// Seeds a fresh empty `models_dev_pricing.json` and `stats_archive_sync.ts` under
-/// `cache_dir/agy-statusline` when absent so offline CLI tests never trigger detached
-/// background `pricing sync` / `stats sync` child processes while preserving existing fixtures.
+/// Seeds a fresh empty `models_dev_pricing.json` under `cache_dir/agy-statusline` when absent
+/// so offline CLI tests never trigger detached background `pricing sync` child processes while
+/// preserving existing fixtures.
 pub fn seed_offline_cache_stamps_if_missing(cache_dir: &Path) {
     let app_cache = cache_dir.join("agy-statusline");
     fs::create_dir_all(&app_cache).unwrap();
@@ -29,11 +29,6 @@ pub fn seed_offline_cache_stamps_if_missing(cache_dir: &Path) {
         .create_new(true)
         .open(app_cache.join("models_dev_pricing.json"))
         .and_then(|mut f| f.write_all(payload.as_bytes()));
-    let _ = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(app_cache.join("stats_archive_sync.ts"))
-        .and_then(|mut f| f.write_all(format!("{now_secs}\n").as_bytes()));
 }
 
 /// Returns a `Command` for `program` isolated inside `dir` with a cleared environment,

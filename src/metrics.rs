@@ -20,8 +20,10 @@ pub(crate) struct QuotaView {
     /// Dynamic bucket label (e.g. `"5h"`, `"3p 5h"`, `"7d"`, `"3p 7d"`, `"24h"`).
     pub(crate) label: String,
     /// Raw bucket identifier key from `payload.quota`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) bucket_key: String,
     /// Parsed rolling window duration in seconds.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) window_secs: u64,
     /// Remaining quota percentage (`0.0..=100.0`).
     pub(crate) remaining_pct: f64,
@@ -31,12 +33,7 @@ pub(crate) struct QuotaView {
     pub(crate) reset_compact: Option<String>,
     /// True when remaining quota is lagging behind remaining time by `> 15%`.
     pub(crate) pace_behind: bool,
-    /// Calibrated estimated remaining tokens for this bucket, when available.
-    pub(crate) est_remaining_tokens: Option<u64>,
 }
-
-/// Resolved quota view paired with its inferred reset Unix epoch timestamp.
-pub(crate) type QuotaResolution = (QuotaView, Option<u64>);
 
 #[derive(Debug, Clone)]
 struct BucketDescriptor {
@@ -215,51 +212,33 @@ fn collect_model_tokens(payload: &StatuslinePayload) -> BTreeSet<String> {
     tokens
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct ResetTiming {
-    remaining_secs: Option<u64>,
-    reset_at_secs: Option<u64>,
-}
-
-impl ResetTiming {
-    fn resolve(bucket: &QuotaBucket, now_unix_secs: u64) -> Self {
-        let parsed_reset_time = bucket
+/// Resolves remaining seconds until quota reset, suppressing rolling `now + window_secs`
+/// timestamps on untouched 100% buckets so idle ticks do not render a synthetic full-window countdown.
+fn resolve_remaining_reset_secs(
+    bucket: &QuotaBucket,
+    now_unix_secs: u64,
+    remaining_frac: Option<f64>,
+    window_secs: u64,
+) -> Option<u64> {
+    let remaining_secs = match bucket.reset_in_seconds {
+        Some(secs) if secs <= 0 => None,
+        Some(secs) => Some(secs as u64),
+        None => bucket
             .reset_time
             .as_deref()
-            .and_then(parse_rfc3339_unix_secs);
-        let remaining_secs = match bucket.reset_in_seconds {
-            Some(secs) if secs <= 0 => None,
-            Some(secs) => Some(secs as u64),
-            None => parsed_reset_time.and_then(|reset_unix| {
+            .and_then(parse_rfc3339_unix_secs)
+            .and_then(|reset_unix| {
                 let diff = i128::from(reset_unix) - i128::from(now_unix_secs);
                 (diff > 0).then(|| diff.min(i128::from(u64::MAX)) as u64)
             }),
-        };
-        let reset_at_secs = match parsed_reset_time {
-            Some(ts) => (ts >= 0).then_some(ts as u64),
-            None => bucket
-                .reset_in_seconds
-                .filter(|&s| s > 0)
-                .map(|s| now_unix_secs.saturating_add(s as u64)),
-        };
-        Self {
-            remaining_secs,
-            reset_at_secs,
-        }
-    }
-
-    /// Suppresses rolling `now + window_secs` reset timestamps on untouched 100% buckets
-    /// so idle ticks do not render a synthetic full-window countdown or drift `last_reset_at_secs`.
-    fn suppress_if_untouched_full(self, remaining_frac: Option<f64>, window_secs: u64) -> Self {
-        let is_untouched_full = remaining_frac.is_some_and(|frac| frac >= UNTOUCHED_FULL_FRAC_MIN)
-            && self
-                .remaining_secs
-                .is_some_and(|s| s.abs_diff(window_secs) <= UNTOUCHED_WINDOW_TOLERANCE_SECS);
-        if is_untouched_full {
-            Self::default()
-        } else {
-            self
-        }
+    };
+    let is_untouched_full = remaining_frac.is_some_and(|frac| frac >= UNTOUCHED_FULL_FRAC_MIN)
+        && remaining_secs
+            .is_some_and(|s| s.abs_diff(window_secs) <= UNTOUCHED_WINDOW_TOLERANCE_SECS);
+    if is_untouched_full {
+        None
+    } else {
+        remaining_secs
     }
 }
 
@@ -268,7 +247,7 @@ fn build_quota_view(
     desc: &BucketDescriptor,
     bucket: &QuotaBucket,
     now_unix_secs: u64,
-) -> Option<(QuotaView, Option<u64>, bool)> {
+) -> Option<(QuotaView, bool)> {
     let (remaining_frac, remaining_pct, remaining_amount) =
         if let Some(frac) = bucket.remaining_fraction.filter(|f| f.is_finite()) {
             let clamped = frac.clamp(0.0, 1.0);
@@ -278,12 +257,11 @@ fn build_quota_view(
             (None, 0.0, Some(amt))
         };
     let has_frac = remaining_frac.is_some();
-    let timing = ResetTiming::resolve(bucket, now_unix_secs)
-        .suppress_if_untouched_full(remaining_frac, desc.window_secs);
-    let reset_compact = timing.remaining_secs.map(format_duration_compact);
+    let remaining_secs =
+        resolve_remaining_reset_secs(bucket, now_unix_secs, remaining_frac, desc.window_secs);
+    let reset_compact = remaining_secs.map(format_duration_compact);
     let pace_behind = has_frac
-        && timing
-            .remaining_secs
+        && remaining_secs
             .filter(|&s| s <= desc.window_secs)
             .is_some_and(|s| {
                 let time_left_pct = (s as f64) * 100.0 / (desc.window_secs as f64);
@@ -298,9 +276,7 @@ fn build_quota_view(
             remaining_amount,
             reset_compact,
             pace_behind,
-            est_remaining_tokens: None,
         },
-        timing.reset_at_secs,
         has_frac,
     ))
 }
@@ -433,7 +409,6 @@ struct Candidate {
     score: AffinityScore,
     has_frac: bool,
     view: QuotaView,
-    reset_at: Option<u64>,
 }
 
 fn is_tighter_equal_score(cand: &Candidate, cur: &Candidate) -> bool {
@@ -461,11 +436,11 @@ fn update_best_candidate(slot: &mut Option<Candidate>, cand: Candidate) {
 }
 
 /// Resolves both the active short-window (`< 24h`) and multi-day (`>= 24h`) quota buckets
-/// and their reset epoch timestamps in a single pass over `payload.quota`.
-pub(crate) fn resolve_quota_views_with_reset_at(
+/// in a single pass over `payload.quota`.
+pub(crate) fn resolve_quota_views(
     payload: &StatuslinePayload,
     now_unix_secs: u64,
-) -> (Option<QuotaResolution>, Option<QuotaResolution>) {
+) -> (Option<QuotaView>, Option<QuotaView>) {
     let Some(quota) = payload.quota.as_ref() else {
         return (None, None);
     };
@@ -488,15 +463,13 @@ pub(crate) fn resolve_quota_views_with_reset_at(
         let Some(score) = score_bucket(&desc, &model_tokens, &affinity) else {
             continue;
         };
-        let Some((view, reset_at, has_frac)) = build_quota_view(key, &desc, bucket, now_unix_secs)
-        else {
+        let Some((view, has_frac)) = build_quota_view(key, &desc, bucket, now_unix_secs) else {
             continue;
         };
         let cand = Candidate {
             score,
             has_frac,
             view,
-            reset_at,
         };
         if desc.window_secs < SECS_PER_DAY {
             update_best_candidate(&mut best_short, cand);
@@ -505,10 +478,7 @@ pub(crate) fn resolve_quota_views_with_reset_at(
         }
     }
 
-    (
-        best_short.map(|c| (c.view, c.reset_at)),
-        best_multi.map(|c| (c.view, c.reset_at)),
-    )
+    (best_short.map(|c| c.view), best_multi.map(|c| c.view))
 }
 
 #[cfg(test)]
@@ -518,18 +488,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn resolve_quota_5h_at(payload: &StatuslinePayload, now_unix_secs: u64) -> Option<QuotaView> {
-        resolve_quota_views_with_reset_at(payload, now_unix_secs)
-            .0
-            .map(|(v, _)| v)
+        resolve_quota_views(payload, now_unix_secs).0
     }
 
     fn resolve_quota_weekly_at(
         payload: &StatuslinePayload,
         now_unix_secs: u64,
     ) -> Option<QuotaView> {
-        resolve_quota_views_with_reset_at(payload, now_unix_secs)
-            .1
-            .map(|(v, _)| v)
+        resolve_quota_views(payload, now_unix_secs).1
     }
 
     #[test]
@@ -994,14 +960,12 @@ mod tests {
             ])),
             ..Default::default()
         };
-        let (short_res, weekly_res) = resolve_quota_views_with_reset_at(&untouched_exact, now);
-        let (q5, reset_at_5) = short_res.unwrap();
+        let (short_res, weekly_res) = resolve_quota_views(&untouched_exact, now);
+        let q5 = short_res.unwrap();
         assert_eq!(q5.reset_compact, None);
-        assert_eq!(reset_at_5, None);
         assert!(!q5.pace_behind);
-        let (qw, reset_at_w) = weekly_res.unwrap();
+        let qw = weekly_res.unwrap();
         assert_eq!(qw.reset_compact, None);
-        assert_eq!(reset_at_w, None);
         assert!(!qw.pace_behind);
 
         // Lower -60s boundary and RFC3339 reset_time fallback are also suppressed at 100%.
@@ -1030,17 +994,15 @@ mod tests {
             ])),
             ..Default::default()
         };
-        let (short_rfc, weekly_low) = resolve_quota_views_with_reset_at(&untouched_rfc3339, now);
-        let (q5_rfc, reset_at_rfc) = short_rfc.unwrap();
+        let (short_rfc, weekly_low) = resolve_quota_views(&untouched_rfc3339, now);
+        let q5_rfc = short_rfc.unwrap();
         assert_eq!(q5_rfc.reset_compact, None);
-        assert_eq!(reset_at_rfc, None);
         assert!(!q5_rfc.pace_behind);
-        let (qw_low, reset_at_low) = weekly_low.unwrap();
+        let qw_low = weekly_low.unwrap();
         assert_eq!(qw_low.reset_compact, None);
-        assert_eq!(reset_at_low, None);
         assert!(!qw_low.pace_behind);
 
-        // 100% bucket whose window started (> 60s elapsed) keeps reset_compact and reset_at.
+        // 100% bucket whose window started (> 60s elapsed) keeps reset_compact.
         let started_full = StatuslinePayload {
             model: Some(ModelInfo {
                 id: Some("acme-4-base".to_string()),
@@ -1056,15 +1018,11 @@ mod tests {
             )])),
             ..Default::default()
         };
-        let (q5_started, reset_at_started) =
-            resolve_quota_views_with_reset_at(&started_full, now)
-                .0
-                .unwrap();
+        let q5_started = resolve_quota_views(&started_full, now).0.unwrap();
         assert_eq!(q5_started.reset_compact.as_deref(), Some("4h58m"));
-        assert_eq!(reset_at_started, Some(now + 17_880));
         assert!(!q5_started.pace_behind);
 
-        // 99% bucket keeps reset_compact and reset_at even when reset_in_seconds == window_secs.
+        // 99% bucket keeps reset_compact even when reset_in_seconds == window_secs.
         let consumed_99 = StatuslinePayload {
             model: Some(ModelInfo {
                 id: Some("acme-4-base".to_string()),
@@ -1080,11 +1038,8 @@ mod tests {
             )])),
             ..Default::default()
         };
-        let (q5_99, reset_at_99) = resolve_quota_views_with_reset_at(&consumed_99, now)
-            .0
-            .unwrap();
+        let q5_99 = resolve_quota_views(&consumed_99, now).0.unwrap();
         assert_eq!(q5_99.reset_compact.as_deref(), Some("5h"));
-        assert_eq!(reset_at_99, Some(now + 18_000));
         assert!(!q5_99.pace_behind);
     }
 

@@ -2,19 +2,18 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::calibration::calibrate_quota_views_at;
 use crate::db::{
-    infer_agy_root_from_transcript_path, open_readonly_db, query_session_metadata_from_conn,
-    resolve_conversation_db_path, SessionMetadata, SpeedReader,
+    open_readonly_db, query_session_metadata_from_conn, resolve_conversation_db_path,
+    SessionMetadata, SpeedReader,
 };
 use crate::git::{GitInfo, GitProbe};
 use crate::layout::{LayoutConfig, WidgetId};
-use crate::render::{write_statusline_with_quotas, CostCoverage};
+use crate::render::{write_statusline_at, CostCoverage};
 use crate::stats::{
     estimate_conversation_cost_usd_with_parent_conn, is_pricing_fingerprint_fresh,
     lookup_cached_conversation_cost, maybe_spawn_pricing_sync_if_stale,
@@ -435,9 +434,9 @@ pub struct StatuslineRuntime<'a> {
     pub reader: &'a dyn SpeedReader,
     /// Git branch/worktree/diff probe.
     pub git_probe: &'a dyn GitProbe,
-    /// Optional statusline cache directory (`quota_cal.json`, `models_dev_pricing.json`, `conv_cost_cache.json`).
-    pub calibration_dir: Option<&'a Path>,
-    /// Optional AGY CLI directory (`~/.gemini/antigravity-cli`) for conversation cost estimation.
+    /// Optional statusline cache directory (`models_dev_pricing.json`, `conv_cost_cache.json`).
+    pub cache_dir: Option<&'a Path>,
+    /// Optional AGY CLI directory (`~/.gemini/antigravity-cli`) for session sniffing and cost estimation.
     pub agy_cli_dir: Option<&'a Path>,
     /// Pricing source for fallback cost estimation when `cost.total_usd` is absent.
     pub pricing: PricingSource<'a>,
@@ -451,7 +450,7 @@ impl<'a> StatuslineRuntime<'a> {
         Self {
             reader,
             git_probe,
-            calibration_dir: None,
+            cache_dir: None,
             agy_cli_dir: None,
             pricing: PricingSource::Disabled,
             now_unix_secs: 0,
@@ -473,43 +472,12 @@ fn layout_needs_session_metadata(cfg: &LayoutConfig) -> bool {
     })
 }
 
-fn layout_needs_quotas(cfg: &LayoutConfig) -> bool {
-    cfg.rows
-        .iter()
-        .flatten()
-        .any(|w| matches!(w, WidgetId::Quota5h | WidgetId::QuotaWeekly))
-}
-
-fn resolve_effective_cli_dir(
-    configured_cli_dir: Option<&Path>,
-    payload: &StatuslinePayload,
-) -> Option<PathBuf> {
-    let dir = configured_cli_dir?;
-    let conv_id = payload
-        .conversation_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if conv_id.is_some_and(|cid| resolve_conversation_db_path(dir, cid).is_some()) {
-        return Some(dir.to_path_buf());
-    }
-    if let Some(inferred) = payload
-        .transcript_path
-        .as_deref()
-        .and_then(|tp| infer_agy_root_from_transcript_path(tp, conv_id))
-        .filter(|inferred| conv_id.is_none_or(|cid| resolve_conversation_db_path(inferred, cid).is_some()))
-    {
-        return Some(inferred);
-    }
-    Some(dir.to_path_buf())
-}
-
 fn read_session_metadata(
     conv_id: Option<&str>,
-    effective_cli_dir: Option<&Path>,
+    cli_dir: Option<&Path>,
     reader: &dyn SpeedReader,
 ) -> SessionMetadata {
-    match (conv_id, effective_cli_dir) {
+    match (conv_id, cli_dir) {
         (Some(id), Some(dir)) => reader.session_metadata_in(dir, id),
         (Some(id), None) => reader.session_metadata(id),
         (None, _) => SessionMetadata::default(),
@@ -638,7 +606,7 @@ pub fn process_statusline<W: Write>(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let effective_cli_dir = resolve_effective_cli_dir(runtime.agy_cli_dir, &payload);
+    let cli_dir = runtime.agy_cli_dir;
     let git_info = probe_git(&payload, runtime.git_probe, cfg);
 
     let needs_meta = layout_needs_session_metadata(cfg);
@@ -651,12 +619,7 @@ pub fn process_statusline<W: Write>(
     // Fast path: check bounded LRU conversation cost cache via lstat before parsing pricing JSON
     // or opening any SQLite DB for cost scanning.
     let cached_cost = if needs_cost {
-        match (
-            runtime.pricing,
-            runtime.calibration_dir,
-            effective_cli_dir.as_deref(),
-            conv_id,
-        ) {
+        match (runtime.pricing, runtime.cache_dir, cli_dir, conv_id) {
             (PricingSource::Effective(mode), Some(cache_dir), Some(cli_dir), Some(cid)) => {
                 let pricing_fp = pricing_cache_fingerprint(Some(cache_dir));
                 let allow_hit = mode != SyncMode::BlockingIfStale
@@ -682,7 +645,7 @@ pub fn process_statusline<W: Write>(
         && cached_cost.is_none()
         && runtime.reader.uses_local_sqlite()
     {
-        match (effective_cli_dir.as_deref(), conv_id) {
+        match (cli_dir, conv_id) {
             (Some(cli_dir), Some(cid)) => resolve_conversation_db_path(cli_dir, cid)
                 .and_then(|db_path| open_readonly_db(&db_path).ok()),
             _ => None,
@@ -694,7 +657,7 @@ pub fn process_statusline<W: Write>(
     let mut meta = if let Some(conn) = shared_parent_conn.as_ref() {
         query_session_metadata_from_conn(conn)
     } else if needs_meta {
-        read_session_metadata(conv_id, effective_cli_dir.as_deref(), runtime.reader)
+        read_session_metadata(conv_id, cli_dir, runtime.reader)
     } else {
         SessionMetadata::default()
     };
@@ -712,7 +675,7 @@ pub fn process_statusline<W: Write>(
                  cache_target: Option<(&Path, PricingFileFingerprint)>|
                  -> (Option<f64>, Option<f64>) {
                     if let Some(cost) = conv_id.and_then(|cid| {
-                        effective_cli_dir.as_deref().and_then(|dir| {
+                        cli_dir.and_then(|dir| {
                             estimate_conversation_cost_usd_with_parent_conn(
                                 dir,
                                 cid,
@@ -740,12 +703,12 @@ pub fn process_statusline<W: Write>(
                 PricingSource::Catalog(pricing) => estimate_with(pricing, None),
                 PricingSource::Effective(mode) => {
                     let pricing = PricingCatalog::load_effective_in(
-                        runtime.calibration_dir,
+                        runtime.cache_dir,
                         mode,
                         runtime.now_unix_secs,
                     );
                     let cache_target = runtime
-                        .calibration_dir
+                        .cache_dir
                         .map(|dir| (dir, pricing_cache_fingerprint(Some(dir))));
                     estimate_with(&pricing, cache_target)
                 }
@@ -753,12 +716,15 @@ pub fn process_statusline<W: Write>(
         }
     }
 
-    let quotas = if layout_needs_quotas(cfg) {
-        calibrate_quota_views_at(&payload, runtime.calibration_dir, runtime.now_unix_secs)
-    } else {
-        (None, None)
-    };
-    write_statusline_with_quotas(&payload, &meta, &git_info, quotas, coverage, cfg, out)
+    write_statusline_at(
+        &payload,
+        &meta,
+        &git_info,
+        coverage,
+        runtime.now_unix_secs,
+        cfg,
+        out,
+    )
 }
 
 #[cfg(test)]
@@ -1010,7 +976,7 @@ mod tests {
         let runtime = StatuslineRuntime {
             reader: &reader,
             git_probe: &git,
-            calibration_dir: None,
+            cache_dir: None,
             agy_cli_dir: Some(dir.path()),
             pricing: PricingSource::Catalog(&pricing),
             now_unix_secs: 0,
@@ -1032,7 +998,7 @@ mod tests {
         uuid: &str,
         idx: i64,
         spec: crate::protobuf::GenBlobSpec<'_>,
-    ) -> PathBuf {
+    ) -> std::path::PathBuf {
         let db_path = cli_dir.join("conversations").join(format!("{uuid}.db"));
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1057,133 +1023,6 @@ mod tests {
             .unwrap()
             .set_modified(mtime + std::time::Duration::from_secs(secs))
             .unwrap();
-    }
-
-    #[test]
-    fn skips_quota_calibration_cache_when_layout_has_no_quota_widgets() {
-        let cal_dir = tempfile::tempdir().unwrap();
-        let reader = StubReader(None);
-        let git = NoopGit;
-        let runtime = StatuslineRuntime {
-            reader: &reader,
-            git_probe: &git,
-            calibration_dir: Some(cal_dir.path()),
-            agy_cli_dir: None,
-            pricing: PricingSource::Disabled,
-            now_unix_secs: 1_700_000_000,
-        };
-        let json = r#"{
-            "agent_state": "idle",
-            "conversation_id": "8d0371e1-5a05-423b-a8bc-ed75995f9a8b",
-            "context_window": { "total_input_tokens": 50000, "total_output_tokens": 2000 },
-            "quota": {
-                "gemini-5h": { "remaining_fraction": 0.80, "reset_in_seconds": 10000 }
-            }
-        }"#;
-
-        let mut cfg_no_quota = LayoutConfig::preset_minimal();
-        cfg_no_quota.theme = crate::layout::ThemeStyle::Mono;
-        cfg_no_quota.rows = vec![vec![WidgetId::State, WidgetId::Model]];
-        let mut out = Vec::new();
-        process_statusline(json, &runtime, &cfg_no_quota, &mut out).unwrap();
-        assert!(!cal_dir.path().join("quota_cal.json").exists());
-        assert!(!cal_dir.path().join("quota_cal.lock").exists());
-
-        let mut cfg_with_quota = LayoutConfig::preset_minimal();
-        cfg_with_quota.theme = crate::layout::ThemeStyle::Mono;
-        cfg_with_quota.rows = vec![vec![WidgetId::Quota5h]];
-        out.clear();
-        process_statusline(json, &runtime, &cfg_with_quota, &mut out).unwrap();
-        assert!(cal_dir.path().join("quota_cal.json").exists());
-    }
-
-    #[test]
-    fn transcript_path_infers_isolated_root_for_speed_and_cost_with_default_precedence_and_minimal_isolation(
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let default_cli = dir.path().join("default-cli");
-        let isolated_cli = dir.path().join("isolated-cli");
-        std::fs::create_dir_all(default_cli.join("conversations")).unwrap();
-        let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
-        let transcript_path = isolated_cli
-            .join("brain")
-            .join(uuid)
-            .join(".system_generated/logs/transcript.jsonl");
-        std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
-        seed_gen_turn_db(
-            &isolated_cli,
-            uuid,
-            1,
-            crate::protobuf::GenBlobSpec {
-                output_tok: 200,
-                dur_secs: 2,
-                model_cost: Some(0.42),
-                ..Default::default()
-            },
-        );
-
-        let reader = crate::db::SqliteSpeedReader::default();
-        let git = NoopGit;
-        let pricing = PricingCatalog::default();
-        let mut cfg = LayoutConfig::preset_minimal();
-        cfg.theme = crate::layout::ThemeStyle::Mono;
-        cfg.rows = vec![vec![WidgetId::Speed, WidgetId::Cost]];
-
-        let json = serde_json::json!({
-            "conversation_id": uuid,
-            "transcript_path": transcript_path.to_str().unwrap(),
-        })
-        .to_string();
-
-        // Default dir lacks the DB -> both speed and cost infer and use isolated_cli.
-        let runtime = StatuslineRuntime {
-            reader: &reader,
-            git_probe: &git,
-            calibration_dir: None,
-            agy_cli_dir: Some(&default_cli),
-            pricing: PricingSource::Catalog(&pricing),
-            now_unix_secs: 0,
-        };
-        let mut out = Vec::new();
-        process_statusline(&json, &runtime, &cfg, &mut out).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("100 tok/s"), "unexpected text: {text:?}");
-        assert!(text.contains("~$0.42"), "unexpected text: {text:?}");
-
-        // Once the DB exists in default_cli, explicit/default dir wins and stdin cannot hijack it.
-        seed_gen_turn_db(
-            &default_cli,
-            uuid,
-            1,
-            crate::protobuf::GenBlobSpec {
-                output_tok: 60,
-                dur_secs: 2,
-                model_cost: Some(0.11),
-                ..Default::default()
-            },
-        );
-        let mut out_default = Vec::new();
-        process_statusline(&json, &runtime, &cfg, &mut out_default).unwrap();
-        let text_default = String::from_utf8(out_default).unwrap();
-        assert!(
-            text_default.contains("30 tok/s"),
-            "unexpected text: {text_default:?}"
-        );
-        assert!(
-            text_default.contains("~$0.11"),
-            "unexpected text: {text_default:?}"
-        );
-
-        // StatuslineRuntime::minimal (agy_cli_dir: None) stays completely isolated from disk.
-        let payload: StatuslinePayload = serde_json::from_str(&json).unwrap();
-        assert_eq!(resolve_effective_cli_dir(None, &payload), None);
-        let stub = StubReader(None);
-        let minimal = StatuslineRuntime::minimal(&stub, &git);
-        let mut out_min = Vec::new();
-        process_statusline(&json, &minimal, &cfg, &mut out_min).unwrap();
-        let text_min = String::from_utf8(out_min).unwrap();
-        assert!(!text_min.contains("0.42"), "unexpected text: {text_min:?}");
-        assert!(!text_min.contains("0.11"), "unexpected text: {text_min:?}");
     }
 
     #[test]
@@ -1251,7 +1090,7 @@ mod tests {
         let runtime = StatuslineRuntime {
             reader: &reader,
             git_probe: &git,
-            calibration_dir: Some(&cache_dir),
+            cache_dir: Some(&cache_dir),
             agy_cli_dir: Some(&cli_dir),
             pricing: PricingSource::Effective(SyncMode::Offline),
             now_unix_secs: 1_700_000_000,

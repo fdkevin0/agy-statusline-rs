@@ -462,14 +462,9 @@ pub(super) fn render_stats_report_with_metric<W: Write>(
         .sqlite
         .median_ttft_secs
         .map_or_else(|| "-".to_string(), |t| format!("{t:.2}s"));
-    let archived_note = if report.sqlite.archived_db_files > 0 {
-        format!(" ({} archived)", report.sqlite.archived_db_files)
-    } else {
-        String::new()
-    };
     writeln!(
         out,
-        "\nSQLite Turns: {} turns across {} DBs{archived_note} · med {} · TTFT {}",
+        "\nSQLite Turns: {} turns across {} DBs · med {} · TTFT {}",
         report.sqlite.completed_turns, report.sqlite.db_files, db_speed, db_ttft
     )?;
 

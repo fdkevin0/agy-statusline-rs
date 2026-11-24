@@ -117,7 +117,7 @@ define_widgets! {
     /// Active cycle mode (`◇ PLAN`, `◇ AUTO`, etc.) and `>200K` indicator.
     Mode => ("mode", "Cycle Mode (Plan/Auto)", 3),
     /// Rolling 5-hour quota remaining % + reset timer + pace warning.
-    #[serde(rename = "quota_5h", alias = "quota5h")]
+    #[serde(rename = "quota_5h")]
     Quota5h => ("quota_5h", "5h Quota + Pace", 4),
     /// Weekly (or multi-day) quota remaining % + reset timer + pace warning.
     QuotaWeekly => ("quota_weekly", "Weekly Quota", 3),
@@ -699,17 +699,13 @@ mod tests {
     }
 
     #[test]
-    fn quota_5h_serializes_canonically_and_accepts_legacy_alias() {
+    fn quota_5h_roundtrips_canonically() {
         assert_eq!(
             serde_json::to_string(&WidgetId::Quota5h).unwrap(),
             "\"quota_5h\""
         );
         assert_eq!(
             serde_json::from_str::<WidgetId>("\"quota_5h\"").unwrap(),
-            WidgetId::Quota5h
-        );
-        assert_eq!(
-            serde_json::from_str::<WidgetId>("\"quota5h\"").unwrap(),
             WidgetId::Quota5h
         );
     }

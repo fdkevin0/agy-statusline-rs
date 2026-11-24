@@ -605,13 +605,13 @@ impl Renderer<'_> {
             });
         };
         let label = &q.label;
-        let (core, tokens_part, fg, bold) = if let Some(amt) = q.remaining_amount {
+        let (core, fg, bold) = if let Some(amt) = q.remaining_amount {
             let (fg, bold) = if amt <= 0 {
                 (pal.ctx_crit, true)
             } else {
                 (pal.ctx_ok, false)
             };
-            (format!("{label} {amt}"), None, fg, bold)
+            (format!("{label} {amt}"), fg, bold)
         } else {
             let core = format!(
                 "{label} {}",
@@ -624,34 +624,16 @@ impl Renderer<'_> {
             } else {
                 (pal.ctx_ok, false)
             };
-            (core, q.est_remaining_tokens, fg, bold)
+            (core, fg, bold)
         };
-        let mut without_tokens = core.clone();
+        let mut full = core.clone();
         if let Some(reset) = &q.reset_compact {
-            without_tokens.push(' ');
-            without_tokens.push_str(glyphs.reset);
-            without_tokens.push_str(reset);
+            full.push(' ');
+            full.push_str(glyphs.reset);
+            full.push_str(reset);
         }
-        let full = if let Some(tok) = tokens_part {
-            let mut s = core.clone();
-            s.push_str(" (~");
-            format_tokens(tok, &mut s);
-            s.push(')');
-            if let Some(reset) = &q.reset_compact {
-                s.push(' ');
-                s.push_str(glyphs.reset);
-                s.push_str(reset);
-            }
-            s
-        } else {
-            without_tokens.clone()
-        };
-        let has_tokens = full != without_tokens;
-        let has_reset = without_tokens != core;
+        let has_reset = full != core;
         let mut seg = Segment::plain(widget, full, fg, bold);
-        if has_tokens {
-            seg.push_fallback(CompactStage::QuotaStripTokens, without_tokens);
-        }
         if has_reset {
             seg.push_fallback(CompactStage::QuotaStripReset, core);
         }

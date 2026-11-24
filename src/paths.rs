@@ -7,8 +7,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::db::is_real_dir;
-
 fn non_empty_path(val: Option<OsString>) -> Option<PathBuf> {
     val.filter(|v| !v.is_empty()).map(PathBuf::from)
 }
@@ -57,7 +55,7 @@ fn expand_tilde_os(raw: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> 
 
 fn classify_data_dir_source(path: &Path) -> &'static str {
     match path.file_name().and_then(OsStr::to_str) {
-        Some("antigravity" | "antigravity-ide") => "desktop",
+        Some("antigravity") => "desktop",
         _ => "cli",
     }
 }
@@ -74,25 +72,21 @@ fn push_unique_root(
     }
 }
 
-/// Resolves all AGY CLI, Desktop, custom, and isolated ACP data roots from explicit inputs,
+/// Resolves all official AGY CLI, Desktop, and explicit custom data roots from explicit inputs,
 /// deduplicating canonical/identical paths while preserving first-seen source priority
 /// (`"cli"` before `"desktop"`).
 pub fn resolve_agy_roots_from(
     home: Option<&Path>,
     antigravity_data_dir: Option<&OsStr>,
     antigravity_cli_home: Option<&OsStr>,
-    agy_home: Option<&OsStr>,
-    antigravity_home: Option<&OsStr>,
 ) -> Vec<(&'static str, PathBuf)> {
     let mut roots: Vec<(&'static str, PathBuf)> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut has_explicit_cli_home = false;
 
-    for env_val in [antigravity_cli_home, agy_home, antigravity_home] {
-        if let Some(path) = expand_tilde_os(env_val, home) {
-            has_explicit_cli_home = true;
-            push_unique_root(&mut roots, &mut seen, "cli", path);
-        }
+    if let Some(path) = expand_tilde_os(antigravity_cli_home, home) {
+        has_explicit_cli_home = true;
+        push_unique_root(&mut roots, &mut seen, "cli", path);
     }
 
     if let Some(raw) = antigravity_data_dir.filter(|v| !v.is_empty()) {
@@ -121,91 +115,9 @@ pub fn resolve_agy_roots_from(
             push_unique_root(&mut roots, &mut seen, "cli", gemini.join("antigravity-cli"));
         }
         push_unique_root(&mut roots, &mut seen, "desktop", gemini.join("antigravity"));
-        push_unique_root(
-            &mut roots,
-            &mut seen,
-            "desktop",
-            gemini.join("antigravity-ide"),
-        );
-        push_unique_root(
-            &mut roots,
-            &mut seen,
-            "cli",
-            gemini.join("antigravity-backup"),
-        );
-        push_unique_root(
-            &mut roots,
-            &mut seen,
-            "desktop",
-            h.join(".config").join("antigravity"),
-        );
-
-        // Bounded single-level checks for isolated ACP roots without following symlinks.
-        let t3_base = h
-            .join(".t3")
-            .join("userdata")
-            .join("providers")
-            .join("antigravity");
-        if is_real_dir(&t3_base) {
-            if let Ok(entries) = fs::read_dir(&t3_base) {
-                let mut provider_dirs: Vec<PathBuf> = entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| is_real_dir(p))
-                    .collect();
-                provider_dirs.sort();
-                for dir in provider_dirs {
-                    let acp = dir.join("antigravity-acp");
-                    if is_real_dir(&acp) {
-                        push_unique_root(&mut roots, &mut seen, "cli", acp);
-                    }
-                }
-            }
-        }
-
-        let pi_base = h
-            .join(".pi")
-            .join("agent")
-            .join("cache")
-            .join("antigravity-acp");
-        let pi_agy = pi_base.join("agy");
-        if is_real_dir(&pi_base) && is_real_dir(&pi_agy) {
-            push_unique_root(&mut roots, &mut seen, "cli", pi_agy);
-        }
     }
 
     roots
-}
-
-/// Returns the parent directory prefixes under `home` that host ephemeral isolated ACP roots
-/// (T3 and pi), including canonicalized variants so previously archived roots remain matched
-/// after their temporary subdirectories are removed from disk.
-pub(crate) fn ephemeral_acp_root_prefixes(home: &Path) -> Vec<PathBuf> {
-    let mut prefixes = Vec::with_capacity(4);
-    let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    let rels = [
-        Path::new(".t3")
-            .join("userdata")
-            .join("providers")
-            .join("antigravity"),
-        Path::new(".pi")
-            .join("agent")
-            .join("cache")
-            .join("antigravity-acp"),
-    ];
-    for rel in &rels {
-        for candidate in [canonical_home.join(rel), home.join(rel)] {
-            if let Ok(canon) = fs::canonicalize(&candidate) {
-                if !prefixes.contains(&canon) {
-                    prefixes.push(canon);
-                }
-            }
-            if !prefixes.contains(&candidate) {
-                prefixes.push(candidate);
-            }
-        }
-    }
-    prefixes
 }
 
 /// Resolves the effective home directory, never letting ambient `HOME`/`USERPROFILE`
@@ -215,30 +127,23 @@ pub(crate) fn resolve_effective_home_env(home: Option<&Path>) -> Option<PathBuf>
 }
 
 /// Resolves all AGY data roots for `home` (falling back to `HOME`/`USERPROFILE` only when
-/// `home` is `None`) together with `ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, `ANTIGRAVITY_HOME`,
-/// and `ANTIGRAVITY_DATA_DIR`.
+/// `home` is `None`) together with `ANTIGRAVITY_CLI_HOME` and `ANTIGRAVITY_DATA_DIR`.
 pub fn resolve_agy_roots(home: Option<&Path>) -> Vec<(&'static str, PathBuf)> {
     let resolved_home = resolve_effective_home_env(home);
     let data_dir = env::var_os("ANTIGRAVITY_DATA_DIR");
     let cli_home = env::var_os("ANTIGRAVITY_CLI_HOME");
-    let agy_home = env::var_os("AGY_HOME");
-    let ag_home = env::var_os("ANTIGRAVITY_HOME");
     resolve_agy_roots_from(
         resolved_home.as_deref(),
         data_dir.as_deref(),
         cli_home.as_deref(),
-        agy_home.as_deref(),
-        ag_home.as_deref(),
     )
 }
 
 fn resolve_agy_cli_dir_from(
     antigravity_cli_home: Option<OsString>,
-    agy_home: Option<OsString>,
     home: Option<PathBuf>,
 ) -> Option<PathBuf> {
     non_empty_path(antigravity_cli_home)
-        .or_else(|| non_empty_path(agy_home))
         .or_else(|| home.map(|h| h.join(".gemini").join("antigravity-cli")))
 }
 
@@ -265,18 +170,11 @@ fn xdg_cache_dir_from(xdg_cache_home: Option<OsString>, home: Option<PathBuf>) -
     home.map(|h| h.join(".cache").join("agy-statusline"))
 }
 
-fn xdg_data_dir_from(xdg_data_home: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
-    if let Some(xdg) = non_empty_path(xdg_data_home) {
-        return Some(xdg.join("agy-statusline"));
-    }
-    home.map(|h| h.join(".local").join("share").join("agy-statusline"))
-}
-
 fn agy_settings_path_from(cli_dir: Option<PathBuf>) -> io::Result<PathBuf> {
     let dir = cli_dir.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            "neither ANTIGRAVITY_CLI_HOME, AGY_HOME, HOME, nor USERPROFILE environment variable is set",
+            "neither ANTIGRAVITY_CLI_HOME, HOME, nor USERPROFILE environment variable is set",
         )
     })?;
     Ok(dir.join("settings.json"))
@@ -287,14 +185,10 @@ pub fn resolve_home_dir() -> Option<PathBuf> {
     resolve_home_dir_from(env::var_os("HOME"), env::var_os("USERPROFILE"))
 }
 
-/// Resolves the AGY CLI data directory (`ANTIGRAVITY_CLI_HOME`, `AGY_HOME`,
+/// Resolves the AGY CLI data directory (`ANTIGRAVITY_CLI_HOME`
 /// or `<home>/.gemini/antigravity-cli`).
 pub fn resolve_agy_cli_dir() -> Option<PathBuf> {
-    resolve_agy_cli_dir_from(
-        env::var_os("ANTIGRAVITY_CLI_HOME"),
-        env::var_os("AGY_HOME"),
-        resolve_home_dir(),
-    )
+    resolve_agy_cli_dir_from(env::var_os("ANTIGRAVITY_CLI_HOME"), resolve_home_dir())
 }
 
 /// Resolves `$XDG_CONFIG_HOME/agy-statusline` or `<home>/.config/agy-statusline`.
@@ -307,14 +201,9 @@ pub fn xdg_cache_dir() -> Option<PathBuf> {
     xdg_cache_dir_from(env::var_os("XDG_CACHE_HOME"), resolve_home_dir())
 }
 
-/// Resolves `$XDG_DATA_HOME/agy-statusline` or `<home>/.local/share/agy-statusline`.
-pub fn xdg_data_dir() -> Option<PathBuf> {
-    xdg_data_dir_from(env::var_os("XDG_DATA_HOME"), resolve_home_dir())
-}
-
 /// Returns the default AGY settings path (`<agy_cli_dir>/settings.json`).
 ///
-/// Honors `ANTIGRAVITY_CLI_HOME`, `AGY_HOME`, or `<home>/.gemini/antigravity-cli`.
+/// Honors `ANTIGRAVITY_CLI_HOME` or `<home>/.gemini/antigravity-cli`.
 pub fn agy_settings_path() -> io::Result<PathBuf> {
     agy_settings_path_from(resolve_agy_cli_dir())
 }
@@ -353,22 +242,18 @@ mod tests {
     fn resolves_agy_cli_dir_precedence() {
         let home = Some(PathBuf::from("/home/alice"));
         assert_eq!(
-            resolve_agy_cli_dir_from(os("/custom/cli"), os("/custom/agy"), home.clone()),
+            resolve_agy_cli_dir_from(os("/custom/cli"), home.clone()),
             Some(PathBuf::from("/custom/cli"))
         );
         assert_eq!(
-            resolve_agy_cli_dir_from(os(""), os("/custom/agy"), home.clone()),
-            Some(PathBuf::from("/custom/agy"))
-        );
-        assert_eq!(
-            resolve_agy_cli_dir_from(None, os(""), home),
+            resolve_agy_cli_dir_from(os(""), home),
             Some(PathBuf::from("/home/alice/.gemini/antigravity-cli"))
         );
-        assert_eq!(resolve_agy_cli_dir_from(None, None, None), None);
+        assert_eq!(resolve_agy_cli_dir_from(None, None), None);
     }
 
     #[test]
-    fn resolves_xdg_config_cache_and_data_dirs() {
+    fn resolves_xdg_config_and_cache_dirs() {
         let home = Some(PathBuf::from("/home/alice"));
         assert_eq!(
             xdg_config_dir_from(os("/xdg/cfg"), home.clone()).unwrap(),
@@ -388,20 +273,10 @@ mod tests {
             Some(PathBuf::from("/xdg/cache/agy-statusline"))
         );
         assert_eq!(
-            xdg_cache_dir_from(os(""), home.clone()),
+            xdg_cache_dir_from(os(""), home),
             Some(PathBuf::from("/home/alice/.cache/agy-statusline"))
         );
         assert_eq!(xdg_cache_dir_from(None, None), None);
-
-        assert_eq!(
-            xdg_data_dir_from(os("/xdg/data"), home.clone()),
-            Some(PathBuf::from("/xdg/data/agy-statusline"))
-        );
-        assert_eq!(
-            xdg_data_dir_from(os(""), home),
-            Some(PathBuf::from("/home/alice/.local/share/agy-statusline"))
-        );
-        assert_eq!(xdg_data_dir_from(None, None), None);
     }
 
     #[test]
@@ -444,110 +319,53 @@ mod tests {
     }
 
     #[test]
-    fn resolve_agy_roots_from_expands_env_deduplicates_and_discovers_multi_roots() {
+    fn resolve_agy_roots_from_expands_env_deduplicates_and_discovers_official_roots() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
 
         let data_cli = home.join("extra-data");
         let data_desk = home.join("extra").join("antigravity");
-        let data_ide = home.join("extra").join("antigravity-ide");
-        let t3_b = home
-            .join(".t3")
-            .join("userdata")
-            .join("providers")
-            .join("antigravity")
-            .join("proj-b")
-            .join("antigravity-acp");
-        let t3_a = home
-            .join(".t3")
-            .join("userdata")
-            .join("providers")
-            .join("antigravity")
-            .join("proj-a")
-            .join("antigravity-acp");
-        let t3_no_acp = home
-            .join(".t3")
-            .join("userdata")
-            .join("providers")
-            .join("antigravity")
-            .join("proj-empty");
-        let pi_agy = home
-            .join(".pi")
-            .join("agent")
-            .join("cache")
-            .join("antigravity-acp")
-            .join("agy");
-
         fs::create_dir_all(&data_cli).unwrap();
         fs::create_dir_all(&data_desk).unwrap();
-        fs::create_dir_all(&data_ide).unwrap();
-        fs::create_dir_all(&t3_b).unwrap();
-        fs::create_dir_all(&t3_a).unwrap();
-        fs::create_dir_all(&t3_no_acp).unwrap();
-        fs::create_dir_all(&pi_agy).unwrap();
 
-        let data_dir_val = OsStr::new(
-            " ~/extra-data , , ~/extra/antigravity , ~/extra/antigravity-ide , ~/extra-data ",
-        );
-        let roots = resolve_agy_roots_from(Some(home), Some(data_dir_val), None, None, None);
+        let data_dir_val = OsStr::new(" ~/extra-data , , ~/extra/antigravity , ~/extra-data ");
+        let roots = resolve_agy_roots_from(Some(home), Some(data_dir_val), None);
         assert_eq!(
             roots,
             vec![
                 ("cli", data_cli.clone()),
                 ("desktop", data_desk.clone()),
-                ("desktop", data_ide.clone()),
                 ("cli", home.join(".gemini").join("antigravity-cli")),
                 ("desktop", home.join(".gemini").join("antigravity")),
-                ("desktop", home.join(".gemini").join("antigravity-ide")),
-                ("cli", home.join(".gemini").join("antigravity-backup")),
-                ("desktop", home.join(".config").join("antigravity")),
-                ("cli", t3_a.clone()),
-                ("cli", t3_b.clone()),
-                ("cli", pi_agy.clone()),
             ]
         );
 
-        // Explicit CLI env vars (including ANTIGRAVITY_HOME) replace the default
-        // `.gemini/antigravity-cli` and win `"cli"` priority over matching desktop data dirs.
+        // Explicit ANTIGRAVITY_CLI_HOME replaces the default `.gemini/antigravity-cli`
+        // and wins `"cli"` priority over a matching desktop data dir.
         let shared_ag = home.join("shared").join("antigravity");
-        let ag_home = home.join("ag-home");
         fs::create_dir_all(&shared_ag).unwrap();
-        fs::create_dir_all(&ag_home).unwrap();
 
         let explicit_roots = resolve_agy_roots_from(
             Some(home),
             Some(OsStr::new("~/shared/antigravity")),
             Some(shared_ag.as_os_str()),
-            None,
-            Some(OsStr::new("~/ag-home")),
         );
-        assert_eq!(explicit_roots[0], ("cli", shared_ag));
-        assert_eq!(explicit_roots[1], ("cli", ag_home));
-        assert!(!explicit_roots
-            .iter()
-            .any(|(_, p)| p == &home.join(".gemini").join("antigravity-cli")));
-        assert!(explicit_roots.contains(&("desktop", home.join(".gemini").join("antigravity"))));
-        assert!(explicit_roots.contains(&("desktop", home.join(".gemini").join("antigravity-ide"))));
-        assert!(explicit_roots.contains(&("cli", home.join(".gemini").join("antigravity-backup"))));
-        assert!(explicit_roots.contains(&("desktop", home.join(".config").join("antigravity"))));
-        assert!(explicit_roots.contains(&("cli", t3_a)));
-        assert!(explicit_roots.contains(&("cli", t3_b)));
-        assert!(explicit_roots.contains(&("cli", pi_agy)));
+        assert_eq!(
+            explicit_roots,
+            vec![
+                ("cli", shared_ag),
+                ("desktop", home.join(".gemini").join("antigravity")),
+            ]
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn resolve_agy_roots_from_ignores_symlinked_isolated_dirs_and_deduplicates_canonical_targets() {
+    fn resolve_agy_roots_from_deduplicates_canonical_targets_with_cli_priority() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        let external = dir.path().join("external");
-        let ext_provider = external.join("ext-provider");
-        let ext_acp = ext_provider.join("antigravity-acp");
-        let ext_pi_agy = external.join("ext-pi-agy");
-        fs::create_dir_all(&ext_acp).unwrap();
-        fs::create_dir_all(&ext_pi_agy).unwrap();
 
         // Symlinked `.gemini/antigravity` pointing to `.gemini/antigravity-cli` deduplicates
         // to the canonical target while preserving `"cli"` source priority.
@@ -556,30 +374,7 @@ mod tests {
         fs::create_dir_all(&cli_dir).unwrap();
         symlink(&cli_dir, &desk_dir).unwrap();
 
-        // Symlinked T3 provider subdir and symlinked `antigravity-acp` leaf are both ignored.
-        let t3_base = home
-            .join(".t3")
-            .join("userdata")
-            .join("providers")
-            .join("antigravity");
-        let real_provider = t3_base.join("real-provider");
-        fs::create_dir_all(&real_provider).unwrap();
-        symlink(&ext_provider, t3_base.join("sym-provider")).unwrap();
-        symlink(&ext_acp, real_provider.join("antigravity-acp")).unwrap();
-
-        // Symlinked pi `agy` leaf is ignored.
-        let pi_base = home
-            .join(".pi")
-            .join("agent")
-            .join("cache")
-            .join("antigravity-acp");
-        fs::create_dir_all(&pi_base).unwrap();
-        symlink(&ext_pi_agy, pi_base.join("agy")).unwrap();
-
-        let roots = resolve_agy_roots_from(Some(home), None, None, None, None);
-        assert!(roots.contains(&("cli", cli_dir)));
-        assert!(!roots.iter().any(|(_, p)| p == &desk_dir));
-        assert!(!roots.iter().any(|(_, p)| p.starts_with(&t3_base)));
-        assert!(!roots.iter().any(|(_, p)| p.starts_with(&pi_base)));
+        let roots = resolve_agy_roots_from(Some(home), None, None);
+        assert_eq!(roots, vec![("cli", cli_dir)]);
     }
 }

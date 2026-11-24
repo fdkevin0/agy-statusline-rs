@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
@@ -211,59 +211,6 @@ pub fn is_valid_uuid(id: &str) -> bool {
         }
     }
     true
-}
-
-/// Safely infers an isolated AGY CLI root directory from a `transcript_path` such as
-/// `<root>/brain/<uuid>/.system_generated/logs/transcript.jsonl`.
-///
-/// Rejects relative paths, `..` traversal, non-UUID segments, `conversation_id` mismatches,
-/// missing trailing path components, and symlinked or missing `<root>` / `<root>/conversations`
-/// directories.
-pub(crate) fn infer_agy_root_from_transcript_path(
-    transcript_path: &str,
-    expected_conversation_id: Option<&str>,
-) -> Option<PathBuf> {
-    let path = Path::new(transcript_path);
-    if !path.is_absolute() {
-        return None;
-    }
-    let components: Vec<Component<'_>> = path.components().collect();
-    if components.iter().any(|c| matches!(c, Component::ParentDir)) {
-        return None;
-    }
-    let expected = expected_conversation_id
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    for i in (1..components.len()).rev() {
-        let Component::Normal(dir_name) = components[i] else {
-            continue;
-        };
-        if dir_name != "brain" {
-            continue;
-        }
-        let Some(Component::Normal(uuid_os)) = components.get(i + 1) else {
-            continue;
-        };
-        let Some(uuid) = uuid_os.to_str() else {
-            continue;
-        };
-        if !is_valid_uuid(uuid) {
-            continue;
-        }
-        if !components[i + 2..]
-            .iter()
-            .any(|c| matches!(c, Component::Normal(_)))
-        {
-            continue;
-        }
-        if expected.is_some_and(|cid| !uuid.eq_ignore_ascii_case(cid)) {
-            return None;
-        }
-        let root: PathBuf = components[..i].iter().collect();
-        return (is_real_dir(&root) && is_real_dir(&root.join("conversations"))).then_some(root);
-    }
-    None
 }
 
 /// Opens a SQLite database in read-only, no-mutex mode with a 25ms busy timeout.
@@ -608,121 +555,6 @@ mod tests {
         assert_eq!(
             inspect_sqlite_path(&poisoned_missing),
             SqlitePathStatus::Unsafe
-        );
-    }
-
-    #[test]
-    fn infer_agy_root_from_transcript_path_validates_structure_and_uuid() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("isolated-agy");
-        let conv_dir = root.join("conversations");
-        let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
-        let other_uuid = "11111111-1111-4111-8111-111111111111";
-        let nested_logs = root.join("brain").join(uuid).join(".system_generated/logs");
-        fs::create_dir_all(&conv_dir).unwrap();
-        fs::create_dir_all(&nested_logs).unwrap();
-
-        let nested_transcript = nested_logs.join("transcript.jsonl");
-        let nested_str = nested_transcript.to_str().unwrap();
-        assert_eq!(
-            infer_agy_root_from_transcript_path(nested_str, Some(uuid)),
-            Some(root.clone())
-        );
-        assert_eq!(
-            infer_agy_root_from_transcript_path(nested_str, Some(&uuid.to_ascii_uppercase())),
-            Some(root.clone())
-        );
-        assert_eq!(
-            infer_agy_root_from_transcript_path(nested_str, None),
-            Some(root.clone())
-        );
-
-        let direct_transcript = root.join("brain").join(uuid).join("transcript.jsonl");
-        assert_eq!(
-            infer_agy_root_from_transcript_path(direct_transcript.to_str().unwrap(), Some(uuid)),
-            Some(root.clone())
-        );
-
-        // Reject relative paths, `..` traversal, conversation_id mismatches, non-UUIDs,
-        // missing trailing components, and roots lacking a `conversations/` directory.
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("isolated-agy/brain/{uuid}/transcript.jsonl"),
-                Some(uuid),
-            ),
-            None
-        );
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("{}/brain/../brain/{uuid}/transcript.jsonl", root.display()),
-                Some(uuid),
-            ),
-            None
-        );
-        assert_eq!(
-            infer_agy_root_from_transcript_path(nested_str, Some(other_uuid)),
-            None
-        );
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("{}/brain/not-a-uuid/transcript.jsonl", root.display()),
-                None,
-            ),
-            None
-        );
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("{}/brain/{uuid}", root.display()),
-                Some(uuid),
-            ),
-            None
-        );
-
-        let no_conv_root = dir.path().join("no-conv-agy");
-        fs::create_dir_all(no_conv_root.join("brain").join(uuid)).unwrap();
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("{}/brain/{uuid}/transcript.jsonl", no_conv_root.display()),
-                Some(uuid),
-            ),
-            None
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn infer_agy_root_from_transcript_path_rejects_symlinked_root_and_conversations() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().unwrap();
-        let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
-        let real_root = dir.path().join("real-agy");
-        fs::create_dir_all(real_root.join("conversations")).unwrap();
-        fs::create_dir_all(real_root.join("brain").join(uuid)).unwrap();
-
-        let sym_root = dir.path().join("sym-agy");
-        symlink(&real_root, &sym_root).unwrap();
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("{}/brain/{uuid}/transcript.jsonl", sym_root.display()),
-                Some(uuid),
-            ),
-            None
-        );
-
-        let sym_conv_root = dir.path().join("sym-conv-agy");
-        fs::create_dir_all(sym_conv_root.join("brain").join(uuid)).unwrap();
-        symlink(
-            real_root.join("conversations"),
-            sym_conv_root.join("conversations"),
-        )
-        .unwrap();
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("{}/brain/{uuid}/transcript.jsonl", sym_conv_root.display()),
-                Some(uuid),
-            ),
-            None
         );
     }
 }
