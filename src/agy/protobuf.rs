@@ -284,8 +284,6 @@ pub(crate) struct GenMetadataSummary {
 /// Full generation record decoded from `CortexStepGeneratorMetadata` (`gen_metadata.data`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GenMetadataRecord {
-    /// First step index associated with this generation (`step_indices[0]`, field `2`).
-    pub first_step_index: Option<u64>,
     /// All step indices covered by this generation (`step_indices`, field `2`).
     pub step_indices: Vec<u64>,
     /// Numeric `Model` enum (prefers `usage.model_enum(1)` when non-zero, else `chat.model(3)`).
@@ -416,9 +414,19 @@ pub(crate) fn extract_gen_metadata_summary(data: &[u8]) -> Option<GenMetadataSum
 /// Extracts a complete [`GenMetadataRecord`] from `CortexStepGeneratorMetadata` (`gen_metadata.data`).
 ///
 /// Returns `None` if `chat_model` (field `1`) is missing or malformed.
+///
+/// # Examples
+///
+/// ```
+/// use agy_statusline::agy::protobuf::extract_gen_metadata_record;
+///
+/// // chat(1) -> { usage(4) -> { output(3)=100 }, duration(12) -> { seconds(1)=2 } }
+/// let blob = [0x0a, 0x08, 0x22, 0x02, 0x18, 0x64, 0x62, 0x02, 0x08, 0x02];
+/// let rec = extract_gen_metadata_record(&blob).unwrap();
+/// assert_eq!(rec.decode_speed_tps(), Some(50.0));
+/// ```
 pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord> {
     let blob = GenMetadataBlob::decode(data).ok()?;
-    let first_step_index = blob.step_indices.first().copied();
     let step_indices = blob.step_indices;
     let chat = blob.chat_model?;
     let usage = chat
@@ -457,7 +465,6 @@ pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord> {
         .filter(|&d| d > 0.0);
 
     Some(GenMetadataRecord {
-        first_step_index,
         step_indices,
         model_enum,
         input_tokens: usage.input_tokens,
@@ -512,15 +519,6 @@ pub fn extract_step_metadata_record(data: &[u8]) -> Option<StepMetadataRecord> {
     })
 }
 
-/// Extracts `CortexStepMetadata.created_at` (`field 1 -> google.protobuf.Timestamp.seconds = 1`)
-/// from a `steps.metadata` Protobuf blob.
-///
-/// Rejects timestamps outside proleptic UTC years `0001..=9999`
-/// (`-62_135_596_800..=253_402_300_799`).
-pub fn extract_step_created_at_secs(data: &[u8]) -> Option<i64> {
-    extract_step_metadata_record(data)?.created_at_secs
-}
-
 /// Extracts `TrajectoryMetadataBlob.created_at` (`field 2 -> google.protobuf.Timestamp.seconds = 1`)
 /// from a `trajectory_metadata_blob.data` Protobuf blob.
 pub fn extract_trajectory_created_at_secs(data: &[u8]) -> Option<i64> {
@@ -528,25 +526,6 @@ pub fn extract_trajectory_created_at_secs(data: &[u8]) -> Option<i64> {
         .ok()?
         .created_at?
         .valid_secs()
-}
-
-/// Extracts output generation speed (tokens/second) from a `gen_metadata` Protobuf blob.
-///
-/// Returns `None` if required nested fields are missing, `nanos >= 1_000_000_000`,
-/// `seconds < 0.01`, `output == 0`, or the resulting speed is not in `(0.0, 10_000.0)`.
-///
-/// # Examples
-///
-/// ```
-/// use agy_statusline::agy::protobuf::extract_metadata_speed;
-///
-/// // chat(1) -> { usage(4) -> { output(3)=100 }, duration(12) -> { seconds(1)=2 } }
-/// let blob = [0x0a, 0x08, 0x22, 0x02, 0x18, 0x64, 0x62, 0x02, 0x08, 0x02];
-/// assert_eq!(extract_metadata_speed(&blob), Some(50.0));
-/// ```
-pub fn extract_metadata_speed(data: &[u8]) -> Option<f64> {
-    let metrics = extract_gen_metadata_summary(data)?.turn?;
-    Some((metrics.output_tokens as f64) / metrics.decode_secs)
 }
 
 #[cfg(test)]
@@ -739,9 +718,12 @@ mod tests {
             dur_secs: 2,
             ..Default::default()
         });
-        assert_eq!(extract_metadata_speed(&valid), Some(50.0));
-        assert_eq!(extract_metadata_speed(&[0x0a, 0xff]), None);
-        assert_eq!(extract_metadata_speed(&[]), None);
+        assert_eq!(
+            extract_gen_metadata_record(&valid).and_then(|r| r.decode_speed_tps()),
+            Some(50.0)
+        );
+        assert_eq!(extract_gen_metadata_record(&[0x0a, 0xff]), None);
+        assert_eq!(extract_gen_metadata_record(&[]), None);
     }
 
     #[test]
@@ -809,7 +791,6 @@ mod tests {
             .unwrap();
         assert_eq!(summary.output_tokens, 100);
         assert_eq!(summary.thinking_tokens, Some(40));
-        assert_eq!(extract_metadata_speed(&split_only), Some(50.0));
 
         let rec = extract_gen_metadata_record(&split_only).unwrap();
         assert_eq!(rec.output_tokens, 100);
@@ -863,7 +844,10 @@ mod tests {
             extract_gen_metadata_summary(&too_short).and_then(|s| s.turn),
             None
         );
-        assert_eq!(extract_metadata_speed(&too_short), None);
+        assert_eq!(
+            extract_gen_metadata_record(&too_short).and_then(|r| r.decode_speed_tps()),
+            None
+        );
 
         // decode_secs = 0.05s (50_000_000 nanos) -> accepted (10 / 0.05 = 200.0 tok/s)
         let fast_50ms = encode_gen_blob(GenBlobSpec {
@@ -871,11 +855,21 @@ mod tests {
             dur_nanos: 50_000_000,
             ..Default::default()
         });
-        assert!((extract_metadata_speed(&fast_50ms).unwrap() - 200.0).abs() < 1e-6);
+        assert!(
+            (extract_gen_metadata_record(&fast_50ms)
+                .and_then(|r| r.decode_speed_tps())
+                .unwrap()
+                - 200.0)
+                .abs()
+                < 1e-6
+        );
 
         // output = 1000, decode_secs = 1s -> 1000.0 tok/s -> accepted (< 10_000.0)
         let fast_1000 = encode_speed_1s_blob(1_000);
-        assert_eq!(extract_metadata_speed(&fast_1000), Some(1000.0));
+        assert_eq!(
+            extract_gen_metadata_record(&fast_1000).and_then(|r| r.decode_speed_tps()),
+            Some(1000.0)
+        );
 
         // output = 10_000, decode_secs = 1s -> 10_000.0 tok/s -> rejected (>= 10_000.0)
         let too_fast = encode_speed_1s_blob(10_000);
@@ -883,7 +877,10 @@ mod tests {
             extract_gen_metadata_summary(&too_fast).and_then(|s| s.turn),
             None
         );
-        assert_eq!(extract_metadata_speed(&too_fast), None);
+        assert_eq!(
+            extract_gen_metadata_record(&too_fast).and_then(|r| r.decode_speed_tps()),
+            None
+        );
     }
 
     #[test]
@@ -905,7 +902,6 @@ mod tests {
         });
 
         let rec = extract_gen_metadata_record(&root_packed).unwrap();
-        assert_eq!(rec.first_step_index, Some(7));
         assert_eq!(rec.step_indices, vec![7, 8]);
         assert_eq!(rec.model_enum, 1526);
         assert_eq!(rec.input_tokens, 12_000);
@@ -929,7 +925,6 @@ mod tests {
         // chat(1) -> { model(3)=1 }, step_indices(2)=14, step_indices(2)=15
         let root_unpacked: &[u8] = &[0x0a, 0x02, 0x18, 0x01, 0x10, 0x0e, 0x10, 0x0f];
         let rec_unpacked = extract_gen_metadata_record(root_unpacked).unwrap();
-        assert_eq!(rec_unpacked.first_step_index, Some(14));
         assert_eq!(rec_unpacked.step_indices, vec![14, 15]);
         assert_eq!(rec_unpacked.model_enum, 1);
     }
@@ -1049,19 +1044,23 @@ mod tests {
     #[test]
     fn step_created_at_secs_rejects_out_of_range_years() {
         assert_eq!(
-            extract_step_created_at_secs(&encode_step_meta_blob(-62_135_596_800)),
+            extract_step_metadata_record(&encode_step_meta_blob(-62_135_596_800))
+                .and_then(|r| r.created_at_secs),
             Some(-62_135_596_800)
         );
         assert_eq!(
-            extract_step_created_at_secs(&encode_step_meta_blob(253_402_300_799)),
+            extract_step_metadata_record(&encode_step_meta_blob(253_402_300_799))
+                .and_then(|r| r.created_at_secs),
             Some(253_402_300_799)
         );
         assert_eq!(
-            extract_step_created_at_secs(&encode_step_meta_blob(-62_135_596_801)),
+            extract_step_metadata_record(&encode_step_meta_blob(-62_135_596_801))
+                .and_then(|r| r.created_at_secs),
             None
         );
         assert_eq!(
-            extract_step_created_at_secs(&encode_step_meta_blob(253_402_300_800)),
+            extract_step_metadata_record(&encode_step_meta_blob(253_402_300_800))
+                .and_then(|r| r.created_at_secs),
             None
         );
     }

@@ -11,7 +11,6 @@ mod query;
 mod render;
 mod scan;
 mod tui;
-mod tz;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -20,17 +19,16 @@ use std::path::{Path, PathBuf};
 pub use metric::{MetricValue, StatsMetric};
 pub use model::*;
 pub(crate) use pricing::{
-    is_pricing_fingerprint_fresh, maybe_spawn_pricing_sync_if_stale, pricing_cache_fingerprint,
-    DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE,
+    inspect_pricing_cache, is_pricing_fingerprint_fresh, maybe_spawn_pricing_sync_if_stale,
+    pricing_cache_fingerprint, DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE,
 };
 pub use pricing::{run_pricing_command, PricingCatalog, SyncMode};
 pub(crate) use scan::{
     estimate_conversation_cost_usd_with_parent_conn, lookup_cached_conversation_cost,
 };
 pub use tui::{run_conversation_stats_tui, run_conversations_tui, run_stats_tui};
-pub use tz::unix_secs_to_utc_date;
 
-use crate::sys::time::civil_date_from_unix_day;
+use crate::sys::time::{civil_date_from_unix_day, format_day, TimeZoneSpec};
 use query::{SourceFilter, StatsDataset};
 use render::{
     render_conversation_stats_report, render_conversations_list, render_stats_report_with_metric,
@@ -39,32 +37,59 @@ use scan::{
     collect_conversation_stats_report, filter_and_rank_conversations, list_conversations,
     UsageEvent,
 };
-use tz::{format_day, TimeZoneSpec};
+
+/// Formats a Unix epoch timestamp (seconds) as a UTC `YYYY-MM-DD` date string.
+pub fn unix_secs_to_utc_date(unix_secs: u64) -> String {
+    crate::sys::time::unix_secs_to_utc_date(unix_secs as i64)
+}
 
 const DAYS_PER_WEEK: i64 = 7;
 const ACTIVITY_WEEKS: usize = 20;
 
-fn accumulate_period(summary: &mut PeriodSummary, ev: &UsageEvent) {
-    summary.requests += 1;
-    summary.input_tokens = summary.input_tokens.saturating_add(ev.input_tokens);
-    summary.cache_read_tokens = summary
-        .cache_read_tokens
-        .saturating_add(ev.cache_read_tokens);
-    summary.cache_write_tokens = summary
-        .cache_write_tokens
-        .saturating_add(ev.cache_write_tokens);
-    summary.output_tokens = summary.output_tokens.saturating_add(ev.output_tokens);
-    summary.thinking_tokens = summary.thinking_tokens.saturating_add(ev.thinking_tokens);
-    summary.total_tokens = summary.total_tokens.saturating_add(ev.total_tokens);
-    match ev.cost_usd {
-        Some(usd) => {
-            summary.priced_usd += usd;
-            summary.priced_requests += 1;
-        }
-        None => {
-            summary.unpriced_requests += 1;
+#[derive(Clone, Copy)]
+pub(super) struct UsageDelta {
+    pub(super) input_tokens: u64,
+    pub(super) cache_read_tokens: u64,
+    pub(super) cache_write_tokens: u64,
+    pub(super) output_tokens: u64,
+    pub(super) thinking_tokens: u64,
+    pub(super) total_tokens: u64,
+    pub(super) cost_usd: Option<f64>,
+}
+
+impl PeriodSummary {
+    pub(super) fn record_usage(&mut self, delta: UsageDelta) {
+        self.requests += 1;
+        self.input_tokens = self.input_tokens.saturating_add(delta.input_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(delta.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(delta.cache_write_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(delta.output_tokens);
+        self.thinking_tokens = self.thinking_tokens.saturating_add(delta.thinking_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(delta.total_tokens);
+        match delta.cost_usd {
+            Some(usd) => {
+                self.priced_usd += usd;
+                self.priced_requests += 1;
+            }
+            None => self.unpriced_requests += 1,
         }
     }
+}
+
+fn accumulate_period(summary: &mut PeriodSummary, ev: &UsageEvent) {
+    summary.record_usage(UsageDelta {
+        input_tokens: ev.input_tokens,
+        cache_read_tokens: ev.cache_read_tokens,
+        cache_write_tokens: ev.cache_write_tokens,
+        output_tokens: ev.output_tokens,
+        thinking_tokens: ev.thinking_tokens,
+        total_tokens: ev.total_tokens,
+        cost_usd: ev.cost_usd,
+    });
 }
 
 #[derive(Default)]
@@ -86,7 +111,7 @@ pub(super) fn activity_week_mondays(today_idx: i64) -> impl Iterator<Item = i64>
     (0..ACTIVITY_WEEKS).map(move |w| first_monday + (w as i64) * DAYS_PER_WEEK)
 }
 
-fn build_weekly_usage(today_idx: i64, daily_by_date: &HashMap<&str, u64>) -> Vec<WeeklyUsage> {
+fn build_weekly_usage(today_idx: i64, daily_by_day: &HashMap<i64, u64>) -> Vec<WeeklyUsage> {
     activity_week_mondays(today_idx)
         .map(|week_mon| {
             let mut daily_tokens = [None; 7];
@@ -94,8 +119,7 @@ fn build_weekly_usage(today_idx: i64, daily_by_date: &HashMap<&str, u64>) -> Vec
             for (d, slot) in daily_tokens.iter_mut().enumerate() {
                 let day_idx = week_mon + (d as i64);
                 if day_idx <= today_idx {
-                    let date = format_day(day_idx);
-                    let tok = daily_by_date.get(date.as_str()).copied().unwrap_or(0);
+                    let tok = daily_by_day.get(&day_idx).copied().unwrap_or(0);
                     *slot = Some(tok);
                     total_tokens = total_tokens.saturating_add(tok);
                 }
@@ -128,7 +152,8 @@ fn collect_stats_with_tz(
         DEFAULT_PRICING_TTL_SECS,
         |_| unreachable!(),
     );
-    StatsDataset::collect_for_roots(&roots, now_unix_secs, tz, &pricing).to_report(days)
+    StatsDataset::collect_for_roots(&roots, now_unix_secs, tz, &pricing)
+        .to_report_with_metric(days, StatsMetric::Total)
 }
 
 /// Shared runtime options for `agy-statusline stats` (static output and interactive TUI).
@@ -156,11 +181,14 @@ pub fn run_stats_command<W: Write>(
     out: &mut W,
 ) -> io::Result<()> {
     let dataset = StatsDataset::collect(roots, opts.cache_dir, opts.now_unix_secs);
-    let report = if json {
-        dataset.to_report(opts.days)
-    } else {
-        dataset.to_report_with_metric(opts.days, opts.metric)
-    };
+    let report = dataset.to_report_with_metric(
+        opts.days,
+        if json {
+            StatsMetric::Total
+        } else {
+            opts.metric
+        },
+    );
 
     if json {
         let formatted = serde_json::to_string_pretty(&report)

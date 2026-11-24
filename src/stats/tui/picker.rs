@@ -16,8 +16,7 @@ use crate::stats::query::SourceFilter;
 use crate::stats::render::format_conversation_display_title;
 use crate::stats::scan::filter_and_rank_conversations;
 use crate::stats::ConversationListItem;
-use crate::statusline::format::format_tokens_string as fmt_tok;
-use crate::statusline::render::truncate_to_width;
+use crate::sys::fmt::{format_tokens_string as fmt_tok, truncate_to_width};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PickerAction {
@@ -288,21 +287,38 @@ impl PickerScreen {
     fn draw_search_bar(&mut self, frame: &mut Frame<'_>, area: Rect, pal: &Palette) {
         self.search_bar = area;
         let query_val = self.input.value();
-        let avail_w = usize::from(area.width.saturating_sub(4)).max(4);
-        let scroll = self.input.visual_scroll(avail_w);
-        let mut bar_spans: Vec<Span<'static>> = Vec::new();
         if self.searching {
-            bar_spans.push(Span::styled(" / ", pal.bold(Color::Cyan)));
-            bar_spans.push(Span::styled(
-                query_val.chars().skip(scroll).collect::<String>(),
-                pal.bold(Color::White),
-            ));
-            let cursor_x = area
+            let prefix_w = 3u16.min(area.width);
+            let input_area = Rect {
+                x: area.x.saturating_add(prefix_w),
+                y: area.y,
+                width: area.width.saturating_sub(prefix_w),
+                height: area.height,
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(" / ", pal.bold(Color::Cyan))),
+                Rect {
+                    width: prefix_w,
+                    ..area
+                },
+            );
+            let scroll = self
+                .input
+                .visual_scroll(usize::from(input_area.width.saturating_sub(1)).max(1));
+            frame.render_widget(
+                Paragraph::new(Span::styled(query_val.to_string(), pal.bold(Color::White)))
+                    .scroll((0, scroll as u16)),
+                input_area,
+            );
+            let cursor_x = input_area
                 .x
-                .saturating_add(3 + (self.input.visual_cursor().saturating_sub(scroll)) as u16)
+                .saturating_add(self.input.visual_cursor().saturating_sub(scroll) as u16)
                 .min(area.right().saturating_sub(1));
             frame.set_cursor_position(Position::new(cursor_x, area.y));
-        } else if !query_val.is_empty() {
+            return;
+        }
+        let mut bar_spans: Vec<Span<'static>> = Vec::new();
+        if !query_val.is_empty() {
             bar_spans.push(Span::styled(" / ", pal.bold(Color::Yellow)));
             bar_spans.push(Span::styled(query_val.to_string(), pal.bold(Color::Yellow)));
             bar_spans.push(Span::styled("  (Esc clear)", pal.dim()));

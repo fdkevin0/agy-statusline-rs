@@ -5,12 +5,11 @@ use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
 use crate::config::layout::{GlyphMode, WidgetId};
-use crate::statusline::format::{format_tokens, format_tokens_string as format_tok_str};
 use crate::statusline::metrics::QuotaView;
 use crate::statusline::theme::Palette;
 use crate::statusline::StatuslinePayload;
+use crate::sys::fmt::{format_tokens, format_tokens_string as format_tok_str, truncate_to_width};
 
-use super::fit::truncate_to_width;
 use super::{
     build_progress_bar_with_chars, CompactStage, RenderContext, Renderer, ResolvedCost, Segment,
 };
@@ -863,39 +862,7 @@ fn abbreviate_leading_word(text: &str) -> String {
     text.to_string()
 }
 
-pub(super) fn sanitize_inline_text(raw: &str) -> String {
-    // Normalize non-CR/LF whitespace (such as `\t` and NEL) before `strip_ansi_escapes`,
-    // whose VTE parser drops C0/C1 control characters other than `\n` and `\r`.
-    let normalized: String = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_whitespace() && !matches!(ch, ' ' | '\n' | '\r') {
-                ' '
-            } else {
-                ch
-            }
-        })
-        .collect();
-    let stripped = strip_ansi_escapes::strip_str(&normalized);
-    let mut out = String::with_capacity(stripped.len());
-    let mut pending_space = false;
-
-    for ch in stripped.chars() {
-        if ch.is_whitespace() {
-            if !out.is_empty() {
-                pending_space = true;
-            }
-        } else if !ch.is_control() {
-            if pending_space {
-                out.push(' ');
-                pending_space = false;
-            }
-            out.push(ch);
-        }
-    }
-
-    out
-}
+use crate::sys::fmt::sanitize_inline_text;
 
 #[cfg(test)]
 mod tests {

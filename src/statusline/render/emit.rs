@@ -2,6 +2,8 @@
 
 use std::io::{self, Write as IoWrite};
 
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::config::layout::{GlyphMode, LayoutConfig, ThemeStyle, VisualStyle};
@@ -183,6 +185,136 @@ impl Renderer<'_> {
                     write!(out, "\x1b[0m\x1b[38;5;{last_bg}m{}\x1b[0m", glyphs.pl_right)?;
                 }
                 Ok(())
+            }
+        }
+    }
+
+    pub(super) fn render_row_groups_line(
+        &self,
+        groups: &[Vec<Segment>],
+        term_width: Option<usize>,
+    ) -> Option<Line<'static>> {
+        let mut spans = Vec::new();
+        match groups {
+            [] => return None,
+            [only] => self.push_slice_spans(only, &mut spans),
+            [left, right] => {
+                let w0 = slice_visible_width(left, self.geom);
+                let w1 = slice_visible_width(right, self.geom);
+                let gap = term_width.unwrap_or(0).saturating_sub(w0 + w1).max(1);
+                self.push_slice_spans(left, &mut spans);
+                spans.push(Span::raw(" ".repeat(gap)));
+                self.push_slice_spans(right, &mut spans);
+            }
+            [left, center, right, ..] => {
+                let w0 = slice_visible_width(left, self.geom);
+                let w1 = slice_visible_width(center, self.geom);
+                let w2 = slice_visible_width(right, self.geom);
+                let rem = term_width.unwrap_or(0).saturating_sub(w0 + w1 + w2);
+                let gap1 = (rem / 2).max(1);
+                let gap2 = rem.saturating_sub(gap1).max(1);
+                self.push_slice_spans(left, &mut spans);
+                spans.push(Span::raw(" ".repeat(gap1)));
+                self.push_slice_spans(center, &mut spans);
+                spans.push(Span::raw(" ".repeat(gap2)));
+                self.push_slice_spans(right, &mut spans);
+            }
+        }
+        Some(Line::from(spans))
+    }
+
+    fn push_slice_spans(&self, segments: &[Segment], spans: &mut Vec<Span<'static>>) {
+        let styled = |fg: u8, bg: Option<u8>, bold: bool| {
+            let mut style = Style::default().fg(Color::Indexed(fg));
+            if let Some(b) = bg {
+                style = style.bg(Color::Indexed(b));
+            }
+            if bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            style
+        };
+
+        if self.geom.mono {
+            for (i, seg) in segments.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::raw(self.geom.sep_str));
+                }
+                spans.push(Span::raw(seg.text.clone()));
+            }
+            return;
+        }
+
+        let pal = self.pal;
+        let glyphs = self.glyphs;
+
+        match self.cfg.style {
+            VisualStyle::Plain => {
+                for (i, seg) in segments.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::styled(
+                            self.geom.sep_str,
+                            Style::default().fg(Color::Indexed(pal.sep)),
+                        ));
+                    }
+                    spans.push(Span::styled(
+                        seg.text.clone(),
+                        styled(seg.fg, None, seg.bold),
+                    ));
+                }
+            }
+            VisualStyle::Pill => {
+                for (i, seg) in segments.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw(" "));
+                    }
+                    let (bg, fg, bold) = match seg.accent_bg {
+                        Some(abg) => (abg, pal.pl_accent_fg, true),
+                        None => (pal.pill_bg, seg.fg, seg.bold),
+                    };
+                    if let Some((cap_l, cap_r)) = glyphs.pill_caps {
+                        spans.push(Span::styled(cap_l, Style::default().fg(Color::Indexed(bg))));
+                        spans.push(Span::styled(seg.text.clone(), styled(fg, Some(bg), bold)));
+                        spans.push(Span::styled(cap_r, Style::default().fg(Color::Indexed(bg))));
+                    } else {
+                        spans.push(Span::styled(
+                            format!(" {} ", seg.text),
+                            styled(fg, Some(bg), bold),
+                        ));
+                    }
+                }
+            }
+            VisualStyle::Powerline => {
+                let mut prev_bg: Option<u8> = None;
+                for (i, seg) in segments.iter().enumerate() {
+                    let (bg, fg, bold) = match seg.accent_bg {
+                        Some(accent) => (accent, pal.pl_accent_fg, true),
+                        None => (
+                            if i % 2 == 0 { pal.pl_bg_a } else { pal.pl_bg_b },
+                            seg.fg,
+                            seg.bold,
+                        ),
+                    };
+                    if let Some(p_bg) = prev_bg {
+                        spans.push(Span::styled(
+                            glyphs.pl_right,
+                            Style::default()
+                                .fg(Color::Indexed(p_bg))
+                                .bg(Color::Indexed(bg)),
+                        ));
+                    }
+                    spans.push(Span::styled(
+                        format!(" {} ", seg.text),
+                        styled(fg, Some(bg), bold),
+                    ));
+                    prev_bg = Some(bg);
+                }
+                if let Some(last_bg) = prev_bg {
+                    spans.push(Span::styled(
+                        glyphs.pl_right,
+                        Style::default().fg(Color::Indexed(last_bg)),
+                    ));
+                }
             }
         }
     }

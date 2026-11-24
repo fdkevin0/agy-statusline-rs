@@ -16,8 +16,6 @@ use crate::statusline::theme::{glyphs_for, palette_for, GlyphSet, Palette};
 use crate::statusline::StatuslinePayload;
 use crate::sys::time::unix_now_secs;
 
-pub(crate) use fit::truncate_to_width;
-
 use emit::{compute_geometry, StyleGeometry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +268,34 @@ pub fn write_statusline<W: IoWrite>(
     write_statusline_at(payload, meta, git, 0, unix_now_secs(), cfg, out)
 }
 
+fn layout_statusline_rows<'a>(
+    payload: &StatuslinePayload,
+    meta: &SessionMetadata,
+    git: &'a GitInfo,
+    unpriced_turns: u64,
+    now_unix_secs: u64,
+    cfg: &'a LayoutConfig,
+) -> (Renderer<'a>, Vec<Vec<Vec<Segment>>>) {
+    let quotas = resolve_quota_views(payload, now_unix_secs);
+    let renderer = Renderer::new(cfg);
+    let ctx = RenderContext::build(payload, meta, git, quotas, unpriced_turns, cfg);
+    let max_width = cfg.responsive.then_some(payload.terminal_width).flatten();
+
+    let rows = cfg
+        .rows
+        .iter()
+        .map(|row| {
+            let segs: Vec<Segment> = row
+                .iter()
+                .filter_map(|&w| renderer.render_widget(w, payload, &ctx))
+                .collect();
+            let groups = fit::split_into_groups(segs);
+            fit::fit_row_groups(groups, max_width, renderer.geom, renderer.glyphs.ellipsis)
+        })
+        .collect();
+    (renderer, rows)
+}
+
 /// Renders all non-empty configured rows using an explicit unpriced-turn count and timestamp.
 pub(crate) fn write_statusline_at<W: IoWrite>(
     payload: &StatuslinePayload,
@@ -280,22 +306,25 @@ pub(crate) fn write_statusline_at<W: IoWrite>(
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
-    let quotas = resolve_quota_views(payload, now_unix_secs);
-    let renderer = Renderer::new(cfg);
-    let ctx = RenderContext::build(payload, meta, git, quotas, unpriced_turns, cfg);
-    let max_width = cfg.responsive.then_some(payload.terminal_width).flatten();
-
-    for row in &cfg.rows {
-        let segs: Vec<Segment> = row
-            .iter()
-            .filter_map(|&w| renderer.render_widget(w, payload, &ctx))
-            .collect();
-        let groups = fit::split_into_groups(segs);
-        let fitted =
-            fit::fit_row_groups(groups, max_width, renderer.geom, renderer.glyphs.ellipsis);
-        renderer.write_row_groups(&fitted, payload.terminal_width, out)?;
+    let (renderer, rows) =
+        layout_statusline_rows(payload, meta, git, unpriced_turns, now_unix_secs, cfg);
+    for fitted in &rows {
+        renderer.write_row_groups(fitted, payload.terminal_width, out)?;
     }
     Ok(())
+}
+
+/// Renders all non-empty configured rows directly into styled [`ratatui::text::Line`] values.
+pub(crate) fn render_statusline_lines(
+    payload: &StatuslinePayload,
+    meta: &SessionMetadata,
+    git: &GitInfo,
+    cfg: &LayoutConfig,
+) -> Vec<ratatui::text::Line<'static>> {
+    let (renderer, rows) = layout_statusline_rows(payload, meta, git, 0, unix_now_secs(), cfg);
+    rows.iter()
+        .filter_map(|fitted| renderer.render_row_groups_line(fitted, payload.terminal_width))
+        .collect()
 }
 
 #[cfg(test)]

@@ -10,8 +10,8 @@ use unicode_width::UnicodeWidthStr;
 
 use agy_statusline::agy::db::SessionMetadata;
 use agy_statusline::agy::protobuf::{
-    extract_gen_metadata_record, extract_metadata_speed, extract_step_created_at_secs,
-    MAX_TIMESTAMP_SECS, MAX_TTFT_SECS, MAX_TURN_SPEED_TPS, MIN_TIMESTAMP_SECS,
+    extract_gen_metadata_record, extract_step_metadata_record, MAX_TIMESTAMP_SECS, MAX_TTFT_SECS,
+    MAX_TURN_SPEED_TPS, MIN_TIMESTAMP_SECS,
 };
 use agy_statusline::config::layout::{GlyphMode, LayoutConfig, ThemeStyle, VisualStyle, WidgetId};
 use agy_statusline::statusline::git::GitInfo;
@@ -53,7 +53,6 @@ proptest! {
         let expected_output = output_tok.max(thinking_tok.saturating_add(resp_out_tok));
         let expected_thinking = expected_output.min(thinking_tok);
         let rec = extract_gen_metadata_record(&gen_blob).unwrap();
-        prop_assert_eq!(rec.first_step_index, Some(step_idx));
         prop_assert_eq!(rec.step_indices.as_slice(), &[step_idx]);
         prop_assert_eq!(rec.model_enum, model_enum);
         prop_assert_eq!(rec.input_tokens, input_tok);
@@ -70,14 +69,13 @@ proptest! {
         prop_assert!((ttft_secs - (ttft_ms as f64) / 1_000.0).abs() < 1e-6);
 
         let expected_tps = (expected_output as f64) / (dur_secs as f64);
-        let speed = extract_metadata_speed(&gen_blob).unwrap();
+        let speed = rec.decode_speed_tps().unwrap();
         prop_assert!(speed > 0.0 && speed < MAX_TURN_SPEED_TPS);
         prop_assert!((speed - expected_tps).abs() < 1e-9);
-        prop_assert_eq!(rec.decode_speed_tps(), Some(speed));
 
         let step_blob = build_step_meta_blob(step_secs);
         prop_assert_eq!(
-            extract_step_created_at_secs(&step_blob),
+            extract_step_metadata_record(&step_blob).and_then(|r| r.created_at_secs),
             Some(step_secs as i64)
         );
     }

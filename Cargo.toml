@@ -15,10 +15,9 @@ default = ["bundled"]
 bundled = ["rusqlite/bundled"]
 
 [dependencies]
-ansi-to-tui = { version = "8.0", default-features = false }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 crossterm = "0.29"
-jiff = "1.0"
+jiff = { version = "1.0", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
 nucleo-matcher = "0.3"
 prost = "0.14"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }

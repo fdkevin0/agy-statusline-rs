@@ -15,7 +15,8 @@ use agy_statusline::cli::apply::{
 };
 use agy_statusline::cli::doctor::run_doctor;
 use agy_statusline::config::layout::{
-    load_layout_config, load_saved_stats_metric, save_layout_config, LayoutConfig, Preset,
+    load_layout_config, load_saved_stats_metric, save_layout_config, save_stats_metric,
+    LayoutConfig, Preset,
 };
 use agy_statusline::config::tui::run_tui_config;
 use agy_statusline::stats::{
@@ -304,7 +305,13 @@ fn main() -> io::Result<()> {
                     );
                 }
                 if output.is_interactive(false) {
-                    return run_stats_tui(ctx.roots, ctx.config_path.as_deref(), &opts);
+                    let final_metric = run_stats_tui(ctx.roots, &opts)?;
+                    if final_metric != ctx.metric {
+                        if let Some(cfg_path) = ctx.config_path.as_deref() {
+                            let _ = save_stats_metric(cfg_path, final_metric);
+                        }
+                    }
+                    return Ok(());
                 }
                 let mut stdout = io::stdout().lock();
                 return run_stats_command(&ctx.roots, &opts, output.json, &mut stdout);

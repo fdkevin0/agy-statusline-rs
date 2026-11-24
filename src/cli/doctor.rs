@@ -1,28 +1,26 @@
 //! Configuration, runtime environment, AGY hook, storage, and live preview diagnostics (`doctor`).
 
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use serde::Deserialize;
 use serde_json::Value;
 
-use crate::agy::db::{is_absent_or_real_file, is_safe_sqlite_file, is_valid_uuid};
-use crate::cli::apply::read_settings_object;
+use crate::agy::db::{is_safe_sqlite_file, is_valid_uuid};
+use crate::agy::settings::read_settings_object;
 use crate::config::layout::try_load_layout_config;
-use crate::stats::{DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE};
+use crate::stats::{inspect_pricing_cache, MODELS_DEV_CACHE_FILE};
 use crate::statusline::render::write_statusline;
 use crate::statusline::{sample_preview_git, sample_preview_metadata, sample_preview_payload};
+use crate::sys::fmt::sanitize_inline_text;
 use crate::sys::process::{run_command_stdout_bounded, BoundedCommandError};
 use crate::sys::time::unix_now_secs;
 
 const AGY_VERSION_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_AGY_VERSION_BYTES: u64 = 4096;
-const MAX_CACHE_INSPECT_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct DoctorEnv<'a> {
@@ -31,13 +29,6 @@ struct DoctorEnv<'a> {
     path_env: Option<&'a OsStr>,
     now_unix_secs: u64,
     no_color: bool,
-}
-
-#[derive(Deserialize)]
-struct PricingCacheSummary {
-    fetched_at: u64,
-    #[serde(default)]
-    models: BTreeMap<String, Value>,
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -111,20 +102,10 @@ fn command_executable_exists_in_path(cmd: &str, path_env: Option<&OsStr>) -> boo
     path_env.is_some_and(|paths| which::which_in(&exe, Some(paths), ".").is_ok())
 }
 
-fn sanitize_single_line(line: &str) -> String {
-    line.chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
-
 fn sanitized_nonempty_lines(bytes: &[u8]) -> Vec<String> {
     let raw = String::from_utf8_lossy(bytes);
-    let stripped = strip_ansi_escapes::strip_str(&raw);
-    stripped
-        .lines()
-        .map(sanitize_single_line)
+    raw.lines()
+        .map(sanitize_inline_text)
         .filter(|line| !line.is_empty())
         .collect()
 }
@@ -200,66 +181,6 @@ fn inspect_conversations_dir(conv_dir: &Path) -> String {
     };
     let noun = if db_count == 1 { "file" } else { "files" };
     format!("found, {db_count} session .db {noun}")
-}
-
-fn inspect_cache_file_safety(path: &Path) -> Result<bool, String> {
-    if !is_absent_or_real_file(path) {
-        let is_symlink = fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
-        return Err(if is_symlink {
-            "symlink (ignored)".to_string()
-        } else {
-            "not a regular file (ignored)".to_string()
-        });
-    }
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("unreadable ({e})")),
-    }
-}
-
-fn read_file_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
-    let file = fs::File::open(path)?;
-    let mut buf = Vec::new();
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut buf)?;
-    if (buf.len() as u64) > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "exceeds maximum inspected size",
-        ));
-    }
-    Ok(buf)
-}
-
-fn compact_json_error(err: &serde_json::Error) -> String {
-    sanitize_single_line(&err.to_string())
-        .chars()
-        .take(80)
-        .collect()
-}
-
-fn inspect_pricing_cache(cache_dir: &Path, now_unix_secs: u64) -> String {
-    let path = cache_dir.join(MODELS_DEV_CACHE_FILE);
-    match inspect_cache_file_safety(&path) {
-        Ok(false) => return "not found".to_string(),
-        Err(reason) => return reason,
-        Ok(true) => {}
-    }
-    let bytes = match read_file_bounded(&path, MAX_CACHE_INSPECT_BYTES) {
-        Ok(b) => b,
-        Err(e) => return format!("corrupt ({e})"),
-    };
-    let parsed: PricingCacheSummary = match serde_json::from_slice(&bytes) {
-        Ok(p) => p,
-        Err(e) => return format!("corrupt ({})", compact_json_error(&e)),
-    };
-    let freshness = if now_unix_secs.saturating_sub(parsed.fetched_at) < DEFAULT_PRICING_TTL_SECS {
-        "fresh"
-    } else {
-        "stale"
-    };
-    format!("found, {} models ({freshness})", parsed.models.len())
 }
 
 fn run_doctor_with<W: Write>(
@@ -404,7 +325,8 @@ mod tests {
     use super::*;
 
     use crate::agy::paths::agy_settings_path_for_home;
-    use crate::cli::apply::apply_statusline_config;
+    use crate::agy::settings::apply_statusline_config;
+    use crate::stats::DEFAULT_PRICING_TTL_SECS;
 
     #[cfg(windows)]
     const FAKE_BIN_NAME: &str = "agy-statusline-fake.exe";

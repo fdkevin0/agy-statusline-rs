@@ -1,12 +1,16 @@
-//! RAII terminal mode guard restoring raw mode, alternate screen, and mouse capture
-//! cleanly on normal exit or panic.
+//! RAII terminal mode guard and shared TUI bootstrap restoring raw mode, alternate screen,
+//! and mouse capture cleanly on normal exit or panic.
 
 use std::io;
 use std::sync::Arc;
 
-use crossterm::event::DisableMouseCapture;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 
 type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
 
@@ -45,4 +49,14 @@ impl Drop for TerminalGuard {
             }
         }
     }
+}
+
+/// Enters raw mode, alternate screen, and mouse capture, returning a drop guard and terminal.
+pub(crate) fn enter_tui() -> io::Result<(TerminalGuard, Terminal<CrosstermBackend<io::Stdout>>)> {
+    let guard = TerminalGuard::enter();
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    Ok((guard, terminal))
 }

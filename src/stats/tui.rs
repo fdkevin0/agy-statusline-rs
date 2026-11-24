@@ -12,10 +12,7 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, EnableMouseCapture, Event, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
-use ratatui::backend::CrosstermBackend;
+use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -23,20 +20,20 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
     TableState,
 };
-use ratatui::{Frame, Terminal};
+use ratatui::Frame;
 
 use super::metric::StatsMetric;
 use super::pricing::{
     fetch_models_dev_via_curl, PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS,
 };
 use super::scan::{collect_conversation_stats_report, list_conversations};
-use super::tz::TimeZoneSpec;
-use super::PeriodSummary;
-use crate::config::layout::save_stats_metric;
-use crate::statusline::format::format_tokens_string as fmt_tok;
-use crate::sys::terminal::TerminalGuard;
+use super::{ConversationStatsReport, PeriodSummary};
+use crate::sys::fmt::format_tokens_string as fmt_tok;
+use crate::sys::terminal::enter_tui;
+use crate::sys::time::TimeZoneSpec;
 
-use dashboard::{DashboardAction, DashboardScreen};
+use dashboard::DashboardScreen;
+use dashboard_state::StatsAction;
 use detail::{DetailAction, DetailScreen};
 use picker::{PickerAction, PickerScreen};
 
@@ -378,30 +375,61 @@ struct StatsApp {
     default_metric: StatsMetric,
     pricing: Option<PricingCatalog>,
     screen: Screen,
-    prev_stack: Vec<Screen>,
+    origin: Screen,
+    opened_from_picker: bool,
     dashboard: Option<DashboardScreen>,
     picker: Option<PickerScreen>,
     detail: Option<DetailScreen>,
 }
 
 impl StatsApp {
-    fn pricing_mut(&mut self) -> &PricingCatalog {
-        let cache = self.cache_dir.as_deref();
-        self.pricing.get_or_insert_with(|| {
-            PricingCatalog::load_effective_with(
-                cache,
-                SyncMode::BlockingIfStale,
-                crate::sys::time::unix_now_secs(),
-                DEFAULT_PRICING_TTL_SECS,
-                fetch_models_dev_via_curl,
-            )
-        })
-    }
-
     fn active_metric(&self) -> StatsMetric {
         self.dashboard
             .as_ref()
             .map_or(self.default_metric, |d| d.state.query.metric)
+    }
+
+    fn back_screen(&self) -> Option<Screen> {
+        match (self.origin, self.screen) {
+            (Screen::Dashboard, Screen::Detail) => Some(Screen::Conversations),
+            (Screen::Dashboard, Screen::Conversations) => Some(Screen::Dashboard),
+            (Screen::Conversations, Screen::Detail) => Some(Screen::Conversations),
+            (Screen::Detail, Screen::Detail) if self.opened_from_picker => {
+                Some(Screen::Conversations)
+            }
+            (Screen::Detail, Screen::Conversations) if !self.opened_from_picker => {
+                Some(Screen::Detail)
+            }
+            _ => None,
+        }
+    }
+
+    fn load_conversation_report(
+        &mut self,
+        conv_id: &str,
+    ) -> io::Result<(ConversationStatsReport, Duration)> {
+        let start = Instant::now();
+        let now = crate::sys::time::unix_now_secs();
+        let metric = self.active_metric();
+        let cache = self.cache_dir.as_deref();
+        let pricing = self.pricing.get_or_insert_with(|| {
+            PricingCatalog::load_effective_with(
+                cache,
+                SyncMode::BlockingIfStale,
+                now,
+                DEFAULT_PRICING_TTL_SECS,
+                fetch_models_dev_via_curl,
+            )
+        });
+        let report = collect_conversation_stats_report(
+            &self.roots,
+            conv_id,
+            now,
+            &self.tz,
+            pricing,
+            metric,
+        )?;
+        Ok((report, start.elapsed()))
     }
 
     fn open_conversations(&mut self) {
@@ -409,48 +437,30 @@ impl StatsApp {
             .detail
             .as_ref()
             .map(|d| d.report.conversation_id.clone());
-        if self.prev_stack.last() == Some(&Screen::Conversations) {
-            self.prev_stack.pop();
-            if let Some(p) = self.picker.as_mut() {
-                p.set_active_id(active_id.as_deref());
-            }
-            self.screen = Screen::Conversations;
-            return;
-        }
         let items = list_conversations(&self.roots, &self.tz);
         match self.picker.as_mut() {
             Some(p) => p.replace_items(items, active_id.as_deref()),
             None => self.picker = Some(PickerScreen::new(items, active_id.as_deref(), None, false)),
         }
-        self.prev_stack.push(self.screen);
         self.screen = Screen::Conversations;
     }
 
     fn open_conversation(&mut self, conv_id: &str) {
-        let start = Instant::now();
-        let now = crate::sys::time::unix_now_secs();
-        let metric = self.active_metric();
-        let roots = self.roots.clone();
-        let tz = self.tz.clone();
-        let pricing = self.pricing_mut();
-        match collect_conversation_stats_report(&roots, conv_id, now, &tz, pricing, metric) {
-            Ok(report) => {
-                let short: String = report.conversation_id.chars().take(8).collect();
-                let turns = report.turns.len();
+        match self.load_conversation_report(conv_id) {
+            Ok((report, elapsed)) => {
+                let msg = format!(
+                    "Loaded {} ({} turns) in {:.0}ms",
+                    &report.conversation_id[..report.conversation_id.len().min(8)],
+                    report.turns.len(),
+                    elapsed.as_secs_f64() * 1_000.0
+                );
                 if let Some(p) = self.picker.as_mut() {
                     p.set_active_id(Some(&report.conversation_id));
                 }
                 let mut detail = DetailScreen::new(report);
-                detail.status_msg = Some(format!(
-                    "Loaded {short} ({turns} turns) in {:.0}ms",
-                    start.elapsed().as_secs_f64() * 1_000.0
-                ));
+                detail.status_msg = Some(msg);
                 self.detail = Some(detail);
-                if self.prev_stack.last() == Some(&Screen::Detail) {
-                    self.prev_stack.pop();
-                } else if self.screen != Screen::Detail {
-                    self.prev_stack.push(self.screen);
-                }
+                self.opened_from_picker = true;
                 self.screen = Screen::Detail;
             }
             Err(err) => {
@@ -462,35 +472,27 @@ impl StatsApp {
     }
 
     fn pop_or_quit(&mut self) -> bool {
-        if let Some(prev) = self.prev_stack.pop() {
-            if prev == Screen::Conversations {
-                if let (Some(p), Some(d)) = (self.picker.as_mut(), self.detail.as_ref()) {
-                    p.set_active_id(Some(&d.report.conversation_id));
-                }
+        let Some(prev) = self.back_screen() else {
+            return true;
+        };
+        if prev == Screen::Conversations {
+            if let (Some(p), Some(d)) = (self.picker.as_mut(), self.detail.as_ref()) {
+                p.set_active_id(Some(&d.report.conversation_id));
             }
-            self.screen = prev;
-            false
-        } else {
-            true
         }
+        self.screen = prev;
+        false
     }
 
-    fn run(mut self, config_path: Option<&Path>, pal: &Palette) -> io::Result<()> {
-        let initial_metric = self.default_metric;
-        let _guard = TerminalGuard::enter();
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
+    fn run(mut self, pal: &Palette) -> io::Result<StatsMetric> {
+        let (_guard, mut terminal) = enter_tui()?;
 
         loop {
             let scanning = self
                 .dashboard
                 .as_mut()
                 .is_some_and(DashboardScreen::poll_scan);
-            let has_back = !self.prev_stack.is_empty();
+            let has_back = self.back_screen().is_some();
 
             terminal.draw(|frame| match self.screen {
                 Screen::Dashboard => {
@@ -521,7 +523,7 @@ impl StatsApp {
                     let term_h = terminal.size().map_or(30, |s| s.height);
                     let action = match evt {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
-                            self.dashboard.as_mut().map_or(DashboardAction::Quit, |d| {
+                            self.dashboard.as_mut().map_or(StatsAction::Quit, |d| {
                                 d.handle_key(key.code, key.modifiers, term_h)
                             })
                         }
@@ -529,19 +531,19 @@ impl StatsApp {
                             if let Some(d) = self.dashboard.as_mut() {
                                 d.handle_mouse(mouse);
                             }
-                            DashboardAction::Continue
+                            StatsAction::Continue
                         }
-                        _ => DashboardAction::Continue,
+                        _ => StatsAction::Continue,
                     };
                     match action {
-                        DashboardAction::Quit => break,
-                        DashboardAction::OpenConversations => self.open_conversations(),
-                        DashboardAction::Refresh => {
+                        StatsAction::Quit => break,
+                        StatsAction::OpenConversations => self.open_conversations(),
+                        StatsAction::Refresh => {
                             if let Some(d) = self.dashboard.as_mut() {
                                 d.trigger_refresh(&self.roots, self.cache_dir.as_deref());
                             }
                         }
-                        DashboardAction::Continue => {}
+                        StatsAction::Continue => {}
                     }
                 }
                 Screen::Conversations => {
@@ -610,22 +612,14 @@ impl StatsApp {
                                 .as_ref()
                                 .map(|d| d.report.conversation_id.clone())
                             {
-                                let start = Instant::now();
-                                let now = crate::sys::time::unix_now_secs();
-                                let metric = self.active_metric();
-                                let roots = self.roots.clone();
-                                let tz = self.tz.clone();
-                                let pricing = self.pricing_mut();
-                                match collect_conversation_stats_report(
-                                    &roots, &conv_id, now, &tz, pricing, metric,
-                                ) {
-                                    Ok(updated) => {
+                                match self.load_conversation_report(&conv_id) {
+                                    Ok((updated, elapsed)) => {
                                         let turns = updated.turns.len();
                                         if let Some(d) = self.detail.as_mut() {
                                             d.replace_report(updated);
                                             d.status_msg = Some(format!(
                                                 "Refreshed {turns} turns in {:.0}ms",
-                                                start.elapsed().as_secs_f64() * 1_000.0
+                                                elapsed.as_secs_f64() * 1_000.0
                                             ));
                                         }
                                     }
@@ -644,14 +638,7 @@ impl StatsApp {
 
         drop(terminal);
         drop(_guard);
-
-        let final_metric = self.active_metric();
-        if final_metric != initial_metric {
-            if let Some(cfg_path) = config_path {
-                let _ = save_stats_metric(cfg_path, final_metric);
-            }
-        }
-        Ok(())
+        Ok(self.active_metric())
     }
 }
 
@@ -662,12 +649,11 @@ fn require_tty(msg: &'static str) -> io::Result<()> {
     Ok(())
 }
 
-/// Launches the interactive `agy-statusline stats` TUI dashboard.
+/// Launches the interactive `agy-statusline stats` TUI dashboard and returns the final metric.
 pub fn run_stats_tui(
     roots: Vec<(&'static str, PathBuf)>,
-    config_path: Option<&Path>,
     opts: &super::StatsOptions<'_>,
-) -> io::Result<()> {
+) -> io::Result<StatsMetric> {
     require_tty("interactive stats requires a TTY (use --plain or --json)")?;
     let tz = TimeZoneSpec::local();
     let timezone = tz.format_offset_at(opts.now_unix_secs as i64);
@@ -690,12 +676,13 @@ pub fn run_stats_tui(
         default_metric: opts.metric,
         pricing: None,
         screen: Screen::Dashboard,
-        prev_stack: Vec::new(),
+        origin: Screen::Dashboard,
+        opened_from_picker: false,
         dashboard: Some(dashboard),
         picker: None,
         detail: None,
     }
-    .run(config_path, &pal)
+    .run(&pal)
 }
 
 /// Launches the interactive single-conversation stats TUI (`agy-statusline stats <CONVERSATION_ID>`).
@@ -736,12 +723,14 @@ pub fn run_conversation_stats_tui(
         default_metric: opts.metric,
         pricing: Some(pricing),
         screen: Screen::Detail,
-        prev_stack: Vec::new(),
+        origin: Screen::Detail,
+        opened_from_picker: false,
         dashboard: None,
         picker: None,
         detail: Some(DetailScreen::new(report)),
     }
-    .run(None, &pal)
+    .run(&pal)?;
+    Ok(())
 }
 
 /// Launches the full-screen historical conversation picker TUI (`agy-statusline conversations`).
@@ -767,7 +756,8 @@ pub fn run_conversations_tui(
         default_metric: opts.metric,
         pricing: None,
         screen: Screen::Conversations,
-        prev_stack: Vec::new(),
+        origin: Screen::Conversations,
+        opened_from_picker: false,
         dashboard: None,
         picker: Some(PickerScreen::new(
             items,
@@ -777,5 +767,69 @@ pub fn run_conversations_tui(
         )),
         detail: None,
     }
-    .run(None, &pal)
+    .run(&pal)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app(origin: Screen) -> StatsApp {
+        StatsApp {
+            roots: Vec::new(),
+            cache_dir: None,
+            tz: TimeZoneSpec::utc(),
+            timezone: "UTC".to_string(),
+            default_metric: StatsMetric::Total,
+            pricing: None,
+            screen: origin,
+            origin,
+            opened_from_picker: false,
+            dashboard: None,
+            picker: None,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn navigation_hierarchy_handles_all_three_entries_without_ping_pong() {
+        // Entry 1: Dashboard -> Conversations -> Detail -> Conversations -> Dashboard.
+        let mut app = test_app(Screen::Dashboard);
+        assert_eq!(app.back_screen(), None);
+        app.screen = Screen::Conversations;
+        assert_eq!(app.back_screen(), Some(Screen::Dashboard));
+        app.screen = Screen::Detail;
+        app.opened_from_picker = true;
+        assert_eq!(app.back_screen(), Some(Screen::Conversations));
+        assert!(!app.pop_or_quit());
+        assert_eq!(app.screen, Screen::Conversations);
+        assert!(!app.pop_or_quit());
+        assert_eq!(app.screen, Screen::Dashboard);
+
+        // Entry 2: Conversations -> Detail -> Conversations -> quit.
+        let mut conv = test_app(Screen::Conversations);
+        assert_eq!(conv.back_screen(), None);
+        conv.screen = Screen::Detail;
+        conv.opened_from_picker = true;
+        assert_eq!(conv.back_screen(), Some(Screen::Conversations));
+        assert!(!conv.pop_or_quit());
+        assert_eq!(conv.screen, Screen::Conversations);
+        assert!(conv.pop_or_quit());
+
+        // Entry 3: Detail -> Conversations (back returns to Detail) -> select new Detail -> back to Conversations -> quit.
+        let mut det = test_app(Screen::Detail);
+        assert_eq!(det.back_screen(), None);
+        det.screen = Screen::Conversations;
+        assert_eq!(det.back_screen(), Some(Screen::Detail));
+        assert!(!det.pop_or_quit());
+        assert_eq!(det.screen, Screen::Detail);
+        det.screen = Screen::Conversations;
+        det.screen = Screen::Detail;
+        det.opened_from_picker = true;
+        assert_eq!(det.back_screen(), Some(Screen::Conversations));
+        assert!(!det.pop_or_quit());
+        assert_eq!(det.screen, Screen::Conversations);
+        assert!(det.pop_or_quit());
+    }
 }

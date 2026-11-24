@@ -7,16 +7,17 @@ use jiff::ToSpan;
 use unicode_width::UnicodeWidthStr;
 
 use super::metric::{
-    cache_hit_pct, format_pct, format_usd_full, format_usd_short, heatmap_level_f64, MetricValue,
-    StatsMetric, UsageCounters,
+    format_pct, format_usd_full, format_usd_short, heatmap_level_f64, MetricValue, StatsMetric,
+    UsageCounters,
 };
 use super::query::{HeatmapWeek, WEEKDAY_NAMES};
 use super::{
     ConversationListItem, ConversationStatsReport, DailyUsage, PeriodSummary, StatsReport,
     ACTIVITY_WEEKS,
 };
-use crate::statusline::format::format_tokens_string as fmt_tok;
-use crate::statusline::render::truncate_to_width;
+use crate::sys::fmt::{
+    format_duration_compact, format_tokens_string as fmt_tok, truncate_to_width,
+};
 
 const MONTH_NAMES: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -516,31 +517,6 @@ pub(super) fn format_ttft_compact(secs: f64) -> String {
     }
 }
 
-pub(super) fn format_span_duration(secs: u64) -> String {
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    if secs < 3_600 {
-        return format!("{}m", secs / 60);
-    }
-    if secs < 86_400 {
-        let h = secs / 3_600;
-        let m = (secs % 3_600) / 60;
-        return if m == 0 {
-            format!("{h}h")
-        } else {
-            format!("{h}h{m}m")
-        };
-    }
-    let d = secs / 86_400;
-    let h = (secs % 86_400) / 3_600;
-    if h == 0 {
-        format!("{d}d")
-    } else {
-        format!("{d}d{h}h")
-    }
-}
-
 fn cache_hit_ansi(pct: Option<f64>) -> &'static str {
     match pct.filter(|p| p.is_finite()) {
         None => "2",
@@ -582,7 +558,7 @@ pub(super) fn format_time_span(
         format!("{first} {arrow} {last}")
     };
     Some(match duration_secs {
-        Some(secs) if secs > 0 => format!("{base} ({})", format_span_duration(secs)),
+        Some(secs) if secs > 0 => format!("{base} ({})", format_duration_compact(secs)),
         _ => base,
     })
 }
@@ -599,11 +575,7 @@ fn write_conv_summary_row<W: Write>(
     let cache_tot = summary
         .cache_read_tokens
         .saturating_add(summary.cache_write_tokens);
-    let hit_pct = cache_hit_pct(
-        summary.input_tokens,
-        summary.cache_read_tokens,
-        summary.cache_write_tokens,
-    );
+    let hit_pct = summary.cache_hit_pct();
     let speed_str = med_speed.map_or_else(|| "-".to_string(), |s| format!("{s:.1}"));
     let ttft_str = format_styled_ttft(med_ttft, 8, no_color);
     let hit_str = format_styled_cache_hit(hit_pct, 9, no_color);
@@ -822,15 +794,7 @@ pub(super) fn render_conversation_stats_report<W: Write>(
                 .summary
                 .cache_read_tokens
                 .saturating_add(sub.summary.cache_write_tokens);
-            let hit = format_styled_cache_hit(
-                cache_hit_pct(
-                    sub.summary.input_tokens,
-                    sub.summary.cache_read_tokens,
-                    sub.summary.cache_write_tokens,
-                ),
-                9,
-                no_color,
-            );
+            let hit = format_styled_cache_hit(sub.summary.cache_hit_pct(), 9, no_color);
             let speed_str = sub
                 .median_tok_per_sec
                 .map_or_else(|| "-".to_string(), |s| format!("{s:.1}"));
@@ -887,11 +851,7 @@ pub(super) fn render_conversation_stats_report<W: Write>(
 
         for m in &report.models {
             let model_cell = pad_model_cell(&m.model, model_w, ascii);
-            let hit = format_styled_cache_hit(
-                cache_hit_pct(m.input_tokens, m.cache_read_tokens, m.cache_write_tokens),
-                9,
-                no_color,
-            );
+            let hit = format_styled_cache_hit(m.cache_hit_pct(), 9, no_color);
             let speed_str = m
                 .median_tok_per_sec
                 .map_or_else(|| "-".to_string(), |s| format!("{s:.1}"));
@@ -1199,7 +1159,10 @@ mod tests {
 
     fn weekly_for(today: &str, daily: &[(&str, u64)]) -> Vec<WeeklyUsage> {
         let today_idx = unix_day_from_civil_date(today.parse().unwrap());
-        let map: HashMap<&str, u64> = daily.iter().copied().collect();
+        let map: HashMap<i64, u64> = daily
+            .iter()
+            .map(|&(d, tok)| (unix_day_from_civil_date(d.parse().unwrap()), tok))
+            .collect();
         build_weekly_usage(today_idx, &map)
     }
 

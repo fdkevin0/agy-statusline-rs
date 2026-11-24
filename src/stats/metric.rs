@@ -10,7 +10,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::{DailyUsage, ModelStats, PeriodSummary};
-use crate::statusline::format::format_tokens_string as fmt_tok;
+use crate::sys::fmt::format_tokens_string as fmt_tok;
 
 /// Computes prompt cache hit percentage in `0.0..=100.0`, or `None` when no prompt tokens exist.
 pub(super) fn cache_hit_pct(input: u64, cache_read: u64, cache_write: u64) -> Option<f64> {
@@ -47,95 +47,48 @@ pub(super) trait UsageCounters {
     }
 }
 
-impl UsageCounters for PeriodSummary {
-    fn requests(&self) -> u64 {
-        self.requests
-    }
-    fn input_tokens(&self) -> u64 {
-        self.input_tokens
-    }
-    fn cache_read_tokens(&self) -> u64 {
-        self.cache_read_tokens
-    }
-    fn cache_write_tokens(&self) -> u64 {
-        self.cache_write_tokens
-    }
-    fn output_tokens(&self) -> u64 {
-        self.output_tokens
-    }
-    fn total_tokens(&self) -> u64 {
-        self.total_tokens
-    }
-    fn priced_usd(&self) -> f64 {
-        self.priced_usd
-    }
-    fn priced_requests(&self) -> u64 {
-        self.priced_requests
-    }
-    fn unpriced_requests(&self) -> u64 {
-        self.unpriced_requests
-    }
+macro_rules! impl_usage_counters {
+    ($ty:ty, |$s:ident| $priced_req:expr) => {
+        impl UsageCounters for $ty {
+            fn requests(&self) -> u64 {
+                self.requests
+            }
+            fn input_tokens(&self) -> u64 {
+                self.input_tokens
+            }
+            fn cache_read_tokens(&self) -> u64 {
+                self.cache_read_tokens
+            }
+            fn cache_write_tokens(&self) -> u64 {
+                self.cache_write_tokens
+            }
+            fn output_tokens(&self) -> u64 {
+                self.output_tokens
+            }
+            fn total_tokens(&self) -> u64 {
+                self.total_tokens
+            }
+            fn priced_usd(&self) -> f64 {
+                self.priced_usd
+            }
+            fn priced_requests(&self) -> u64 {
+                let $s = self;
+                $priced_req
+            }
+            fn unpriced_requests(&self) -> u64 {
+                self.unpriced_requests
+            }
+        }
+    };
 }
 
-impl UsageCounters for DailyUsage {
-    fn requests(&self) -> u64 {
-        self.requests
-    }
-    fn input_tokens(&self) -> u64 {
-        self.input_tokens
-    }
-    fn cache_read_tokens(&self) -> u64 {
-        self.cache_read_tokens
-    }
-    fn cache_write_tokens(&self) -> u64 {
-        self.cache_write_tokens
-    }
-    fn output_tokens(&self) -> u64 {
-        self.output_tokens
-    }
-    fn total_tokens(&self) -> u64 {
-        self.total_tokens
-    }
-    fn priced_usd(&self) -> f64 {
-        self.priced_usd
-    }
-    fn priced_requests(&self) -> u64 {
-        self.requests.saturating_sub(self.unpriced_requests)
-    }
-    fn unpriced_requests(&self) -> u64 {
-        self.unpriced_requests
-    }
-}
-
-impl UsageCounters for ModelStats {
-    fn requests(&self) -> u64 {
-        self.requests
-    }
-    fn input_tokens(&self) -> u64 {
-        self.input_tokens
-    }
-    fn cache_read_tokens(&self) -> u64 {
-        self.cache_read_tokens
-    }
-    fn cache_write_tokens(&self) -> u64 {
-        self.cache_write_tokens
-    }
-    fn output_tokens(&self) -> u64 {
-        self.output_tokens
-    }
-    fn total_tokens(&self) -> u64 {
-        self.total_tokens
-    }
-    fn priced_usd(&self) -> f64 {
-        self.priced_usd
-    }
-    fn priced_requests(&self) -> u64 {
-        self.requests.saturating_sub(self.unpriced_requests)
-    }
-    fn unpriced_requests(&self) -> u64 {
-        self.unpriced_requests
-    }
-}
+impl_usage_counters!(PeriodSummary, |s| s.priced_requests);
+impl_usage_counters!(DailyUsage, |s| s
+    .requests
+    .saturating_sub(s.unpriced_requests));
+impl_usage_counters!(ModelStats, |s| s
+    .requests
+    .saturating_sub(s.unpriced_requests));
 
 /// Active additive aggregation metric for daily usage, heatmap, KPIs, and model rankings.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]

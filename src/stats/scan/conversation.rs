@@ -9,8 +9,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use super::{
     deduplicate_parent_priority_turns, discover_sqlite_db_targets, extract_sqlite_db_turns,
-    merge_raw_turn, resolve_descendant_conversation_ids, valid_decode_speed, valid_ttft_secs,
-    RawTurn, TurnPricer, UsageEvent, UsageSource,
+    merge_raw_turn, valid_decode_speed, valid_ttft_secs, RawTurn, TurnPricer,
 };
 use crate::agy::db::{
     compute_median, is_safe_sqlite_file, is_valid_uuid, open_readonly_db,
@@ -18,13 +17,14 @@ use crate::agy::db::{
 };
 use crate::stats::metric::{cache_hit_pct, StatsMetric};
 use crate::stats::pricing::{round_usd_6, PricingCatalog};
-use crate::stats::query::{accumulate_model, finalize_models, SourceFilter};
-use crate::stats::tz::TimeZoneSpec;
+use crate::stats::query::{finalize_models, SourceFilter};
 use crate::stats::{
-    accumulate_period, ConversationListItem, ConversationStatsReport, ConversationTurnStats,
-    ModelAccumulator, PeriodSummary, SqliteStats, SubagentConversationStats,
+    ConversationListItem, ConversationStatsReport, ConversationTurnStats, ModelAccumulator,
+    PeriodSummary, SqliteStats, SubagentConversationStats, UsageDelta,
 };
+use crate::sys::fmt::sanitize_inline_text;
 use crate::sys::fs::modified_timestamp;
+use crate::sys::time::TimeZoneSpec;
 
 #[derive(Debug, Clone)]
 struct ResolvedConversationTarget {
@@ -405,24 +405,47 @@ pub(in crate::stats) fn list_conversations(
 }
 
 fn sanitize_summary_text(raw: Option<String>) -> Option<String> {
-    let raw = raw?;
-    let mut out = String::with_capacity(raw.len());
-    let mut prev_space = true;
-    for ch in raw.chars() {
-        if ch.is_control() || ch.is_whitespace() {
-            if !prev_space {
-                out.push(' ');
-                prev_space = true;
-            }
-        } else {
-            out.push(ch);
-            prev_space = false;
+    let cleaned = sanitize_inline_text(&raw?);
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// Walks descendant conversation IDs in memory (BFS, depth <= 8, cycle-safe) from a
+/// preloaded `conversation_summaries.db` map so callers never open the summary DB twice.
+fn descendant_ids_from_summaries(
+    summaries: &HashMap<String, IndexedSummaryRow>,
+    root_id: &str,
+) -> Vec<String> {
+    let root_lower = root_id.to_ascii_lowercase();
+    let mut children_by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (id, row) in summaries {
+        if let Some(parent) = row.parent_conversation_id.as_deref() {
+            children_by_parent
+                .entry(parent)
+                .or_default()
+                .push(id.as_str());
         }
     }
-    if out.ends_with(' ') {
-        out.pop();
+    let mut seen: HashSet<&str> = HashSet::from([root_lower.as_str()]);
+    let mut frontier: Vec<(&str, usize)> = vec![(root_lower.as_str(), 0)];
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while idx < frontier.len() {
+        let (cur, depth) = frontier[idx];
+        idx += 1;
+        if depth >= 8 {
+            continue;
+        }
+        if let Some(children) = children_by_parent.get(cur) {
+            for &child in children {
+                if seen.insert(child) {
+                    out.push(child.to_string());
+                    frontier.push((child, depth + 1));
+                }
+            }
+        }
     }
-    (!out.is_empty()).then_some(out)
+    out.sort();
+    out
 }
 
 struct ConversationTurnSlot {
@@ -441,6 +464,7 @@ struct SubagentAccumulator {
 
 fn load_conversation_turn_slots(
     target: &ResolvedConversationTarget,
+    desc_ids: &[String],
 ) -> io::Result<(Vec<ConversationTurnSlot>, Vec<String>, u64)> {
     let mut tagged_turns: Vec<ConversationTurnSlot> = Vec::new();
     let mut db_files: u64 = 1;
@@ -463,9 +487,8 @@ fn load_conversation_turn_slots(
         }
     }
 
-    let desc_ids = resolve_descendant_conversation_ids(&target.root, &target.conversation_id);
     let mut active_subagent_ids: Vec<String> = Vec::new();
-    for desc_id in &desc_ids {
+    for desc_id in desc_ids {
         let Some(desc_path) = resolve_conversation_db_path(&target.root, desc_id) else {
             continue;
         };
@@ -505,14 +528,13 @@ pub(in crate::stats) fn collect_conversation_stats_report(
     sort_metric: StatsMetric,
 ) -> io::Result<ConversationStatsReport> {
     let target = resolve_conversation_target(roots, conversation_query)?;
-    let usage_source = UsageSource::from_root_label(target.source);
     let timezone = tz.format_offset_at(now_unix_secs as i64);
 
-    let (tagged_turns, active_subagent_ids, db_files) = load_conversation_turn_slots(&target)?;
-
-    let mut wanted_ids: HashSet<String> = active_subagent_ids.iter().cloned().collect();
-    wanted_ids.insert(target.conversation_id.clone());
-    let summary_meta = load_conversation_summaries(&target.root, Some(&wanted_ids));
+    // Open `conversation_summaries.db` once to resolve both descendants and display metadata.
+    let summary_meta = load_conversation_summaries(&target.root, None);
+    let desc_ids = descendant_ids_from_summaries(&summary_meta, &target.conversation_id);
+    let (tagged_turns, active_subagent_ids, db_files) =
+        load_conversation_turn_slots(&target, &desc_ids)?;
 
     let mut deduped = deduplicate_parent_priority_turns(
         tagged_turns,
@@ -589,10 +611,6 @@ pub(in crate::stats) fn collect_conversation_stats_report(
         }
         let total_tokens = prompt_tokens.saturating_add(turn.output_tokens);
         let resolved = pricer.price_turn(turn);
-        let (local_day, local_date) = turn
-            .ts_secs
-            .map(|ts| tz.local_day_and_date(ts))
-            .unwrap_or_default();
 
         if prompt_tokens > 0 {
             let had_earlier_prompt = !seen_prompt_convs.insert(slot.conversation_id.clone());
@@ -604,12 +622,7 @@ pub(in crate::stats) fn collect_conversation_stats_report(
             }
         }
 
-        let ev = UsageEvent {
-            source: usage_source,
-            local_day,
-            local_date,
-            model_group: resolved.model_group.clone(),
-            pricing_key: resolved.pricing_key,
+        let delta = UsageDelta {
             input_tokens: turn.input_tokens,
             cache_read_tokens: turn.cache_read_tokens,
             cache_write_tokens: turn.cache_write_tokens,
@@ -617,17 +630,15 @@ pub(in crate::stats) fn collect_conversation_stats_report(
             thinking_tokens: turn.thinking_tokens,
             total_tokens,
             cost_usd: resolved.cost_usd,
-            decode_speed,
-            ttft_secs,
         };
 
-        accumulate_period(&mut totals, &ev);
+        totals.record_usage(delta);
         if slot.is_subagent {
-            accumulate_period(&mut subagents_summary, &ev);
+            subagents_summary.record_usage(delta);
             let sub_acc = subagent_map
                 .entry(slot.conversation_id.clone())
                 .or_default();
-            accumulate_period(&mut sub_acc.summary, &ev);
+            sub_acc.summary.record_usage(delta);
             if let Some(speed) = decode_speed {
                 sub_speeds.push(speed);
                 sub_acc.speeds.push(speed);
@@ -637,7 +648,7 @@ pub(in crate::stats) fn collect_conversation_stats_report(
                 sub_acc.ttfts.push(ttft);
             }
         } else {
-            accumulate_period(&mut main, &ev);
+            main.record_usage(delta);
             if let Some(speed) = decode_speed {
                 main_speeds.push(speed);
             }
@@ -645,7 +656,17 @@ pub(in crate::stats) fn collect_conversation_stats_report(
                 main_ttfts.push(ttft);
             }
         }
-        accumulate_model(&mut model_map, &ev);
+        let model_entry = model_map.entry(resolved.model_group.clone()).or_default();
+        if model_entry.pricing_key.is_none() {
+            model_entry.pricing_key = resolved.pricing_key;
+        }
+        model_entry.summary.record_usage(delta);
+        if let Some(speed) = decode_speed {
+            model_entry.speeds.push(speed);
+        }
+        if let Some(ttft) = ttft_secs {
+            model_entry.ttfts.push(ttft);
+        }
 
         turns_out.push(ConversationTurnStats {
             index: turns_out.len() + 1,

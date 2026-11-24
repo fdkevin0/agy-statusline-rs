@@ -3,27 +3,21 @@
 use std::io::{self, IsTerminal};
 use std::path::Path;
 
-use ansi_to_tui::IntoText;
-use crossterm::event::{
-    self, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
-};
-use crossterm::execute;
-use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
-use ratatui::backend::CrosstermBackend;
+use crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
-use ratatui::{Frame, Terminal};
+use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::editor::{ActivePane, ExitOutcome, PreviewWidth, SettingField, TuiEditorState};
 use super::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
 use crate::agy::paths::agy_settings_path;
-use crate::cli::apply::{apply_statusline_config, resolve_invoked_binary_path};
-use crate::statusline::render::write_statusline;
+use crate::agy::settings::{apply_statusline_config, resolve_invoked_binary_path};
+use crate::statusline::render::render_statusline_lines;
 use crate::statusline::{sample_preview_git, sample_preview_metadata, sample_preview_payload};
-use crate::sys::terminal::TerminalGuard;
+use crate::sys::terminal::enter_tui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PillHit {
@@ -60,13 +54,7 @@ pub fn run_tui_config(config_path: &Path) -> io::Result<()> {
     let initial = load_layout_config(config_path);
     let mut state = TuiEditorState::new(initial);
 
-    let _guard = TerminalGuard::enter();
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let (_guard, mut terminal) = enter_tui()?;
     let mut outcome = ExitOutcome::Continue;
     let mut hit_map = UiHitMap::default();
 
@@ -113,16 +101,7 @@ fn build_preview_lines(state: &TuiEditorState, box_inner: u16) -> (Vec<Line<'sta
     let sample = sample_preview_payload(width);
     let meta = sample_preview_metadata();
     let git = sample_preview_git();
-    let mut buf = Vec::new();
-    let _ = write_statusline(&sample, &meta, &git, &state.config, &mut buf);
-    let raw = String::from_utf8_lossy(&buf);
-    let lines = match raw.as_ref().into_text() {
-        Ok(text) => text.lines,
-        Err(_) => strip_ansi_escapes::strip_str(raw.as_ref())
-            .lines()
-            .map(|line| Line::from(line.to_owned()))
-            .collect(),
-    };
+    let lines = render_statusline_lines(&sample, &meta, &git, &state.config);
     (lines, width)
 }
 
@@ -573,7 +552,7 @@ mod tests {
         assert!(preview_text.contains("68 tok/s"));
 
         let backend = ratatui::backend::TestBackend::new(110, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
                 draw_settings_pane(frame, frame.area(), &state);

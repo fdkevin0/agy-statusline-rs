@@ -4,30 +4,30 @@ use crate::config::layout::{GlyphMode, ThemeStyle};
 
 /// 256-color ANSI palette indices for statusline segments and surfaces.
 #[derive(Debug, Clone, Copy)]
-pub struct Palette {
-    pub ready: u8,
-    pub thinking: u8,
-    pub working: u8,
-    pub tool: u8,
-    pub review: u8,
-    pub error: u8,
-    pub model: u8,
-    pub dir: u8,
-    pub vcs_clean: u8,
-    pub vcs_dirty: u8,
-    pub ctx_ok: u8,
-    pub ctx_warn: u8,
-    pub ctx_crit: u8,
-    pub cache: u8,
-    pub speed_ok: u8,
-    pub speed_slow: u8,
-    pub cost: u8,
-    pub muted: u8,
-    pub sep: u8,
-    pub pill_bg: u8,
-    pub pl_bg_a: u8,
-    pub pl_bg_b: u8,
-    pub pl_accent_fg: u8,
+pub(super) struct Palette {
+    pub(super) ready: u8,
+    pub(super) thinking: u8,
+    pub(super) working: u8,
+    pub(super) tool: u8,
+    pub(super) review: u8,
+    pub(super) error: u8,
+    pub(super) model: u8,
+    pub(super) dir: u8,
+    pub(super) vcs_clean: u8,
+    pub(super) vcs_dirty: u8,
+    pub(super) ctx_ok: u8,
+    pub(super) ctx_warn: u8,
+    pub(super) ctx_crit: u8,
+    pub(super) cache: u8,
+    pub(super) speed_ok: u8,
+    pub(super) speed_slow: u8,
+    pub(super) cost: u8,
+    pub(super) muted: u8,
+    pub(super) sep: u8,
+    pub(super) pill_bg: u8,
+    pub(super) pl_bg_a: u8,
+    pub(super) pl_bg_b: u8,
+    pub(super) pl_accent_fg: u8,
 }
 
 const PALETTE_DEFAULT: Palette = Palette {
@@ -190,7 +190,7 @@ const PALETTE_LIGHT: Palette = Palette {
 ///
 /// `ThemeStyle::Mono` short-circuits ANSI color emission in the renderer, so it
 /// falls back to [`PALETTE_DEFAULT`] rather than duplicating a dummy table.
-pub const fn palette_for(theme: ThemeStyle) -> &'static Palette {
+pub(super) const fn palette_for(theme: ThemeStyle) -> &'static Palette {
     match theme {
         ThemeStyle::Default | ThemeStyle::Mono => &PALETTE_DEFAULT,
         ThemeStyle::Nord => &PALETTE_NORD,
@@ -203,25 +203,25 @@ pub const fn palette_for(theme: ThemeStyle) -> &'static Palette {
 
 /// Glyph set selected by [`GlyphMode`].
 #[derive(Debug, Clone, Copy)]
-pub struct GlyphSet {
-    pub ready: &'static str,
-    pub thinking: &'static str,
-    pub working: &'static str,
-    pub tool: &'static str,
-    pub review: &'static str,
-    pub error: &'static str,
-    pub other: &'static str,
-    pub dir: &'static str,
-    pub branch: &'static str,
-    pub cache_label: &'static str,
-    pub reset: &'static str,
-    pub speed: &'static str,
-    pub ttft: &'static str,
-    pub mode: &'static str,
-    pub ellipsis: &'static str,
-    pub bar_chars: [char; 5],
-    pub pl_right: &'static str,
-    pub pill_caps: Option<(&'static str, &'static str)>,
+pub(super) struct GlyphSet {
+    pub(super) ready: &'static str,
+    pub(super) thinking: &'static str,
+    pub(super) working: &'static str,
+    pub(super) tool: &'static str,
+    pub(super) review: &'static str,
+    pub(super) error: &'static str,
+    pub(super) other: &'static str,
+    pub(super) dir: &'static str,
+    pub(super) branch: &'static str,
+    pub(super) cache_label: &'static str,
+    pub(super) reset: &'static str,
+    pub(super) speed: &'static str,
+    pub(super) ttft: &'static str,
+    pub(super) mode: &'static str,
+    pub(super) ellipsis: &'static str,
+    pub(super) bar_chars: [char; 5],
+    pub(super) pl_right: &'static str,
+    pub(super) pill_caps: Option<(&'static str, &'static str)>,
 }
 
 const GLYPHS_UNICODE: GlyphSet = GlyphSet {
@@ -288,7 +288,7 @@ const GLYPHS_ASCII: GlyphSet = GlyphSet {
 };
 
 /// Returns the static glyph table for `mode`.
-pub const fn glyphs_for(mode: GlyphMode) -> &'static GlyphSet {
+pub(super) const fn glyphs_for(mode: GlyphMode) -> &'static GlyphSet {
     match mode {
         GlyphMode::Unicode => &GLYPHS_UNICODE,
         GlyphMode::Nerd => &GLYPHS_NERD,

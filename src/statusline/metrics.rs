@@ -69,31 +69,7 @@ pub(crate) fn current_context_tokens(payload: &StatuslinePayload) -> Option<u64>
     Some(inp.saturating_add(read).saturating_add(create))
 }
 
-/// Formats a duration in seconds into a compact human-readable string (`45s`, `12m`, `3h10m`, `5d12h`).
-fn format_duration_compact(secs: u64) -> String {
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    if secs < SECS_PER_HOUR {
-        return format!("{}m", secs / 60);
-    }
-    if secs < SECS_PER_DAY {
-        let h = secs / SECS_PER_HOUR;
-        let m = (secs % SECS_PER_HOUR) / 60;
-        return if m == 0 {
-            format!("{h}h")
-        } else {
-            format!("{h}h{m}m")
-        };
-    }
-    let d = secs / SECS_PER_DAY;
-    let h = (secs % SECS_PER_DAY) / SECS_PER_HOUR;
-    if h == 0 {
-        format!("{d}d")
-    } else {
-        format!("{d}d{h}h")
-    }
-}
+use crate::sys::fmt::format_duration_compact;
 
 /// Formats a validated remaining quota percentage (`0.0..=100.0`) without rounding sub-1% values to `0%`.
 ///

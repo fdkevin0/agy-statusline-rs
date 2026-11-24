@@ -14,13 +14,13 @@ use super::{
     render_table_with_scrollbar, right_cell, token_breakdown_lines, Palette, TableChrome, TableHit,
 };
 use crate::agy::db::compute_median;
-use crate::stats::metric::{cache_hit_pct, format_pct, format_usd_short, UsageCounters};
+use crate::stats::metric::{format_pct, format_usd_short, UsageCounters};
+use crate::stats::pricing::round_usd_6;
 use crate::stats::render::{
     format_subagent_short_label, format_time_span, format_ttft_compact, format_turn_time,
 };
-use crate::stats::{ConversationStatsReport, ConversationTurnStats, PeriodSummary};
-use crate::statusline::format::format_tokens_string as fmt_tok;
-use crate::statusline::render::truncate_to_width;
+use crate::stats::{ConversationStatsReport, ConversationTurnStats, PeriodSummary, UsageDelta};
+use crate::sys::fmt::{format_tokens_string as fmt_tok, truncate_to_width};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnSort {
@@ -206,24 +206,15 @@ impl DetailScreen {
 
         for &idx in &turn_indices {
             let t = &self.report.turns[idx];
-            summary.requests += 1;
-            summary.input_tokens = summary.input_tokens.saturating_add(t.input_tokens);
-            summary.cache_read_tokens = summary
-                .cache_read_tokens
-                .saturating_add(t.cache_read_tokens);
-            summary.cache_write_tokens = summary
-                .cache_write_tokens
-                .saturating_add(t.cache_write_tokens);
-            summary.output_tokens = summary.output_tokens.saturating_add(t.output_tokens);
-            summary.thinking_tokens = summary.thinking_tokens.saturating_add(t.thinking_tokens);
-            summary.total_tokens = summary.total_tokens.saturating_add(t.total_tokens);
-            match t.priced_usd {
-                Some(usd) => {
-                    summary.priced_usd += usd;
-                    summary.priced_requests += 1;
-                }
-                None => summary.unpriced_requests += 1,
-            }
+            summary.record_usage(UsageDelta {
+                input_tokens: t.input_tokens,
+                cache_read_tokens: t.cache_read_tokens,
+                cache_write_tokens: t.cache_write_tokens,
+                output_tokens: t.output_tokens,
+                thinking_tokens: t.thinking_tokens,
+                total_tokens: t.total_tokens,
+                cost_usd: t.priced_usd,
+            });
             if let Some(spd) = t.tok_per_sec {
                 speeds.push(spd);
             }
@@ -235,6 +226,7 @@ impl DetailScreen {
                 peak_ctx = Some(peak_ctx.map_or(ctx, |p| p.max(ctx)));
             }
         }
+        summary.priced_usd = round_usd_6(summary.priced_usd);
 
         let multi_day = match (
             self.report
@@ -1023,10 +1015,14 @@ impl DetailScreen {
                     } else {
                         m.model.clone()
                     };
-                    let val_str = if show_cost && m.priced_usd > 0.0 {
-                        format_usd_short(m.priced_usd)
+                    let (val_str, val_dim) = if show_cost {
+                        if m.priced_requests() > 0 {
+                            (format_usd_short(m.priced_usd), false)
+                        } else {
+                            ("-".to_string(), true)
+                        }
                     } else {
-                        fmt_tok(m.total_tokens)
+                        (fmt_tok(m.total_tokens), false)
                     };
                     let mut cells = vec![
                         Cell::from(name).style(if is_filtered {
@@ -1037,11 +1033,15 @@ impl DetailScreen {
                         right_cell(format!("{}t", m.requests), pal.dim()),
                         right_cell(
                             val_str,
-                            pal.bold(if is_filtered {
-                                Color::Yellow
+                            if val_dim {
+                                pal.dim()
                             } else {
-                                Color::Cyan
-                            }),
+                                pal.bold(if is_filtered {
+                                    Color::Yellow
+                                } else {
+                                    Color::Cyan
+                                })
+                            },
                         ),
                     ];
                     if show_hit {
@@ -1067,10 +1067,14 @@ impl DetailScreen {
                     } else {
                         base
                     };
-                    let val_str = if show_cost && sub.summary.priced_requests > 0 {
-                        format_usd_short(sub.summary.priced_usd)
+                    let (val_str, val_dim) = if show_cost {
+                        if sub.summary.priced_requests > 0 {
+                            (format_usd_short(sub.summary.priced_usd), false)
+                        } else {
+                            ("-".to_string(), true)
+                        }
                     } else {
-                        fmt_tok(sub.summary.total_tokens)
+                        (fmt_tok(sub.summary.total_tokens), false)
                     };
                     let mut cells = vec![
                         Cell::from(name).style(if is_filtered {
@@ -1081,19 +1085,19 @@ impl DetailScreen {
                         right_cell(format!("{}t", sub.summary.requests), pal.dim()),
                         right_cell(
                             val_str,
-                            pal.bold(if is_filtered {
-                                Color::Yellow
+                            if val_dim {
+                                pal.dim()
                             } else {
-                                Color::Cyan
-                            }),
+                                pal.bold(if is_filtered {
+                                    Color::Yellow
+                                } else {
+                                    Color::Cyan
+                                })
+                            },
                         ),
                     ];
                     if show_hit {
-                        let hit = cache_hit_pct(
-                            sub.summary.input_tokens,
-                            sub.summary.cache_read_tokens,
-                            sub.summary.cache_write_tokens,
-                        );
+                        let hit = sub.summary.cache_hit_pct();
                         cells.push(right_cell(format_pct(hit), pal.cache_hit_style(hit)));
                     }
                     Row::new(cells)
@@ -1265,6 +1269,7 @@ mod tests {
     use ratatui::Terminal;
 
     use super::*;
+    use crate::stats::metric::cache_hit_pct;
     use crate::stats::{ModelStats, SqliteStats, SubagentConversationStats};
 
     #[allow(clippy::too_many_arguments)]

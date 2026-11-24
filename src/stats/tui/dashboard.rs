@@ -22,16 +22,9 @@ use crate::stats::metric::{
 };
 use crate::stats::query::{HeatmapWeek, SourceFilter, StatsDataset, StatsView, WEEKDAY_NAMES};
 use crate::stats::render::{build_month_header, ASCII_HEATMAP, UNICODE_HEATMAP};
-use crate::statusline::format::format_tokens_string as fmt_tok;
+use crate::sys::fmt::{format_tokens_string as fmt_tok, truncate_to_width};
 
 const UNICODE_BAR_EIGHTHS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
-
-pub(super) enum DashboardAction {
-    Continue,
-    Refresh,
-    OpenConversations,
-    Quit,
-}
 
 #[derive(Default)]
 struct DashboardTables {
@@ -152,17 +145,10 @@ impl DashboardScreen {
         code: KeyCode,
         mods: KeyModifiers,
         term_h: u16,
-    ) -> DashboardAction {
+    ) -> StatsAction {
         let page_size = self.hit_map.daily.data_rows.max(5);
-        match self
-            .state
+        self.state
             .handle_key(code, mods, self.view.as_ref(), page_size, term_h)
-        {
-            StatsAction::Quit => DashboardAction::Quit,
-            StatsAction::OpenConversations => DashboardAction::OpenConversations,
-            StatsAction::Refresh => DashboardAction::Refresh,
-            StatsAction::Continue => DashboardAction::Continue,
-        }
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -435,11 +421,7 @@ fn draw_control_bar(
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD)
         };
-        let label = crate::statusline::render::truncate_to_width(
-            model,
-            18,
-            if pal.ascii { "..." } else { "…" },
-        );
+        let label = truncate_to_width(model, 18, if pal.ascii { "..." } else { "…" });
         let _ = push(format!(" {close} {label} "), style);
     }
 
@@ -1112,7 +1094,6 @@ mod tests {
                 UsageEvent {
                     source: UsageSource::Cli,
                     local_day: d1,
-                    local_date: "2026-11-19".to_string(),
                     model_group: "Gemini 4 Neon".to_string(),
                     pricing_key: Some("gemini-4-neon".to_string()),
                     input_tokens: 20_000,
@@ -1128,7 +1109,6 @@ mod tests {
                 UsageEvent {
                     source: UsageSource::Cli,
                     local_day: d2,
-                    local_date: "2026-11-20".to_string(),
                     model_group: "Gemini 4 Hydrogen".to_string(),
                     pricing_key: Some("gemini-4-hydrogen".to_string()),
                     input_tokens: 5_000,

@@ -15,7 +15,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::pricing::{normalize_model_key, round_usd_6, PricingCatalog};
-use super::tz::TimeZoneSpec;
 use super::SqliteStats;
 use crate::agy::db::{
     compute_median, is_real_dir, is_safe_sqlite_file, is_valid_uuid, open_readonly_db,
@@ -23,9 +22,10 @@ use crate::agy::db::{
 };
 use crate::agy::protobuf::{
     extract_gen_metadata_record, extract_step_metadata_record, extract_trajectory_created_at_secs,
-    MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
+    UsageAttemptRecord, MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
 };
 use crate::sys::fs::modified_timestamp;
+use crate::sys::time::TimeZoneSpec;
 
 pub(super) fn is_effort_token(word: &str) -> bool {
     matches!(
@@ -89,7 +89,7 @@ fn derive_model_name(
 
 /// Origin of a scanned usage event (`antigravity-cli` vs desktop `antigravity`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UsageSource {
+pub(super) enum UsageSource {
     Cli,
     Desktop,
 }
@@ -108,7 +108,6 @@ impl UsageSource {
 pub(super) struct UsageEvent {
     pub(super) source: UsageSource,
     pub(super) local_day: i64,
-    pub(super) local_date: String,
     pub(super) model_group: String,
     pub(super) pricing_key: Option<String>,
     pub(super) input_tokens: u64,
@@ -338,23 +337,85 @@ fn build_turn_union_find<'a>(
     uf
 }
 
-fn deduplicate_raw_turns(turns: Vec<RawTurn>) -> Vec<RawTurn> {
-    if turns.len() <= 1 {
-        return turns;
+/// Deduplicates items sharing turn identities via Union-Find.
+/// When `should_replace(existing, incoming)` is true, `incoming` becomes the primary entry
+/// and the prior primary is merged into it; otherwise `incoming` is merged into `existing`.
+fn deduplicate_turns_by<T>(
+    items: Vec<T>,
+    turn_ref: impl Fn(&T) -> &RawTurn,
+    should_replace: impl Fn(&T, &T) -> bool,
+    mut merge_into: impl FnMut(&mut T, T),
+) -> Vec<T> {
+    if items.len() <= 1 {
+        return items;
     }
-    let mut uf = build_turn_union_find(turns.iter(), turns.len());
+    let mut uf = build_turn_union_find(items.iter().map(&turn_ref), items.len());
     let mut root_to_slot: HashMap<usize, usize> = HashMap::new();
-    let mut merged: Vec<RawTurn> = Vec::with_capacity(turns.len());
-    for (idx, turn) in turns.into_iter().enumerate() {
+    let mut deduped: Vec<T> = Vec::with_capacity(items.len());
+    for (idx, item) in items.into_iter().enumerate() {
         let root = uf.find(idx);
         if let Some(&slot) = root_to_slot.get(&root) {
-            merge_raw_turn(&mut merged[slot], turn);
+            let existing = &mut deduped[slot];
+            if should_replace(existing, &item) {
+                let prev = std::mem::replace(existing, item);
+                merge_into(existing, prev);
+            } else {
+                merge_into(existing, item);
+            }
         } else {
-            root_to_slot.insert(root, merged.len());
-            merged.push(turn);
+            root_to_slot.insert(root, deduped.len());
+            deduped.push(item);
         }
     }
-    merged
+    deduped
+}
+
+impl RawTurn {
+    fn from_attempt(
+        attempt: UsageAttemptRecord,
+        ts: (Option<i64>, u8),
+        outer_model_enum: u64,
+        outer_response_model: Option<&str>,
+        outer_display_name: Option<&str>,
+        inherit_when_outer_zero: bool,
+    ) -> Self {
+        // When a retry attempt ran on a different model_enum than the outer record,
+        // omit outer strings so the scan-time model_enum learning table resolves it.
+        let inherits_outer = attempt.model_enum == 0
+            || attempt.model_enum == outer_model_enum
+            || (inherit_when_outer_zero && outer_model_enum == 0);
+        let (response_model, model_display_name) = if inherits_outer {
+            (
+                outer_response_model.map(str::to_string),
+                outer_display_name.map(str::to_string),
+            )
+        } else {
+            (None, None)
+        };
+        let model_enum = if attempt.model_enum != 0 {
+            attempt.model_enum
+        } else {
+            outer_model_enum
+        };
+        Self {
+            ts_secs: ts.0,
+            ts_quality: ts.1,
+            model_enum,
+            response_model,
+            model_display_name,
+            input_tokens: attempt.input_tokens,
+            cache_read_tokens: attempt.cache_read_tokens,
+            cache_write_tokens: attempt.cache_write_tokens,
+            output_tokens: attempt.output_tokens,
+            thinking_tokens: attempt.thinking_output_tokens,
+            native_cost_usd: None,
+            decode_speed: None,
+            ttft_secs: None,
+            id_11: attempt.identity.id_11,
+            id_12: attempt.identity.id_12,
+            id_7: attempt.identity.id_7,
+        }
+    }
 }
 
 fn discover_sqlite_db_targets(roots: &[(&'static str, PathBuf)]) -> Vec<DbTarget> {
@@ -464,79 +525,28 @@ fn extract_sqlite_db_turns(
                 };
 
                 if let Some(usage) = step_rec.usage {
-                    let inherits_info = usage.model_enum == 0
-                        || step_rec.model_enum == 0
-                        || usage.model_enum == step_rec.model_enum;
-                    let (response_model, model_display_name) = if inherits_info {
-                        (
-                            step_rec.response_model.clone(),
-                            step_rec.model_display_name.clone(),
-                        )
-                    } else {
-                        (None, None)
-                    };
-                    let model_enum = if usage.model_enum != 0 {
-                        usage.model_enum
-                    } else {
-                        step_rec.model_enum
-                    };
-                    let turn = RawTurn {
-                        ts_secs: step_ts.0,
-                        ts_quality: step_ts.1,
-                        model_enum,
-                        response_model,
-                        model_display_name,
-                        input_tokens: usage.input_tokens,
-                        cache_read_tokens: usage.cache_read_tokens,
-                        cache_write_tokens: usage.cache_write_tokens,
-                        output_tokens: usage.output_tokens,
-                        thinking_tokens: usage.thinking_output_tokens,
-                        native_cost_usd: None,
-                        decode_speed: None,
-                        ttft_secs: None,
-                        id_11: usage.identity.id_11,
-                        id_12: usage.identity.id_12,
-                        id_7: usage.identity.id_7,
-                    };
+                    let turn = RawTurn::from_attempt(
+                        usage,
+                        step_ts,
+                        step_rec.model_enum,
+                        step_rec.response_model.as_deref(),
+                        step_rec.model_display_name.as_deref(),
+                        true,
+                    );
                     if turn.has_signal() {
                         step_candidates.push((step_idx, turn));
                     }
                 }
 
                 for retry in step_rec.retry_usages {
-                    let inherits_info =
-                        retry.model_enum == 0 || retry.model_enum == step_rec.model_enum;
-                    let (response_model, model_display_name) = if inherits_info {
-                        (
-                            step_rec.response_model.clone(),
-                            step_rec.model_display_name.clone(),
-                        )
-                    } else {
-                        (None, None)
-                    };
-                    let model_enum = if retry.model_enum != 0 {
-                        retry.model_enum
-                    } else {
-                        step_rec.model_enum
-                    };
-                    let turn = RawTurn {
-                        ts_secs: step_ts.0,
-                        ts_quality: step_ts.1,
-                        model_enum,
-                        response_model,
-                        model_display_name,
-                        input_tokens: retry.input_tokens,
-                        cache_read_tokens: retry.cache_read_tokens,
-                        cache_write_tokens: retry.cache_write_tokens,
-                        output_tokens: retry.output_tokens,
-                        thinking_tokens: retry.thinking_output_tokens,
-                        native_cost_usd: None,
-                        decode_speed: None,
-                        ttft_secs: None,
-                        id_11: retry.identity.id_11,
-                        id_12: retry.identity.id_12,
-                        id_7: retry.identity.id_7,
-                    };
+                    let turn = RawTurn::from_attempt(
+                        retry,
+                        step_ts,
+                        step_rec.model_enum,
+                        step_rec.response_model.as_deref(),
+                        step_rec.model_display_name.as_deref(),
+                        false,
+                    );
                     if turn.has_signal() {
                         step_candidates.push((step_idx, turn));
                     }
@@ -597,38 +607,14 @@ fn extract_sqlite_db_turns(
                 }
 
                 for retry in rec.retry_usages {
-                    // When a retry attempt ran on a different model_enum than the outer chat,
-                    // omit outer strings so the scan-time model_enum learning table resolves it.
-                    let inherits_outer =
-                        retry.model_enum == 0 || retry.model_enum == rec.model_enum;
-                    let (response_model, model_display_name) = if inherits_outer {
-                        (rec.response_model.clone(), rec.model_display_name.clone())
-                    } else {
-                        (None, None)
-                    };
-                    let model_enum = if retry.model_enum != 0 {
-                        retry.model_enum
-                    } else {
-                        rec.model_enum
-                    };
-                    let retry_turn = RawTurn {
-                        ts_secs,
-                        ts_quality,
-                        model_enum,
-                        response_model,
-                        model_display_name,
-                        input_tokens: retry.input_tokens,
-                        cache_read_tokens: retry.cache_read_tokens,
-                        cache_write_tokens: retry.cache_write_tokens,
-                        output_tokens: retry.output_tokens,
-                        thinking_tokens: retry.thinking_output_tokens,
-                        native_cost_usd: None,
-                        decode_speed: None,
-                        ttft_secs: None,
-                        id_11: retry.identity.id_11,
-                        id_12: retry.identity.id_12,
-                        id_7: retry.identity.id_7,
-                    };
+                    let retry_turn = RawTurn::from_attempt(
+                        retry,
+                        (ts_secs, ts_quality),
+                        rec.model_enum,
+                        rec.response_model.as_deref(),
+                        rec.model_display_name.as_deref(),
+                        false,
+                    );
                     if retry_turn.has_signal() {
                         turns.push(retry_turn);
                     }
@@ -648,7 +634,12 @@ fn extract_sqlite_db_turns(
         turns.push(turn);
     }
 
-    Some(deduplicate_raw_turns(turns))
+    Some(deduplicate_turns_by(
+        turns,
+        |t| t,
+        |_, _| false,
+        merge_raw_turn,
+    ))
 }
 
 fn scan_single_sqlite_db_raw(target: &DbTarget) -> Option<(&'static str, Vec<RawTurn>)> {
@@ -1012,35 +1003,6 @@ struct SourcedTurn {
     turn: RawTurn,
 }
 
-fn deduplicate_sourced_turns(items: Vec<SourcedTurn>) -> Vec<SourcedTurn> {
-    if items.is_empty() {
-        return Vec::new();
-    }
-    let mut uf = build_turn_union_find(items.iter().map(|i| &i.turn), items.len());
-    let mut root_to_slot: HashMap<usize, usize> = HashMap::new();
-    let mut merged: Vec<SourcedTurn> = Vec::with_capacity(items.len());
-
-    for (idx, item) in items.into_iter().enumerate() {
-        let root = uf.find(idx);
-        if let Some(&slot) = root_to_slot.get(&root) {
-            let entry = &mut merged[slot];
-            // Enforce deterministic UsageSource priority (Cli > Desktop).
-            if entry.source == UsageSource::Desktop && item.source == UsageSource::Cli {
-                let prev = std::mem::replace(&mut entry.turn, item.turn);
-                entry.source = UsageSource::Cli;
-                merge_raw_turn(&mut entry.turn, prev);
-            } else {
-                merge_raw_turn(&mut entry.turn, item.turn);
-            }
-        } else {
-            root_to_slot.insert(root, merged.len());
-            merged.push(item);
-        }
-    }
-
-    merged
-}
-
 fn project_sqlite_conversations<'a>(
     conversations: impl IntoIterator<Item = (&'static str, &'a [RawTurn])>,
     tz: &TimeZoneSpec,
@@ -1060,7 +1022,15 @@ fn project_sqlite_conversations<'a>(
         }
     }
 
-    let merged_turns = deduplicate_sourced_turns(raw_items);
+    let merged_turns = deduplicate_turns_by(
+        raw_items,
+        |i| &i.turn,
+        // Enforce deterministic UsageSource priority (Cli > Desktop).
+        |existing, incoming| {
+            existing.source == UsageSource::Desktop && incoming.source == UsageSource::Cli
+        },
+        |dst, other| merge_raw_turn(&mut dst.turn, other.turn),
+    );
     let pricer = TurnPricer::build(pricing, merged_turns.iter().map(|m| &m.turn));
 
     let mut speed_samples = Vec::new();
@@ -1090,13 +1060,12 @@ fn project_sqlite_conversations<'a>(
             .saturating_add(turn.cache_read_tokens)
             .saturating_add(turn.cache_write_tokens)
             .saturating_add(turn.output_tokens);
-        let (local_day, local_date) = tz.local_day_and_date(ts_secs);
+        let local_day = tz.local_day(ts_secs);
         let resolved = pricer.price_turn(turn);
 
         events.push(UsageEvent {
             source: entry.source,
             local_day,
-            local_date,
             model_group: resolved.model_group,
             pricing_key: resolved.pricing_key,
             input_tokens: turn.input_tokens,
@@ -1189,30 +1158,14 @@ fn deduplicate_parent_priority_turns<T>(
     items: Vec<T>,
     turn_ref: impl Fn(&T) -> &RawTurn,
     is_sub: impl Fn(&T) -> bool,
-    mut merge_into: impl FnMut(&mut T, T),
+    merge_into: impl FnMut(&mut T, T),
 ) -> Vec<T> {
-    if items.len() <= 1 {
-        return items;
-    }
-    let mut uf = build_turn_union_find(items.iter().map(&turn_ref), items.len());
-    let mut root_to_slot: HashMap<usize, usize> = HashMap::new();
-    let mut deduped: Vec<T> = Vec::with_capacity(items.len());
-    for (idx, item) in items.into_iter().enumerate() {
-        let root = uf.find(idx);
-        if let Some(&slot) = root_to_slot.get(&root) {
-            let existing = &mut deduped[slot];
-            if is_sub(existing) && !is_sub(&item) {
-                let prev = std::mem::replace(existing, item);
-                merge_into(existing, prev);
-            } else {
-                merge_into(existing, item);
-            }
-        } else {
-            root_to_slot.insert(root, deduped.len());
-            deduped.push(item);
-        }
-    }
-    deduped
+    deduplicate_turns_by(
+        items,
+        turn_ref,
+        |existing, incoming| is_sub(existing) && !is_sub(incoming),
+        merge_into,
+    )
 }
 
 #[cfg(test)]

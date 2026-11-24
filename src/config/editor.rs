@@ -6,7 +6,7 @@ use crate::config::layout::{LayoutConfig, Preset, WidgetId, MAX_ROWS};
 
 /// Ordered entries in the Settings pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingField {
+pub(super) enum SettingField {
     /// Built-in preset selector.
     Preset,
     /// Visual rendering style (`Plain`, `Pill`, `Powerline`).
@@ -37,7 +37,7 @@ pub enum SettingField {
 
 impl SettingField {
     /// Canonical list of all settings in display order.
-    pub const ALL: &'static [Self] = &[
+    pub(super) const ALL: &'static [Self] = &[
         Self::Preset,
         Self::Style,
         Self::Theme,
@@ -56,7 +56,7 @@ impl SettingField {
 
 /// Currently focused pane inside the 3-pane configurator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivePane {
+pub(super) enum ActivePane {
     /// Left pane: 3-line layout canvas with pill reordering and Move Mode.
     Canvas,
     /// Center pane: catalog of all 33 widgets toggled into the target line.
@@ -67,7 +67,7 @@ pub enum ActivePane {
 
 impl ActivePane {
     /// Cycles forward (`Canvas` -> `Catalog` -> `Settings` -> `Canvas`).
-    pub const fn next(self) -> Self {
+    pub(super) const fn next(self) -> Self {
         match self {
             Self::Canvas => Self::Catalog,
             Self::Catalog => Self::Settings,
@@ -76,7 +76,7 @@ impl ActivePane {
     }
 
     /// Cycles backward (`Canvas` -> `Settings` -> `Catalog` -> `Canvas`).
-    pub const fn prev(self) -> Self {
+    pub(super) const fn prev(self) -> Self {
         match self {
             Self::Canvas => Self::Settings,
             Self::Catalog => Self::Canvas,
@@ -87,7 +87,7 @@ impl ActivePane {
 
 /// Preview width mode for testing responsive truncation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviewWidth {
+pub(super) enum PreviewWidth {
     /// Use current terminal width inside the preview box.
     Auto,
     /// Simulate wide 120-column terminal.
@@ -98,7 +98,7 @@ pub enum PreviewWidth {
 
 impl PreviewWidth {
     /// Cycles preview width (`Auto` -> `Wide120` -> `Narrow72` -> `Auto`).
-    pub const fn next(self) -> Self {
+    pub(super) const fn next(self) -> Self {
         match self {
             Self::Auto => Self::Wide120,
             Self::Wide120 => Self::Narrow72,
@@ -107,7 +107,7 @@ impl PreviewWidth {
     }
 
     /// Label shown in the Live Preview title bar.
-    pub const fn label(self) -> &'static str {
+    pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
             Self::Wide120 => "120col",
@@ -116,7 +116,7 @@ impl PreviewWidth {
     }
 
     /// Effective column budget given the preview pane's inner width.
-    pub fn resolve(self, box_inner: u16) -> usize {
+    pub(super) fn resolve(self, box_inner: u16) -> usize {
         match self {
             Self::Auto => usize::from(box_inner).max(40),
             Self::Wide120 => 120,
@@ -127,7 +127,7 @@ impl PreviewWidth {
 
 /// Action returned by [`TuiEditorState::handle_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitOutcome {
+pub(super) enum ExitOutcome {
     /// Keep running the TUI event loop.
     Continue,
     /// Exit without saving changes.
@@ -140,30 +140,30 @@ pub enum ExitOutcome {
 
 /// State for the interactive 3-pane statusline configurator.
 #[derive(Debug, Clone)]
-pub struct TuiEditorState {
+pub(super) struct TuiEditorState {
     /// Editable layout configuration.
-    pub config: LayoutConfig,
+    pub(super) config: LayoutConfig,
     /// Active pane (`Canvas`, `Catalog`, `Settings`).
-    pub active_pane: ActivePane,
+    pub(super) active_pane: ActivePane,
     /// Active row in Canvas (`0..3`), also the target line when toggling in Catalog.
-    pub canvas_row: usize,
+    pub(super) canvas_row: usize,
     /// Active widget index within `config.rows[canvas_row]`.
-    pub canvas_col: usize,
+    pub(super) canvas_col: usize,
     /// Whether the active Canvas widget is currently grabbed for Move Mode.
-    pub grabbed: bool,
+    pub(super) grabbed: bool,
     /// Selected index in `WidgetId::ALL` inside `Catalog`.
-    pub catalog_idx: usize,
+    pub(super) catalog_idx: usize,
     /// Selected index in `SettingField::ALL` inside `Settings`.
-    pub settings_idx: usize,
+    pub(super) settings_idx: usize,
     /// Active preset cursor.
-    pub preset: Preset,
+    pub(super) preset: Preset,
     /// Current Live Preview width simulation mode.
-    pub preview_width: PreviewWidth,
+    pub(super) preview_width: PreviewWidth,
 }
 
 impl TuiEditorState {
     /// Initializes editor state from `config`.
-    pub fn new(mut config: LayoutConfig) -> Self {
+    pub(super) fn new(mut config: LayoutConfig) -> Self {
         config.normalize_rows();
         let preset = config.matching_preset().unwrap_or(Preset::Full);
         Self {
@@ -180,7 +180,7 @@ impl TuiEditorState {
     }
 
     /// Applies one of the built-in presets while preserving non-layout preferences.
-    pub fn apply_preset(&mut self, preset: Preset) {
+    pub(super) fn apply_preset(&mut self, preset: Preset) {
         let saved_metric = self.config.stats_metric;
         self.config = preset.to_layout();
         self.config.stats_metric = saved_metric;
@@ -228,7 +228,7 @@ impl TuiEditorState {
     }
 
     /// Adjusts `setting_idx` by `dir` (`-1` or `+1`).
-    pub fn adjust_setting_at(&mut self, idx: usize, dir: isize) {
+    pub(super) fn adjust_setting_at(&mut self, idx: usize, dir: isize) {
         if idx < SettingField::ALL.len() {
             self.settings_idx = idx;
             self.adjust_setting(dir);
@@ -236,7 +236,7 @@ impl TuiEditorState {
     }
 
     /// Selects `ActivePane::Canvas` row `r` and optional pill `col` (toggling Move Mode if re-clicked).
-    pub fn click_canvas(&mut self, row: usize, col: Option<usize>) {
+    pub(super) fn click_canvas(&mut self, row: usize, col: Option<usize>) {
         if row >= MAX_ROWS {
             return;
         }
@@ -253,7 +253,7 @@ impl TuiEditorState {
     }
 
     /// Removes the pill at `(row, col)` if present.
-    pub fn remove_canvas_pill(&mut self, row: usize, col: usize) {
+    pub(super) fn remove_canvas_pill(&mut self, row: usize, col: usize) {
         if row < MAX_ROWS && col < self.config.rows[row].len() {
             self.active_pane = ActivePane::Canvas;
             self.canvas_row = row;
@@ -264,7 +264,7 @@ impl TuiEditorState {
     }
 
     /// Selects and toggles the widget at `idx` in `Catalog`.
-    pub fn click_catalog(&mut self, idx: usize) {
+    pub(super) fn click_catalog(&mut self, idx: usize) {
         if idx < WidgetId::ALL.len() {
             self.active_pane = ActivePane::Catalog;
             self.grabbed = false;
@@ -274,14 +274,14 @@ impl TuiEditorState {
     }
 
     /// Moves `catalog_idx` by `delta` (`-1` or `+1`).
-    pub fn scroll_catalog(&mut self, delta: isize) {
+    pub(super) fn scroll_catalog(&mut self, delta: isize) {
         self.active_pane = ActivePane::Catalog;
         let next = (self.catalog_idx as isize + delta).clamp(0, (WidgetId::ALL.len() - 1) as isize);
         self.catalog_idx = next as usize;
     }
 
     /// Moves `settings_idx` by `delta` (`-1` or `+1`).
-    pub fn scroll_settings(&mut self, delta: isize) {
+    pub(super) fn scroll_settings(&mut self, delta: isize) {
         self.active_pane = ActivePane::Settings;
         let next =
             (self.settings_idx as isize + delta).clamp(0, (SettingField::ALL.len() - 1) as isize);
@@ -436,7 +436,10 @@ impl TuiEditorState {
     }
 
     /// Dispatches a key press and returns the resulting [`ExitOutcome`].
-    pub fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> ExitOutcome {
+    pub(super) fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> ExitOutcome {
+        if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+            return ExitOutcome::Quit;
+        }
         match code {
             KeyCode::Tab => {
                 self.grabbed = false;
@@ -551,6 +554,12 @@ mod tests {
         assert_eq!(
             ed.handle_key(KeyCode::Char('s'), KeyModifiers::NONE),
             ExitOutcome::SaveAndApply
+        );
+        // Ctrl+C always exits even while a pill is grabbed in Move Mode.
+        ed.grabbed = true;
+        assert_eq!(
+            ed.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ExitOutcome::Quit
         );
     }
 

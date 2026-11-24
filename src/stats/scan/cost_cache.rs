@@ -97,7 +97,7 @@ fn db_file_fingerprint(db_path: &Path) -> Option<DbFileFingerprint> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ConversationCost {
     pub(crate) usd: Option<f64>,
     pub(crate) subagent_usd: Option<f64>,
@@ -110,13 +110,6 @@ const CONV_COST_CACHE_MAX_ENTRIES: usize = 32;
 const MAX_CONV_COST_CACHE_BYTES: u64 = 512 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct CachedConversationCost {
-    usd: Option<f64>,
-    subagent_usd: Option<f64>,
-    unpriced_turns: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct ConvCostCacheEntry {
     cli_dir: String,
     conversation_id: String,
@@ -124,7 +117,7 @@ struct ConvCostCacheEntry {
     summaries_fp: Option<DbFileFingerprint>,
     descendants: Vec<(String, Option<DbFileFingerprint>)>,
     pricing_fp: PricingFileFingerprint,
-    cost: CachedConversationCost,
+    cost: ConversationCost,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -217,11 +210,7 @@ pub(crate) fn lookup_cached_conversation_cost(
     {
         return None;
     }
-    Some(ConversationCost {
-        usd: entry.cost.usd,
-        subagent_usd: entry.cost.subagent_usd,
-        unpriced_turns: entry.cost.unpriced_turns,
-    })
+    Some(entry.cost)
 }
 
 fn compute_conversation_cost_from_turns(
@@ -330,11 +319,7 @@ pub(crate) fn estimate_conversation_cost_usd_with_parent_conn(
                 summaries_fp,
                 descendants,
                 pricing_fp,
-                cost: CachedConversationCost {
-                    usd: cost.usd,
-                    subagent_usd: cost.subagent_usd,
-                    unpriced_turns: cost.unpriced_turns,
-                },
+                cost,
             },
             CONV_COST_CACHE_MAX_ENTRIES,
         );
@@ -621,7 +606,7 @@ mod tests {
             summaries_fp: None,
             descendants: Vec::new(),
             pricing_fp: PricingFileFingerprint::default(),
-            cost: CachedConversationCost {
+            cost: ConversationCost {
                 usd: Some(usd),
                 subagent_usd: None,
                 unpriced_turns: 0,

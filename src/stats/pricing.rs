@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::scan::is_effort_token;
+use crate::agy::db::is_absent_or_real_file;
+use crate::sys::fmt::sanitize_inline_text;
 use crate::sys::fs::{atomic_write, modified_timestamp};
 use crate::sys::process::{run_command_stdout_bounded, BoundedCommandError};
 use crate::sys::time::{unix_now_secs, SECS_PER_DAY};
@@ -579,9 +581,70 @@ fn is_valid_tier_rate(tier: &ContextPricingTier) -> bool {
         .all(|v| v.is_finite() && *v >= 0.0)
 }
 
+fn read_cache_bytes_bounded(path: &Path) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(MAX_PRICING_JSON_BYTES.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if (buf.len() as u64) > MAX_PRICING_JSON_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exceeds maximum inspected size",
+        ));
+    }
+    Ok(buf)
+}
+
 fn load_cached_file(path: &Path) -> Option<CachedPricingFile> {
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<CachedPricingFile>(&raw).ok()
+    if !is_absent_or_real_file(path) {
+        return None;
+    }
+    let bytes = read_cache_bytes_bounded(path).ok()?;
+    serde_json::from_slice::<CachedPricingFile>(&bytes).ok()
+}
+
+/// Inspects `models_dev_pricing.json` under `cache_dir` and returns a concise diagnostic status.
+pub(crate) fn inspect_pricing_cache(cache_dir: &Path, now_unix_secs: u64) -> String {
+    let path = cache_dir.join(MODELS_DEV_CACHE_FILE);
+    if !is_absent_or_real_file(&path) {
+        let is_symlink = fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+        return if is_symlink {
+            "symlink (ignored)".to_string()
+        } else {
+            "not a regular file (ignored)".to_string()
+        };
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return "not found".to_string(),
+        Err(e) => return format!("unreadable ({e})"),
+    }
+    let bytes = match read_cache_bytes_bounded(&path) {
+        Ok(b) => b,
+        Err(e) => return format!("corrupt ({e})"),
+    };
+    #[derive(Deserialize)]
+    struct Summary {
+        fetched_at: u64,
+        #[serde(default)]
+        models: BTreeMap<String, Value>,
+    }
+    let parsed: Summary = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            let reason: String = sanitize_inline_text(&e.to_string())
+                .chars()
+                .take(80)
+                .collect();
+            return format!("corrupt ({reason})");
+        }
+    };
+    let freshness = if now_unix_secs.saturating_sub(parsed.fetched_at) < DEFAULT_PRICING_TTL_SECS {
+        "fresh"
+    } else {
+        "stale"
+    };
+    format!("found, {} models ({freshness})", parsed.models.len())
 }
 
 fn in_retry_cooldown(cache_dir: &Path, now_secs: u64) -> bool {
