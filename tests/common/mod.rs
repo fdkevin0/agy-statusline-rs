@@ -12,9 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_agy-statusline");
 
-pub fn unix_now_secs() -> u64 {
-    jiff::Timestamp::now().as_second().max(0) as u64
-}
+pub use agy_statusline::unix_now_secs;
 
 /// Seeds a fresh empty `models_dev_pricing.json` under `cache_dir/agy-statusline` when absent
 /// so offline CLI tests never trigger detached background `pricing sync` child processes while
@@ -33,8 +31,8 @@ pub fn seed_offline_cache_stamps_if_missing(cache_dir: &Path) {
 
 /// Returns a `Command` for `program` isolated inside `dir` with a cleared environment,
 /// `XDG_CONFIG_HOME = dir/config`, `XDG_CACHE_HOME = dir/cache`,
-/// `XDG_DATA_HOME = dir/data`, `ANTIGRAVITY_CLI_HOME = dir/.gemini/antigravity-cli`,
-/// `TZ = UTC`, and offline pricing/sync stamps pre-seeded if missing.
+/// `ANTIGRAVITY_CLI_HOME = dir/.gemini/antigravity-cli`, `TZ = UTC`,
+/// and an offline pricing cache pre-seeded if missing.
 pub fn isolated_cmd(program: impl AsRef<Path>, dir: &Path) -> Command {
     let xdg_cache = dir.join("cache");
     seed_offline_cache_stamps_if_missing(&xdg_cache);
@@ -46,7 +44,6 @@ pub fn isolated_cmd(program: impl AsRef<Path>, dir: &Path) -> Command {
         .env("USERPROFILE", dir)
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("XDG_CACHE_HOME", xdg_cache)
-        .env("XDG_DATA_HOME", dir.join("data"))
         .env("ANTIGRAVITY_CLI_HOME", dir.join(".gemini/antigravity-cli"))
         .env("TZ", "UTC");
     cmd

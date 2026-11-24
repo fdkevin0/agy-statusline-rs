@@ -127,7 +127,7 @@ fn resolve_agy_cli_dir_from(
     antigravity_cli_home: Option<OsString>,
     home: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    non_empty_path(antigravity_cli_home)
+    expand_tilde_os(antigravity_cli_home.as_deref(), home.as_deref())
         .or_else(|| home.map(|h| h.join(".gemini").join("antigravity-cli")))
 }
 
@@ -228,6 +228,10 @@ mod tests {
         assert_eq!(
             resolve_agy_cli_dir_from(os("/custom/cli"), home.clone()),
             Some(PathBuf::from("/custom/cli"))
+        );
+        assert_eq!(
+            resolve_agy_cli_dir_from(os("~/custom-cli"), home.clone()),
+            Some(PathBuf::from("/home/alice/custom-cli"))
         );
         assert_eq!(
             resolve_agy_cli_dir_from(os(""), home),
