@@ -9,7 +9,6 @@ use unicode_width::UnicodeWidthStr;
 use crate::config::layout::{GlyphMode, LayoutConfig, ThemeStyle, VisualStyle};
 use crate::statusline::theme::GlyphSet;
 
-use super::fit::slice_visible_width;
 use super::{Renderer, Segment};
 
 #[derive(Debug, Clone, Copy)]
@@ -19,6 +18,20 @@ pub(super) struct StyleGeometry {
     pub(super) slice_trail_w: usize,
     pub(super) mono: bool,
     pub(super) sep_str: &'static str,
+}
+
+impl StyleGeometry {
+    pub(super) fn slice_visible_width(self, segments: &[Segment]) -> usize {
+        if segments.is_empty() {
+            return 0;
+        }
+        let body: usize = segments
+            .iter()
+            .enumerate()
+            .map(|(i, s)| s.text.width() + self.pad_per_seg + if i > 0 { self.sep_w } else { 0 })
+            .sum();
+        body + self.slice_trail_w
+    }
 }
 
 pub(super) fn compute_geometry(cfg: &LayoutConfig, glyphs: &GlyphSet) -> StyleGeometry {
@@ -85,8 +98,8 @@ impl Renderer<'_> {
                 writeln!(out)
             }
             [left, right] => {
-                let w0 = slice_visible_width(left, self.geom);
-                let w1 = slice_visible_width(right, self.geom);
+                let w0 = self.geom.slice_visible_width(left);
+                let w1 = self.geom.slice_visible_width(right);
                 let gap = term_width.unwrap_or(0).saturating_sub(w0 + w1).max(1);
                 self.write_slice(left, out)?;
                 write!(out, "{}", " ".repeat(gap))?;
@@ -94,9 +107,9 @@ impl Renderer<'_> {
                 writeln!(out)
             }
             [left, center, right, ..] => {
-                let w0 = slice_visible_width(left, self.geom);
-                let w1 = slice_visible_width(center, self.geom);
-                let w2 = slice_visible_width(right, self.geom);
+                let w0 = self.geom.slice_visible_width(left);
+                let w1 = self.geom.slice_visible_width(center);
+                let w2 = self.geom.slice_visible_width(right);
                 let rem = term_width.unwrap_or(0).saturating_sub(w0 + w1 + w2);
                 let gap1 = (rem / 2).max(1);
                 let gap2 = rem.saturating_sub(gap1).max(1);
@@ -199,17 +212,17 @@ impl Renderer<'_> {
             [] => return None,
             [only] => self.push_slice_spans(only, &mut spans),
             [left, right] => {
-                let w0 = slice_visible_width(left, self.geom);
-                let w1 = slice_visible_width(right, self.geom);
+                let w0 = self.geom.slice_visible_width(left);
+                let w1 = self.geom.slice_visible_width(right);
                 let gap = term_width.unwrap_or(0).saturating_sub(w0 + w1).max(1);
                 self.push_slice_spans(left, &mut spans);
                 spans.push(Span::raw(" ".repeat(gap)));
                 self.push_slice_spans(right, &mut spans);
             }
             [left, center, right, ..] => {
-                let w0 = slice_visible_width(left, self.geom);
-                let w1 = slice_visible_width(center, self.geom);
-                let w2 = slice_visible_width(right, self.geom);
+                let w0 = self.geom.slice_visible_width(left);
+                let w1 = self.geom.slice_visible_width(center);
+                let w2 = self.geom.slice_visible_width(right);
                 let rem = term_width.unwrap_or(0).saturating_sub(w0 + w1 + w2);
                 let gap1 = (rem / 2).max(1);
                 let gap2 = rem.saturating_sub(gap1).max(1);

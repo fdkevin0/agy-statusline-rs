@@ -1,7 +1,5 @@
 //! Responsive width measurement, spacer group splitting, and staged compaction.
 
-use unicode_width::UnicodeWidthStr;
-
 use crate::sys::fmt::truncate_to_width;
 
 use super::emit::StyleGeometry;
@@ -21,23 +19,11 @@ const COMPACT_STAGES: &[CompactStage] = &[
     CompactStage::TitleTruncate,
 ];
 
-pub(super) fn slice_visible_width(segments: &[Segment], geom: StyleGeometry) -> usize {
-    if segments.is_empty() {
-        return 0;
-    }
-    let body: usize = segments
-        .iter()
-        .enumerate()
-        .map(|(i, s)| s.text.width() + geom.pad_per_seg + if i > 0 { geom.sep_w } else { 0 })
-        .sum();
-    body + geom.slice_trail_w
-}
-
 fn groups_visible_width(groups: &[Vec<Segment>], geom: StyleGeometry) -> usize {
     if groups.is_empty() {
         return 0;
     }
-    let sum: usize = groups.iter().map(|g| slice_visible_width(g, geom)).sum();
+    let sum: usize = groups.iter().map(|g| geom.slice_visible_width(g)).sum();
     sum + groups.len().saturating_sub(1)
 }
 
