@@ -3,9 +3,7 @@
 mod conversation;
 mod cost_cache;
 
-pub(in crate::stats) use conversation::{
-    collect_conversation_stats_report, filter_and_rank_conversations, list_conversations,
-};
+pub(in crate::stats) use conversation::{collect_conversation_stats_report, list_conversations};
 pub(crate) use cost_cache::{
     estimate_conversation_cost_usd_with_parent_conn, lookup_cached_conversation_cost,
 };
@@ -14,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::pricing::{normalize_model_key, round_usd_6, PricingCatalog};
+use super::pricing::{is_effort_token, normalize_model_key, round_usd_6, PricingCatalog};
 use super::SqliteStats;
 use crate::agy::db::{
     compute_median, is_real_dir, is_safe_sqlite_file, is_valid_uuid, open_readonly_db,
@@ -26,25 +24,6 @@ use crate::agy::protobuf::{
 };
 use crate::sys::fs::modified_timestamp;
 use crate::sys::time::TimeZoneSpec;
-
-pub(super) fn is_effort_token(word: &str) -> bool {
-    matches!(
-        word,
-        "xlow"
-            | "extralow"
-            | "low"
-            | "medium"
-            | "med"
-            | "high"
-            | "xhigh"
-            | "extrahigh"
-            | "extra"
-            | "minimal"
-            | "max"
-            | "none"
-            | "off"
-    )
-}
 
 fn is_effort_qualifier(tag: &str) -> bool {
     let norm: String = tag

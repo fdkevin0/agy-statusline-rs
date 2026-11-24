@@ -39,7 +39,7 @@ struct DashboardHitMap {
 }
 
 pub(super) struct DashboardScreen {
-    pub(super) state: StatsTuiState,
+    state: StatsTuiState,
     dataset: Option<StatsDataset>,
     view: Option<StatsView>,
     tables: DashboardTables,
@@ -83,6 +83,10 @@ impl DashboardScreen {
         }
     }
 
+    pub(super) fn active_metric(&self) -> StatsMetric {
+        self.state.query().metric
+    }
+
     /// Polls any in-flight background scan and recomputes the view if dirty.
     /// Returns `true` while a scan is still active.
     pub(super) fn poll_scan(&mut self) -> bool {
@@ -90,34 +94,30 @@ impl DashboardScreen {
             match rx.try_recv() {
                 Ok((ds, elapsed)) => {
                     let is_refresh = self.dataset.is_some();
-                    let (turns, dbs) = (ds.events.len(), ds.sqlite.db_files);
+                    let (turns, dbs) = (ds.turn_count(), ds.sqlite.db_files);
                     self.dataset = Some(ds);
-                    self.state.loading = false;
-                    self.state.view_dirty = true;
-                    if is_refresh {
-                        self.state.status_msg = Some(format!(
+                    let status_msg = is_refresh.then(|| {
+                        format!(
                             "Refreshed {turns} turns across {dbs} DBs in {:.2}s",
                             elapsed.as_secs_f64()
-                        ));
-                    }
+                        )
+                    });
+                    self.state.finish_scan(status_msg);
                     self.pending_scan = None;
                 }
                 Err(TryRecvError::Disconnected) => {
-                    self.state.loading = false;
-                    self.state.status_msg = Some("Background scan interrupted.".to_string());
+                    self.state.fail_scan("Background scan interrupted.");
                     self.pending_scan = None;
                 }
                 Err(TryRecvError::Empty) => {}
             }
         }
 
-        if self.state.view_dirty {
+        if self.state.is_view_dirty() {
             if let Some(ds) = self.dataset.as_ref() {
-                let computed =
-                    ds.compute_view(&self.state.query, self.state.selected_date.as_deref());
+                let computed = ds.compute_view(self.state.query(), self.state.selected_date());
                 self.state.sync_with_view(&computed);
                 self.view = Some(computed);
-                self.state.view_dirty = false;
             }
         }
         self.pending_scan.is_some()
@@ -129,8 +129,7 @@ impl DashboardScreen {
         cache_dir: Option<&Path>,
     ) {
         if self.pending_scan.is_none() {
-            self.state.loading = true;
-            self.state.status_msg = Some("Refreshing local AGY usage...".to_string());
+            self.state.begin_refresh("Refreshing local AGY usage...");
             let now = crate::sys::time::unix_now_secs();
             self.pending_scan = Some(spawn_dataset_scan(
                 roots.to_vec(),
@@ -173,7 +172,7 @@ impl DashboardScreen {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.hit_map.daily.contains(pos) {
-                    self.state.active_pane = StatsPane::Daily;
+                    self.state.focus_daily();
                     if let Some(target) = self.hit_map.daily.row_at(
                         pos,
                         self.tables.daily.offset(),
@@ -185,20 +184,12 @@ impl DashboardScreen {
                     if mouse.row == self.hit_map.models.pane.y {
                         self.state.toggle_model_scope();
                     } else {
-                        let was_active = self.state.active_pane == StatsPane::Models;
-                        self.state.active_pane = StatsPane::Models;
                         let len = self.state.active_models(v).len();
-                        if let Some(target) =
+                        let target =
                             self.hit_map
                                 .models
-                                .row_at(pos, self.tables.models.offset(), len)
-                        {
-                            if was_active && self.state.model_idx == target {
-                                self.state.toggle_model_filter(target, v);
-                            } else {
-                                self.state.model_idx = target;
-                            }
-                        }
+                                .row_at(pos, self.tables.models.offset(), len);
+                        self.state.click_model_row(target, v);
                     }
                 }
             }
@@ -292,7 +283,7 @@ fn draw_stats_ui(
             draw_day_detail_pane(frame, right[0], v, pal);
             hit_map.models = draw_models_pane(frame, right[1], state, &mut tables.models, v, pal);
         } else {
-            match state.active_pane {
+            match state.active_pane() {
                 StatsPane::Daily => {
                     hit_map.daily =
                         draw_daily_pane(frame, chunks[2], state, &mut tables.daily, v, pal);
@@ -312,7 +303,7 @@ fn draw_stats_ui(
             }
         }
     } else {
-        let msg = if state.loading {
+        let msg = if state.is_loading() {
             "Scanning local AGY conversation databases & pricing cache..."
         } else {
             "No local AGY usage data found."
@@ -339,7 +330,7 @@ fn draw_control_bar(
             " agy-statusline stats {sep} Local {} ({}) {}",
             ds.today_local,
             ds.timezone,
-            if state.loading {
+            if state.is_loading() {
                 "[refreshing...] "
             } else {
                 ""
@@ -372,7 +363,7 @@ fn draw_control_bar(
         } else {
             format!(" {}:{} ", idx + 1, preset.label())
         };
-        if !push(label, pal.pill(state.query.metric == preset)) {
+        if !push(label, pal.pill(state.query().metric == preset)) {
             break;
         }
         let _ = push(" ".to_string(), Style::default());
@@ -380,10 +371,10 @@ fn draw_control_bar(
 
     if push(format!(" {sep} "), pal.dim()) {
         if compact {
-            let _ = push(format!("[{}]", state.query.range.label()), pal.pill(true));
+            let _ = push(format!("[{}]", state.query().range.label()), pal.pill(true));
         } else {
-            for &range in &state.range_options {
-                let active = state.query.range == range;
+            for &range in state.range_options() {
+                let active = state.query().range == range;
                 let text = if active {
                     format!("[{}]", range.label())
                 } else {
@@ -398,20 +389,20 @@ fn draw_control_bar(
     }
 
     let show_src = dataset.is_some_and(|d| d.has_cli && d.has_desktop)
-        || state.query.source_filter != SourceFilter::All;
+        || state.query().source_filter != SourceFilter::All;
     if show_src {
-        let style = if state.query.source_filter == SourceFilter::All {
+        let style = if state.query().source_filter == SourceFilter::All {
             pal.pill(false)
         } else {
             pal.bold(Color::Yellow)
         };
         let _ = push(
-            format!(" Src:{} ", state.query.source_filter.label()),
+            format!(" Src:{} ", state.query().source_filter.label()),
             style,
         );
     }
 
-    if let Some(model) = state.query.model_filter.as_deref() {
+    if let Some(model) = state.query().model_filter.as_deref() {
         let close = if pal.ascii { "x" } else { "×" };
         let style = if pal.no_color {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -438,11 +429,11 @@ fn draw_summary_card(
     view: &StatsView,
     pal: &Palette,
 ) {
-    let metric = state.query.metric;
+    let metric = state.query().metric;
     let sep = pal.sep();
     let title = format!(
         " Summary ({} {sep} {}) ",
-        state.query.range.label(),
+        state.query().range.label(),
         metric.label()
     );
 
@@ -509,8 +500,8 @@ fn draw_summary_card(
         kv("Speed/TTFT", format!("{spd} {sep} {ttft}"), Color::White),
     ];
 
-    if let Some(model) = &state.query.model_filter {
-        lines.push(kv("Model", model.clone(), Color::Yellow));
+    if let Some(model) = state.query().model_filter.as_deref() {
+        lines.push(kv("Model", model.to_string(), Color::Yellow));
     } else if metric == StatsMetric::Cost && view.summary.unpriced_requests > 0 {
         lines.push(Line::styled(
             format!(
@@ -534,7 +525,7 @@ fn draw_compact_summary(
     view: &StatsView,
     pal: &Palette,
 ) {
-    let metric = state.query.metric;
+    let metric = state.query().metric;
     let sep = format!(" {} ", pal.sep());
     let peak_str = match &view.peak_day {
         Some((date, _, val)) => {
@@ -597,7 +588,7 @@ fn draw_compact_summary(
 
     let title = format!(
         " Summary ({} {} {}) ",
-        state.query.range.label(),
+        state.query().range.label(),
         pal.sep(),
         metric.label()
     );
@@ -614,7 +605,7 @@ fn draw_heatmap_pane(
     view: &StatsView,
     pal: &Palette,
 ) {
-    let metric = state.query.metric;
+    let metric = state.query().metric;
     let sep = pal.sep();
     let title = format!(" Activity (20w {sep} {}) ", metric.label());
 
@@ -667,7 +658,7 @@ fn draw_heatmap_pane(
             match &week.daily[wd_idx] {
                 Some((date, val)) => {
                     let lvl = heatmap_level_f64(val.magnitude(), peak_mag);
-                    let is_sel = state.selected_date.as_deref() == Some(date.as_str());
+                    let is_sel = state.selected_date() == Some(date.as_str());
                     row_spans.push(Span::styled(glyphs[lvl], pal.heatmap(lvl, is_sel)));
                 }
                 None => row_spans.push(Span::raw("  ")),
@@ -756,13 +747,13 @@ fn draw_daily_pane(
     view: &StatsView,
     pal: &Palette,
 ) -> TableHit {
-    let active = state.active_pane == StatsPane::Daily;
-    let metric = state.query.metric;
+    let active = state.active_pane() == StatsPane::Daily;
+    let metric = state.query().metric;
     let sep = pal.sep();
     let title = format!(
         " 1. Daily Usage ({}d {sep} {} {sep} {}) ",
         view.daily_rows.len(),
-        state.query.sort.label(pal.ascii),
+        state.query().sort.label(pal.ascii),
         metric.label(),
     );
 
@@ -884,7 +875,7 @@ fn draw_daily_pane(
         table,
         (area, area),
         table_state,
-        state.daily_idx,
+        state.daily_idx(),
         view.daily_rows.len(),
         TableChrome {
             highlight: true,
@@ -948,9 +939,9 @@ fn draw_models_pane(
     view: &StatsView,
     pal: &Palette,
 ) -> TableHit {
-    let active = state.active_pane == StatsPane::Models;
-    let metric = state.query.metric;
-    let title = format!(" 3. Models [{}] (v) ", state.query.model_scope.label());
+    let active = state.active_pane() == StatsPane::Models;
+    let metric = state.query().metric;
+    let title = format!(" 3. Models [{}] (v) ", state.query().model_scope.label());
 
     let models = state.active_models(view);
     if models.is_empty() {
@@ -969,7 +960,7 @@ fn draw_models_pane(
     let rows: Vec<Row<'static>> = models
         .iter()
         .map(|m| {
-            let is_filtered = state.query.model_filter.as_deref() == Some(m.model.as_str());
+            let is_filtered = state.query().model_filter.as_deref() == Some(m.model.as_str());
             let val = metric.extract(m);
             let name = if is_filtered {
                 format!("{filter_glyph}{}", m.model)
@@ -1022,7 +1013,7 @@ fn draw_models_pane(
         table,
         (area, area),
         table_state,
-        state.model_idx,
+        state.model_idx(),
         models.len(),
         TableChrome {
             highlight: active,
@@ -1041,9 +1032,9 @@ fn draw_footer_bar(
     pal: &Palette,
 ) {
     let sep = format!(" {} ", pal.sep());
-    let text = if let Some(msg) = &state.status_msg {
+    let text = if let Some(msg) = state.status_msg() {
         format!(" {msg}")
-    } else if let Some(model) = &state.query.model_filter {
+    } else if let Some(model) = state.query().model_filter.as_deref() {
         format!(
             " Filtered: {model}{sep}Esc Clear{sep}1-5 Metric{sep}t Range{sep}c Convs{sep}s Sort{sep}r Refresh{sep}q Quit"
         )
@@ -1059,7 +1050,7 @@ fn draw_footer_bar(
             " 1-5 Metric{sep}t Range{sep}c Convs{sep}s Sort{sep}v Day/Win{sep}z Gaps{sep}g Heatmap{src_hint}{sep}Tab Pane{sep}r Refresh{sep}q Quit"
         )
     };
-    let style = if state.status_msg.is_some() {
+    let style = if state.status_msg().is_some() {
         pal.bold(Color::Yellow)
     } else {
         pal.dim()
@@ -1081,16 +1072,16 @@ mod tests {
     fn test_dataset() -> StatsDataset {
         let d1 = unix_day_from_civil_date("2026-11-19".parse().unwrap());
         let d2 = unix_day_from_civil_date("2026-11-20".parse().unwrap());
-        StatsDataset {
-            today_day_idx: d2,
-            today_local: "2026-11-20".to_string(),
-            timezone: "UTC+08:00".to_string(),
-            today_utc: "2026-11-20".to_string(),
-            first_active_date: Some("2026-11-19".to_string()),
-            sqlite: SqliteStats::default(),
-            has_cli: true,
-            has_desktop: false,
-            events: vec![
+        StatsDataset::for_tests(
+            d2,
+            "2026-11-20",
+            "UTC+08:00",
+            "2026-11-20",
+            Some("2026-11-19".to_string()),
+            SqliteStats::default(),
+            true,
+            false,
+            vec![
                 UsageEvent {
                     source: UsageSource::Cli,
                     local_day: d1,
@@ -1122,15 +1113,15 @@ mod tests {
                     ttft_secs: Some(0.6),
                 },
             ],
-        }
+        )
     }
 
     fn render_buffer_text(width: u16, height: u16, metric: StatsMetric, ascii: bool) -> String {
         let ds = test_dataset();
         let mut st = StatsTuiState::new(None, metric);
         let mut tables = DashboardTables::default();
-        st.loading = false;
-        let view = ds.compute_view(&st.query, None);
+        st.finish_scan(None);
+        let view = ds.compute_view(st.query(), None);
         st.sync_with_view(&view);
         let pal = Palette {
             no_color: true,
@@ -1190,7 +1181,7 @@ mod tests {
             hit_map: DashboardHitMap::default(),
             pending_scan: None,
         };
-        screen.state.loading = false;
+        screen.state.finish_scan(None);
         screen.poll_scan();
         *screen.tables.models.offset_mut() = 10;
 
@@ -1205,14 +1196,14 @@ mod tests {
         let daily_x = screen.hit_map.daily.pane.x + 4;
         let daily_y = screen.hit_map.daily.data_y0;
         screen.handle_mouse(mouse(MouseEventKind::ScrollDown, daily_x, daily_y));
-        assert_eq!(screen.state.daily_idx, 1);
+        assert_eq!(screen.state.daily_idx(), 1);
 
         screen.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             daily_x,
             daily_y,
         ));
-        assert_eq!(screen.state.daily_idx, 0);
+        assert_eq!(screen.state.daily_idx(), 0);
 
         let models_x = screen.hit_map.models.pane.x + 3;
         screen.handle_mouse(mouse(
@@ -1220,7 +1211,7 @@ mod tests {
             models_x,
             screen.hit_map.models.pane.y,
         ));
-        assert_eq!(screen.state.query.model_scope, ModelScope::Window);
+        assert_eq!(screen.state.query().model_scope, ModelScope::Window);
 
         let model0_y = screen.hit_map.models.data_y0;
         screen.handle_mouse(mouse(
@@ -1228,13 +1219,13 @@ mod tests {
             models_x,
             model0_y,
         ));
-        assert_eq!(screen.state.active_pane, StatsPane::Models);
-        assert!(screen.state.query.model_filter.is_none());
+        assert_eq!(screen.state.active_pane(), StatsPane::Models);
+        assert!(screen.state.query().model_filter.is_none());
         screen.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             models_x,
             model0_y,
         ));
-        assert!(screen.state.query.model_filter.is_some());
+        assert!(screen.state.query().model_filter.is_some());
     }
 }

@@ -386,7 +386,7 @@ impl StatsApp {
     fn active_metric(&self) -> StatsMetric {
         self.dashboard
             .as_ref()
-            .map_or(self.default_metric, |d| d.state.query.metric)
+            .map_or(self.default_metric, DashboardScreen::active_metric)
     }
 
     fn back_screen(&self) -> Option<Screen> {
@@ -436,7 +436,7 @@ impl StatsApp {
         let active_id = self
             .detail
             .as_ref()
-            .map(|d| d.report.conversation_id.clone());
+            .map(|d| d.conversation_id().to_string());
         let items = list_conversations(&self.roots, &self.tz);
         match self.picker.as_mut() {
             Some(p) => p.replace_items(items, active_id.as_deref()),
@@ -458,14 +458,14 @@ impl StatsApp {
                     p.set_active_id(Some(&report.conversation_id));
                 }
                 let mut detail = DetailScreen::new(report);
-                detail.status_msg = Some(msg);
+                detail.set_status_msg(msg);
                 self.detail = Some(detail);
                 self.opened_from_picker = true;
                 self.screen = Screen::Detail;
             }
             Err(err) => {
                 if let Some(p) = self.picker.as_mut() {
-                    p.status_msg = Some(format!("Failed to load conversation: {err}"));
+                    p.set_status_msg(format!("Failed to load conversation: {err}"));
                 }
             }
         }
@@ -477,7 +477,7 @@ impl StatsApp {
         };
         if prev == Screen::Conversations {
             if let (Some(p), Some(d)) = (self.picker.as_mut(), self.detail.as_ref()) {
-                p.set_active_id(Some(&d.report.conversation_id));
+                p.set_active_id(Some(d.conversation_id()));
             }
         }
         self.screen = prev;
@@ -573,7 +573,7 @@ impl StatsApp {
                             if let Some(p) = self.picker.as_mut() {
                                 let active = p.active_id().map(str::to_string);
                                 p.replace_items(refreshed, active.as_deref());
-                                p.status_msg = Some(format!(
+                                p.set_status_msg(format!(
                                     "Reloaded {count} conversations in {:.0}ms",
                                     start.elapsed().as_secs_f64() * 1_000.0
                                 ));
@@ -610,14 +610,14 @@ impl StatsApp {
                             if let Some(conv_id) = self
                                 .detail
                                 .as_ref()
-                                .map(|d| d.report.conversation_id.clone())
+                                .map(|d| d.conversation_id().to_string())
                             {
                                 match self.load_conversation_report(&conv_id) {
                                     Ok((updated, elapsed)) => {
                                         let turns = updated.turns.len();
                                         if let Some(d) = self.detail.as_mut() {
                                             d.replace_report(updated);
-                                            d.status_msg = Some(format!(
+                                            d.set_status_msg(format!(
                                                 "Refreshed {turns} turns in {:.0}ms",
                                                 elapsed.as_secs_f64() * 1_000.0
                                             ));
@@ -625,7 +625,7 @@ impl StatsApp {
                                     }
                                     Err(err) => {
                                         if let Some(d) = self.detail.as_mut() {
-                                            d.status_msg = Some(format!("Refresh failed: {err}"));
+                                            d.set_status_msg(format!("Refresh failed: {err}"));
                                         }
                                     }
                                 }

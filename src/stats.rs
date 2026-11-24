@@ -28,15 +28,14 @@ pub(crate) use scan::{
 };
 pub use tui::{run_conversation_stats_tui, run_conversations_tui, run_stats_tui};
 
+use crate::agy::db::compute_median;
 use crate::sys::time::{civil_date_from_unix_day, format_day, TimeZoneSpec};
-use query::{SourceFilter, StatsDataset};
+use pricing::round_usd_6;
+use query::{filter_and_rank_conversations, SourceFilter, StatsDataset};
 use render::{
     render_conversation_stats_report, render_conversations_list, render_stats_report_with_metric,
 };
-use scan::{
-    collect_conversation_stats_report, filter_and_rank_conversations, list_conversations,
-    UsageEvent,
-};
+use scan::{collect_conversation_stats_report, list_conversations, UsageEvent};
 
 /// Formats a Unix epoch timestamp (seconds) as a UTC `YYYY-MM-DD` date string.
 pub fn unix_secs_to_utc_date(unix_secs: u64) -> String {
@@ -98,6 +97,41 @@ struct ModelAccumulator {
     summary: PeriodSummary,
     speeds: Vec<f64>,
     ttfts: Vec<f64>,
+}
+
+fn finalize_models(
+    model_map: HashMap<String, ModelAccumulator>,
+    sort_metric: StatsMetric,
+) -> Vec<ModelStats> {
+    let mut models: Vec<ModelStats> = model_map
+        .into_iter()
+        .map(|(model, acc)| ModelStats {
+            model,
+            pricing_key: acc.pricing_key,
+            requests: acc.summary.requests,
+            input_tokens: acc.summary.input_tokens,
+            cache_read_tokens: acc.summary.cache_read_tokens,
+            cache_write_tokens: acc.summary.cache_write_tokens,
+            output_tokens: acc.summary.output_tokens,
+            thinking_tokens: acc.summary.thinking_tokens,
+            total_tokens: acc.summary.total_tokens,
+            priced_usd: round_usd_6(acc.summary.priced_usd),
+            unpriced_requests: acc.summary.unpriced_requests,
+            speed_samples: acc.speeds.len(),
+            median_tok_per_sec: compute_median(&acc.speeds),
+            ttft_samples: acc.ttfts.len(),
+            median_ttft_secs: compute_median(&acc.ttfts),
+        })
+        .collect();
+
+    models.sort_by(|a, b| {
+        sort_metric
+            .extract(a)
+            .cmp_desc(sort_metric.extract(b))
+            .then_with(|| b.total_tokens.cmp(&a.total_tokens))
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    models
 }
 
 /// Yields the 20 Monday Unix day indices ending with the calendar week containing `today_idx`.

@@ -11,7 +11,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::scan::is_effort_token;
 use crate::agy::db::is_absent_or_real_file;
 use crate::sys::fmt::sanitize_inline_text;
 use crate::sys::fs::{atomic_write, modified_timestamp};
@@ -467,6 +466,25 @@ impl PricingCatalog {
         }
         None
     }
+}
+
+pub(super) fn is_effort_token(word: &str) -> bool {
+    matches!(
+        word,
+        "xlow"
+            | "extralow"
+            | "low"
+            | "medium"
+            | "med"
+            | "high"
+            | "xhigh"
+            | "extrahigh"
+            | "extra"
+            | "minimal"
+            | "max"
+            | "none"
+            | "off"
+    )
 }
 
 fn is_generic_orchestrator_token(word: &str) -> bool {

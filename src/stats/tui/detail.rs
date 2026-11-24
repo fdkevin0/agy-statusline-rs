@@ -94,7 +94,7 @@ fn turn_prompt_context(t: &ConversationTurnStats) -> u64 {
 }
 
 pub(super) struct DetailScreen {
-    pub(super) report: ConversationStatsReport,
+    report: ConversationStatsReport,
     sort: TurnSort,
     right_tab: RightTab,
     active_pane: DetailPane,
@@ -103,7 +103,7 @@ pub(super) struct DetailScreen {
     subagent_filter: Option<String>,
     turn_idx: usize,
     breakdown_idx: usize,
-    pub(super) status_msg: Option<String>,
+    status_msg: Option<String>,
     view: DetailView,
     turns_table: TableState,
     breakdown_table: TableState,
@@ -147,6 +147,14 @@ impl DetailScreen {
         };
         screen.recompute_view();
         screen
+    }
+
+    pub(super) fn conversation_id(&self) -> &str {
+        &self.report.conversation_id
+    }
+
+    pub(super) fn set_status_msg(&mut self, msg: impl Into<String>) {
+        self.status_msg = Some(msg.into());
     }
 
     pub(super) fn replace_report(&mut self, report: ConversationStatsReport) {

@@ -37,17 +37,17 @@ pub(super) enum StatsAction {
 /// Complete mutable UI state for the interactive stats dashboard.
 #[derive(Debug, Clone)]
 pub(super) struct StatsTuiState {
-    pub(super) query: StatsQuery,
-    pub(super) range_options: Vec<RangePreset>,
-    pub(super) active_pane: StatsPane,
-    pub(super) daily_idx: usize,
-    pub(super) selected_date: Option<String>,
-    pub(super) model_idx: usize,
+    query: StatsQuery,
+    range_options: Vec<RangePreset>,
+    active_pane: StatsPane,
+    daily_idx: usize,
+    selected_date: Option<String>,
+    model_idx: usize,
     /// `None` = auto based on terminal height (`>= 32`), `Some(v)` = manual override via `g`.
-    pub(super) show_heatmap: Option<bool>,
-    pub(super) status_msg: Option<String>,
-    pub(super) loading: bool,
-    pub(super) view_dirty: bool,
+    show_heatmap: Option<bool>,
+    status_msg: Option<String>,
+    loading: bool,
+    view_dirty: bool,
 }
 
 impl StatsTuiState {
@@ -72,6 +72,76 @@ impl StatsTuiState {
             status_msg: None,
             loading: true,
             view_dirty: true,
+        }
+    }
+
+    pub(super) fn query(&self) -> &StatsQuery {
+        &self.query
+    }
+
+    pub(super) fn range_options(&self) -> &[RangePreset] {
+        &self.range_options
+    }
+
+    pub(super) fn active_pane(&self) -> StatsPane {
+        self.active_pane
+    }
+
+    pub(super) fn daily_idx(&self) -> usize {
+        self.daily_idx
+    }
+
+    pub(super) fn selected_date(&self) -> Option<&str> {
+        self.selected_date.as_deref()
+    }
+
+    pub(super) fn model_idx(&self) -> usize {
+        self.model_idx
+    }
+
+    pub(super) fn status_msg(&self) -> Option<&str> {
+        self.status_msg.as_deref()
+    }
+
+    pub(super) fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    pub(super) fn is_view_dirty(&self) -> bool {
+        self.view_dirty
+    }
+
+    pub(super) fn begin_refresh(&mut self, msg: impl Into<String>) {
+        self.loading = true;
+        self.status_msg = Some(msg.into());
+    }
+
+    pub(super) fn finish_scan(&mut self, status_msg: Option<String>) {
+        self.loading = false;
+        self.view_dirty = true;
+        if status_msg.is_some() {
+            self.status_msg = status_msg;
+        }
+    }
+
+    pub(super) fn fail_scan(&mut self, msg: impl Into<String>) {
+        self.loading = false;
+        self.status_msg = Some(msg.into());
+    }
+
+    pub(super) fn focus_daily(&mut self) {
+        self.active_pane = StatsPane::Daily;
+    }
+
+    pub(super) fn click_model_row(&mut self, target: Option<usize>, view: &StatsView) {
+        let was_active = self.active_pane == StatsPane::Models;
+        self.active_pane = StatsPane::Models;
+        if let Some(idx) = target {
+            if was_active && self.model_idx == idx {
+                self.toggle_model_filter(idx, view);
+            } else if idx < self.active_models(view).len() {
+                self.model_idx = idx;
+            }
         }
     }
 
@@ -111,6 +181,7 @@ impl StatsTuiState {
         } else if self.model_idx >= models_len {
             self.model_idx = models_len - 1;
         }
+        self.view_dirty = false;
     }
 
     pub fn select_metric(&mut self, metric: StatsMetric) {
