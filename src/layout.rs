@@ -455,6 +455,7 @@ impl LayoutConfig {
                 WidgetId::Queue,
                 WidgetId::Vim,
                 WidgetId::Battle,
+                WidgetId::Version,
             ],
             vec![
                 WidgetId::CtxBar,
@@ -717,6 +718,7 @@ mod tests {
         assert_eq!(cfg.speed_warn_threshold, 35.0);
         assert_eq!(cfg.rows.len(), MAX_ROWS);
         assert!(!cfg.rows[0].is_empty());
+        assert_eq!(cfg.rows[0].last(), Some(&WidgetId::Version));
         assert!(!cfg.rows[1].is_empty());
         assert!(cfg.rows[2].is_empty());
         assert_eq!(WidgetId::CacheHit.priority(), 3);
