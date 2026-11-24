@@ -10,22 +10,22 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use agy_statusline::apply::{
     resolve_invoked_binary_path, run_apply_command, set_statusline_enabled,
 };
-use agy_statusline::db::SqliteSpeedReader;
 use agy_statusline::doctor::run_doctor;
 use agy_statusline::git::SystemGitProbe;
 use agy_statusline::layout::{
     load_layout_config, load_saved_stats_metric, save_layout_config, LayoutConfig, Preset,
 };
 use agy_statusline::paths::{
-    agy_settings_path, resolve_agy_cli_dir, resolve_agy_roots, resolve_home_dir, xdg_cache_dir,
-    xdg_config_dir,
+    agy_settings_path, resolve_agy_cli_dir, resolve_agy_roots, xdg_cache_dir, xdg_config_dir,
 };
 use agy_statusline::stats::{
-    maybe_spawn_background_archive_sync, run_pricing_command, run_stats_command_with_metric,
-    run_stats_sync_command, run_stats_tui, StatsMetric, SyncMode,
+    run_pricing_command, run_stats_command, run_stats_tui, StatsMetric, StatsOptions, SyncMode,
 };
-use agy_statusline::statusline::{process_statusline, PricingSource, StatuslineRuntime};
+use agy_statusline::statusline::{
+    process_statusline, PricingSource, SessionSource, StatuslineRuntime,
+};
 use agy_statusline::tui::run_tui_config;
+use agy_statusline::unix_now_secs;
 
 const MAX_STDIN_BYTES: u64 = 1024 * 1024;
 
@@ -77,11 +77,7 @@ enum Command {
     Doctor,
 
     /// Show local daily & model token usage, estimated API cost, and speed stats (launches interactive TUI on a TTY)
-    #[command(args_conflicts_with_subcommands = true)]
     Stats {
-        #[command(subcommand)]
-        action: Option<StatsCommand>,
-
         /// Restrict summary and daily usage to the last N days (>= 1)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         days: Option<u32>,
@@ -134,16 +130,6 @@ struct ConfigArgs {
 }
 
 #[derive(Debug, Subcommand)]
-enum StatsCommand {
-    /// Incrementally sync local AGY conversation DBs into the persistent stats archive
-    Sync {
-        /// Only sync if the archive was not synced within the last 30 minutes
-        #[arg(long)]
-        if_stale: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 enum PricingCommand {
     /// Show current pricing cache status (default)
     Status,
@@ -154,10 +140,6 @@ enum PricingCommand {
         #[arg(long)]
         if_stale: bool,
     },
-}
-
-fn unix_now_secs() -> u64 {
-    jiff::Timestamp::now().as_second().max(0) as u64
 }
 
 fn main() -> io::Result<()> {
@@ -205,11 +187,19 @@ fn main() -> io::Result<()> {
             Command::Doctor => {
                 let config_path = xdg_config_dir()?.join("config.json");
                 let settings_path = agy_settings_path()?;
+                let cache_dir = xdg_cache_dir();
+                let path_env = env::var_os("PATH");
                 let mut stdout = io::stdout().lock();
-                return run_doctor(&config_path, &settings_path, no_color, &mut stdout);
+                return run_doctor(
+                    &config_path,
+                    &settings_path,
+                    cache_dir.as_deref(),
+                    path_env.as_deref(),
+                    no_color,
+                    &mut stdout,
+                );
             }
             Command::Stats {
-                action,
                 days,
                 metric,
                 tui,
@@ -217,50 +207,33 @@ fn main() -> io::Result<()> {
                 json,
                 ascii,
             } => {
-                let home = resolve_home_dir();
-                if resolve_agy_roots(home.as_deref()).is_empty() {
+                let roots = resolve_agy_roots();
+                if roots.is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
-                        "no AGY data roots found (set HOME, USERPROFILE, ANTIGRAVITY_CLI_HOME, AGY_HOME, ANTIGRAVITY_HOME, or ANTIGRAVITY_DATA_DIR)",
+                        "no AGY data roots found (set HOME, USERPROFILE, ANTIGRAVITY_CLI_HOME, or ANTIGRAVITY_DATA_DIR)",
                     ));
                 }
-                if let Some(StatsCommand::Sync { if_stale }) = action {
-                    let mut stdout = io::stdout().lock();
-                    return run_stats_sync_command(
-                        home.as_deref(),
-                        if_stale,
-                        unix_now_secs(),
-                        &mut stdout,
-                    );
-                }
+                let cache_dir = xdg_cache_dir();
                 let config_path = xdg_config_dir().ok().map(|d| d.join("config.json"));
                 let effective_metric = metric
                     .or_else(|| config_path.as_deref().and_then(load_saved_stats_metric))
                     .unwrap_or_default();
+                let opts = StatsOptions {
+                    cache_dir: cache_dir.as_deref(),
+                    days,
+                    metric: effective_metric,
+                    no_color,
+                    ascii,
+                    now_unix_secs: unix_now_secs(),
+                };
                 let interactive =
                     tui || (!plain && !json && io::stdin().is_terminal() && io::stdout().is_terminal());
                 if interactive {
-                    return run_stats_tui(
-                        home.as_deref(),
-                        config_path.as_deref(),
-                        days,
-                        effective_metric,
-                        no_color,
-                        ascii,
-                        unix_now_secs(),
-                    );
+                    return run_stats_tui(roots, config_path.as_deref(), &opts);
                 }
                 let mut stdout = io::stdout().lock();
-                return run_stats_command_with_metric(
-                    home.as_deref(),
-                    days,
-                    effective_metric,
-                    json,
-                    no_color,
-                    ascii,
-                    unix_now_secs(),
-                    &mut stdout,
-                );
+                return run_stats_command(&roots, &opts, json, &mut stdout);
             }
             Command::Config(args) => {
                 let config_path = xdg_config_dir()?.join("config.json");
@@ -294,12 +267,18 @@ fn main() -> io::Result<()> {
                 return run_tui_config(&config_path);
             }
             Command::Pricing { action } => {
+                let cache_dir = xdg_cache_dir().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "unable to resolve pricing cache directory",
+                    )
+                })?;
                 let (sync, if_stale) = match action {
                     None | Some(PricingCommand::Status) => (false, false),
                     Some(PricingCommand::Sync { if_stale }) => (true, if_stale),
                 };
                 let mut stdout = io::stdout().lock();
-                return run_pricing_command(sync, if_stale, &mut stdout);
+                return run_pricing_command(&cache_dir, sync, if_stale, &mut stdout);
             }
             Command::Version => {
                 println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -331,26 +310,23 @@ fn main() -> io::Result<()> {
     let _ = io::stdin()
         .take(MAX_STDIN_BYTES)
         .read_to_string(&mut input);
-    let reader = SqliteSpeedReader::default();
-    let git_probe = SystemGitProbe::with_default_cache();
-    let calibration_dir = xdg_cache_dir();
+    let cache_dir = xdg_cache_dir();
+    let git_probe = SystemGitProbe {
+        cache_dir: cache_dir.clone(),
+    };
     let agy_cli_dir = resolve_agy_cli_dir();
     let runtime = StatuslineRuntime {
-        reader: &reader,
+        session: agy_cli_dir
+            .as_deref()
+            .map_or(SessionSource::None, SessionSource::LocalDir),
         git_probe: &git_probe,
-        calibration_dir: calibration_dir.as_deref(),
-        agy_cli_dir: agy_cli_dir.as_deref(),
+        cache_dir: cache_dir.as_deref(),
         pricing: PricingSource::Effective(SyncMode::SpawnIfStale),
         now_unix_secs: unix_now_secs(),
     };
     let mut stdout = io::stdout().lock();
     let result = process_statusline(&input, &runtime, &cfg, &mut stdout);
     let _ = stdout.flush();
-    maybe_spawn_background_archive_sync(
-        resolve_home_dir().as_deref(),
-        calibration_dir.as_deref(),
-        runtime.now_unix_secs,
-    );
     result
 }
 
@@ -421,7 +397,6 @@ mod tests {
         assert!(matches!(
             stats_custom.command,
             Some(Command::Stats {
-                action: None,
                 days: Some(14),
                 metric: Some(StatsMetric::InputOutput),
                 tui: false,
@@ -430,17 +405,6 @@ mod tests {
                 ascii: false,
             })
         ));
-        let stats_sync =
-            Cli::try_parse_from(["agy-statusline", "stats", "sync", "--if-stale"]).unwrap();
-        assert!(matches!(
-            stats_sync.command,
-            Some(Command::Stats {
-                action: Some(StatsCommand::Sync { if_stale: true }),
-                ..
-            })
-        ));
-        assert!(Cli::try_parse_from(["agy-statusline", "stats", "--days", "7", "sync"]).is_err());
-        assert!(Cli::try_parse_from(["agy-statusline", "stats", "--json", "sync"]).is_err());
         assert!(Cli::try_parse_from(["agy-statusline", "pricing", "--if-stale"]).is_err());
         assert!(Cli::try_parse_from(["agy-statusline", "pricing", "status", "--if-stale"]).is_err());
     }

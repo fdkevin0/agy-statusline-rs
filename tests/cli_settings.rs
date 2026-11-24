@@ -183,56 +183,40 @@ fn tier2_doctor_reports_config_states_and_render_uses_defaults_on_error() {
 }
 
 #[test]
-fn tier2_apply_and_doctor_honor_antigravity_cli_home_and_agy_home() {
+fn tier2_apply_and_doctor_honor_antigravity_cli_home() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();
     let cli_home = base.join("custom_cli_home");
-    let agy_home = base.join("custom_agy_home");
 
-    // ANTIGRAVITY_CLI_HOME takes precedence over AGY_HOME and HOME.
+    // ANTIGRAVITY_CLI_HOME takes precedence over HOME.
     stdout(
         isolated_agy_cmd(base)
             .env("ANTIGRAVITY_CLI_HOME", &cli_home)
-            .env("AGY_HOME", &agy_home)
             .env("NO_COLOR", "1")
             .args(["apply", "--yes"])
             .output()
             .unwrap(),
     );
     assert!(cli_home.join("settings.json").is_file());
-    assert!(!agy_home.join("settings.json").exists());
     assert!(!base.join(".gemini/antigravity-cli/settings.json").exists());
-
-    // AGY_HOME is used when ANTIGRAVITY_CLI_HOME is unset.
-    stdout(
-        isolated_agy_cmd(base)
-            .env_remove("ANTIGRAVITY_CLI_HOME")
-            .env("AGY_HOME", &agy_home)
-            .env("NO_COLOR", "1")
-            .args(["apply", "--yes"])
-            .output()
-            .unwrap(),
-    );
-    assert!(agy_home.join("settings.json").is_file());
 
     let doctor_text = stdout(
         isolated_agy_cmd(base)
-            .env_remove("ANTIGRAVITY_CLI_HOME")
-            .env("AGY_HOME", &agy_home)
+            .env("ANTIGRAVITY_CLI_HOME", &cli_home)
             .env("NO_COLOR", "1")
             .args(["doctor"])
             .output()
             .unwrap(),
     );
     assert!(
-        doctor_text.contains(&agy_home.join("settings.json").display().to_string()),
+        doctor_text.contains(&cli_home.join("settings.json").display().to_string()),
         "doctor stdout: {doctor_text}"
     );
     assert!(doctor_text.contains("enabled=true"));
 }
 
 #[test]
-fn tier2_doctor_reports_conversations_archive_and_agy_cli_status() {
+fn tier2_doctor_reports_conversations_and_agy_cli_status() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
 
@@ -246,10 +230,6 @@ fn tier2_doctor_reports_conversations_archive_and_agy_cli_status() {
     assert!(empty.contains("AGY CLI:  not found"), "doctor stdout:\n{empty}");
     assert!(
         empty.contains("conversations [not found]"),
-        "doctor stdout:\n{empty}"
-    );
-    assert!(
-        empty.contains("stats_history.db [not found]"),
         "doctor stdout:\n{empty}"
     );
 
@@ -267,10 +247,6 @@ fn tier2_doctor_reports_conversations_archive_and_agy_cli_status() {
     .unwrap();
     fs::write(conv_dir.join("not-a-uuid.db"), b"junk").unwrap();
 
-    let archive_path = root.join("data/agy-statusline/stats_history.db");
-    fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
-    fs::write(&archive_path, vec![0u8; 2048]).unwrap();
-
     let populated = stdout(
         isolated_agy_cmd(root)
             .env("NO_COLOR", "1")
@@ -280,10 +256,6 @@ fn tier2_doctor_reports_conversations_archive_and_agy_cli_status() {
     );
     assert!(
         populated.contains("conversations [found, 1 session .db file]"),
-        "doctor stdout:\n{populated}"
-    );
-    assert!(
-        populated.contains("stats_history.db [found, 2.0 KiB, unreadable schema]"),
         "doctor stdout:\n{populated}"
     );
 }

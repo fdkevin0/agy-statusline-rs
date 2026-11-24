@@ -3,13 +3,12 @@
 //!
 //! Reads AGY statusline JSON from stdin, inspects local SQLite conversation
 //! metadata for decode/e2e speed, TTFT, thinking tokens, and compaction limits,
-//! calibrates rolling quota pools, and renders a customizable multi-row
-//! statusline (`Plain`, `Pill`, or `Powerline`) alongside local usage stats
-//! (`agy-statusline stats`), pricing sync (`agy-statusline pricing`), and an
-//! interactive `ratatui` configurator (`agy-statusline config`).
+//! and renders a customizable multi-row statusline (`Plain`, `Pill`, or
+//! `Powerline`) alongside local usage stats (`agy-statusline stats`), pricing
+//! sync (`agy-statusline pricing`), and an interactive `ratatui` configurator
+//! (`agy-statusline config`).
 
 pub mod apply;
-pub mod calibration;
 pub mod db;
 pub mod doctor;
 pub(crate) mod editor;
@@ -27,3 +26,5 @@ pub mod statusline;
 pub(crate) mod theme;
 pub(crate) mod timeutil;
 pub mod tui;
+
+pub use timeutil::unix_now_secs;

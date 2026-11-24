@@ -6,12 +6,11 @@
 
 use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::paths::resolve_agy_cli_dir;
 use crate::protobuf::{extract_gen_metadata_summary, TurnMetrics};
 
 /// Session generation metadata sniffed from `gen_metadata`.
@@ -43,54 +42,27 @@ pub struct SessionMetadata {
 pub trait SpeedReader {
     /// Returns session generation speed, TTFT, and context window metadata.
     fn session_metadata(&self, conversation_id: &str) -> SessionMetadata;
-
-    /// Returns session generation metadata resolved inside an explicit AGY CLI directory.
-    fn session_metadata_in(&self, _cli_dir: &Path, conversation_id: &str) -> SessionMetadata {
-        self.session_metadata(conversation_id)
-    }
-
-    /// Returns `true` when this reader directly queries local SQLite conversation DBs
-    /// under the caller-supplied AGY CLI directory.
-    fn uses_local_sqlite(&self) -> bool {
-        false
-    }
 }
 
-/// Production [`SpeedReader`] backed by the local AGY SQLite conversation database.
-#[derive(Debug, Clone, Default)]
+/// Production [`SpeedReader`] backed by an AGY CLI directory (`<cli_dir>/conversations/*.db`).
+#[derive(Debug, Clone)]
 pub struct SqliteSpeedReader {
-    /// Optional override for the base home directory (used in isolated tests).
-    pub home_override: Option<PathBuf>,
+    /// AGY CLI data directory containing `conversations/<uuid>.db`.
+    pub cli_dir: PathBuf,
+}
+
+impl SqliteSpeedReader {
+    /// Constructs a reader targeting an explicit AGY CLI data directory.
+    pub fn new(cli_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            cli_dir: cli_dir.into(),
+        }
+    }
 }
 
 impl SpeedReader for SqliteSpeedReader {
     fn session_metadata(&self, conversation_id: &str) -> SessionMetadata {
-        let Some(cli_dir) = self
-            .home_override
-            .as_ref()
-            .map(|home| home.join(".gemini").join("antigravity-cli"))
-            .or_else(resolve_agy_cli_dir)
-        else {
-            return SessionMetadata::default();
-        };
-        let Some(db_path) = resolve_conversation_db_path(&cli_dir, conversation_id) else {
-            return SessionMetadata::default();
-        };
-        query_session_metadata_from_db(&db_path)
-    }
-
-    fn session_metadata_in(&self, cli_dir: &Path, conversation_id: &str) -> SessionMetadata {
-        if self.home_override.is_some() {
-            return self.session_metadata(conversation_id);
-        }
-        let Some(db_path) = resolve_conversation_db_path(cli_dir, conversation_id) else {
-            return SessionMetadata::default();
-        };
-        query_session_metadata_from_db(&db_path)
-    }
-
-    fn uses_local_sqlite(&self) -> bool {
-        self.home_override.is_none()
+        query_session_metadata_in(&self.cli_dir, conversation_id)
     }
 }
 
@@ -118,10 +90,10 @@ pub(crate) fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
 }
 
 /// Safety classification for a SQLite database file and its `-wal`/`-shm` sidecars.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SqlitePathStatus {
+#[derive(Debug)]
+enum SqlitePathStatus {
     /// Regular non-symlink database file whose `-wal`/`-shm` sidecars are absent or regular files.
-    Valid,
+    Valid(fs::Metadata),
     /// Database file is absent and its `-wal`/`-shm` sidecars are absent or regular files.
     Missing,
     /// Database path or a `-wal`/`-shm` sidecar is a symlink, non-regular file, or unreadable.
@@ -129,14 +101,14 @@ pub(crate) enum SqlitePathStatus {
 }
 
 /// Inspects `db_path` and its `-wal`/`-shm` sidecars without following symlinks.
-pub(crate) fn inspect_sqlite_path(db_path: &Path) -> SqlitePathStatus {
+fn inspect_sqlite_path(db_path: &Path) -> SqlitePathStatus {
     let base = match fs::symlink_metadata(db_path) {
         Ok(meta) => {
             let ft = meta.file_type();
             if ft.is_symlink() || !ft.is_file() {
                 return SqlitePathStatus::Unsafe;
             }
-            SqlitePathStatus::Valid
+            SqlitePathStatus::Valid(meta)
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => SqlitePathStatus::Missing,
         Err(_) => return SqlitePathStatus::Unsafe,
@@ -149,8 +121,16 @@ pub(crate) fn inspect_sqlite_path(db_path: &Path) -> SqlitePathStatus {
     base
 }
 
+/// Returns `db_path`'s `symlink_metadata` when `db_path` is a safe regular file with safe sidecars.
+pub(crate) fn safe_sqlite_metadata(db_path: &Path) -> Option<fs::Metadata> {
+    match inspect_sqlite_path(db_path) {
+        SqlitePathStatus::Valid(meta) => Some(meta),
+        SqlitePathStatus::Missing | SqlitePathStatus::Unsafe => None,
+    }
+}
+
 pub(crate) fn is_safe_sqlite_file(db_path: &Path) -> bool {
-    matches!(inspect_sqlite_path(db_path), SqlitePathStatus::Valid)
+    safe_sqlite_metadata(db_path).is_some()
 }
 
 /// Resolves `<cli_dir>/conversations/<conversation_id>.db`, falling back to lowercase
@@ -169,14 +149,13 @@ pub(crate) fn resolve_conversation_db_path(cli_dir: &Path, conversation_id: &str
     }
     let exact = conv_dir.join(format!("{conversation_id}.db"));
     match inspect_sqlite_path(&exact) {
-        SqlitePathStatus::Valid => Some(exact),
+        SqlitePathStatus::Valid(_) => Some(exact),
         SqlitePathStatus::Unsafe => None,
         SqlitePathStatus::Missing => {
             let lower = conversation_id.to_ascii_lowercase();
             if lower != conversation_id {
                 let candidate = conv_dir.join(format!("{lower}.db"));
-                matches!(inspect_sqlite_path(&candidate), SqlitePathStatus::Valid)
-                    .then_some(candidate)
+                is_safe_sqlite_file(&candidate).then_some(candidate)
             } else {
                 None
             }
@@ -211,59 +190,6 @@ pub fn is_valid_uuid(id: &str) -> bool {
         }
     }
     true
-}
-
-/// Safely infers an isolated AGY CLI root directory from a `transcript_path` such as
-/// `<root>/brain/<uuid>/.system_generated/logs/transcript.jsonl`.
-///
-/// Rejects relative paths, `..` traversal, non-UUID segments, `conversation_id` mismatches,
-/// missing trailing path components, and symlinked or missing `<root>` / `<root>/conversations`
-/// directories.
-pub(crate) fn infer_agy_root_from_transcript_path(
-    transcript_path: &str,
-    expected_conversation_id: Option<&str>,
-) -> Option<PathBuf> {
-    let path = Path::new(transcript_path);
-    if !path.is_absolute() {
-        return None;
-    }
-    let components: Vec<Component<'_>> = path.components().collect();
-    if components.iter().any(|c| matches!(c, Component::ParentDir)) {
-        return None;
-    }
-    let expected = expected_conversation_id
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    for i in (1..components.len()).rev() {
-        let Component::Normal(dir_name) = components[i] else {
-            continue;
-        };
-        if dir_name != "brain" {
-            continue;
-        }
-        let Some(Component::Normal(uuid_os)) = components.get(i + 1) else {
-            continue;
-        };
-        let Some(uuid) = uuid_os.to_str() else {
-            continue;
-        };
-        if !is_valid_uuid(uuid) {
-            continue;
-        }
-        if !components[i + 2..]
-            .iter()
-            .any(|c| matches!(c, Component::Normal(_)))
-        {
-            continue;
-        }
-        if expected.is_some_and(|cid| !uuid.eq_ignore_ascii_case(cid)) {
-            return None;
-        }
-        let root: PathBuf = components[..i].iter().collect();
-        return (is_real_dir(&root) && is_real_dir(&root.join("conversations"))).then_some(root);
-    }
-    None
 }
 
 /// Opens a SQLite database in read-only, no-mutex mode with a 25ms busy timeout.
@@ -343,9 +269,12 @@ pub(crate) fn query_session_metadata_from_conn(conn: &Connection) -> SessionMeta
     meta
 }
 
-/// Opens `db_path` in read-only mode and extracts speed, TTFT, and context window metadata.
-fn query_session_metadata_from_db(db_path: &Path) -> SessionMetadata {
-    let Ok(conn) = open_readonly_db(db_path) else {
+/// Resolves `<cli_dir>/conversations/<conversation_id>.db` and extracts session metadata.
+pub(crate) fn query_session_metadata_in(cli_dir: &Path, conversation_id: &str) -> SessionMetadata {
+    let Some(db_path) = resolve_conversation_db_path(cli_dir, conversation_id) else {
+        return SessionMetadata::default();
+    };
+    let Ok(conn) = open_readonly_db(&db_path) else {
         return SessionMetadata::default();
     };
     query_session_metadata_from_conn(&conn)
@@ -377,9 +306,7 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let reader = SqliteSpeedReader {
-            home_override: Some(dir.path().to_path_buf()),
-        };
+        let reader = SqliteSpeedReader::new(dir.path());
         assert_eq!(reader.session_metadata(uuid).speed, Some(50.0));
         assert_eq!(reader.session_metadata("invalid").speed, None);
     }
@@ -402,15 +329,13 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let reader = SqliteSpeedReader {
-            home_override: Some(dir.path().to_path_buf()),
-        };
+        let reader = SqliteSpeedReader::new(dir.path());
         assert_eq!(reader.session_metadata(uuid).speed, Some(50.0));
     }
 
     fn create_temp_conv_db() -> (tempfile::TempDir, Connection, &'static str) {
         let dir = tempfile::tempdir().unwrap();
-        let conv_dir = dir.path().join(".gemini/antigravity-cli/conversations");
+        let conv_dir = dir.path().join("conversations");
         std::fs::create_dir_all(&conv_dir).unwrap();
         let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
         let db_path = conv_dir.join(format!("{uuid}.db"));
@@ -438,9 +363,7 @@ mod tests {
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (9, ?1)", [encode_speed_1s_blob(120)]).unwrap();
         drop(conn);
 
-        let reader = SqliteSpeedReader {
-            home_override: Some(dir.path().to_path_buf()),
-        };
+        let reader = SqliteSpeedReader::new(dir.path());
         let meta = reader.session_metadata(uuid);
         assert_eq!(meta.speed, Some(100.0));
         assert_eq!(meta.median_speed, Some(80.0));
@@ -456,9 +379,7 @@ mod tests {
         conn.execute("INSERT INTO gen_metadata (idx, data) VALUES (4, ?1)", [encode_speed_1s_blob(40)]).unwrap();
         drop(conn);
 
-        let reader = SqliteSpeedReader {
-            home_override: Some(dir.path().to_path_buf()),
-        };
+        let reader = SqliteSpeedReader::new(dir.path());
         let meta = reader.session_metadata(uuid);
         assert_eq!(meta.median_speed, Some(50.0));
         assert_eq!(meta.speed, Some(55.0));
@@ -484,9 +405,7 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let reader = SqliteSpeedReader {
-            home_override: Some(dir.path().to_path_buf()),
-        };
+        let reader = SqliteSpeedReader::new(dir.path());
         let meta = reader.session_metadata(uuid);
         assert_eq!(meta.estimated_context_tokens, Some(64_000));
         assert_eq!(meta.max_context_tokens, Some(512_000));
@@ -505,29 +424,29 @@ mod tests {
     fn resolve_conversation_db_path_falls_back_to_lowercase_uuid() {
         let (dir, conn, uuid) = create_temp_conv_db();
         drop(conn);
-        let cli_dir = dir.path().join(".gemini/antigravity-cli");
+        let cli_dir = dir.path();
         let upper = uuid.to_ascii_uppercase();
 
-        let exact = resolve_conversation_db_path(&cli_dir, uuid).unwrap();
-        let via_upper = resolve_conversation_db_path(&cli_dir, &upper).unwrap();
+        let exact = resolve_conversation_db_path(cli_dir, uuid).unwrap();
+        let via_upper = resolve_conversation_db_path(cli_dir, &upper).unwrap();
         assert_eq!(exact, via_upper);
-        assert!(resolve_conversation_db_path(&cli_dir, "not-a-uuid").is_none());
+        assert!(resolve_conversation_db_path(cli_dir, "not-a-uuid").is_none());
     }
 
     #[test]
     fn resolve_conversation_db_path_accepts_regular_sidecars_and_rejects_non_files() {
         let (dir, conn, uuid) = create_temp_conv_db();
         drop(conn);
-        let cli_dir = dir.path().join(".gemini/antigravity-cli");
+        let cli_dir = dir.path();
         let conv_dir = cli_dir.join("conversations");
 
         fs::write(conv_dir.join(format!("{uuid}.db-wal")), b"wal").unwrap();
         fs::write(conv_dir.join(format!("{uuid}.db-shm")), b"shm").unwrap();
-        assert!(resolve_conversation_db_path(&cli_dir, uuid).is_some());
+        assert!(resolve_conversation_db_path(cli_dir, uuid).is_some());
 
         let dir_uuid = "11111111-1111-4111-8111-111111111111";
         fs::create_dir(conv_dir.join(format!("{dir_uuid}.db"))).unwrap();
-        assert!(resolve_conversation_db_path(&cli_dir, dir_uuid).is_none());
+        assert!(resolve_conversation_db_path(cli_dir, dir_uuid).is_none());
     }
 
     #[cfg(unix)]
@@ -596,133 +515,24 @@ mod tests {
         // Missing DB with clean sidecars is Missing; dangling symlink and
         // missing DB with symlinked sidecars are Unsafe.
         let missing_db = conv_dir.join("absent.db");
-        assert_eq!(inspect_sqlite_path(&missing_db), SqlitePathStatus::Missing);
+        assert!(matches!(
+            inspect_sqlite_path(&missing_db),
+            SqlitePathStatus::Missing
+        ));
         assert!(!is_safe_sqlite_file(&missing_db));
 
         let dangling_db = conv_dir.join("dangling.db");
         symlink(external.join("does_not_exist.db"), &dangling_db).unwrap();
-        assert_eq!(inspect_sqlite_path(&dangling_db), SqlitePathStatus::Unsafe);
+        assert!(matches!(
+            inspect_sqlite_path(&dangling_db),
+            SqlitePathStatus::Unsafe
+        ));
 
         let poisoned_missing = conv_dir.join("poisoned_missing.db");
         symlink(&target_sidecar, sidecar_path(&poisoned_missing, "-wal")).unwrap();
-        assert_eq!(
+        assert!(matches!(
             inspect_sqlite_path(&poisoned_missing),
             SqlitePathStatus::Unsafe
-        );
-    }
-
-    #[test]
-    fn infer_agy_root_from_transcript_path_validates_structure_and_uuid() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("isolated-agy");
-        let conv_dir = root.join("conversations");
-        let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
-        let other_uuid = "11111111-1111-4111-8111-111111111111";
-        let nested_logs = root.join("brain").join(uuid).join(".system_generated/logs");
-        fs::create_dir_all(&conv_dir).unwrap();
-        fs::create_dir_all(&nested_logs).unwrap();
-
-        let nested_transcript = nested_logs.join("transcript.jsonl");
-        let nested_str = nested_transcript.to_str().unwrap();
-        assert_eq!(
-            infer_agy_root_from_transcript_path(nested_str, Some(uuid)),
-            Some(root.clone())
-        );
-        assert_eq!(
-            infer_agy_root_from_transcript_path(nested_str, Some(&uuid.to_ascii_uppercase())),
-            Some(root.clone())
-        );
-        assert_eq!(
-            infer_agy_root_from_transcript_path(nested_str, None),
-            Some(root.clone())
-        );
-
-        let direct_transcript = root.join("brain").join(uuid).join("transcript.jsonl");
-        assert_eq!(
-            infer_agy_root_from_transcript_path(direct_transcript.to_str().unwrap(), Some(uuid)),
-            Some(root.clone())
-        );
-
-        // Reject relative paths, `..` traversal, conversation_id mismatches, non-UUIDs,
-        // missing trailing components, and roots lacking a `conversations/` directory.
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("isolated-agy/brain/{uuid}/transcript.jsonl"),
-                Some(uuid),
-            ),
-            None
-        );
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("{}/brain/../brain/{uuid}/transcript.jsonl", root.display()),
-                Some(uuid),
-            ),
-            None
-        );
-        assert_eq!(
-            infer_agy_root_from_transcript_path(nested_str, Some(other_uuid)),
-            None
-        );
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("{}/brain/not-a-uuid/transcript.jsonl", root.display()),
-                None,
-            ),
-            None
-        );
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("{}/brain/{uuid}", root.display()),
-                Some(uuid),
-            ),
-            None
-        );
-
-        let no_conv_root = dir.path().join("no-conv-agy");
-        fs::create_dir_all(no_conv_root.join("brain").join(uuid)).unwrap();
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("{}/brain/{uuid}/transcript.jsonl", no_conv_root.display()),
-                Some(uuid),
-            ),
-            None
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn infer_agy_root_from_transcript_path_rejects_symlinked_root_and_conversations() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().unwrap();
-        let uuid = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
-        let real_root = dir.path().join("real-agy");
-        fs::create_dir_all(real_root.join("conversations")).unwrap();
-        fs::create_dir_all(real_root.join("brain").join(uuid)).unwrap();
-
-        let sym_root = dir.path().join("sym-agy");
-        symlink(&real_root, &sym_root).unwrap();
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("{}/brain/{uuid}/transcript.jsonl", sym_root.display()),
-                Some(uuid),
-            ),
-            None
-        );
-
-        let sym_conv_root = dir.path().join("sym-conv-agy");
-        fs::create_dir_all(sym_conv_root.join("brain").join(uuid)).unwrap();
-        symlink(
-            real_root.join("conversations"),
-            sym_conv_root.join("conversations"),
-        )
-        .unwrap();
-        assert_eq!(
-            infer_agy_root_from_transcript_path(
-                &format!("{}/brain/{uuid}/transcript.jsonl", sym_conv_root.display()),
-                Some(uuid),
-            ),
-            None
-        );
+        ));
     }
 }

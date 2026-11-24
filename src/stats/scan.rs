@@ -1,42 +1,23 @@
-//! Read-only SQLite `gen_metadata` and `transcript.jsonl` / `transcript_full.jsonl` scanners.
+//! Read-only SQLite `gen_metadata` and `steps.metadata` scanner.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::pricing::{normalize_model_key, round_usd_6, PricingCatalog, PricingFileFingerprint};
 use super::tz::TimeZoneSpec;
 use super::SqliteStats;
 use crate::db::{
     compute_median, is_absent_or_real_file, is_real_dir, is_safe_sqlite_file, is_valid_uuid,
-    open_readonly_db, resolve_conversation_db_path, sidecar_path,
+    open_readonly_db, resolve_conversation_db_path, safe_sqlite_metadata, sidecar_path,
 };
-use crate::fsutil::atomic_write;
+use crate::fsutil::{atomic_write, modified_timestamp};
 use crate::protobuf::{
     extract_gen_metadata_record, extract_step_metadata_record, extract_trajectory_created_at_secs,
-    is_sane_decode_speed, MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
+    MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
 };
-use crate::timeutil::parse_rfc3339_unix_secs;
-
-const MAX_TRANSCRIPT_SCAN_DEPTH: usize = 4;
-const COMPACT_TRANSCRIPT_FILENAME: &str = "transcript.jsonl";
-const FULL_TRANSCRIPT_FILENAME: &str = "transcript_full.jsonl";
-
-const SKIP_DIRS: &[&str] = &[
-    "steps",
-    "tasks",
-    "scratch",
-    "media",
-    "artifacts",
-    "node_modules",
-    ".git",
-    "__pycache__",
-];
 
 pub(super) fn is_effort_token(word: &str) -> bool {
     matches!(
@@ -98,126 +79,6 @@ fn derive_model_name(
     "unknown".to_string()
 }
 
-fn value_as_u64(v: Option<&Value>) -> u64 {
-    match v {
-        Some(Value::Number(n)) => {
-            if let Some(u) = n.as_u64() {
-                u
-            } else if let Some(i) = n.as_i64() {
-                i.max(0) as u64
-            } else if let Some(f) = n.as_f64() {
-                if f.is_finite() && f >= 0.0 {
-                    f as u64
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        }
-        Some(Value::String(s)) => s.trim().parse::<u64>().unwrap_or(0),
-        _ => 0,
-    }
-}
-
-fn value_as_positive_f64(v: Option<&Value>) -> Option<f64> {
-    let f = v.and_then(Value::as_f64)?;
-    (f.is_finite() && f > 0.0).then_some(f)
-}
-
-fn parse_duration_secs(v: Option<&Value>) -> Option<f64> {
-    let val = v?;
-    match val {
-        Value::Number(n) => {
-            let f = n.as_f64()?;
-            (f.is_finite() && f >= 0.0).then_some(f)
-        }
-        Value::String(raw) => {
-            let s = raw.trim();
-            if s.is_empty() {
-                return None;
-            }
-            let (num_str, scale) =
-                if let Some(prefix) = s.strip_suffix("ms").or_else(|| s.strip_suffix("MS")) {
-                    (prefix.trim(), 0.001)
-                } else if let Some(prefix) = s.strip_suffix('s').or_else(|| s.strip_suffix('S')) {
-                    (prefix.trim(), 1.0)
-                } else {
-                    (s, 1.0)
-                };
-            let parsed = num_str.parse::<f64>().ok()?;
-            let secs = parsed * scale;
-            (secs.is_finite() && secs >= 0.0).then_some(secs)
-        }
-        _ => None,
-    }
-}
-
-fn non_empty_str(v: Option<&Value>) -> Option<&str> {
-    v.and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-}
-
-fn extract_explicit_event_id(obj: &serde_json::Map<String, Value>) -> Option<&str> {
-    let usage_obj = obj
-        .get("chatModel")
-        .and_then(|c| c.get("usage"))
-        .and_then(Value::as_object)
-        .or_else(|| obj.get("usage").and_then(Value::as_object));
-
-    usage_obj
-        .and_then(|u| {
-            non_empty_str(u.get("responseId"))
-                .or_else(|| non_empty_str(u.get("response_id")))
-                .or_else(|| non_empty_str(u.get("messageId")))
-                .or_else(|| non_empty_str(u.get("message_id")))
-                .or_else(|| non_empty_str(u.get("callId")))
-                .or_else(|| non_empty_str(u.get("call_id")))
-        })
-        .or_else(|| non_empty_str(obj.get("responseId")))
-        .or_else(|| non_empty_str(obj.get("response_id")))
-        .or_else(|| non_empty_str(obj.get("messageId")))
-        .or_else(|| non_empty_str(obj.get("message_id")))
-        .or_else(|| non_empty_str(obj.get("callId")))
-        .or_else(|| non_empty_str(obj.get("call_id")))
-}
-
-fn extract_canonical_event_key(
-    obj: &serde_json::Map<String, Value>,
-    explicit_id: Option<&str>,
-    root_source: &str,
-    default_cascade: &str,
-    line_idx: usize,
-) -> String {
-    if let Some(id) = explicit_id {
-        return format!("id:{id}");
-    }
-
-    let source = non_empty_str(obj.get("source")).unwrap_or(root_source);
-    let cascade = non_empty_str(obj.get("cascadeId"))
-        .or_else(|| non_empty_str(obj.get("cascade_id")))
-        .unwrap_or(default_cascade);
-
-    let step_idx = obj
-        .get("stepIndices")
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.first())
-        .and_then(Value::as_u64)
-        .or_else(|| obj.get("stepIndex").and_then(Value::as_u64))
-        .or_else(|| obj.get("step_index").and_then(Value::as_u64))
-        .unwrap_or(line_idx as u64);
-
-    format!("{source}:{cascade}#{step_idx}")
-}
-
-/// Conversations and explicit response/call IDs already covered by SQLite usage records.
-#[derive(Debug, Default)]
-pub(super) struct SqliteCoverage {
-    pub(super) conversations: HashSet<(&'static str, String)>,
-    pub(super) response_ids: HashSet<String>,
-}
-
 /// Origin of a scanned usage event (`antigravity-cli` vs desktop `antigravity`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageSource {
@@ -253,405 +114,25 @@ pub(super) struct UsageEvent {
     pub(super) ttft_secs: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
-struct TranscriptJob {
-    path: PathBuf,
-    source: &'static str,
-    cascade_hint: String,
-}
-
 fn canonical_or_self(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn is_non_empty_file(path: &Path) -> bool {
-    // Follow symlinks via `fs::metadata` so symlinked transcripts remain discoverable and
-    // deduplicated by `canonical_or_self`.
-    fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
-}
-
-fn cascade_hint_from_transcript_path(path: &Path) -> String {
-    let components: Vec<String> = path
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    for i in 0..components.len() {
-        if components[i].eq_ignore_ascii_case("brain") {
-            if let Some(next) = components.get(i + 1) {
-                return next.clone();
-            }
-        }
-    }
-    path.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "session".to_string())
-}
-
-fn collect_transcript_jobs_in_brain(
-    dir: &Path,
-    source: &'static str,
-    depth: usize,
-    visited_dirs: &mut HashSet<PathBuf>,
-    seen_files: &mut HashSet<PathBuf>,
-    jobs: &mut Vec<TranscriptJob>,
-) {
-    if depth > MAX_TRANSCRIPT_SCAN_DEPTH || !dir.is_dir() {
-        return;
-    }
-    let real_dir = canonical_or_self(dir);
-    if !visited_dirs.insert(real_dir) {
-        return;
-    }
-
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut sorted_entries: Vec<_> = entries.filter_map(Result::ok).collect();
-    sorted_entries.sort_by_key(|e| e.file_name());
-
-    for entry in sorted_entries {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if SKIP_DIRS.contains(&name_str.as_ref()) {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(meta) = fs::metadata(&path) else {
-            continue;
-        };
-
-        if meta.is_dir() {
-            if depth == 0 {
-                let mut push_if_file = |candidate: PathBuf| -> bool {
-                    if !is_non_empty_file(&candidate) {
-                        return false;
-                    }
-                    let real = canonical_or_self(&candidate);
-                    if seen_files.insert(real) {
-                        jobs.push(TranscriptJob {
-                            cascade_hint: name_str.clone().into_owned(),
-                            path: candidate,
-                            source,
-                        });
-                    }
-                    true
-                };
-                let std_dir = path.join(".system_generated").join("logs");
-                let mut matched_fast = false;
-                for candidate in [
-                    std_dir.join(COMPACT_TRANSCRIPT_FILENAME),
-                    path.join(COMPACT_TRANSCRIPT_FILENAME),
-                ] {
-                    if push_if_file(candidate) {
-                        matched_fast = true;
-                        break;
-                    }
-                }
-                if !matched_fast {
-                    for candidate in [
-                        std_dir.join(FULL_TRANSCRIPT_FILENAME),
-                        path.join(FULL_TRANSCRIPT_FILENAME),
-                    ] {
-                        if push_if_file(candidate) {
-                            matched_fast = true;
-                            break;
-                        }
-                    }
-                }
-                if matched_fast {
-                    continue;
-                }
-            }
-            collect_transcript_jobs_in_brain(
-                &path,
-                source,
-                depth + 1,
-                visited_dirs,
-                seen_files,
-                jobs,
-            );
-        } else if meta.is_file()
-            && meta.len() > 0
-            && (name_str == COMPACT_TRANSCRIPT_FILENAME
-                || (name_str == FULL_TRANSCRIPT_FILENAME
-                    && !is_non_empty_file(&dir.join(COMPACT_TRANSCRIPT_FILENAME))))
-        {
-            let real = canonical_or_self(&path);
-            if seen_files.insert(real) {
-                jobs.push(TranscriptJob {
-                    cascade_hint: cascade_hint_from_transcript_path(&path),
-                    path,
-                    source,
-                });
-            }
-        }
-    }
-}
-
-fn resolve_turn_cost(
-    pricing: &PricingCatalog,
-    native_cost_usd: Option<f64>,
-    candidates: &[Option<&str>],
-    input_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    output_tokens: u64,
-) -> (Option<String>, Option<f64>) {
-    if let Some(usd) = native_cost_usd {
-        return (Some("native".to_string()), Some(round_usd_6(usd)));
-    }
-    let active: Vec<&str> = candidates.iter().copied().flatten().collect();
-    pricing
-        .estimate_cost(
-            &active,
-            input_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            output_tokens,
-        )
-        .unzip()
-}
-
-fn parse_transcript_line(
-    line: &str,
-    job: &TranscriptJob,
-    line_idx: usize,
-    tz: &TimeZoneSpec,
-    pricing: &PricingCatalog,
-    covered: &SqliteCoverage,
-) -> Option<(String, UsageEvent)> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let Value::Object(obj) = serde_json::from_str::<Value>(trimmed).ok()? else {
-        return None;
-    };
-
-    if let Some(cid) =
-        non_empty_str(obj.get("cascadeId")).or_else(|| non_empty_str(obj.get("cascade_id")))
-    {
-        if is_valid_uuid(cid)
-            && covered
-                .conversations
-                .contains(&(job.source, cid.to_ascii_lowercase()))
-        {
-            return None;
-        }
-    }
-
-    let explicit_id = extract_explicit_event_id(&obj);
-    if explicit_id.is_some_and(|id| covered.response_ids.contains(id)) {
-        return None;
-    }
-
-    let created_at = non_empty_str(obj.get("created_at"))?;
-    let unix_secs = parse_rfc3339_unix_secs(created_at)?;
-    let (local_day, local_date) = tz.local_day_and_date(unix_secs);
-
-    let cm_obj = obj.get("chatModel").and_then(Value::as_object);
-    let usage_obj = cm_obj
-        .and_then(|cm| cm.get("usage"))
-        .and_then(Value::as_object);
-
-    let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens) =
-        if ["input_tokens", "output_tokens", "cache_read_tokens"]
-            .iter()
-            .any(|k| obj.get(*k).is_some_and(|v| !v.is_null()))
-        {
-            (
-                value_as_u64(obj.get("input_tokens")),
-                value_as_u64(obj.get("output_tokens")),
-                value_as_u64(obj.get("cache_read_tokens")),
-                value_as_u64(obj.get("cache_write_tokens")),
-                value_as_u64(obj.get("thinking_output_tokens")),
-            )
-        } else if let Some(u) = usage_obj {
-            (
-                value_as_u64(u.get("inputTokens").or_else(|| u.get("input_tokens"))),
-                value_as_u64(u.get("outputTokens").or_else(|| u.get("output_tokens"))),
-                value_as_u64(
-                    u.get("cacheReadTokens")
-                        .or_else(|| u.get("cache_read_tokens")),
-                ),
-                value_as_u64(
-                    u.get("cacheWriteTokens")
-                        .or_else(|| u.get("cache_write_tokens")),
-                ),
-                value_as_u64(
-                    u.get("thinkingOutputTokens")
-                        .or_else(|| u.get("thinking_output_tokens")),
-                ),
-            )
-        } else {
-            (0, 0, 0, 0, 0)
-        };
-
-    let total_tokens = input_tokens
-        .saturating_add(cache_read_tokens)
-        .saturating_add(cache_write_tokens)
-        .saturating_add(output_tokens);
-    if total_tokens == 0 {
-        return None;
-    }
-
-    let disp = cm_obj
-        .and_then(|m| non_empty_str(m.get("modelDisplayName")))
-        .or_else(|| non_empty_str(obj.get("modelDisplayName")));
-    let resp = cm_obj
-        .and_then(|m| {
-            non_empty_str(m.get("responseModel"))
-                .or_else(|| non_empty_str(m.get("model")))
-                .or_else(|| non_empty_str(m.get("modelId")))
-        })
-        .or_else(|| non_empty_str(obj.get("responseModel")))
-        .or_else(|| non_empty_str(obj.get("model")))
-        .or_else(|| non_empty_str(obj.get("modelId")));
-    let model_group = derive_model_name(disp, resp, 0);
-
-    let native_cost = cm_obj
-        .and_then(|cm| value_as_positive_f64(cm.get("modelCost")))
-        .or_else(|| value_as_positive_f64(obj.get("cost_usd")))
-        .or_else(|| value_as_positive_f64(obj.get("cost")));
-
-    let (pricing_key, cost_usd) = resolve_turn_cost(
-        pricing,
-        native_cost,
-        &[resp, disp, Some(model_group.as_str())],
-        input_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-        output_tokens,
-    );
-
-    let streaming_secs = cm_obj
-        .and_then(|cm| parse_duration_secs(cm.get("streamingDuration")))
-        .or_else(|| parse_duration_secs(obj.get("streamingSec")));
-    let decode_speed = streaming_secs
-        .filter(|&secs| is_sane_decode_speed(output_tokens, secs))
-        .map(|secs| (output_tokens as f64) / secs);
-
-    let ttft_secs = cm_obj
-        .and_then(|cm| parse_duration_secs(cm.get("timeToFirstToken")))
-        .or_else(|| parse_duration_secs(obj.get("ttftSec")))
-        .filter(|&t| t > 0.0 && t < MAX_TTFT_SECS);
-
-    let event_key =
-        extract_canonical_event_key(&obj, explicit_id, job.source, &job.cascade_hint, line_idx);
-
-    Some((
-        event_key,
-        UsageEvent {
-            source: UsageSource::from_root_label(job.source),
-            local_day,
-            local_date,
-            model_group,
-            pricing_key,
-            input_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            output_tokens,
-            thinking_tokens,
-            total_tokens,
-            cost_usd,
-            decode_speed,
-            ttft_secs,
-        },
-    ))
-}
-
-pub(super) fn scan_transcripts(
-    roots: &[(&'static str, PathBuf)],
-    tz: &TimeZoneSpec,
-    pricing: &PricingCatalog,
-    covered: &SqliteCoverage,
-) -> Vec<UsageEvent> {
-    let mut visited_dirs = HashSet::new();
-    let mut seen_files = HashSet::new();
-    let mut jobs = Vec::new();
-
-    for (source, root) in roots {
-        let brain_dir = root.join("brain");
-        collect_transcript_jobs_in_brain(
-            &brain_dir,
-            source,
-            0,
-            &mut visited_dirs,
-            &mut seen_files,
-            &mut jobs,
-        );
-    }
-
-    let mut seen_events = HashSet::new();
-    let mut events = Vec::new();
-    let mut byte_buf = Vec::with_capacity(4096);
-
-    for job in &jobs {
-        if is_valid_uuid(&job.cascade_hint)
-            && covered
-                .conversations
-                .contains(&(job.source, job.cascade_hint.to_ascii_lowercase()))
-        {
-            continue;
-        }
-        let Ok(file) = File::open(&job.path) else {
-            continue;
-        };
-        let mut reader = BufReader::new(file);
-        let mut line_idx = 0usize;
-
-        loop {
-            byte_buf.clear();
-            let Ok(read_bytes) = reader.read_until(b'\n', &mut byte_buf) else {
-                break;
-            };
-            if read_bytes == 0 {
-                break;
-            }
-            if let Ok(line) = std::str::from_utf8(&byte_buf) {
-                if let Some((event_key, event)) =
-                    parse_transcript_line(line, job, line_idx, tz, pricing, covered)
-                {
-                    if seen_events.insert(event_key) {
-                        events.push(event);
-                    }
-                }
-            }
-            line_idx += 1;
-        }
-    }
-
-    events
-}
-
 /// File-level change fingerprint for a SQLite conversation DB and its `-wal` sidecar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct DbFileFingerprint {
-    pub(super) db_mtime_secs: i64,
-    pub(super) db_mtime_nanos: u32,
-    pub(super) db_ctime_secs: i64,
-    pub(super) db_ctime_nanos: u32,
-    pub(super) db_size: u64,
+struct DbFileFingerprint {
+    db_mtime_secs: i64,
+    db_mtime_nanos: u32,
+    db_ctime_secs: i64,
+    db_ctime_nanos: u32,
+    db_size: u64,
     /// Normalized to `0` when `wal_size == 0` so AGY startup touching idle 0-byte
     /// `-wal` files does not trigger redundant re-scans.
-    pub(super) wal_mtime_secs: i64,
-    pub(super) wal_mtime_nanos: u32,
-    pub(super) wal_ctime_secs: i64,
-    pub(super) wal_ctime_nanos: u32,
-    pub(super) wal_size: u64,
-}
-
-fn modified_timestamp(meta: &fs::Metadata) -> (i64, u32) {
-    match meta.modified() {
-        Ok(t) => match t.duration_since(UNIX_EPOCH) {
-            Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
-            Err(e) => {
-                let d = e.duration();
-                (-(d.as_secs() as i64), d.subsec_nanos())
-            }
-        },
-        Err(_) => (0, 0),
-    }
+    wal_mtime_secs: i64,
+    wal_mtime_nanos: u32,
+    wal_ctime_secs: i64,
+    wal_ctime_nanos: u32,
+    wal_size: u64,
 }
 
 #[cfg(unix)]
@@ -667,7 +148,7 @@ fn status_change_timestamp(_meta: &fs::Metadata) -> (i64, u32) {
     (0, 0)
 }
 
-pub(super) fn db_file_fingerprint(db_path: &Path) -> Option<DbFileFingerprint> {
+fn db_file_fingerprint(db_path: &Path) -> Option<DbFileFingerprint> {
     let db_meta = fs::symlink_metadata(db_path).ok()?;
     let db_ft = db_meta.file_type();
     if db_ft.is_symlink() || !db_ft.is_file() {
@@ -719,17 +200,15 @@ pub(super) fn db_file_fingerprint(db_path: &Path) -> Option<DbFileFingerprint> {
     })
 }
 
-pub(super) fn root_path_key(root: &Path) -> String {
+fn root_path_key(root: &Path) -> String {
     canonical_or_self(root).to_string_lossy().into_owned()
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct DbTarget {
-    pub(super) source: &'static str,
-    pub(super) root_key: String,
-    pub(super) uuid: String,
-    pub(super) path: PathBuf,
-    pub(super) fingerprint: DbFileFingerprint,
+struct DbTarget {
+    source: &'static str,
+    path: PathBuf,
+    db_mtime_secs: Option<i64>,
 }
 
 const TS_QUALITY_NONE: u8 = 0;
@@ -740,27 +219,27 @@ const TS_QUALITY_STEP_PRIMARY: u8 = 4;
 
 /// Timezone- and pricing-independent turn record extracted from a SQLite conversation DB.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct RawTurn {
-    pub(super) ts_secs: Option<i64>,
-    pub(super) ts_quality: u8,
-    pub(super) model_enum: u64,
-    pub(super) response_model: Option<String>,
-    pub(super) model_display_name: Option<String>,
-    pub(super) input_tokens: u64,
-    pub(super) cache_read_tokens: u64,
-    pub(super) cache_write_tokens: u64,
-    pub(super) output_tokens: u64,
-    pub(super) thinking_tokens: u64,
-    pub(super) native_cost_usd: Option<f64>,
-    pub(super) decode_speed: Option<f64>,
-    pub(super) ttft_secs: Option<f64>,
-    pub(super) id_11: Option<String>,
-    pub(super) id_12: Option<String>,
-    pub(super) id_7: Option<String>,
+struct RawTurn {
+    ts_secs: Option<i64>,
+    ts_quality: u8,
+    model_enum: u64,
+    response_model: Option<String>,
+    model_display_name: Option<String>,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    output_tokens: u64,
+    thinking_tokens: u64,
+    native_cost_usd: Option<f64>,
+    decode_speed: Option<f64>,
+    ttft_secs: Option<f64>,
+    id_11: Option<String>,
+    id_12: Option<String>,
+    id_7: Option<String>,
 }
 
 impl RawTurn {
-    pub(super) fn has_billable_usage(&self) -> bool {
+    fn has_billable_usage(&self) -> bool {
         self.input_tokens > 0
             || self.output_tokens > 0
             || self.cache_read_tokens > 0
@@ -783,15 +262,6 @@ impl RawTurn {
             (7, self.id_7.as_deref()),
         ]
     }
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct RawConversationScan {
-    pub(super) source: &'static str,
-    pub(super) root_key: String,
-    pub(super) uuid: String,
-    pub(super) fingerprint: DbFileFingerprint,
-    pub(super) turns: Vec<RawTurn>,
 }
 
 struct UnionFind {
@@ -954,12 +424,11 @@ fn deduplicate_raw_turns(turns: Vec<RawTurn>) -> Vec<RawTurn> {
     merged
 }
 
-pub(super) fn discover_sqlite_db_targets(roots: &[(&'static str, PathBuf)]) -> Vec<DbTarget> {
+fn discover_sqlite_db_targets(roots: &[(&'static str, PathBuf)]) -> Vec<DbTarget> {
     let mut seen_dbs = HashSet::new();
     let mut targets = Vec::new();
 
     for (source, root) in roots {
-        let root_key = root_path_key(root);
         let conv_dir = root.join("conversations");
         if !is_real_dir(&conv_dir) {
             continue;
@@ -979,18 +448,16 @@ pub(super) fn discover_sqlite_db_targets(roots: &[(&'static str, PathBuf)]) -> V
                 continue;
             }
             let path = entry.path();
-            let Some(fingerprint) = db_file_fingerprint(&path) else {
+            let Some(meta) = safe_sqlite_metadata(&path) else {
                 continue;
             };
-            let uuid_lower = stem.to_ascii_lowercase();
+            let db_mtime_secs = Some(modified_timestamp(&meta).0).filter(|&secs| secs > 0);
             let real = canonical_or_self(&path);
             if seen_dbs.insert(real) {
                 targets.push(DbTarget {
                     source,
-                    root_key: root_key.clone(),
-                    uuid: uuid_lower,
                     path,
-                    fingerprint,
+                    db_mtime_secs,
                 });
             }
         }
@@ -1245,22 +712,13 @@ fn extract_sqlite_db_turns(
     Some(deduplicate_raw_turns(turns))
 }
 
-fn scan_single_sqlite_db_raw(target: &DbTarget) -> Option<RawConversationScan> {
-    let db_mtime_secs =
-        (target.fingerprint.db_mtime_secs > 0).then_some(target.fingerprint.db_mtime_secs);
+fn scan_single_sqlite_db_raw(target: &DbTarget) -> Option<(&'static str, Vec<RawTurn>)> {
     let conn = open_readonly_db(&target.path).ok()?;
-    let turns = extract_sqlite_db_turns(&conn, db_mtime_secs)?;
-
-    Some(RawConversationScan {
-        source: target.source,
-        root_key: target.root_key.clone(),
-        uuid: target.uuid.clone(),
-        fingerprint: target.fingerprint,
-        turns,
-    })
+    let turns = extract_sqlite_db_turns(&conn, target.db_mtime_secs)?;
+    Some((target.source, turns))
 }
 
-pub(super) fn scan_sqlite_targets_raw(targets: &[DbTarget]) -> Vec<RawConversationScan> {
+fn scan_sqlite_targets_raw(targets: &[DbTarget]) -> Vec<(&'static str, Vec<RawTurn>)> {
     let workers = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .clamp(1, 8);
@@ -1599,7 +1057,6 @@ impl<'a, 'b> TurnPricer<'a, 'b> {
                         turn.cache_read_tokens,
                         turn.cache_write_tokens,
                         turn.output_tokens,
-                        true,
                     )
                 })
                 .unzip()
@@ -1613,32 +1070,23 @@ impl<'a, 'b> TurnPricer<'a, 'b> {
     }
 }
 
-struct SourcedTurn<'a> {
+struct SourcedTurn {
     source: UsageSource,
-    conv_source: &'static str,
-    conv_uuid: &'a str,
     turn: RawTurn,
 }
 
-struct MergedSourcedTurn<'a> {
-    source: UsageSource,
-    turn: RawTurn,
-    contributors: Vec<(&'static str, &'a str)>,
-}
-
-fn deduplicate_sourced_turns<'a>(items: Vec<SourcedTurn<'a>>) -> Vec<MergedSourcedTurn<'a>> {
+fn deduplicate_sourced_turns(items: Vec<SourcedTurn>) -> Vec<SourcedTurn> {
     if items.is_empty() {
         return Vec::new();
     }
     let mut uf = build_turn_union_find(items.iter().map(|i| &i.turn), items.len());
     let mut root_to_slot: HashMap<usize, usize> = HashMap::new();
-    let mut merged: Vec<MergedSourcedTurn<'a>> = Vec::with_capacity(items.len());
+    let mut merged: Vec<SourcedTurn> = Vec::with_capacity(items.len());
 
     for (idx, item) in items.into_iter().enumerate() {
         let root = uf.find(idx);
         if let Some(&slot) = root_to_slot.get(&root) {
             let entry = &mut merged[slot];
-            entry.contributors.push((item.conv_source, item.conv_uuid));
             // Enforce deterministic UsageSource priority (Cli > Desktop).
             if entry.source == UsageSource::Desktop && item.source == UsageSource::Cli {
                 let prev = std::mem::replace(&mut entry.turn, item.turn);
@@ -1649,43 +1097,27 @@ fn deduplicate_sourced_turns<'a>(items: Vec<SourcedTurn<'a>>) -> Vec<MergedSourc
             }
         } else {
             root_to_slot.insert(root, merged.len());
-            merged.push(MergedSourcedTurn {
-                source: item.source,
-                turn: item.turn,
-                contributors: vec![(item.conv_source, item.conv_uuid)],
-            });
+            merged.push(item);
         }
     }
 
     merged
 }
 
-pub(super) fn project_sqlite_conversations<'a>(
-    conversations: impl IntoIterator<Item = (&'static str, &'a str, &'a [RawTurn])>,
-    archived_db_files: u64,
+fn project_sqlite_conversations<'a>(
+    conversations: impl IntoIterator<Item = (&'static str, &'a [RawTurn])>,
     tz: &TimeZoneSpec,
     pricing: &PricingCatalog,
-) -> (SqliteStats, Vec<UsageEvent>, SqliteCoverage) {
-    let mut stats = SqliteStats {
-        archived_db_files,
-        ..SqliteStats::default()
-    };
-    let mut covered = SqliteCoverage::default();
-    let mut raw_items: Vec<SourcedTurn<'a>> = Vec::new();
+) -> (SqliteStats, Vec<UsageEvent>) {
+    let mut stats = SqliteStats::default();
+    let mut raw_items: Vec<SourcedTurn> = Vec::new();
 
-    for (source, uuid, turns) in conversations {
+    for (source, turns) in conversations {
         stats.db_files += 1;
         let usage_source = UsageSource::from_root_label(source);
         for turn in turns {
-            for (_, val_opt) in turn.identity_keys() {
-                if let Some(val) = val_opt.map(str::trim).filter(|s| !s.is_empty()) {
-                    covered.response_ids.insert(val.to_string());
-                }
-            }
             raw_items.push(SourcedTurn {
                 source: usage_source,
-                conv_source: source,
-                conv_uuid: uuid,
                 turn: turn.clone(),
             });
         }
@@ -1717,12 +1149,6 @@ pub(super) fn project_sqlite_conversations<'a>(
             continue;
         };
 
-        for &(conv_source, conv_uuid) in &entry.contributors {
-            covered
-                .conversations
-                .insert((conv_source, conv_uuid.to_owned()));
-        }
-
         let total_tokens = turn
             .input_tokens
             .saturating_add(turn.cache_read_tokens)
@@ -1752,7 +1178,21 @@ pub(super) fn project_sqlite_conversations<'a>(
     stats.ttft_samples = ttft_samples.len();
     stats.median_tok_per_sec = compute_median(&speed_samples);
     stats.median_ttft_secs = compute_median(&ttft_samples);
-    (stats, events, covered)
+    (stats, events)
+}
+
+pub(super) fn scan_sqlite_conversations(
+    roots: &[(&'static str, PathBuf)],
+    tz: &TimeZoneSpec,
+    pricing: &PricingCatalog,
+) -> (SqliteStats, Vec<UsageEvent>) {
+    let targets = discover_sqlite_db_targets(roots);
+    let scanned = scan_sqlite_targets_raw(&targets);
+    project_sqlite_conversations(
+        scanned.iter().map(|(source, turns)| (*source, turns.as_slice())),
+        tz,
+        pricing,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2079,9 +1519,10 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+    use crate::stats::collect_stats_with_tz;
     use crate::stats::render::render_stats_report;
     use crate::stats::test_helpers::build_gen_blob;
-    use crate::stats::collect_stats_with_tz;
+    use crate::timeutil::parse_rfc3339_unix_secs;
 
     #[test]
     fn derive_model_name_is_dynamic_and_strips_only_effort_suffixes() {
@@ -2137,29 +1578,6 @@ mod tests {
         );
         assert_eq!(derive_model_name(None, None, 1999), "model#1999");
         assert_eq!(derive_model_name(None, None, 0), "unknown");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_cycles_and_duplicate_links_do_not_loop_or_double_count() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-        let brain = home.join(".gemini/antigravity-cli/brain");
-        let real_log = brain.join("session-a/transcript.jsonl");
-        fs::create_dir_all(real_log.parent().unwrap()).unwrap();
-        let ev = r#"{"created_at":"2026-11-18T10:00:00Z","step_index":0,"chatModel":{"model":"local-model-v1","usage":{"inputTokens":1000,"cacheReadTokens":0,"outputTokens":100,"responseId":"sym-1"}}}"#;
-        fs::write(&real_log, format!("{ev}\n")).unwrap();
-
-        std::os::unix::fs::symlink(&brain, brain.join("cycle")).unwrap();
-        let desk_session = home.join(".gemini/antigravity/brain/session-a");
-        fs::create_dir_all(&desk_session).unwrap();
-        std::os::unix::fs::symlink(&real_log, desk_session.join("transcript.jsonl")).unwrap();
-
-        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
-        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
-        assert_eq!(report.totals.requests, 1);
-        assert_eq!(report.totals.total_tokens, 1100);
-        assert_eq!(report.models[0].model, "local-model-v1");
     }
 
     #[test]
@@ -2218,249 +1636,6 @@ mod tests {
         assert_eq!(populated.sqlite.completed_turns, 1);
         assert_eq!(populated.windows.all_time.requests, 1);
         assert_eq!(populated.models[0].model, "tiny-model");
-    }
-
-    #[test]
-    fn empty_or_schemaless_db_falls_back_to_transcript_jsonl() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-        let uuid_empty = "55555555-5555-4555-8555-555555555555";
-        let uuid_schemaless = "66666666-6666-4666-8666-666666666666";
-        let conv_dir = home.join(".gemini/antigravity-cli/conversations");
-        fs::create_dir_all(&conv_dir).unwrap();
-
-        // 0-byte .db file.
-        fs::write(conv_dir.join(format!("{uuid_empty}.db")), b"").unwrap();
-        let t1 = home.join(format!(
-            ".gemini/antigravity-cli/brain/{uuid_empty}/.system_generated/logs/transcript.jsonl"
-        ));
-        fs::create_dir_all(t1.parent().unwrap()).unwrap();
-        fs::write(
-            &t1,
-            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"step_index\":1,\"model\":\"fallback-a\",\"input_tokens\":500,\"output_tokens\":50}\n",
-        )
-        .unwrap();
-
-        // Schema-less SQLite .db missing gen_metadata.
-        let conn = Connection::open(conv_dir.join(format!("{uuid_schemaless}.db"))).unwrap();
-        conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)", [])
-            .unwrap();
-        drop(conn);
-        let t2 = home.join(format!(
-            ".gemini/antigravity-cli/brain/{uuid_schemaless}/.system_generated/logs/transcript.jsonl"
-        ));
-        fs::create_dir_all(t2.parent().unwrap()).unwrap();
-        fs::write(
-            &t2,
-            "{\"created_at\":\"2026-11-18T11:00:00Z\",\"step_index\":1,\"model\":\"fallback-b\",\"input_tokens\":700,\"output_tokens\":100}\n",
-        )
-        .unwrap();
-
-        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
-        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
-        assert_eq!(report.sqlite.db_files, 0);
-        assert_eq!(report.totals.requests, 2);
-        assert_eq!(report.totals.total_tokens, 1350);
-
-        let db = Connection::open(conv_dir.join(format!("{uuid_empty}.db"))).unwrap();
-        db.execute(
-            "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
-            [],
-        )
-        .unwrap();
-        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
-        assert_eq!(report.sqlite.db_files, 1);
-        assert_eq!(report.totals.total_tokens, 1350);
-    }
-
-    #[test]
-    fn transcript_full_fallback_counts_usage_when_compact_transcript_is_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-
-        // Standard depth-0 layout: .system_generated/logs/transcript_full.jsonl only.
-        let std_full = home.join(
-            ".gemini/antigravity-cli/brain/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/.system_generated/logs/transcript_full.jsonl",
-        );
-        fs::create_dir_all(std_full.parent().unwrap()).unwrap();
-        fs::write(
-            &std_full,
-            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"step_index\":1,\"model\":\"full-std\",\"input_tokens\":1000,\"output_tokens\":200}\n",
-        )
-        .unwrap();
-
-        // Direct depth-0 layout: transcript_full.jsonl only.
-        let direct_full = home.join(
-            ".gemini/antigravity/brain/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/transcript_full.jsonl",
-        );
-        fs::create_dir_all(direct_full.parent().unwrap()).unwrap();
-        fs::write(
-            &direct_full,
-            "{\"created_at\":\"2026-11-18T10:30:00Z\",\"step_index\":1,\"model\":\"full-direct\",\"input_tokens\":500,\"output_tokens\":50}\n",
-        )
-        .unwrap();
-
-        // Recursive nested layout: nested/sub/transcript_full.jsonl only.
-        let nested_full =
-            home.join(".gemini/antigravity-cli/brain/group/sub/transcript_full.jsonl");
-        fs::create_dir_all(nested_full.parent().unwrap()).unwrap();
-        fs::write(
-            &nested_full,
-            "{\"created_at\":\"2026-11-18T11:00:00Z\",\"step_index\":1,\"model\":\"full-nested\",\"input_tokens\":300,\"output_tokens\":30}\n",
-        )
-        .unwrap();
-
-        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
-        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
-        assert_eq!(report.totals.requests, 3);
-        assert_eq!(report.totals.input_tokens, 1800);
-        assert_eq!(report.totals.output_tokens, 280);
-        assert_eq!(report.totals.total_tokens, 2080);
-    }
-
-    #[test]
-    fn transcript_full_is_skipped_when_compact_transcript_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-
-        // Depth-0 fast path: both transcript.jsonl and transcript_full.jsonl exist.
-        // Distinct step_index and token counts ensure scanning transcript_full.jsonl would inflate totals.
-        let std_dir = home.join(
-            ".gemini/antigravity-cli/brain/cccccccc-cccc-4ccc-8ccc-cccccccccccc/.system_generated/logs",
-        );
-        fs::create_dir_all(&std_dir).unwrap();
-        fs::write(
-            std_dir.join("transcript.jsonl"),
-            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"step_index\":1,\"model\":\"compact-std\",\"input_tokens\":400,\"output_tokens\":40}\n",
-        )
-        .unwrap();
-        fs::write(
-            std_dir.join("transcript_full.jsonl"),
-            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"step_index\":99,\"model\":\"compact-std\",\"input_tokens\":9000,\"output_tokens\":900}\n",
-        )
-        .unwrap();
-
-        // Recursive nested path: both transcript.jsonl and transcript_full.jsonl in same parent dir.
-        let nested_dir = home.join(".gemini/antigravity/brain/group/nested");
-        fs::create_dir_all(&nested_dir).unwrap();
-        fs::write(
-            nested_dir.join("transcript.jsonl"),
-            "{\"created_at\":\"2026-11-18T11:00:00Z\",\"step_index\":2,\"model\":\"compact-nested\",\"input_tokens\":600,\"output_tokens\":60}\n",
-        )
-        .unwrap();
-        fs::write(
-            nested_dir.join("transcript_full.jsonl"),
-            "{\"created_at\":\"2026-11-18T11:00:00Z\",\"step_index\":88,\"model\":\"compact-nested\",\"input_tokens\":8000,\"output_tokens\":800}\n",
-        )
-        .unwrap();
-
-        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
-        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
-        assert_eq!(report.totals.requests, 2);
-        assert_eq!(report.totals.input_tokens, 1000);
-        assert_eq!(report.totals.output_tokens, 100);
-        assert_eq!(report.totals.total_tokens, 1100);
-    }
-
-    #[test]
-    fn empty_compact_transcript_does_not_shadow_populated_transcript_full() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-
-        // Depth-0 fast path: 0-byte transcript.jsonl alongside populated transcript_full.jsonl.
-        let std_dir = home.join(
-            ".gemini/antigravity-cli/brain/dddddddd-dddd-4ddd-8ddd-dddddddddddd/.system_generated/logs",
-        );
-        fs::create_dir_all(&std_dir).unwrap();
-        fs::write(std_dir.join("transcript.jsonl"), b"").unwrap();
-        fs::write(
-            std_dir.join("transcript_full.jsonl"),
-            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"step_index\":1,\"model\":\"full-after-empty-std\",\"input_tokens\":400,\"output_tokens\":40}\n",
-        )
-        .unwrap();
-
-        // Recursive nested path: 0-byte transcript.jsonl alongside populated transcript_full.jsonl.
-        let nested_dir = home.join(".gemini/antigravity/brain/group/nested");
-        fs::create_dir_all(&nested_dir).unwrap();
-        fs::write(nested_dir.join("transcript.jsonl"), b"").unwrap();
-        fs::write(
-            nested_dir.join("transcript_full.jsonl"),
-            "{\"created_at\":\"2026-11-18T11:00:00Z\",\"step_index\":2,\"model\":\"full-after-empty-nested\",\"input_tokens\":600,\"output_tokens\":60}\n",
-        )
-        .unwrap();
-
-        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
-        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
-        assert_eq!(report.totals.requests, 2);
-        assert_eq!(report.totals.input_tokens, 1000);
-        assert_eq!(report.totals.output_tokens, 100);
-        assert_eq!(report.totals.total_tokens, 1100);
-    }
-
-    #[test]
-    fn depth0_fast_path_queues_only_first_non_empty_transcript_per_session() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-        let brain = home.join(".gemini/antigravity-cli/brain");
-
-        // Session with both `.system_generated/logs/transcript.jsonl` and `<session>/transcript.jsonl`.
-        // Lines omit `responseId` and the second file has an extra line so double-queuing would inflate totals.
-        let compact_session = brain.join("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
-        let std_compact = compact_session.join(".system_generated/logs/transcript.jsonl");
-        fs::create_dir_all(std_compact.parent().unwrap()).unwrap();
-        fs::write(
-            &std_compact,
-            "{\"created_at\":\"2026-11-18T10:00:00Z\",\"model\":\"compact-primary\",\"input_tokens\":400,\"output_tokens\":40}\n",
-        )
-        .unwrap();
-        fs::write(
-            compact_session.join("transcript.jsonl"),
-            concat!(
-                "{\"created_at\":\"2026-11-18T10:00:00Z\",\"model\":\"compact-dup\",\"input_tokens\":400,\"output_tokens\":40}\n",
-                "{\"created_at\":\"2026-11-18T10:01:00Z\",\"model\":\"compact-dup\",\"input_tokens\":9000,\"output_tokens\":900}\n",
-            ),
-        )
-        .unwrap();
-
-        // Session with both `.system_generated/logs/transcript_full.jsonl` and `<session>/transcript_full.jsonl`.
-        let full_session = brain.join("ffffffff-ffff-4fff-8fff-ffffffffffff");
-        let std_full = full_session.join(".system_generated/logs/transcript_full.jsonl");
-        fs::create_dir_all(std_full.parent().unwrap()).unwrap();
-        fs::write(
-            &std_full,
-            "{\"created_at\":\"2026-11-18T10:30:00Z\",\"model\":\"full-primary\",\"input_tokens\":300,\"output_tokens\":30}\n",
-        )
-        .unwrap();
-        fs::write(
-            full_session.join("transcript_full.jsonl"),
-            concat!(
-                "{\"created_at\":\"2026-11-18T10:30:00Z\",\"model\":\"full-dup\",\"input_tokens\":300,\"output_tokens\":30}\n",
-                "{\"created_at\":\"2026-11-18T10:31:00Z\",\"model\":\"full-dup\",\"input_tokens\":8000,\"output_tokens\":800}\n",
-            ),
-        )
-        .unwrap();
-
-        let mut visited_dirs = HashSet::new();
-        let mut seen_files = HashSet::new();
-        let mut jobs = Vec::new();
-        collect_transcript_jobs_in_brain(
-            &brain,
-            "cli",
-            0,
-            &mut visited_dirs,
-            &mut seen_files,
-            &mut jobs,
-        );
-        assert_eq!(jobs.len(), 2);
-        assert_eq!(jobs[0].path, std_compact);
-        assert_eq!(jobs[1].path, std_full);
-
-        let now_secs = parse_rfc3339_unix_secs("2026-11-18T12:00:00Z").unwrap() as u64;
-        let report = collect_stats_with_tz(home, None, now_secs, &TimeZoneSpec::utc());
-        assert_eq!(report.totals.requests, 2);
-        assert_eq!(report.totals.input_tokens, 700);
-        assert_eq!(report.totals.output_tokens, 70);
-        assert_eq!(report.totals.total_tokens, 770);
     }
 
     fn seed_cost_db(cli_dir: &Path, uuid: &str, idx: i64, blob: Vec<u8>) {
@@ -2659,9 +1834,8 @@ mod tests {
             mk_turn("shared-worker-id", Some("Gemini Flash")),
         ];
 
-        let (_, events, _) = project_sqlite_conversations(
-            [("cli", "11111111-1111-4111-8111-111111111111", turns.as_slice())],
-            0,
+        let (_, events) = project_sqlite_conversations(
+            [("cli", turns.as_slice())],
             &TimeZoneSpec::utc(),
             &pricing,
         );
@@ -2854,8 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn project_sqlite_union_find_transitively_dedups_three_records_across_roots_and_blocks_transcript(
-    ) {
+    fn project_sqlite_union_find_transitively_dedups_three_records_across_roots() {
         let dir = tempfile::tempdir().unwrap();
         let pricing = test_pricing_catalog(&dir.path().join("cache"));
 
@@ -2914,13 +2087,12 @@ mod tests {
             id_7: Some("c-shared".to_string()),
         }];
 
-        let (stats, events, covered) = project_sqlite_conversations(
+        let (stats, events) = project_sqlite_conversations(
             [
-                ("desktop", "11111111-1111-4111-8111-111111111111", desk_a.as_slice()),
-                ("cli", "22222222-2222-4222-8222-222222222222", cli_b.as_slice()),
-                ("desktop", "33333333-3333-4333-8333-333333333333", desk_c.as_slice()),
+                ("desktop", desk_a.as_slice()),
+                ("cli", cli_b.as_slice()),
+                ("desktop", desk_c.as_slice()),
             ],
-            0,
             &TimeZoneSpec::utc(),
             &pricing,
         );
@@ -2940,37 +2112,6 @@ mod tests {
         assert_eq!(events[0].thinking_tokens, 120);
         assert_eq!(events[0].model_group, "Gemini 4 Hydrogen (Orchestrator)");
         assert_eq!(events[0].pricing_key.as_deref(), Some("gemini-4-hydrogen"));
-        assert!(covered.response_ids.contains("r-shared"));
-        assert!(covered.response_ids.contains("c-shared"));
-        assert!(covered.response_ids.contains("m-shared"));
-
-        // Transcript fallback in an unrelated session skips any explicit ID already covered by SQLite.
-        let cli_root = dir.path().join("cli");
-        let transcript = cli_root.join("brain/uncovered-session/transcript.jsonl");
-        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-        fs::write(
-            &transcript,
-            concat!(
-                r#"{"created_at":"2026-11-18T10:00:00Z","model":"m1","input_tokens":9000,"output_tokens":90,"responseId":"r-shared"}"#,
-                "\n",
-                r#"{"created_at":"2026-11-18T10:01:00Z","model":"m1","input_tokens":8000,"output_tokens":80,"callId":"c-shared"}"#,
-                "\n",
-                r#"{"created_at":"2026-11-18T10:02:00Z","model":"m1","input_tokens":7000,"output_tokens":70,"messageId":"m-shared"}"#,
-                "\n",
-                r#"{"created_at":"2026-11-18T10:03:00Z","model":"m-kept","input_tokens":300,"output_tokens":30,"responseId":"r-unique"}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-        let fallback = scan_transcripts(
-            &[("cli", cli_root)],
-            &TimeZoneSpec::utc(),
-            &pricing,
-            &covered,
-        );
-        assert_eq!(fallback.len(), 1);
-        assert_eq!(fallback[0].model_group, "m-kept");
-        assert_eq!(fallback[0].input_tokens, 300);
     }
 
     #[test]
@@ -3016,9 +2157,8 @@ mod tests {
             mk(9999, None, None),
         ];
 
-        let (_, events, _) = project_sqlite_conversations(
-            [("cli", "11111111-1111-4111-8111-111111111111", turns.as_slice())],
-            0,
+        let (_, events) = project_sqlite_conversations(
+            [("cli", turns.as_slice())],
             &TimeZoneSpec::utc(),
             &pricing,
         );

@@ -117,7 +117,7 @@ define_widgets! {
     /// Active cycle mode (`◇ PLAN`, `◇ AUTO`, etc.) and `>200K` indicator.
     Mode => ("mode", "Cycle Mode (Plan/Auto)", 3),
     /// Rolling 5-hour quota remaining % + reset timer + pace warning.
-    #[serde(rename = "quota_5h", alias = "quota5h")]
+    #[serde(rename = "quota_5h")]
     Quota5h => ("quota_5h", "5h Quota + Pace", 4),
     /// Weekly (or multi-day) quota remaining % + reset timer + pace warning.
     QuotaWeekly => ("quota_weekly", "Weekly Quota", 3),
@@ -135,7 +135,7 @@ define_widgets! {
     Battle => ("battle", "Battle Mode", 1),
     /// Sandbox status (`sandbox ON` / `sandbox ON+net` / `sandbox off`).
     Sandbox => ("sandbox", "Sandbox Status", 1),
-    /// AGY CLI version (`v1.5.11`).
+    /// AGY CLI version (`v1.5.16`).
     Version => ("version", "AGY Version", 1),
     /// Account subscription tier (`Pro`, `Ultra`, etc.).
     Plan => ("plan", "Plan Tier", 1),
@@ -606,7 +606,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let raw = Option::<String>::deserialize(deserializer)?;
-    // Ignore removed legacy metric strings (e.g. pre-0.5 custom masks) instead of invalidating config.json.
+    // Ignore unknown metric strings instead of invalidating config.json.
     Ok(raw.and_then(|s| s.parse::<StatsMetric>().ok()))
 }
 
@@ -699,17 +699,13 @@ mod tests {
     }
 
     #[test]
-    fn quota_5h_serializes_canonically_and_accepts_legacy_alias() {
+    fn quota_5h_roundtrips_canonically() {
         assert_eq!(
             serde_json::to_string(&WidgetId::Quota5h).unwrap(),
             "\"quota_5h\""
         );
         assert_eq!(
             serde_json::from_str::<WidgetId>("\"quota_5h\"").unwrap(),
-            WidgetId::Quota5h
-        );
-        assert_eq!(
-            serde_json::from_str::<WidgetId>("\"quota5h\"").unwrap(),
             WidgetId::Quota5h
         );
     }

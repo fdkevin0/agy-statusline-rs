@@ -1,15 +1,9 @@
 //! Local usage, estimated cost, and speed statistics (`agy-statusline stats`).
 //!
-//! Scans AGY local directories in read-only mode and incrementally archives normalized
-//! per-turn SQLite facts into `$XDG_DATA_HOME/agy-statusline/stats_history.db`:
-//! - `conversations/<uuid>.db` (`gen_metadata` joined with `steps.metadata`) as the
-//!   authoritative primary source for turns, tokens, thinking tokens, model names,
-//!   timestamps, decode speed, and TTFT (retained in the local archive after AGY prunes
-//!   older sessions beyond its 500-DB startup cap).
-//! - `brain/**/{transcript,transcript_full}.jsonl` as a deduplicated fallback ONLY for
-//!   conversations that have no usable SQLite usage records (live or archived).
+//! Scans AGY local directories (`conversations/<uuid>.db`: `gen_metadata` joined with
+//! `steps.metadata`) in read-only mode as the single authoritative source for turns,
+//! tokens, thinking tokens, model names, timestamps, decode speed, and TTFT.
 
-mod archive;
 mod metric;
 mod pricing;
 mod query;
@@ -21,16 +15,14 @@ mod tz;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) use archive::ARCHIVE_DB_FILENAME;
-pub use archive::{maybe_spawn_background_archive_sync, run_stats_sync_command};
 pub use metric::{MetricValue, StatsMetric};
 pub(crate) use pricing::{
     is_pricing_fingerprint_fresh, maybe_spawn_pricing_sync_if_stale, pricing_cache_fingerprint,
-    PricingFileFingerprint, DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE,
+    DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE,
 };
 pub use pricing::{run_pricing_command, PricingCatalog, SyncMode};
 pub(crate) use scan::{
@@ -163,15 +155,11 @@ pub struct ModelStats {
     pub median_ttft_secs: Option<f64>,
 }
 
-/// Aggregate speed and TTFT statistics from live `conversations/*.db` and the local history archive.
+/// Aggregate speed and TTFT statistics from `conversations/*.db`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SqliteStats {
-    /// Total valid UUID `.db` conversations tracked (live on disk + preserved in local archive).
+    /// Total valid UUID `.db` conversations scanned.
     pub db_files: u64,
-    /// Archived conversations preserved in `$XDG_DATA_HOME/agy-statusline/stats_history.db`
-    /// that are no longer present in `conversations/` (e.g. after AGY's 500-DB pruning).
-    #[serde(default)]
-    pub archived_db_files: u64,
     /// Completed turns decoded from `gen_metadata` passing speed sanity bounds.
     pub completed_turns: u64,
     /// Sum of output tokens across completed speed turns.
@@ -207,7 +195,7 @@ pub struct StatsReport {
     pub weekly: Vec<WeeklyUsage>,
     /// Per-model breakdown sorted by `total_tokens` descending.
     pub models: Vec<ModelStats>,
-    /// Aggregate statistics from live `conversations/*.db` and the local history archive (`gen_metadata`).
+    /// Aggregate statistics from `conversations/*.db` (`gen_metadata`).
     pub sqlite: SqliteStats,
 }
 
@@ -298,49 +286,38 @@ fn collect_stats_with_tz(
         DEFAULT_PRICING_TTL_SECS,
         |_| unreachable!(),
     );
-    StatsDataset::collect_for_roots_with_archive(&roots, None, None, now_unix_secs, tz, &pricing)
-        .to_report(days)
+    StatsDataset::collect_for_roots(&roots, now_unix_secs, tz, &pricing).to_report(days)
+}
+
+/// Shared runtime options for `agy-statusline stats` (static output and interactive TUI).
+#[derive(Debug, Clone, Copy)]
+pub struct StatsOptions<'a> {
+    /// Optional XDG cache directory for `models_dev_pricing.json`.
+    pub cache_dir: Option<&'a Path>,
+    /// Optional trailing day window (`--days N`).
+    pub days: Option<u32>,
+    /// Primary aggregation metric (`--metric`).
+    pub metric: StatsMetric,
+    /// Disable ANSI color escapes (`NO_COLOR`).
+    pub no_color: bool,
+    /// Use pure 7-bit ASCII characters (`--ascii`).
+    pub ascii: bool,
+    /// Reference Unix epoch timestamp in seconds.
+    pub now_unix_secs: u64,
 }
 
 /// Runs the non-interactive `agy-statusline stats` subcommand (`--plain` / `--json` / piped).
 pub fn run_stats_command<W: Write>(
-    home: Option<&Path>,
-    days: Option<u32>,
+    roots: &[(&'static str, PathBuf)],
+    opts: &StatsOptions<'_>,
     json: bool,
-    no_color: bool,
-    ascii: bool,
-    now_unix_secs: u64,
     out: &mut W,
 ) -> io::Result<()> {
-    run_stats_command_with_metric(
-        home,
-        days,
-        StatsMetric::Total,
-        json,
-        no_color,
-        ascii,
-        now_unix_secs,
-        out,
-    )
-}
-
-/// Runs the non-interactive `agy-statusline stats` subcommand with an explicit [`StatsMetric`].
-#[allow(clippy::too_many_arguments)]
-pub fn run_stats_command_with_metric<W: Write>(
-    home: Option<&Path>,
-    days: Option<u32>,
-    metric: StatsMetric,
-    json: bool,
-    no_color: bool,
-    ascii: bool,
-    now_unix_secs: u64,
-    out: &mut W,
-) -> io::Result<()> {
-    let dataset = StatsDataset::collect_from_env(home, now_unix_secs);
+    let dataset = StatsDataset::collect(roots, opts.cache_dir, opts.now_unix_secs);
     let report = if json {
-        dataset.to_report(days)
+        dataset.to_report(opts.days)
     } else {
-        dataset.to_report_with_metric(days, metric)
+        dataset.to_report_with_metric(opts.days, opts.metric)
     };
 
     if json {
@@ -350,14 +327,17 @@ pub fn run_stats_command_with_metric<W: Write>(
         return Ok(());
     }
 
-    let metric_heatmap = (metric != StatsMetric::Total)
-        .then(|| dataset.build_metric_heatmap(metric, SourceFilter::All, None).0);
+    let metric_heatmap = (opts.metric != StatsMetric::Total).then(|| {
+        dataset
+            .build_metric_heatmap(opts.metric, SourceFilter::All, None)
+            .0
+    });
     render_stats_report_with_metric(
         &report,
-        metric,
+        opts.metric,
         metric_heatmap.as_deref(),
-        no_color,
-        ascii,
+        opts.no_color,
+        opts.ascii,
         out,
     )
 }
@@ -440,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_is_primary_and_transcript_fallback_skips_covered_uuids() {
+    fn sqlite_aggregates_cli_and_desktop_roots_with_timezone_and_medians() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         let uuid = "11111111-1111-4111-8111-111111111111";
@@ -449,6 +429,7 @@ mod tests {
         // CLI DB has 2 turns on 2026-11-17T20:00:00Z (= 2026-11-18T04:00:00+08:00)
         // and 1 turn on 2026-11-10T10:00:00Z (= 2026-11-10T18:00:00+08:00).
         let ts_today_utc17 = parse_rfc3339_unix_secs("2026-11-17T20:00:00Z").unwrap();
+        let ts_desk_utc17 = parse_rfc3339_unix_secs("2026-11-17T21:00:00Z").unwrap();
         let ts_old = parse_rfc3339_unix_secs("2026-11-10T10:00:00Z").unwrap();
 
         let db_path = home
@@ -508,21 +489,28 @@ mod tests {
         );
         drop(conn);
 
-        // Matching CLI transcript for the SAME uuid MUST be ignored (no double counting).
-        let cli_transcript = home.join(format!(
-            ".gemini/antigravity-cli/brain/{uuid}/.system_generated/logs/transcript.jsonl"
-        ));
-        fs::create_dir_all(cli_transcript.parent().unwrap()).unwrap();
-        let dup_line = r#"{"created_at":"2026-11-17T20:00:00Z","step_index":1,"input_tokens":99999,"output_tokens":999,"cache_read_tokens":0}"#;
-        fs::write(&cli_transcript, format!("{dup_line}\n")).unwrap();
-
-        // Desktop session WITHOUT a .db uses transcript fallback.
-        let desk_transcript = home.join(format!(
-            ".gemini/antigravity/brain/{desk_uuid}/transcript.jsonl"
-        ));
-        fs::create_dir_all(desk_transcript.parent().unwrap()).unwrap();
-        let desk_line = r#"{"created_at":"2026-11-17T21:00:00Z","step_index":0,"model":"desktop-model","input_tokens":400,"cache_read_tokens":600,"output_tokens":100}"#;
-        fs::write(&desk_transcript, format!("{desk_line}\n")).unwrap();
+        // Desktop SQLite session contributes alongside CLI.
+        let desk_db_path = home
+            .join(".gemini/antigravity/conversations")
+            .join(format!("{desk_uuid}.db"));
+        let desk_conn = create_conv_db_tables(&desk_db_path);
+        insert_step(&desk_conn, 1, ts_desk_utc17);
+        insert_gen(
+            &desk_conn,
+            1,
+            GenBlobSpec {
+                step_indices: vec![1],
+                model_enum: 1400,
+                resp_model: Some("desktop-model"),
+                input_tok: 400,
+                cache_read_tok: 600,
+                output_tok: 100,
+                dur_secs: 1,
+                ttft_nanos: 300_000_000,
+                ..Default::default()
+            },
+        );
+        drop(desk_conn);
 
         let tz_plus8 = TimeZoneSpec::fixed_offset(8 * 3_600);
         let now_secs = parse_rfc3339_unix_secs("2026-11-17T22:00:00Z").unwrap() as u64;
@@ -532,8 +520,9 @@ mod tests {
         assert_eq!(report.timezone, "UTC+08:00");
         assert_eq!(report.today_utc, "2026-11-17");
         assert_eq!(report.first_active_date.as_deref(), Some("2026-11-10"));
+        assert_eq!(report.sqlite.db_files, 2);
 
-        // Today in UTC+08:00 has 2 CLI SQLite turns + 1 desktop fallback turn = 3 turns.
+        // Today in UTC+08:00 has 2 CLI SQLite turns + 1 desktop SQLite turn = 3 turns.
         assert_eq!(report.windows.today.requests, 3);
         assert_eq!(report.windows.today.input_tokens, 3400);
         assert_eq!(report.windows.today.cache_read_tokens, 9600);

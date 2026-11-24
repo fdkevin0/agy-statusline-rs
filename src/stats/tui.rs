@@ -165,13 +165,14 @@ impl Palette {
 }
 
 fn spawn_dataset_scan(
-    home: Option<PathBuf>,
+    roots: Vec<(&'static str, PathBuf)>,
+    cache_dir: Option<PathBuf>,
     now_unix_secs: u64,
 ) -> mpsc::Receiver<(StatsDataset, Duration)> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let start = Instant::now();
-        let ds = StatsDataset::collect_from_env(home.as_deref(), now_unix_secs);
+        let ds = StatsDataset::collect(&roots, cache_dir.as_deref(), now_unix_secs);
         let _ = tx.send((ds, start.elapsed()));
     });
     rx
@@ -179,13 +180,9 @@ fn spawn_dataset_scan(
 
 /// Launches the interactive `agy-statusline stats` TUI dashboard.
 pub fn run_stats_tui(
-    home: Option<&Path>,
+    roots: Vec<(&'static str, PathBuf)>,
     config_path: Option<&Path>,
-    days: Option<u32>,
-    initial_metric: StatsMetric,
-    no_color: bool,
-    ascii: bool,
-    now_unix_secs: u64,
+    opts: &super::StatsOptions<'_>,
 ) -> io::Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::new(
@@ -194,10 +191,13 @@ pub fn run_stats_tui(
         ));
     }
 
-    let mut state = StatsTuiState::new(days, initial_metric);
+    let mut state = StatsTuiState::new(opts.days, opts.metric);
     let mut tables = TableStates::default();
-    let pal = Palette { no_color, ascii };
-    let home_owned = home.map(Path::to_path_buf);
+    let pal = Palette {
+        no_color: opts.no_color,
+        ascii: opts.ascii,
+    };
+    let cache_owned = opts.cache_dir.map(Path::to_path_buf);
 
     let _guard = TerminalGuard::enter();
     enable_raw_mode()?;
@@ -210,29 +210,24 @@ pub fn run_stats_tui(
     let mut dataset: Option<StatsDataset> = None;
     let mut view: Option<StatsView> = None;
     let mut daily_visible_rows: usize = 10;
-    let mut pending_scan = Some(spawn_dataset_scan(home_owned.clone(), now_unix_secs));
+    let mut pending_scan = Some(spawn_dataset_scan(
+        roots.clone(),
+        cache_owned.clone(),
+        opts.now_unix_secs,
+    ));
 
     loop {
         if let Some(rx) = pending_scan.as_ref() {
             match rx.try_recv() {
                 Ok((ds, elapsed)) => {
                     let is_refresh = dataset.is_some();
-                    let (turns, dbs, archived) = (
-                        ds.events.len(),
-                        ds.sqlite.db_files,
-                        ds.sqlite.archived_db_files,
-                    );
+                    let (turns, dbs) = (ds.events.len(), ds.sqlite.db_files);
                     dataset = Some(ds);
                     state.loading = false;
                     state.view_dirty = true;
                     if is_refresh {
-                        let archived_note = if archived > 0 {
-                            format!(" ({archived} archived)")
-                        } else {
-                            String::new()
-                        };
                         state.status_msg = Some(format!(
-                            "Refreshed {turns} turns across {dbs} DBs{archived_note} in {:.2}s",
+                            "Refreshed {turns} turns across {dbs} DBs in {:.2}s",
                             elapsed.as_secs_f64()
                         ));
                     }
@@ -276,8 +271,9 @@ pub fn run_stats_tui(
                         if pending_scan.is_none() {
                             state.loading = true;
                             state.status_msg = Some("Refreshing local AGY usage...".to_string());
-                            let now = jiff::Timestamp::now().as_second().max(0) as u64;
-                            pending_scan = Some(spawn_dataset_scan(home_owned.clone(), now));
+                            let now = crate::timeutil::unix_now_secs();
+                            pending_scan =
+                                Some(spawn_dataset_scan(roots.clone(), cache_owned.clone(), now));
                         }
                     }
                     StatsAction::Continue => {}
@@ -289,7 +285,7 @@ pub fn run_stats_tui(
     drop(terminal);
     drop(_guard);
 
-    if state.query.metric != initial_metric {
+    if state.query.metric != opts.metric {
         if let Some(cfg_path) = config_path {
             let _ = save_stats_metric(cfg_path, state.query.metric);
         }

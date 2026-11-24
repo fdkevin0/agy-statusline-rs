@@ -314,7 +314,7 @@ fn cli_handles_agy_1510_negative_reset_disabled_credits_completed_subagents_and_
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cost_widget_labels_partial_and_latest_turn_estimates() {
+fn cost_widget_labels_partial_and_unpriced_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let cli = home.join(".gemini/antigravity-cli");
@@ -361,10 +361,10 @@ fn cost_widget_labels_partial_and_latest_turn_estimates() {
         "model": {"id": "model-alpha"},
         "context_window": {"current_usage": {"input_tokens": 1_000_000}}
     });
-    let latest_out = run_statusline_stdin(home, &["--full"], &payload.to_string());
+    let no_conv_out = run_statusline_stdin(home, &["--full"], &payload.to_string());
     assert!(
-        latest_out.contains("~$1.00 (latest turn)"),
-        "stdout was: {latest_out}"
+        !no_conv_out.contains('$'),
+        "unexpected cost without conversation_id: {no_conv_out}"
     );
 
     payload["conversation_id"] = uuid.into();

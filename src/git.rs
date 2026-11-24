@@ -6,7 +6,6 @@ use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::fsutil::atomic_write;
-use crate::paths::xdg_cache_dir;
 use crate::procutil::run_command_stdout_bounded;
 use crate::timeutil::unix_now_secs;
 
@@ -37,15 +36,6 @@ pub trait GitProbe {
 pub struct SystemGitProbe {
     /// Optional directory for caching `git diff --numstat` results across rapid state ticks.
     pub cache_dir: Option<PathBuf>,
-}
-
-impl SystemGitProbe {
-    /// Creates a probe configured with the default per-user diff cache directory.
-    pub fn with_default_cache() -> Self {
-        Self {
-            cache_dir: xdg_cache_dir(),
-        }
-    }
 }
 
 impl GitProbe for SystemGitProbe {

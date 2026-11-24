@@ -7,7 +7,7 @@ use jiff::Timestamp;
 pub(crate) const SECS_PER_DAY: i64 = 86_400;
 
 /// Returns the current Unix epoch timestamp in seconds (`0` if system clock is before 1970).
-pub(crate) fn unix_now_secs() -> u64 {
+pub fn unix_now_secs() -> u64 {
     Timestamp::now().as_second().max(0) as u64
 }
 

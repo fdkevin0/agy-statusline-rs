@@ -1,6 +1,10 @@
 # agy-statusline
 
-A `#![forbid(unsafe_code)]` Rust statusline for Antigravity CLI (`agy`) with quota pacing, real compaction-threshold sniffing, pure-Rust `.git/HEAD` + worktree awareness, and an interactive 3-pane TUI configurator.
+A `#![forbid(unsafe_code)]` Rust statusline and local usage dashboard for Antigravity CLI (`agy >= 1.5.15`), with quota pacing, real compaction-threshold sniffing, subagent-aware `models.dev` cost estimation, pure-Rust `.git/HEAD` + worktree awareness, and an interactive 3-pane TUI configurator.
+
+## Requirements
+
+- **Antigravity CLI `>= 1.5.15`** (and **Antigravity Desktop `>= 2.35.0`** for shared `~/.gemini/antigravity` stats), where upstream 500-conversation startup pruning is disabled and `conversations/*.db` serves as the single authoritative usage store.
 
 ## Install
 
