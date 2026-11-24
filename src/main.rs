@@ -13,12 +13,12 @@ use agy_statusline::agy::paths::{
 use agy_statusline::cli::apply::{
     resolve_invoked_binary_path, run_apply_command, set_statusline_enabled,
 };
+use agy_statusline::cli::config::run_tui_config;
 use agy_statusline::cli::doctor::run_doctor;
 use agy_statusline::config::layout::{
     load_layout_config, load_saved_stats_metric, save_layout_config, save_stats_metric,
     LayoutConfig, Preset,
 };
-use agy_statusline::config::tui::run_tui_config;
 use agy_statusline::stats::{
     run_conversation_stats_command, run_conversation_stats_tui, run_conversations_command,
     run_conversations_tui, run_pricing_command, run_stats_command, run_stats_tui, StatsMetric,
