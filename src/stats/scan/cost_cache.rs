@@ -6,96 +6,13 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    deduplicate_parent_priority_turns, extract_sqlite_db_turns, merge_raw_turn,
-    read_single_db_turns, resolve_descendant_conversation_ids, root_path_key, RawTurn, TurnPricer,
+    db_file_fingerprint, deduplicate_parent_priority_turns, extract_sqlite_db_turns,
+    merge_raw_turn, read_single_db_turns, resolve_descendant_conversation_ids, root_path_key,
+    DbFileFingerprint, RawTurn, TurnPricer,
 };
-use crate::agy::db::{
-    is_absent_or_real_file, is_valid_uuid, resolve_conversation_db_path, sidecar_path,
-};
+use crate::agy::db::{is_valid_uuid, resolve_conversation_db_path};
 use crate::stats::pricing::{round_usd_6, PricingCatalog, PricingFileFingerprint};
-use crate::sys::fs::{atomic_write, modified_timestamp};
-
-/// File-level change fingerprint for a SQLite conversation DB and its `-wal` sidecar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct DbFileFingerprint {
-    db_mtime_secs: i64,
-    db_mtime_nanos: u32,
-    db_ctime_secs: i64,
-    db_ctime_nanos: u32,
-    db_size: u64,
-    /// Normalized to `0` when `wal_size == 0` so AGY startup touching idle 0-byte
-    /// `-wal` files does not trigger redundant re-scans.
-    wal_mtime_secs: i64,
-    wal_mtime_nanos: u32,
-    wal_ctime_secs: i64,
-    wal_ctime_nanos: u32,
-    wal_size: u64,
-}
-
-#[cfg(unix)]
-fn status_change_timestamp(meta: &fs::Metadata) -> (i64, u32) {
-    use std::os::unix::fs::MetadataExt;
-    let secs = meta.ctime();
-    let nanos = meta.ctime_nsec().clamp(0, 999_999_999) as u32;
-    (secs, nanos)
-}
-
-#[cfg(not(unix))]
-fn status_change_timestamp(_meta: &fs::Metadata) -> (i64, u32) {
-    (0, 0)
-}
-
-fn db_file_fingerprint(db_path: &Path) -> Option<DbFileFingerprint> {
-    let db_meta = fs::symlink_metadata(db_path).ok()?;
-    let db_ft = db_meta.file_type();
-    if db_ft.is_symlink() || !db_ft.is_file() {
-        return None;
-    }
-    if !is_absent_or_real_file(&sidecar_path(db_path, "-shm")) {
-        return None;
-    }
-    let (db_mtime_secs, db_mtime_nanos) = modified_timestamp(&db_meta);
-    let (db_ctime_secs, db_ctime_nanos) = status_change_timestamp(&db_meta);
-    let db_size = db_meta.len();
-
-    let (wal_mtime_secs, wal_mtime_nanos, wal_ctime_secs, wal_ctime_nanos, wal_size) =
-        match fs::symlink_metadata(sidecar_path(db_path, "-wal")) {
-            Ok(wal_meta) => {
-                let wal_ft = wal_meta.file_type();
-                if wal_ft.is_symlink() || !wal_ft.is_file() {
-                    return None;
-                }
-                if wal_meta.len() > 0 {
-                    let (mtime_secs, mtime_nanos) = modified_timestamp(&wal_meta);
-                    let (ctime_secs, ctime_nanos) = status_change_timestamp(&wal_meta);
-                    (
-                        mtime_secs,
-                        mtime_nanos,
-                        ctime_secs,
-                        ctime_nanos,
-                        wal_meta.len(),
-                    )
-                } else {
-                    (0, 0, 0, 0, 0)
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0, 0, 0, 0, 0),
-            Err(_) => return None,
-        };
-
-    Some(DbFileFingerprint {
-        db_mtime_secs,
-        db_mtime_nanos,
-        db_ctime_secs,
-        db_ctime_nanos,
-        db_size,
-        wal_mtime_secs,
-        wal_mtime_nanos,
-        wal_ctime_secs,
-        wal_ctime_nanos,
-        wal_size,
-    })
-}
+use crate::sys::fs::atomic_write;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ConversationCost {

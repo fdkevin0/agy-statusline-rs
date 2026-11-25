@@ -16,13 +16,13 @@ use agy_statusline::cli::apply::{
 use agy_statusline::cli::config::run_tui_config;
 use agy_statusline::cli::doctor::run_doctor;
 use agy_statusline::config::layout::{
-    load_layout_config, load_saved_stats_metric, save_layout_config, save_stats_metric,
+    load_layout_config, load_saved_stats_tui_prefs, save_layout_config, save_stats_tui_prefs,
     LayoutConfig, Preset,
 };
 use agy_statusline::stats::{
     run_conversation_stats_command, run_conversation_stats_tui, run_conversations_command,
     run_conversations_tui, run_pricing_command, run_stats_command, run_stats_tui, StatsMetric,
-    StatsOptions, SyncMode,
+    StatsOptions, StatsTuiPrefs, SyncMode,
 };
 use agy_statusline::statusline::git::SystemGitProbe;
 use agy_statusline::statusline::{
@@ -164,7 +164,7 @@ struct StatsContext {
     roots: Vec<(&'static str, std::path::PathBuf)>,
     cache_dir: Option<std::path::PathBuf>,
     config_path: Option<std::path::PathBuf>,
-    metric: StatsMetric,
+    prefs: StatsTuiPrefs,
 }
 
 fn resolve_stats_context(metric_override: Option<StatsMetric>) -> io::Result<StatsContext> {
@@ -177,15 +177,33 @@ fn resolve_stats_context(metric_override: Option<StatsMetric>) -> io::Result<Sta
     }
     let cache_dir = xdg_cache_dir();
     let config_path = xdg_config_dir().ok().map(|d| d.join("config.json"));
-    let metric = metric_override
-        .or_else(|| config_path.as_deref().and_then(load_saved_stats_metric))
+    let mut prefs = config_path
+        .as_deref()
+        .map(load_saved_stats_tui_prefs)
         .unwrap_or_default();
+    if let Some(m) = metric_override {
+        prefs.metric = m;
+    }
     Ok(StatsContext {
         roots,
         cache_dir,
         config_path,
-        metric,
+        prefs,
     })
+}
+
+fn make_prefs_saver(
+    config_path: Option<std::path::PathBuf>,
+) -> impl FnMut(
+    Option<StatsMetric>,
+    Option<agy_statusline::stats::TurnSort>,
+    Option<agy_statusline::stats::ConversationSort>,
+) + 'static {
+    move |metric, turn_sort, conv_sort| {
+        if let Some(path) = config_path.as_deref() {
+            let _ = save_stats_tui_prefs(path, metric, turn_sort, conv_sort);
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Args)]
@@ -285,14 +303,21 @@ fn main() -> io::Result<()> {
                 let opts = StatsOptions {
                     cache_dir: ctx.cache_dir.as_deref(),
                     days,
-                    metric: ctx.metric,
+                    metric: ctx.prefs.metric,
                     no_color,
                     ascii: output.ascii,
                     now_unix_secs: unix_now_secs(),
                 };
                 if let Some(conv_id) = conversation.as_deref() {
                     if output.is_interactive(all) {
-                        return run_conversation_stats_tui(&ctx.roots, conv_id, &opts);
+                        run_conversation_stats_tui(
+                            &ctx.roots,
+                            conv_id,
+                            &opts,
+                            ctx.prefs,
+                            make_prefs_saver(ctx.config_path),
+                        )?;
+                        return Ok(());
                     }
                     let mut stdout = io::stdout().lock();
                     return run_conversation_stats_command(
@@ -305,12 +330,12 @@ fn main() -> io::Result<()> {
                     );
                 }
                 if output.is_interactive(false) {
-                    let final_metric = run_stats_tui(ctx.roots, &opts)?;
-                    if final_metric != ctx.metric {
-                        if let Some(cfg_path) = ctx.config_path.as_deref() {
-                            let _ = save_stats_metric(cfg_path, final_metric);
-                        }
-                    }
+                    run_stats_tui(
+                        ctx.roots,
+                        &opts,
+                        ctx.prefs,
+                        make_prefs_saver(ctx.config_path),
+                    )?;
                     return Ok(());
                 }
                 let mut stdout = io::stdout().lock();
@@ -326,13 +351,21 @@ fn main() -> io::Result<()> {
                 let opts = StatsOptions {
                     cache_dir: ctx.cache_dir.as_deref(),
                     days: None,
-                    metric: ctx.metric,
+                    metric: ctx.prefs.metric,
                     no_color,
                     ascii: output.ascii,
                     now_unix_secs: unix_now_secs(),
                 };
                 if output.is_interactive(limit.is_some()) {
-                    return run_conversations_tui(&ctx.roots, query.as_deref(), subagents, &opts);
+                    run_conversations_tui(
+                        &ctx.roots,
+                        query.as_deref(),
+                        subagents,
+                        &opts,
+                        ctx.prefs,
+                        make_prefs_saver(ctx.config_path),
+                    )?;
+                    return Ok(());
                 }
                 let mut stdout = io::stdout().lock();
                 return run_conversations_command(
@@ -364,8 +397,11 @@ fn main() -> io::Result<()> {
                     return Ok(());
                 }
                 if let Some(preset) = args.preset {
+                    let existing = load_layout_config(&config_path);
                     let mut layout = preset.to_layout();
-                    layout.stats_metric = load_saved_stats_metric(&config_path);
+                    layout.stats_metric = existing.stats_metric;
+                    layout.conv_turn_sort = existing.conv_turn_sort;
+                    layout.conv_list_sort = existing.conv_list_sort;
                     save_layout_config(&config_path, &layout)?;
                     println!(
                         "Applied preset '{}' to {}",

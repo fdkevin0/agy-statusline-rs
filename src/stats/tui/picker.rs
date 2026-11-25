@@ -1,17 +1,23 @@
 //! Full-screen historical conversation browser powered by `tui-input` and `nucleo-matcher`.
 
+use std::cmp::Ordering;
+
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
-use super::{render_table_with_scrollbar, right_cell, Palette, TableChrome, TableHit};
+use super::{
+    compute_header_hits, render_table_with_scrollbar, right_cell, HeaderHits, Palette, TableChrome,
+    TableHit,
+};
+use crate::stats::metric::{ConversationSort, ConversationSortField, SortDir};
 use crate::stats::query::{filter_and_rank_conversations, SourceFilter};
 use crate::stats::render::format_conversation_display_title;
 use crate::stats::ConversationListItem;
@@ -26,6 +32,55 @@ pub(super) enum PickerAction {
     Quit,
 }
 
+fn apply_dir(ord: Ordering, dir: SortDir) -> Ordering {
+    match dir {
+        SortDir::Asc => ord,
+        SortDir::Desc => ord.reverse(),
+    }
+}
+
+fn cmp_opt_str_ci(a: Option<&str>, b: Option<&str>, dir: SortDir) -> Ordering {
+    match (a, b) {
+        (Some(va), Some(vb)) => {
+            apply_dir(va.to_ascii_lowercase().cmp(&vb.to_ascii_lowercase()), dir)
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn cmp_conversations(
+    a: &ConversationListItem,
+    b: &ConversationListItem,
+    sort: ConversationSort,
+) -> Ordering {
+    let ord = match sort.field {
+        ConversationSortField::Modified => {
+            apply_dir(a.last_modified_secs.cmp(&b.last_modified_secs), sort.dir)
+        }
+        ConversationSortField::Id => apply_dir(a.conversation_id.cmp(&b.conversation_id), sort.dir),
+        ConversationSortField::Title => {
+            cmp_opt_str_ci(a.title.as_deref(), b.title.as_deref(), sort.dir)
+        }
+        ConversationSortField::Workspace => {
+            cmp_opt_str_ci(a.workspace.as_deref(), b.workspace.as_deref(), sort.dir)
+        }
+        ConversationSortField::Steps => match (a.step_count, b.step_count) {
+            (Some(sa), Some(sb)) => apply_dir(sa.cmp(&sb), sort.dir),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => apply_dir(a.db_size_bytes.cmp(&b.db_size_bytes), sort.dir),
+        },
+        ConversationSortField::Subagents => {
+            apply_dir(a.subagent_count.cmp(&b.subagent_count), sort.dir)
+        }
+        ConversationSortField::Source => apply_dir(a.source.cmp(&b.source), sort.dir),
+    };
+    ord.then_with(|| b.last_modified_secs.cmp(&a.last_modified_secs))
+        .then_with(|| a.conversation_id.cmp(&b.conversation_id))
+}
+
 pub(super) struct PickerScreen {
     items: Vec<ConversationListItem>,
     filtered: Vec<usize>,
@@ -34,6 +89,7 @@ pub(super) struct PickerScreen {
     searching: bool,
     show_subagents: bool,
     source_filter: SourceFilter,
+    sort: ConversationSort,
     has_cli: bool,
     has_desktop: bool,
     active_id: Option<String>,
@@ -41,6 +97,7 @@ pub(super) struct PickerScreen {
     table_state: TableState,
     search_bar: Rect,
     table_hit: TableHit,
+    header_hits: HeaderHits<ConversationSortField>,
 }
 
 impl PickerScreen {
@@ -49,6 +106,7 @@ impl PickerScreen {
         active_id: Option<&str>,
         initial_query: Option<&str>,
         show_subagents: bool,
+        sort: ConversationSort,
     ) -> Self {
         let mut screen = Self {
             items: Vec::new(),
@@ -58,6 +116,7 @@ impl PickerScreen {
             searching: false,
             show_subagents,
             source_filter: SourceFilter::All,
+            sort,
             has_cli: false,
             has_desktop: false,
             active_id: active_id.map(str::to_ascii_lowercase),
@@ -65,6 +124,7 @@ impl PickerScreen {
             table_state: TableState::default(),
             search_bar: Rect::default(),
             table_hit: TableHit::default(),
+            header_hits: HeaderHits::default(),
         };
         screen.replace_items(items, active_id);
         screen
@@ -72,6 +132,10 @@ impl PickerScreen {
 
     pub(super) fn active_id(&self) -> Option<&str> {
         self.active_id.as_deref()
+    }
+
+    pub(super) fn sort(&self) -> ConversationSort {
+        self.sort
     }
 
     pub(super) fn set_active_id(&mut self, active_id: Option<&str>) {
@@ -112,6 +176,28 @@ impl PickerScreen {
         }
     }
 
+    /// Updates the conversation list on a live watch tick without interrupting search
+    /// input or losing the currently highlighted conversation.
+    pub(super) fn refresh_items_live(&mut self, items: Vec<ConversationListItem>) {
+        let selected_id = self
+            .filtered
+            .get(self.selected)
+            .map(|&idx| self.items[idx].conversation_id.clone());
+        self.has_cli = items.iter().any(|it| it.source == "cli");
+        self.has_desktop = items.iter().any(|it| it.source == "desktop");
+        self.items = items;
+        self.recompute_filtered();
+        if let Some(sel_id) = selected_id.as_deref() {
+            if let Some(pos) = self
+                .filtered
+                .iter()
+                .position(|&idx| self.items[idx].conversation_id == sel_id)
+            {
+                self.selected = pos;
+            }
+        }
+    }
+
     fn recompute_filtered(&mut self) {
         self.filtered = filter_and_rank_conversations(
             &self.items,
@@ -119,11 +205,52 @@ impl PickerScreen {
             self.show_subagents,
             self.source_filter,
         );
+        if self.input.value().trim().is_empty() || self.sort != ConversationSort::default() {
+            self.filtered
+                .sort_by(|&a, &b| cmp_conversations(&self.items[a], &self.items[b], self.sort));
+        }
         if self.filtered.is_empty() {
             self.selected = 0;
         } else if self.selected >= self.filtered.len() {
             self.selected = self.filtered.len() - 1;
         }
+    }
+
+    fn cycle_sort_field(&mut self) {
+        let fields: Vec<ConversationSortField> = if !self.header_hits.cols.is_empty() {
+            self.header_hits.cols.iter().map(|c| c.col).collect()
+        } else {
+            let mut all = vec![
+                ConversationSortField::Modified,
+                ConversationSortField::Id,
+                ConversationSortField::Title,
+                ConversationSortField::Workspace,
+                ConversationSortField::Steps,
+                ConversationSortField::Subagents,
+            ];
+            if self.has_cli && self.has_desktop {
+                all.push(ConversationSortField::Source);
+            }
+            all
+        };
+        let next_field = fields
+            .iter()
+            .position(|&f| f == self.sort.field)
+            .map_or(ConversationSortField::Modified, |idx| {
+                fields[(idx + 1) % fields.len()]
+            });
+        self.sort = ConversationSort {
+            field: next_field,
+            dir: next_field.default_dir(),
+        };
+        self.selected = 0;
+        self.recompute_filtered();
+    }
+
+    fn click_sort_field(&mut self, field: ConversationSortField) {
+        self.sort = self.sort.click(field);
+        self.selected = 0;
+        self.recompute_filtered();
     }
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> PickerAction {
@@ -195,6 +322,12 @@ impl PickerScreen {
                 self.selected = 0;
                 self.recompute_filtered();
             }
+            KeyCode::Char('s') => self.cycle_sort_field(),
+            KeyCode::Char('S') => {
+                self.sort = self.sort.toggle_dir();
+                self.selected = 0;
+                self.recompute_filtered();
+            }
             KeyCode::Char('r') => return PickerAction::Reload,
             KeyCode::Enter => {
                 if let Some(&idx) = self.filtered.get(self.selected) {
@@ -232,6 +365,11 @@ impl PickerScreen {
                     self.searching = true;
                     return PickerAction::Continue;
                 }
+                if let Some(col) = self.header_hits.col_at(pos) {
+                    self.searching = false;
+                    self.click_sort_field(col);
+                    return PickerAction::Continue;
+                }
                 if let Some(target) = self.table_hit.row_at(pos, self.table_state.offset(), len) {
                     if self.selected == target && !self.searching {
                         return PickerAction::Select(
@@ -261,10 +399,12 @@ impl PickerScreen {
         } else {
             String::new()
         };
+        let live_mark = if pal.ascii { "* Live" } else { "● Live" };
         let title = format!(
-            " agy-statusline conversations {sep} {}/{}{sub_tag} {sep} {timezone} ",
+            " agy-statusline conversations {sep} {}/{}{sub_tag} {sep} {} {sep} {timezone} {sep} {live_mark} ",
             self.filtered.len(),
-            self.items.len()
+            self.items.len(),
+            self.sort.label(pal.ascii),
         );
         let block = pal.pane_block(title, true);
         let inner = block.inner(area);
@@ -358,6 +498,7 @@ impl PickerScreen {
                 pane: list_area,
                 ..Default::default()
             };
+            self.header_hits = HeaderHits::default();
             return;
         }
 
@@ -370,32 +511,67 @@ impl PickerScreen {
         let ellipsis = if pal.ascii { "..." } else { "…" };
         let active_mark = if pal.ascii { "*" } else { "●" };
 
+        let mut cols = vec![
+            ConversationSortField::Modified,
+            ConversationSortField::Id,
+            ConversationSortField::Title,
+        ];
         let mut widths = vec![
             Constraint::Length(if show_full_time { 16 } else { 11 }),
             Constraint::Length(10),
             Constraint::Min(14),
         ];
-        let mut hdr_cells = vec![
-            Cell::from("Modified"),
-            Cell::from("ID"),
-            Cell::from("Title"),
-        ];
         if show_ws {
+            cols.push(ConversationSortField::Workspace);
             widths.push(Constraint::Length(16));
-            hdr_cells.push(Cell::from("Workspace"));
         }
         if show_info {
+            cols.push(ConversationSortField::Steps);
             widths.push(Constraint::Length(7));
-            hdr_cells.push(right_cell("Steps", pal.dim()));
         }
         if show_sub_col {
-            widths.push(Constraint::Length(4));
-            hdr_cells.push(right_cell("Sub", pal.dim()));
+            cols.push(ConversationSortField::Subagents);
+            widths.push(Constraint::Length(5));
         }
         if show_src_col {
-            widths.push(Constraint::Length(3));
-            hdr_cells.push(Cell::from("Src"));
+            cols.push(ConversationSortField::Source);
+            widths.push(Constraint::Length(5));
         }
+        let hdr_cells: Vec<Cell<'static>> = cols
+            .iter()
+            .map(|&col| {
+                let active = self.sort.field == col;
+                let label = if active {
+                    format!("{} {}", col.header_label(), self.sort.dir.arrow(pal.ascii))
+                } else {
+                    col.header_label().to_string()
+                };
+                let style = if active {
+                    if pal.no_color {
+                        Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    } else {
+                        pal.bold(Color::Cyan)
+                    }
+                } else {
+                    pal.dim()
+                };
+                if matches!(
+                    col,
+                    ConversationSortField::Steps | ConversationSortField::Subagents
+                ) {
+                    right_cell(label, style)
+                } else {
+                    Cell::from(label).style(style)
+                }
+            })
+            .collect();
+        let chrome = TableChrome {
+            highlight: true,
+            header: true,
+            footer: false,
+            border: false,
+        };
+        self.header_hits = compute_header_hits(list_area, &cols, &widths, chrome, 2);
 
         let rows: Vec<Row<'static>> = self
             .filtered
@@ -491,12 +667,7 @@ impl PickerScreen {
             &mut self.table_state,
             self.selected,
             self.filtered.len(),
-            TableChrome {
-                highlight: true,
-                header: true,
-                footer: false,
-                border: false,
-            },
+            chrome,
         );
     }
 
@@ -524,7 +695,7 @@ impl PickerScreen {
             };
             (
                 format!(
-                    " {nav} Select{sep_s}/ Search{sep_s}Enter Open{sep_s}a Subagents{src_hint}{sep_s}r Reload{back_hint}{sep_s}q Quit"
+                    " {nav} Select{sep_s}/ Search{sep_s}Enter Open{sep_s}s/S Sort{sep_s}a Subagents{src_hint}{sep_s}r Reload{back_hint}{sep_s}q Quit"
                 ),
                 pal.dim(),
             )
@@ -607,6 +778,7 @@ mod tests {
             Some("8d0371e1-5a05-423b-a8bc-ed75995f9a8b"),
             None,
             false,
+            ConversationSort::default(),
         );
         // Subagents hidden by default -> 2 top-level rows.
         assert_eq!(p.filtered.len(), 2);
@@ -664,7 +836,12 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(rendered.contains("agy-statusline conversations · 3/3 · +Sub · UTC+08:00"));
+        assert!(
+            rendered.contains(
+                "agy-statusline conversations · 3/3 · +Sub · Modified ↓ · UTC+08:00 · ● Live"
+            ),
+            "{rendered}"
+        );
         assert!(rendered.contains("b Back"));
 
         let m = |kind, column, row| MouseEvent {
@@ -690,8 +867,70 @@ mod tests {
             PickerAction::Select("9a1482f2-6b16-434c-99cd-fe86aa60ab9c".to_string())
         );
 
-        // Search-mode footer uses pure ASCII labels under --ascii.
+        // Clicking Title header sorts alphabetically by title and toggles asc/desc on repeat click.
+        let title_hit = p
+            .header_hits
+            .cols
+            .iter()
+            .find(|c| c.col == ConversationSortField::Title)
+            .copied()
+            .unwrap();
+        let title_hdr: String = (title_hit.x0..title_hit.x1)
+            .map(|x| terminal.backend().buffer()[(x, p.header_hits.y)].symbol())
+            .collect();
+        assert!(title_hdr.contains("Title"), "{title_hdr:?}");
+        p.handle_mouse(m(
+            MouseEventKind::Down(MouseButton::Left),
+            title_hit.x0 + 1,
+            p.header_hits.y,
+        ));
+        assert_eq!(
+            p.sort,
+            ConversationSort {
+                field: ConversationSortField::Title,
+                dir: SortDir::Asc,
+            }
+        );
+        assert_eq!(
+            p.items[p.filtered[0]].title.as_deref(),
+            Some("Cache Hit Investigation")
+        );
+        p.handle_mouse(m(
+            MouseEventKind::Down(MouseButton::Left),
+            title_hit.x0 + 1,
+            p.header_hits.y,
+        ));
+        assert_eq!(
+            p.sort,
+            ConversationSort {
+                field: ConversationSortField::Title,
+                dir: SortDir::Desc,
+            }
+        );
+        assert_eq!(
+            p.items[p.filtered[0]].title.as_deref(),
+            Some("Subagent Research")
+        );
+
+        // Live refresh preserves highlighted conversation and active search mode.
+        p.selected = 1;
+        let pinned_id = p.items[p.filtered[1]].conversation_id.clone();
         p.handle_key(key(KeyCode::Char('/')));
+        let mut expanded = sample_items();
+        expanded.push(item(
+            "aaaa0000-1111-4111-8111-111111111111",
+            "cli",
+            "Zebra Live Session",
+            Some("ws"),
+            None,
+            None,
+            1_795_600_000,
+        ));
+        p.refresh_items_live(expanded);
+        assert!(p.searching);
+        assert_eq!(p.items[p.filtered[p.selected]].conversation_id, pinned_id);
+
+        // Search-mode footer uses pure ASCII labels under --ascii.
         let ascii_pal = Palette {
             no_color: true,
             ascii: true,

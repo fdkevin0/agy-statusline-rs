@@ -1,5 +1,6 @@
 //! Single-conversation interactive turn inspector (`agy-statusline stats <CONVERSATION_ID>`).
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -11,48 +12,19 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    render_table_with_scrollbar, right_cell, token_breakdown_lines, Palette, TableChrome, TableHit,
+    compute_header_hits, render_table_with_scrollbar, right_cell, token_breakdown_lines,
+    HeaderHits, Palette, TableChrome, TableHit,
 };
 use crate::agy::db::compute_median;
-use crate::stats::metric::{format_pct, format_usd_short, UsageCounters};
+use crate::stats::metric::{
+    format_pct, format_usd_short, SortDir, TurnSort, TurnSortField, UsageCounters,
+};
 use crate::stats::pricing::round_usd_6;
 use crate::stats::render::{
     format_subagent_short_label, format_time_span, format_ttft_compact, format_turn_time,
 };
 use crate::stats::{ConversationStatsReport, ConversationTurnStats, PeriodSummary, UsageDelta};
 use crate::sys::fmt::{format_tokens_string as fmt_tok, truncate_to_width};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TurnSort {
-    TurnAsc,
-    TurnDesc,
-    CacheHitAsc,
-    CostDesc,
-}
-
-impl TurnSort {
-    fn next(self) -> Self {
-        match self {
-            Self::TurnAsc => Self::TurnDesc,
-            Self::TurnDesc => Self::CacheHitAsc,
-            Self::CacheHitAsc => Self::CostDesc,
-            Self::CostDesc => Self::TurnAsc,
-        }
-    }
-
-    fn label(self, ascii: bool) -> &'static str {
-        match (self, ascii) {
-            (Self::TurnAsc, false) => "# ↑",
-            (Self::TurnAsc, true) => "# ^",
-            (Self::TurnDesc, false) => "# ↓",
-            (Self::TurnDesc, true) => "# v",
-            (Self::CacheHitAsc, false) => "Cache% ↑",
-            (Self::CacheHitAsc, true) => "Cache% ^",
-            (Self::CostDesc, false) => "Cost ↓",
-            (Self::CostDesc, true) => "Cost v",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RightTab {
@@ -93,6 +65,66 @@ fn turn_prompt_context(t: &ConversationTurnStats) -> u64 {
         .saturating_add(t.cache_write_tokens)
 }
 
+fn apply_dir(ord: Ordering, dir: SortDir) -> Ordering {
+    match dir {
+        SortDir::Asc => ord,
+        SortDir::Desc => ord.reverse(),
+    }
+}
+
+/// Compares optional floats with `None` always placed last regardless of direction.
+fn cmp_opt_f64(a: Option<f64>, b: Option<f64>, dir: SortDir) -> Ordering {
+    match (a, b) {
+        (Some(va), Some(vb)) => apply_dir(va.total_cmp(&vb), dir),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Compares optional strings with `None` always placed last regardless of direction.
+fn cmp_opt_str(a: Option<&str>, b: Option<&str>, dir: SortDir) -> Ordering {
+    match (a, b) {
+        (Some(va), Some(vb)) => apply_dir(va.cmp(vb), dir),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn cmp_turns(ta: &ConversationTurnStats, tb: &ConversationTurnStats, sort: TurnSort) -> Ordering {
+    let ord = match sort.field {
+        TurnSortField::Turn => apply_dir(ta.index.cmp(&tb.index), sort.dir),
+        TurnSortField::Time => cmp_opt_str(
+            ta.timestamp_local.as_deref(),
+            tb.timestamp_local.as_deref(),
+            sort.dir,
+        ),
+        TurnSortField::Model => apply_dir(
+            ta.model
+                .to_ascii_lowercase()
+                .cmp(&tb.model.to_ascii_lowercase()),
+            sort.dir,
+        ),
+        TurnSortField::Context => apply_dir(
+            turn_prompt_context(ta).cmp(&turn_prompt_context(tb)),
+            sort.dir,
+        ),
+        TurnSortField::Input => apply_dir(ta.input_tokens.cmp(&tb.input_tokens), sort.dir),
+        TurnSortField::Cache => {
+            let ca = ta.cache_read_tokens.saturating_add(ta.cache_write_tokens);
+            let cb = tb.cache_read_tokens.saturating_add(tb.cache_write_tokens);
+            apply_dir(ca.cmp(&cb), sort.dir)
+        }
+        TurnSortField::Output => apply_dir(ta.output_tokens.cmp(&tb.output_tokens), sort.dir),
+        TurnSortField::CacheHit => cmp_opt_f64(ta.cache_hit_pct, tb.cache_hit_pct, sort.dir),
+        TurnSortField::Speed => cmp_opt_f64(ta.tok_per_sec, tb.tok_per_sec, sort.dir),
+        TurnSortField::Ttft => cmp_opt_f64(ta.ttft_secs, tb.ttft_secs, sort.dir),
+        TurnSortField::Cost => cmp_opt_f64(ta.priced_usd, tb.priced_usd, sort.dir),
+    };
+    ord.then_with(|| ta.index.cmp(&tb.index))
+}
+
 pub(super) struct DetailScreen {
     report: ConversationStatsReport,
     sort: TurnSort,
@@ -108,11 +140,12 @@ pub(super) struct DetailScreen {
     turns_table: TableState,
     breakdown_table: TableState,
     turns_hit: TableHit,
+    turns_header_hits: HeaderHits<TurnCol>,
     breakdown_hit: TableHit,
 }
 
 impl DetailScreen {
-    pub(super) fn new(report: ConversationStatsReport) -> Self {
+    pub(super) fn new(report: ConversationStatsReport, sort: TurnSort) -> Self {
         let right_tab = if report.models.len() <= 1 && !report.subagents.is_empty() {
             RightTab::Subagents
         } else {
@@ -131,7 +164,7 @@ impl DetailScreen {
                 subagent_short_labels: HashMap::new(),
             },
             report,
-            sort: TurnSort::TurnAsc,
+            sort,
             right_tab,
             active_pane: DetailPane::Turns,
             misses_only: false,
@@ -143,6 +176,7 @@ impl DetailScreen {
             turns_table: TableState::default(),
             breakdown_table: TableState::default(),
             turns_hit: TableHit::default(),
+            turns_header_hits: HeaderHits::default(),
             breakdown_hit: TableHit::default(),
         };
         screen.recompute_view();
@@ -153,12 +187,131 @@ impl DetailScreen {
         &self.report.conversation_id
     }
 
+    pub(super) fn subagent_ids(&self) -> Vec<String> {
+        self.report
+            .subagents
+            .iter()
+            .map(|s| s.conversation_id.clone())
+            .collect()
+    }
+
+    pub(super) fn sort(&self) -> TurnSort {
+        self.sort
+    }
+
     pub(super) fn set_status_msg(&mut self, msg: impl Into<String>) {
         self.status_msg = Some(msg.into());
     }
 
     pub(super) fn replace_report(&mut self, report: ConversationStatsReport) {
+        self.apply_live_report(report);
+    }
+
+    /// Replaces the report from a live watch tick or manual refresh while preserving
+    /// the selected turn (or following the tail in default `# ↑` mode when new turns arrive).
+    pub(super) fn apply_live_report(&mut self, report: ConversationStatsReport) {
+        let selected_turn_key = self.view.turn_indices.get(self.turn_idx).map(|&raw_idx| {
+            let t = &self.report.turns[raw_idx];
+            (t.conversation_id.clone(), t.index)
+        });
+        let was_at_tail_asc = self.sort == TurnSort::default()
+            && !self.view.turn_indices.is_empty()
+            && self.turn_idx + 1 == self.view.turn_indices.len();
+        let old_turn_count = self.report.turns.len();
+        let selected_model = (self.right_tab == RightTab::Models)
+            .then(|| {
+                self.report
+                    .models
+                    .get(self.breakdown_idx)
+                    .map(|m| m.model.clone())
+            })
+            .flatten();
+        let selected_sub = (self.right_tab == RightTab::Subagents)
+            .then(|| {
+                self.report
+                    .subagents
+                    .get(self.breakdown_idx)
+                    .map(|s| s.conversation_id.clone())
+            })
+            .flatten();
+
         self.report = report;
+        self.recompute_view();
+
+        if was_at_tail_asc
+            && self.report.turns.len() > old_turn_count
+            && !self.view.turn_indices.is_empty()
+        {
+            self.turn_idx = self.view.turn_indices.len() - 1;
+        } else if let Some((cid, idx)) = selected_turn_key {
+            if let Some(pos) = self.view.turn_indices.iter().position(|&raw_idx| {
+                let t = &self.report.turns[raw_idx];
+                t.index == idx && t.conversation_id == cid
+            }) {
+                self.turn_idx = pos;
+            }
+        }
+
+        if let Some(model) = selected_model {
+            if let Some(pos) = self.report.models.iter().position(|m| m.model == model) {
+                self.breakdown_idx = pos;
+            }
+        } else if let Some(sub_id) = selected_sub {
+            if let Some(pos) = self
+                .report
+                .subagents
+                .iter()
+                .position(|s| s.conversation_id == sub_id)
+            {
+                self.breakdown_idx = pos;
+            }
+        }
+    }
+
+    fn cycle_sort_field(&mut self) {
+        let fields: Vec<TurnSortField> = if !self.turns_header_hits.cols.is_empty() {
+            self.turns_header_hits
+                .cols
+                .iter()
+                .map(|c| c.col.sort_field())
+                .collect()
+        } else {
+            let mut all = vec![
+                TurnSortField::Turn,
+                TurnSortField::Time,
+                TurnSortField::Model,
+                TurnSortField::Context,
+                TurnSortField::Input,
+                TurnSortField::Cache,
+                TurnSortField::Output,
+                TurnSortField::CacheHit,
+                TurnSortField::Speed,
+                TurnSortField::Ttft,
+                TurnSortField::Cost,
+            ];
+            if !self.view.show_model_col {
+                all.retain(|&f| f != TurnSortField::Model);
+            }
+            if !self.view.show_cost {
+                all.retain(|&f| f != TurnSortField::Cost);
+            }
+            all
+        };
+        let next_field = fields
+            .iter()
+            .position(|&f| f == self.sort.field)
+            .map_or(TurnSortField::Turn, |idx| fields[(idx + 1) % fields.len()]);
+        self.sort = TurnSort {
+            field: next_field,
+            dir: next_field.default_dir(),
+        };
+        self.turn_idx = 0;
+        self.recompute_view();
+    }
+
+    fn click_sort_field(&mut self, field: TurnSortField) {
+        self.sort = self.sort.click(field);
+        self.turn_idx = 0;
         self.recompute_view();
     }
 
@@ -189,23 +342,8 @@ impl DetailScreen {
             .map(|(idx, _)| idx)
             .collect();
 
-        turn_indices.sort_by(|&a, &b| {
-            let ta = &self.report.turns[a];
-            let tb = &self.report.turns[b];
-            let ord = match self.sort {
-                TurnSort::TurnAsc => ta.index.cmp(&tb.index),
-                TurnSort::TurnDesc => tb.index.cmp(&ta.index),
-                TurnSort::CacheHitAsc => ta
-                    .cache_hit_pct
-                    .unwrap_or(f64::INFINITY)
-                    .total_cmp(&tb.cache_hit_pct.unwrap_or(f64::INFINITY)),
-                TurnSort::CostDesc => tb
-                    .priced_usd
-                    .unwrap_or(-1.0)
-                    .total_cmp(&ta.priced_usd.unwrap_or(-1.0)),
-            };
-            ord.then_with(|| ta.index.cmp(&tb.index))
-        });
+        turn_indices
+            .sort_by(|&a, &b| cmp_turns(&self.report.turns[a], &self.report.turns[b], self.sort));
 
         let mut summary = PeriodSummary::default();
         let mut speeds = Vec::new();
@@ -358,7 +496,10 @@ impl DetailScreen {
                 };
             }
             KeyCode::Char('s') => {
-                self.sort = self.sort.next();
+                self.cycle_sort_field();
+            }
+            KeyCode::Char('S') => {
+                self.sort = self.sort.toggle_dir();
                 self.turn_idx = 0;
                 self.recompute_view();
             }
@@ -425,7 +566,9 @@ impl DetailScreen {
                 self.status_msg = None;
                 if self.turns_hit.contains(pos) {
                     self.active_pane = DetailPane::Turns;
-                    if let Some(target) = self.turns_hit.row_at(
+                    if let Some(col) = self.turns_header_hits.col_at(pos) {
+                        self.click_sort_field(col.sort_field());
+                    } else if let Some(target) = self.turns_hit.row_at(
                         pos,
                         self.turns_table.offset(),
                         self.view.turn_indices.len(),
@@ -477,6 +620,7 @@ impl DetailScreen {
 
         let body = root[2];
         self.turns_hit = TableHit::default();
+        self.turns_header_hits = HeaderHits::default();
         self.breakdown_hit = TableHit::default();
 
         if body.width >= 96 {
@@ -516,8 +660,9 @@ impl DetailScreen {
         } else {
             String::new()
         };
+        let live_mark = if pal.ascii { "* Live" } else { "● Live" };
         let title = format!(
-            " agy-statusline stats {sep} Conversation {short_id}{model_tag} {sep} {} {sep} {} ",
+            " agy-statusline stats {sep} Conversation {short_id}{model_tag} {sep} {} {sep} {} {sep} {live_mark} ",
             self.report.source, self.report.timezone
         );
 
@@ -752,9 +897,16 @@ impl DetailScreen {
         );
         let widths: Vec<Constraint> = cols
             .iter()
-            .map(|c| c.constraint(self.view.multi_day))
+            .map(|c| c.constraint(self.view.multi_day, self.sort.field == c.sort_field()))
             .collect();
-        let header = Row::new(cols.iter().map(|c| c.header(pal))).style(pal.dim());
+        let header = Row::new(cols.iter().map(|c| c.header(self.sort, pal))).style(pal.dim());
+        let chrome = TableChrome {
+            highlight: true,
+            header: true,
+            footer: has_footer,
+            border: true,
+        };
+        self.turns_header_hits = compute_header_hits(area, &cols, &widths, chrome, 2);
 
         let val_style = pal.bold(Color::Cyan);
         let summary_hit = self.view.summary.cache_hit_pct();
@@ -886,12 +1038,7 @@ impl DetailScreen {
             &mut self.turns_table,
             self.turn_idx,
             self.view.turn_indices.len(),
-            TableChrome {
-                highlight: true,
-                header: true,
-                footer: has_footer,
-                border: true,
-            },
+            chrome,
         )
     }
 
@@ -1160,9 +1307,9 @@ impl DetailScreen {
         let text = if let Some(msg) = &self.status_msg {
             format!(" {msg}")
         } else if self.has_active_filters() {
-            format!(" Esc Clear{sep}c Convs{sep}s Sort{sep}m Misses{sep}Tab Pane{sep}r Refresh{back_hint}{sep}q Quit")
+            format!(" Esc Clear{sep}c Convs{sep}s/S Sort{sep}m Misses{sep}Tab Pane{sep}r Refresh{back_hint}{sep}q Quit")
         } else if area.width < 92 {
-            format!(" c Convs{sep}s Sort{sep}m Misses{sep}Tab Pane{back_hint}{sep}q Quit")
+            format!(" c Convs{sep}s/S Sort{sep}m Misses{sep}Tab Pane{back_hint}{sep}q Quit")
         } else {
             let sub_hint = if self.report.subagents.is_empty() {
                 String::new()
@@ -1170,7 +1317,7 @@ impl DetailScreen {
                 format!("{sep}v Models/Sub")
             };
             let nav = if pal.ascii { "j/k" } else { "↑↓/jk" };
-            format!(" {nav} Select{sep}c Convs{sep}s Sort{sep}m Misses{sub_hint}{sep}Tab Pane{sep}r Refresh{back_hint}{sep}q Quit")
+            format!(" {nav} Select{sep}c Convs{sep}s/S Sort (click header){sep}m Misses{sub_hint}{sep}Tab Pane{sep}r Refresh{back_hint}{sep}q Quit")
         };
         let style = if self.status_msg.is_some() {
             pal.bold(Color::Yellow)
@@ -1197,31 +1344,60 @@ enum TurnCol {
 }
 
 impl TurnCol {
-    fn constraint(self, multi_day: bool) -> Constraint {
+    const fn sort_field(self) -> TurnSortField {
+        match self {
+            Self::Idx => TurnSortField::Turn,
+            Self::Time => TurnSortField::Time,
+            Self::Model => TurnSortField::Model,
+            Self::Ctx => TurnSortField::Context,
+            Self::Input => TurnSortField::Input,
+            Self::Cache => TurnSortField::Cache,
+            Self::Output => TurnSortField::Output,
+            Self::Hit => TurnSortField::CacheHit,
+            Self::Speed => TurnSortField::Speed,
+            Self::Ttft => TurnSortField::Ttft,
+            Self::Cost => TurnSortField::Cost,
+        }
+    }
+
+    const fn is_right_aligned(self) -> bool {
+        !matches!(self, Self::Time | Self::Model)
+    }
+
+    fn constraint(self, multi_day: bool, active: bool) -> Constraint {
         match self {
             Self::Idx => Constraint::Length(4),
             Self::Time => Constraint::Length(if multi_day { 11 } else { 8 }),
             Self::Model => Constraint::Min(12),
-            Self::Ctx | Self::Input | Self::Cache => Constraint::Length(6),
-            Self::Output | Self::Speed => Constraint::Length(5),
-            Self::Hit | Self::Ttft => Constraint::Length(6),
+            Self::Ctx | Self::Hit | Self::Ttft => Constraint::Length(6),
+            Self::Input | Self::Cache => Constraint::Length(if active { 7 } else { 6 }),
+            Self::Output => Constraint::Length(5),
+            Self::Speed => Constraint::Length(if active { 7 } else { 5 }),
             Self::Cost => Constraint::Length(7),
         }
     }
 
-    fn header(self, pal: &Palette) -> Cell<'static> {
-        match self {
-            Self::Idx => right_cell("#", pal.dim()),
-            Self::Time => Cell::from("Time"),
-            Self::Model => Cell::from("Model"),
-            Self::Ctx => right_cell("Ctx", pal.dim()),
-            Self::Input => right_cell("Input", pal.dim()),
-            Self::Cache => right_cell("Cache", pal.dim()),
-            Self::Output => right_cell("Out", pal.dim()),
-            Self::Hit => right_cell("Hit%", pal.dim()),
-            Self::Speed => right_cell("tok/s", pal.dim()),
-            Self::Ttft => right_cell("TTFT", pal.dim()),
-            Self::Cost => right_cell("Cost", pal.dim()),
+    fn header(self, sort: TurnSort, pal: &Palette) -> Cell<'static> {
+        let field = self.sort_field();
+        let active = sort.field == field;
+        let label = if active {
+            format!("{} {}", field.header_label(), sort.dir.arrow(pal.ascii))
+        } else {
+            field.header_label().to_string()
+        };
+        let style = if active {
+            if pal.no_color {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                pal.bold(Color::Cyan)
+            }
+        } else {
+            pal.dim()
+        };
+        if self.is_right_aligned() {
+            right_cell(label, style)
+        } else {
+            Cell::from(label).style(style)
         }
     }
 }
@@ -1416,15 +1592,23 @@ mod tests {
 
     #[test]
     fn detail_screen_handles_sort_filters_render_and_mouse() {
-        let mut screen = DetailScreen::new(sample_report());
+        let mut screen = DetailScreen::new(sample_report(), TurnSort::default());
+        assert_eq!(screen.sort, TurnSort::default());
         assert_eq!(screen.view.turn_indices, vec![0, 1, 2]);
 
-        // Sort cycles: TurnAsc -> TurnDesc -> CacheHitAsc -> CostDesc.
-        screen.handle_key(KeyCode::Char('s'), KeyModifiers::NONE, false);
+        // 'S' reverses current sort direction (# ↑ -> # ↓), 's' cycles to next column.
+        screen.handle_key(KeyCode::Char('S'), KeyModifiers::NONE, false);
+        assert_eq!(
+            screen.sort,
+            TurnSort {
+                field: TurnSortField::Turn,
+                dir: SortDir::Desc,
+            }
+        );
         assert_eq!(screen.view.turn_indices, vec![2, 1, 0]);
-        screen.handle_key(KeyCode::Char('s'), KeyModifiers::NONE, false);
-        assert_eq!(screen.sort, TurnSort::CacheHitAsc);
-        assert_eq!(screen.view.turn_indices, vec![2, 1, 0]);
+        screen.handle_key(KeyCode::Char('S'), KeyModifiers::NONE, false);
+        assert_eq!(screen.sort, TurnSort::default());
+        assert_eq!(screen.view.turn_indices, vec![0, 1, 2]);
 
         // 'm' filters to cache anomalies (<50%) -> turn #3 only; Esc clears filters before quitting.
         screen.handle_key(KeyCode::Char('m'), KeyModifiers::NONE, false);
@@ -1435,7 +1619,7 @@ mod tests {
         );
         assert_eq!(screen.view.turn_indices.len(), 3);
 
-        // Render wide + narrow viewports and test mouse wheel + clicks.
+        // Render wide viewport and verify exact mouse column-header click sorting + row clicks.
         let pal = Palette {
             no_color: true,
             ascii: false,
@@ -1452,9 +1636,24 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(wide.contains("Conversation 8d0371e1"), "{wide}");
+        assert!(wide.contains("● Live"), "{wide}");
         assert!(wide.contains("1 miss (~$0.62)"), "{wide}");
         assert!(wide.contains("sub:Model Beta"), "{wide}");
         assert!(wide.contains("b Back"), "{wide}");
+
+        // Verify computed Cost header hit box actually contains the rendered "Cost" text.
+        let header_y = screen.turns_header_hits.y;
+        let cost_hit = screen
+            .turns_header_hits
+            .cols
+            .iter()
+            .find(|c| c.col == TurnCol::Cost)
+            .copied()
+            .unwrap();
+        let cost_header_text: String = (cost_hit.x0..cost_hit.x1)
+            .map(|x| terminal.backend().buffer()[(x, header_y)].symbol())
+            .collect();
+        assert!(cost_header_text.contains("Cost"), "{cost_header_text:?}");
 
         let m = |kind, column, row| MouseEvent {
             kind,
@@ -1462,6 +1661,53 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
+
+        // Click Cost header -> sorts Cost descending (turn #3 $0.62, #1 $0.10, #2 $0.02).
+        screen.handle_mouse(m(
+            MouseEventKind::Down(MouseButton::Left),
+            cost_hit.x0 + 1,
+            header_y,
+        ));
+        assert_eq!(
+            screen.sort,
+            TurnSort {
+                field: TurnSortField::Cost,
+                dir: SortDir::Desc,
+            }
+        );
+        assert_eq!(screen.view.turn_indices, vec![2, 0, 1]);
+
+        // Click Cost header again -> toggles to Cost ascending (turn #2 $0.02, #1 $0.10, #3 $0.62).
+        screen.handle_mouse(m(
+            MouseEventKind::Down(MouseButton::Left),
+            cost_hit.x0 + 1,
+            header_y,
+        ));
+        assert_eq!(
+            screen.sort,
+            TurnSort {
+                field: TurnSortField::Cost,
+                dir: SortDir::Asc,
+            }
+        );
+        assert_eq!(screen.view.turn_indices, vec![1, 0, 2]);
+
+        // Click '#' header -> restores default turn ascending.
+        let idx_hit = screen
+            .turns_header_hits
+            .cols
+            .iter()
+            .find(|c| c.col == TurnCol::Idx)
+            .copied()
+            .unwrap();
+        screen.handle_mouse(m(
+            MouseEventKind::Down(MouseButton::Left),
+            idx_hit.x0,
+            header_y,
+        ));
+        assert_eq!(screen.sort, TurnSort::default());
+        assert_eq!(screen.view.turn_indices, vec![0, 1, 2]);
+
         let tx = screen.turns_hit.pane.x + 4;
         let t2_y = screen.turns_hit.data_y0 + 2;
         screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), tx, t2_y));
@@ -1484,5 +1730,46 @@ mod tests {
             screen.breakdown_hit.pane.y,
         ));
         assert_eq!(screen.right_tab, RightTab::Subagents);
+    }
+
+    #[test]
+    fn detail_screen_live_update_follows_tail_in_default_asc_and_pins_mid_selection() {
+        let root_id = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
+        let mut screen = DetailScreen::new(sample_report(), TurnSort::default());
+        // Select the last turn (#3) while in default `# ↑` mode.
+        screen.turn_idx = 2;
+
+        let mut updated = sample_report();
+        updated.turns.push(make_turn(
+            4,
+            root_id,
+            false,
+            "2026-11-24 10:15:00",
+            "Model Alpha",
+            8_000,
+            92_000,
+            900,
+            0.05,
+        ));
+        screen.apply_live_report(updated.clone());
+        assert_eq!(screen.view.turn_indices.len(), 4);
+        assert_eq!(screen.turn_idx, 3);
+
+        // Selecting an earlier turn (#1) stays pinned when another turn arrives.
+        screen.turn_idx = 0;
+        updated.turns.push(make_turn(
+            5,
+            root_id,
+            false,
+            "2026-11-24 10:16:00",
+            "Model Alpha",
+            9_000,
+            95_000,
+            1_000,
+            0.06,
+        ));
+        screen.apply_live_report(updated);
+        assert_eq!(screen.view.turn_indices.len(), 5);
+        assert_eq!(screen.turn_idx, 0);
     }
 }
