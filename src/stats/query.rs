@@ -8,14 +8,18 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
+
 use super::metric::{MetricValue, StatsMetric, UsageCounters};
 use super::pricing::{
     fetch_models_dev_via_curl, round_usd_6, PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS,
 };
 use super::scan::{scan_sqlite_conversations, UsageEvent, UsageSource};
 use super::{
-    accumulate_period, activity_week_mondays, build_weekly_usage, DailyUsage, ModelAccumulator,
-    ModelStats, PeriodSummary, SqliteStats, StatsReport, WindowSummaries, DAYS_PER_WEEK,
+    accumulate_period, activity_week_mondays, build_weekly_usage, finalize_models,
+    ConversationListItem, DailyUsage, ModelAccumulator, ModelStats, PeriodSummary, SqliteStats,
+    StatsReport, WindowSummaries, DAYS_PER_WEEK,
 };
 use crate::agy::db::compute_median;
 use crate::sys::time::{civil_date_from_unix_day, format_day, unix_secs_to_utc_date, TimeZoneSpec};
@@ -271,9 +275,41 @@ pub(super) struct StatsDataset {
     pub(super) today_utc: String,
     pub(super) first_active_date: Option<String>,
     pub(super) sqlite: SqliteStats,
-    pub(super) events: Vec<UsageEvent>,
+    events: Vec<UsageEvent>,
     pub(super) has_cli: bool,
     pub(super) has_desktop: bool,
+}
+
+impl StatsDataset {
+    pub(super) fn turn_count(&self) -> usize {
+        self.events.len()
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::stats) fn for_tests(
+        today_day_idx: i64,
+        today_local: impl Into<String>,
+        timezone: impl Into<String>,
+        today_utc: impl Into<String>,
+        first_active_date: Option<String>,
+        sqlite: SqliteStats,
+        has_cli: bool,
+        has_desktop: bool,
+        events: Vec<UsageEvent>,
+    ) -> Self {
+        Self {
+            today_day_idx,
+            today_local: today_local.into(),
+            timezone: timezone.into(),
+            today_utc: today_utc.into(),
+            first_active_date,
+            sqlite,
+            events,
+            has_cli,
+            has_desktop,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -283,39 +319,67 @@ struct DayAccumulator {
     ttfts: Vec<f64>,
 }
 
-pub(super) fn finalize_models(
-    model_map: HashMap<String, ModelAccumulator>,
-    sort_metric: StatsMetric,
-) -> Vec<ModelStats> {
-    let mut models: Vec<ModelStats> = model_map
-        .into_iter()
-        .map(|(model, acc)| ModelStats {
-            model,
-            pricing_key: acc.pricing_key,
-            requests: acc.summary.requests,
-            input_tokens: acc.summary.input_tokens,
-            cache_read_tokens: acc.summary.cache_read_tokens,
-            cache_write_tokens: acc.summary.cache_write_tokens,
-            output_tokens: acc.summary.output_tokens,
-            thinking_tokens: acc.summary.thinking_tokens,
-            total_tokens: acc.summary.total_tokens,
-            priced_usd: round_usd_6(acc.summary.priced_usd),
-            unpriced_requests: acc.summary.unpriced_requests,
-            speed_samples: acc.speeds.len(),
-            median_tok_per_sec: compute_median(&acc.speeds),
-            ttft_samples: acc.ttfts.len(),
-            median_ttft_secs: compute_median(&acc.ttfts),
-        })
-        .collect();
+/// Filters and fuzzy-ranks historical conversations using `nucleo-matcher` (shared by TUI and CLI).
+///
+/// Preserves chronological newest-first order when `query` is empty; ranks by fuzzy relevance
+/// score descending (tie-breaking by `last_modified_secs` descending) when `query` is non-empty.
+pub(in crate::stats) fn filter_and_rank_conversations(
+    items: &[ConversationListItem],
+    query: &str,
+    show_subagents: bool,
+    source_filter: SourceFilter,
+) -> Vec<usize> {
+    let trimmed = query.trim();
+    let candidates = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| show_subagents || it.parent_conversation_id.is_none())
+        .filter(|(_, it)| match source_filter {
+            SourceFilter::All => true,
+            SourceFilter::Cli => it.source == "cli",
+            SourceFilter::Desktop => it.source == "desktop",
+        });
 
-    models.sort_by(|a, b| {
-        sort_metric
-            .extract(a)
-            .cmp_desc(sort_metric.extract(b))
-            .then_with(|| b.total_tokens.cmp(&a.total_tokens))
-            .then_with(|| a.model.cmp(&b.model))
+    if trimmed.is_empty() {
+        return candidates.map(|(idx, _)| idx).collect();
+    }
+
+    let pattern = Pattern::parse(trimmed, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut utf32_buf = Vec::new();
+    let mut scored: Vec<(u32, i64, usize)> = Vec::new();
+
+    for (idx, it) in candidates {
+        let mut haystack = String::with_capacity(96);
+        haystack.push_str(&it.conversation_id);
+        if let Some(title) = it.title.as_deref() {
+            haystack.push(' ');
+            haystack.push_str(title);
+        }
+        if let Some(ws) = it.workspace.as_deref() {
+            haystack.push(' ');
+            haystack.push_str(ws);
+        }
+        if let Some(agent) = it.agent_name.as_deref() {
+            haystack.push(' ');
+            haystack.push_str(agent);
+        }
+        haystack.push(' ');
+        haystack.push_str(&it.source);
+
+        utf32_buf.clear();
+        let needle_haystack = Utf32Str::new(&haystack, &mut utf32_buf);
+        if let Some(score) = pattern.score(needle_haystack, &mut matcher) {
+            scored.push((score, it.last_modified_secs, idx));
+        }
+    }
+
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.cmp(&b.2))
     });
-    models
+    scored.into_iter().map(|(_, _, idx)| idx).collect()
 }
 
 pub(super) fn accumulate_model(model_map: &mut HashMap<String, ModelAccumulator>, ev: &UsageEvent) {

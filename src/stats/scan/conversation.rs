@@ -1,11 +1,8 @@
-//! Single-conversation stats reporting and historical conversation catalog with `nucleo-matcher` fuzzy ranking.
+//! Single-conversation stats reporting and historical conversation catalog.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-
-use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use super::{
     deduplicate_parent_priority_turns, discover_sqlite_db_targets, extract_sqlite_db_turns,
@@ -17,10 +14,9 @@ use crate::agy::db::{
 };
 use crate::stats::metric::{cache_hit_pct, StatsMetric};
 use crate::stats::pricing::{round_usd_6, PricingCatalog};
-use crate::stats::query::{finalize_models, SourceFilter};
 use crate::stats::{
-    ConversationListItem, ConversationStatsReport, ConversationTurnStats, ModelAccumulator,
-    PeriodSummary, SqliteStats, SubagentConversationStats, UsageDelta,
+    finalize_models, ConversationListItem, ConversationStatsReport, ConversationTurnStats,
+    ModelAccumulator, PeriodSummary, SqliteStats, SubagentConversationStats, UsageDelta,
 };
 use crate::sys::fmt::sanitize_inline_text;
 use crate::sys::fs::modified_timestamp;
@@ -137,69 +133,6 @@ impl IndexedSummaryRow {
     fn display_title(&self) -> Option<String> {
         self.title.clone().or_else(|| self.preview.clone())
     }
-}
-
-/// Filters and fuzzy-ranks historical conversations using `nucleo-matcher` (shared by TUI and CLI).
-///
-/// Preserves chronological newest-first order when `query` is empty; ranks by fuzzy relevance
-/// score descending (tie-breaking by `last_modified_secs` descending) when `query` is non-empty.
-pub(in crate::stats) fn filter_and_rank_conversations(
-    items: &[ConversationListItem],
-    query: &str,
-    show_subagents: bool,
-    source_filter: SourceFilter,
-) -> Vec<usize> {
-    let trimmed = query.trim();
-    let candidates = items
-        .iter()
-        .enumerate()
-        .filter(|(_, it)| show_subagents || it.parent_conversation_id.is_none())
-        .filter(|(_, it)| match source_filter {
-            SourceFilter::All => true,
-            SourceFilter::Cli => it.source == "cli",
-            SourceFilter::Desktop => it.source == "desktop",
-        });
-
-    if trimmed.is_empty() {
-        return candidates.map(|(idx, _)| idx).collect();
-    }
-
-    let pattern = Pattern::parse(trimmed, CaseMatching::Smart, Normalization::Smart);
-    let mut matcher = Matcher::new(Config::DEFAULT);
-    let mut utf32_buf = Vec::new();
-    let mut scored: Vec<(u32, i64, usize)> = Vec::new();
-
-    for (idx, it) in candidates {
-        let mut haystack = String::with_capacity(96);
-        haystack.push_str(&it.conversation_id);
-        if let Some(title) = it.title.as_deref() {
-            haystack.push(' ');
-            haystack.push_str(title);
-        }
-        if let Some(ws) = it.workspace.as_deref() {
-            haystack.push(' ');
-            haystack.push_str(ws);
-        }
-        if let Some(agent) = it.agent_name.as_deref() {
-            haystack.push(' ');
-            haystack.push_str(agent);
-        }
-        haystack.push(' ');
-        haystack.push_str(&it.source);
-
-        utf32_buf.clear();
-        let needle_haystack = Utf32Str::new(&haystack, &mut utf32_buf);
-        if let Some(score) = pattern.score(needle_haystack, &mut matcher) {
-            scored.push((score, it.last_modified_secs, idx));
-        }
-    }
-
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| a.2.cmp(&b.2))
-    });
-    scored.into_iter().map(|(_, _, idx)| idx).collect()
 }
 
 fn parse_summary_timestamp_secs(raw: Option<String>) -> Option<i64> {

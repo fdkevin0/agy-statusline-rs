@@ -1,5 +1,3 @@
-//! Statusline layout configuration, built-in presets, and interactive `config` TUI.
+//! Statusline layout configuration and built-in presets.
 
-pub(crate) mod editor;
 pub mod layout;
-pub mod tui;

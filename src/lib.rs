@@ -3,8 +3,8 @@
 //!
 //! Architecture pillars:
 //! - [`agy`] — local Antigravity storage paths, read-only SQLite sniffing, and protobuf decoding
-//! - [`cli`] — non-TUI CLI command handlers (`apply`, `doctor`)
-//! - [`config`] — layout configuration, built-in presets, and the 3-pane `config` TUI
+//! - [`cli`] — CLI command handlers (`apply`, interactive `config` TUI, `doctor`)
+//! - [`config`] — layout configuration and built-in presets
 //! - [`statusline`] — stdin JSON pipeline, git/quota/speed metrics, and multi-row ANSI renderer
 //! - [`stats`] — local usage analytics, `models.dev` pricing sync, and unified `stats`/`conversations` TUI
 //! - [`sys`] — OS, filesystem, subprocess, terminal guard, and civil-time helpers

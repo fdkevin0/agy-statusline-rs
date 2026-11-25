@@ -1,5 +1,7 @@
 //! 3-pane `ratatui` + `crossterm` interactive TUI configurator with true-color live preview.
 
+mod editor;
+
 use std::io::{self, IsTerminal};
 use std::path::Path;
 
@@ -11,13 +13,13 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::editor::{ActivePane, ExitOutcome, PreviewWidth, SettingField, TuiEditorState};
-use super::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
 use crate::agy::paths::agy_settings_path;
 use crate::agy::settings::{apply_statusline_config, resolve_invoked_binary_path};
+use crate::config::layout::{load_layout_config, save_layout_config, WidgetId, MAX_ROWS};
 use crate::statusline::render::render_statusline_lines;
 use crate::statusline::{sample_preview_git, sample_preview_metadata, sample_preview_payload};
 use crate::sys::terminal::enter_tui;
+use editor::{ActivePane, ExitOutcome, PreviewWidth, SettingField, TuiEditorState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PillHit {

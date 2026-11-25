@@ -7,7 +7,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::config::layout::{GlyphMode, WidgetId};
 use crate::statusline::metrics::QuotaView;
 use crate::statusline::theme::Palette;
-use crate::statusline::StatuslinePayload;
+use crate::statusline::{
+    single_active_subagent_label, subagent_count, workspace_basename, StatuslinePayload,
+};
 use crate::sys::fmt::{format_tokens, format_tokens_string as format_tok_str, truncate_to_width};
 
 use super::{
@@ -275,7 +277,7 @@ impl Renderer<'_> {
 
         match widget {
             WidgetId::Directory => {
-                let dir = sanitize_inline_text(payload.workspace_basename()?);
+                let dir = sanitize_inline_text(workspace_basename(payload)?);
                 if dir.is_empty() {
                     return None;
                 }
@@ -644,13 +646,12 @@ impl Renderer<'_> {
                 Some(Segment::plain(widget, format!("art {n}"), pal.muted, false))
             }
             WidgetId::Subagents => {
-                let n = payload.subagent_count();
+                let n = subagent_count(payload);
                 if self.cfg.smart_hide && n == 0 {
                     return None;
                 }
                 let base = format!("sub {n}");
-                match payload
-                    .single_active_subagent_label()
+                match single_active_subagent_label(payload)
                     .map(sanitize_inline_text)
                     .filter(|s| !s.is_empty())
                 {

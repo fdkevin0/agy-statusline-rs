@@ -12,9 +12,8 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::{render_table_with_scrollbar, right_cell, Palette, TableChrome, TableHit};
-use crate::stats::query::SourceFilter;
+use crate::stats::query::{filter_and_rank_conversations, SourceFilter};
 use crate::stats::render::format_conversation_display_title;
-use crate::stats::scan::filter_and_rank_conversations;
 use crate::stats::ConversationListItem;
 use crate::sys::fmt::{format_tokens_string as fmt_tok, truncate_to_width};
 
@@ -38,7 +37,7 @@ pub(super) struct PickerScreen {
     has_cli: bool,
     has_desktop: bool,
     active_id: Option<String>,
-    pub(super) status_msg: Option<String>,
+    status_msg: Option<String>,
     table_state: TableState,
     search_bar: Rect,
     table_hit: TableHit,
@@ -77,6 +76,10 @@ impl PickerScreen {
 
     pub(super) fn set_active_id(&mut self, active_id: Option<&str>) {
         self.active_id = active_id.map(str::to_ascii_lowercase);
+    }
+
+    pub(super) fn set_status_msg(&mut self, msg: impl Into<String>) {
+        self.status_msg = Some(msg.into());
     }
 
     pub(super) fn replace_items(
