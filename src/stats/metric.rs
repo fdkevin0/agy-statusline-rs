@@ -282,6 +282,13 @@ impl SortDir {
         }
     }
 
+    pub(super) const fn apply(self, ord: Ordering) -> Ordering {
+        match self {
+            Self::Asc => ord,
+            Self::Desc => ord.reverse(),
+        }
+    }
+
     pub const fn arrow(self, ascii: bool) -> &'static str {
         match (self, ascii) {
             (Self::Asc, false) => "↑",
@@ -762,6 +769,67 @@ mod tests {
         assert!("".parse::<StatsMetric>().is_err());
         assert!("bogus".parse::<StatsMetric>().is_err());
         assert!("input+".parse::<StatsMetric>().is_err());
+    }
+
+    #[test]
+    fn sort_types_parse_aliases_default_dirs_and_reject_invalid() {
+        assert_eq!(
+            "turn".parse::<TurnSort>().unwrap(),
+            TurnSort {
+                field: TurnSortField::Turn,
+                dir: SortDir::Asc,
+            }
+        );
+        assert_eq!(
+            "cost".parse::<TurnSort>().unwrap(),
+            TurnSort {
+                field: TurnSortField::Cost,
+                dir: SortDir::Desc,
+            }
+        );
+        assert_eq!(
+            "hit:desc".parse::<TurnSort>().unwrap(),
+            TurnSort {
+                field: TurnSortField::CacheHit,
+                dir: SortDir::Desc,
+            }
+        );
+        assert_eq!(
+            "tok/s:asc".parse::<TurnSort>().unwrap(),
+            TurnSort {
+                field: TurnSortField::Speed,
+                dir: SortDir::Asc,
+            }
+        );
+        assert!("cost:sideways".parse::<TurnSort>().is_err());
+        assert!("unknown:asc".parse::<TurnSort>().is_err());
+
+        assert_eq!(
+            "ws".parse::<ConversationSort>().unwrap(),
+            ConversationSort {
+                field: ConversationSortField::Workspace,
+                dir: SortDir::Asc,
+            }
+        );
+        assert_eq!(
+            "sub".parse::<ConversationSort>().unwrap(),
+            ConversationSort {
+                field: ConversationSortField::Subagents,
+                dir: SortDir::Desc,
+            }
+        );
+        assert_eq!(
+            "time:asc".parse::<ConversationSort>().unwrap(),
+            ConversationSort {
+                field: ConversationSortField::Modified,
+                dir: SortDir::Asc,
+            }
+        );
+        assert!("steps:up".parse::<ConversationSort>().is_err());
+        assert!("bogus:desc".parse::<ConversationSort>().is_err());
+
+        assert_eq!(SortDir::Asc.apply(Ordering::Less), Ordering::Less);
+        assert_eq!(SortDir::Desc.apply(Ordering::Less), Ordering::Greater);
     }
 
     #[test]

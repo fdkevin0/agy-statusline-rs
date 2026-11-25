@@ -235,7 +235,7 @@ pub(crate) fn subagent_count(payload: &StatuslinePayload) -> usize {
     active_subagents(payload).count()
 }
 
-/// Returns the role or name of the sole active subagent when `subagent_count() == 1`.
+/// Returns the role or name of the sole active subagent when `subagent_count(payload) == 1`.
 pub(crate) fn single_active_subagent_label(payload: &StatuslinePayload) -> Option<&str> {
     let mut iter = active_subagents(payload);
     let first = iter.next()?;

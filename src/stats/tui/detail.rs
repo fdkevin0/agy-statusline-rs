@@ -65,17 +65,10 @@ fn turn_prompt_context(t: &ConversationTurnStats) -> u64 {
         .saturating_add(t.cache_write_tokens)
 }
 
-fn apply_dir(ord: Ordering, dir: SortDir) -> Ordering {
-    match dir {
-        SortDir::Asc => ord,
-        SortDir::Desc => ord.reverse(),
-    }
-}
-
 /// Compares optional floats with `None` always placed last regardless of direction.
 fn cmp_opt_f64(a: Option<f64>, b: Option<f64>, dir: SortDir) -> Ordering {
     match (a, b) {
-        (Some(va), Some(vb)) => apply_dir(va.total_cmp(&vb), dir),
+        (Some(va), Some(vb)) => dir.apply(va.total_cmp(&vb)),
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
@@ -85,7 +78,7 @@ fn cmp_opt_f64(a: Option<f64>, b: Option<f64>, dir: SortDir) -> Ordering {
 /// Compares optional strings with `None` always placed last regardless of direction.
 fn cmp_opt_str(a: Option<&str>, b: Option<&str>, dir: SortDir) -> Ordering {
     match (a, b) {
-        (Some(va), Some(vb)) => apply_dir(va.cmp(vb), dir),
+        (Some(va), Some(vb)) => dir.apply(va.cmp(vb)),
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
@@ -94,29 +87,27 @@ fn cmp_opt_str(a: Option<&str>, b: Option<&str>, dir: SortDir) -> Ordering {
 
 fn cmp_turns(ta: &ConversationTurnStats, tb: &ConversationTurnStats, sort: TurnSort) -> Ordering {
     let ord = match sort.field {
-        TurnSortField::Turn => apply_dir(ta.index.cmp(&tb.index), sort.dir),
+        TurnSortField::Turn => sort.dir.apply(ta.index.cmp(&tb.index)),
         TurnSortField::Time => cmp_opt_str(
             ta.timestamp_local.as_deref(),
             tb.timestamp_local.as_deref(),
             sort.dir,
         ),
-        TurnSortField::Model => apply_dir(
+        TurnSortField::Model => sort.dir.apply(
             ta.model
                 .to_ascii_lowercase()
                 .cmp(&tb.model.to_ascii_lowercase()),
-            sort.dir,
         ),
-        TurnSortField::Context => apply_dir(
-            turn_prompt_context(ta).cmp(&turn_prompt_context(tb)),
-            sort.dir,
-        ),
-        TurnSortField::Input => apply_dir(ta.input_tokens.cmp(&tb.input_tokens), sort.dir),
+        TurnSortField::Context => sort
+            .dir
+            .apply(turn_prompt_context(ta).cmp(&turn_prompt_context(tb))),
+        TurnSortField::Input => sort.dir.apply(ta.input_tokens.cmp(&tb.input_tokens)),
         TurnSortField::Cache => {
             let ca = ta.cache_read_tokens.saturating_add(ta.cache_write_tokens);
             let cb = tb.cache_read_tokens.saturating_add(tb.cache_write_tokens);
-            apply_dir(ca.cmp(&cb), sort.dir)
+            sort.dir.apply(ca.cmp(&cb))
         }
-        TurnSortField::Output => apply_dir(ta.output_tokens.cmp(&tb.output_tokens), sort.dir),
+        TurnSortField::Output => sort.dir.apply(ta.output_tokens.cmp(&tb.output_tokens)),
         TurnSortField::CacheHit => cmp_opt_f64(ta.cache_hit_pct, tb.cache_hit_pct, sort.dir),
         TurnSortField::Speed => cmp_opt_f64(ta.tok_per_sec, tb.tok_per_sec, sort.dir),
         TurnSortField::Ttft => cmp_opt_f64(ta.ttft_secs, tb.ttft_secs, sort.dir),
@@ -201,10 +192,6 @@ impl DetailScreen {
 
     pub(super) fn set_status_msg(&mut self, msg: impl Into<String>) {
         self.status_msg = Some(msg.into());
-    }
-
-    pub(super) fn replace_report(&mut self, report: ConversationStatsReport) {
-        self.apply_live_report(report);
     }
 
     /// Replaces the report from a live watch tick or manual refresh while preserving
@@ -1596,7 +1583,7 @@ mod tests {
         assert_eq!(screen.sort, TurnSort::default());
         assert_eq!(screen.view.turn_indices, vec![0, 1, 2]);
 
-        // 'S' reverses current sort direction (# ↑ -> # ↓), 's' cycles to next column.
+        // 'S' reverses current sort direction (# ↑ -> # ↓); 's' cycles visible columns.
         screen.handle_key(KeyCode::Char('S'), KeyModifiers::NONE, false);
         assert_eq!(
             screen.sort,
@@ -1606,7 +1593,15 @@ mod tests {
             }
         );
         assert_eq!(screen.view.turn_indices, vec![2, 1, 0]);
-        screen.handle_key(KeyCode::Char('S'), KeyModifiers::NONE, false);
+        screen.handle_key(KeyCode::Char('s'), KeyModifiers::NONE, false);
+        assert_eq!(
+            screen.sort,
+            TurnSort {
+                field: TurnSortField::Time,
+                dir: SortDir::Asc,
+            }
+        );
+        screen.click_sort_field(TurnSortField::Turn);
         assert_eq!(screen.sort, TurnSort::default());
         assert_eq!(screen.view.turn_indices, vec![0, 1, 2]);
 
