@@ -119,9 +119,7 @@ impl StatsTuiState {
     pub(super) fn finish_scan(&mut self, status_msg: Option<String>) {
         self.loading = false;
         self.view_dirty = true;
-        if status_msg.is_some() {
-            self.status_msg = status_msg;
-        }
+        self.status_msg = status_msg;
     }
 
     pub(super) fn fail_scan(&mut self, msg: impl Into<String>) {

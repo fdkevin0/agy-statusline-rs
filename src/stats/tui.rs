@@ -227,6 +227,9 @@ pub(super) fn compute_header_hits<C: Copy>(
         return HeaderHits::default();
     }
     let border = u16::from(chrome.border);
+    if table_area.height <= border * 2 {
+        return HeaderHits::default();
+    }
     let inner_x = table_area.x.saturating_add(border);
     let inner_w = table_area.width.saturating_sub(border * 2);
     let sym_w = if chrome.highlight {
@@ -550,10 +553,18 @@ impl StatsApp {
                     return;
                 }
                 if let Ok((updated, _)) = self.load_conversation_report(&conv_id) {
+                    let mut subagents_changed = false;
                     if let Some(d) = self.detail.as_mut() {
                         d.apply_live_report(updated);
+                        subagents_changed = d.subagent_ids() != sub_ids;
                     }
-                    self.refresh_detail_watch_fp();
+                    // Store pre-read `fp` when subagent set is unchanged so a mid-read commit is
+                    // caught on the next tick; only re-fingerprint when new subagents appear.
+                    if subagents_changed {
+                        self.refresh_detail_watch_fp();
+                    } else {
+                        self.detail_watch_fp = Some(fp);
+                    }
                 }
             }
             Screen::Conversations => {
@@ -830,7 +841,7 @@ impl StatsApp {
                                     Ok((updated, elapsed)) => {
                                         let turns = updated.turns.len();
                                         if let Some(d) = self.detail.as_mut() {
-                                            d.replace_report(updated);
+                                            d.apply_live_report(updated);
                                             d.set_status_msg(format!(
                                                 "Refreshed {turns} turns in {:.0}ms",
                                                 elapsed.as_secs_f64() * 1_000.0

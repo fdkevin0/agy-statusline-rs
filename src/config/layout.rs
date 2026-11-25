@@ -628,13 +628,6 @@ where
     Ok(raw.and_then(|s| s.parse::<T>().ok()))
 }
 
-/// Loads the persisted `stats_metric` preference from `config.json`, if valid and set.
-pub fn load_saved_stats_metric(path: &Path) -> Option<StatsMetric> {
-    try_load_layout_config(path)
-        .ok()
-        .and_then(|cfg| cfg.stats_metric)
-}
-
 /// Loads all persisted `stats`/`conversations` TUI preferences from `config.json`.
 pub fn load_saved_stats_tui_prefs(path: &Path) -> StatsTuiPrefs {
     try_load_layout_config(path)
@@ -644,23 +637,6 @@ pub fn load_saved_stats_tui_prefs(path: &Path) -> StatsTuiPrefs {
             turn_sort: cfg.conv_turn_sort.unwrap_or_default(),
             conv_sort: cfg.conv_list_sort.unwrap_or_default(),
         })
-}
-
-/// Persists `metric` into `config.json` without disturbing existing layout settings.
-///
-/// If `config.json` does not exist yet, writes defaults with `stats_metric` set.
-/// If `config.json` exists but is corrupt/unreadable, leaves it untouched to avoid clobbering user data.
-pub fn save_stats_metric(path: &Path, metric: StatsMetric) -> io::Result<()> {
-    let mut cfg = match try_load_layout_config(path) {
-        Ok(cfg) => cfg,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => LayoutConfig::default(),
-        Err(_) => return Ok(()),
-    };
-    if cfg.stats_metric == Some(metric) {
-        return Ok(());
-    }
-    cfg.stats_metric = Some(metric);
-    save_layout_config(path, &cfg)
 }
 
 /// Persists changed `stats`/`conversations` TUI preferences into `config.json`
@@ -791,52 +767,15 @@ mod tests {
     }
 
     #[test]
-    fn stats_metric_persists_without_breaking_preset_matching_or_corrupt_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-
-        // Missing file -> creates defaults with stats_metric saved.
-        assert_eq!(load_saved_stats_metric(&path), None);
-        save_stats_metric(&path, StatsMetric::Cost).unwrap();
-        assert_eq!(load_saved_stats_metric(&path), Some(StatsMetric::Cost));
-        let loaded = load_layout_config(&path);
-        assert_eq!(loaded.matching_preset(), Some(Preset::Full));
-
-        // Preserves custom layout settings when updating metric.
-        let mut custom = LayoutConfig::preset_powerline();
-        custom.bar_length = 12;
-        save_layout_config(&path, &custom).unwrap();
-        save_stats_metric(&path, StatsMetric::InputOutput).unwrap();
-        let reloaded = load_layout_config(&path);
-        assert_eq!(reloaded.style, VisualStyle::Powerline);
-        assert_eq!(reloaded.bar_length, 12);
-        assert_eq!(reloaded.stats_metric, Some(StatsMetric::InputOutput));
-
-        // Legacy/removed stats_metric values in config.json degrade to None without discarding layout settings.
-        let raw = fs::read_to_string(&path)
-            .unwrap()
-            .replace("\"io\"", "\"input+output+cache_write\"");
-        fs::write(&path, raw).unwrap();
-        let degraded = load_layout_config(&path);
-        assert_eq!(degraded.style, VisualStyle::Powerline);
-        assert_eq!(degraded.bar_length, 12);
-        assert_eq!(degraded.stats_metric, None);
-
-        // Corrupt config file is left untouched rather than clobbered.
-        fs::write(&path, "{broken").unwrap();
-        save_stats_metric(&path, StatsMetric::Turns).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "{broken");
-    }
-
-    #[test]
-    fn conv_sort_prefs_persist_and_degrade_gracefully_on_unknown_values() {
+    fn stats_tui_prefs_persist_without_breaking_presets_custom_layout_or_corrupt_files() {
         use crate::stats::{ConversationSortField, SortDir, TurnSortField};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
 
-        // Defaults when unset: turn ascending, modified descending.
+        // Missing file -> defaults (total metric, turn ascending, modified descending).
         let initial = load_saved_stats_tui_prefs(&path);
+        assert_eq!(initial.metric, StatsMetric::Total);
         assert_eq!(
             initial.turn_sort,
             TurnSort {
@@ -860,8 +799,15 @@ mod tests {
             field: ConversationSortField::Steps,
             dir: SortDir::Asc,
         };
-        save_stats_tui_prefs(&path, None, Some(cost_desc), Some(steps_asc)).unwrap();
+        save_stats_tui_prefs(
+            &path,
+            Some(StatsMetric::Cost),
+            Some(cost_desc),
+            Some(steps_asc),
+        )
+        .unwrap();
         let loaded = load_saved_stats_tui_prefs(&path);
+        assert_eq!(loaded.metric, StatsMetric::Cost);
         assert_eq!(loaded.turn_sort, cost_desc);
         assert_eq!(loaded.conv_sort, steps_asc);
         assert_eq!(
@@ -869,14 +815,43 @@ mod tests {
             Some(Preset::Full)
         );
 
-        // Unknown persisted sort strings degrade safely to defaults without discarding layout settings.
+        // Preserves custom layout settings when updating preferences.
+        let mut custom = LayoutConfig::preset_powerline();
+        custom.bar_length = 12;
+        save_layout_config(&path, &custom).unwrap();
+        save_stats_tui_prefs(
+            &path,
+            Some(StatsMetric::InputOutput),
+            Some(cost_desc),
+            Some(steps_asc),
+        )
+        .unwrap();
+        let reloaded = load_layout_config(&path);
+        assert_eq!(reloaded.style, VisualStyle::Powerline);
+        assert_eq!(reloaded.bar_length, 12);
+        assert_eq!(reloaded.stats_metric, Some(StatsMetric::InputOutput));
+        assert_eq!(reloaded.conv_turn_sort, Some(cost_desc));
+        assert_eq!(reloaded.conv_list_sort, Some(steps_asc));
+
+        // Legacy/unknown persisted values degrade safely to defaults without discarding layout settings.
         let raw = fs::read_to_string(&path)
             .unwrap()
+            .replace("\"io\"", "\"input+output+cache_write\"")
             .replace("\"cost:desc\"", "\"nonexistent:desc\"")
             .replace("\"steps:asc\"", "\"badfield:asc\"");
         fs::write(&path, raw).unwrap();
+        let degraded_cfg = load_layout_config(&path);
+        assert_eq!(degraded_cfg.style, VisualStyle::Powerline);
+        assert_eq!(degraded_cfg.bar_length, 12);
+        assert_eq!(degraded_cfg.stats_metric, None);
+        assert_eq!(degraded_cfg.conv_turn_sort, None);
+        assert_eq!(degraded_cfg.conv_list_sort, None);
         let degraded = load_saved_stats_tui_prefs(&path);
-        assert_eq!(degraded.turn_sort, TurnSort::default());
-        assert_eq!(degraded.conv_sort, ConversationSort::default());
+        assert_eq!(degraded, StatsTuiPrefs::default());
+
+        // Corrupt config file is left untouched rather than clobbered.
+        fs::write(&path, "{broken").unwrap();
+        save_stats_tui_prefs(&path, Some(StatsMetric::Turns), Some(cost_desc), None).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{broken");
     }
 }

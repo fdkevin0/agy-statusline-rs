@@ -32,18 +32,9 @@ pub(super) enum PickerAction {
     Quit,
 }
 
-fn apply_dir(ord: Ordering, dir: SortDir) -> Ordering {
-    match dir {
-        SortDir::Asc => ord,
-        SortDir::Desc => ord.reverse(),
-    }
-}
-
 fn cmp_opt_str_ci(a: Option<&str>, b: Option<&str>, dir: SortDir) -> Ordering {
     match (a, b) {
-        (Some(va), Some(vb)) => {
-            apply_dir(va.to_ascii_lowercase().cmp(&vb.to_ascii_lowercase()), dir)
-        }
+        (Some(va), Some(vb)) => dir.apply(va.to_ascii_lowercase().cmp(&vb.to_ascii_lowercase())),
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
@@ -56,10 +47,10 @@ fn cmp_conversations(
     sort: ConversationSort,
 ) -> Ordering {
     let ord = match sort.field {
-        ConversationSortField::Modified => {
-            apply_dir(a.last_modified_secs.cmp(&b.last_modified_secs), sort.dir)
-        }
-        ConversationSortField::Id => apply_dir(a.conversation_id.cmp(&b.conversation_id), sort.dir),
+        ConversationSortField::Modified => sort
+            .dir
+            .apply(a.last_modified_secs.cmp(&b.last_modified_secs)),
+        ConversationSortField::Id => sort.dir.apply(a.conversation_id.cmp(&b.conversation_id)),
         ConversationSortField::Title => {
             cmp_opt_str_ci(a.title.as_deref(), b.title.as_deref(), sort.dir)
         }
@@ -67,15 +58,13 @@ fn cmp_conversations(
             cmp_opt_str_ci(a.workspace.as_deref(), b.workspace.as_deref(), sort.dir)
         }
         ConversationSortField::Steps => match (a.step_count, b.step_count) {
-            (Some(sa), Some(sb)) => apply_dir(sa.cmp(&sb), sort.dir),
+            (Some(sa), Some(sb)) => sort.dir.apply(sa.cmp(&sb)),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
-            (None, None) => apply_dir(a.db_size_bytes.cmp(&b.db_size_bytes), sort.dir),
+            (None, None) => sort.dir.apply(a.db_size_bytes.cmp(&b.db_size_bytes)),
         },
-        ConversationSortField::Subagents => {
-            apply_dir(a.subagent_count.cmp(&b.subagent_count), sort.dir)
-        }
-        ConversationSortField::Source => apply_dir(a.source.cmp(&b.source), sort.dir),
+        ConversationSortField::Subagents => sort.dir.apply(a.subagent_count.cmp(&b.subagent_count)),
+        ConversationSortField::Source => sort.dir.apply(a.source.cmp(&b.source)),
     };
     ord.then_with(|| b.last_modified_secs.cmp(&a.last_modified_secs))
         .then_with(|| a.conversation_id.cmp(&b.conversation_id))
@@ -410,6 +399,9 @@ impl PickerScreen {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.height < 3 || inner.width < 16 {
+            self.search_bar = Rect::default();
+            self.table_hit = TableHit::default();
+            self.header_hits = HeaderHits::default();
             return;
         }
 
@@ -910,6 +902,16 @@ mod tests {
         assert_eq!(
             p.items[p.filtered[0]].title.as_deref(),
             Some("Subagent Research")
+        );
+
+        // 's' cycles sort columns across visible headers (Title -> Workspace), then click restores Title ↓.
+        p.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(
+            p.sort,
+            ConversationSort {
+                field: ConversationSortField::Workspace,
+                dir: SortDir::Asc,
+            }
         );
 
         // Live refresh preserves highlighted conversation and active search mode.

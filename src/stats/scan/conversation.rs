@@ -87,7 +87,7 @@ struct RootWatchFingerprint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::stats) struct ConversationsListFingerprint {
     roots: Vec<RootWatchFingerprint>,
-    dbs: Vec<(String, Option<DbFileFingerprint>)>,
+    dbs: Vec<(String, Option<i64>, u64)>,
 }
 
 /// Computes a zero-SQLite-open change fingerprint across all AGY roots' conversation lists.
@@ -107,12 +107,10 @@ pub(in crate::stats) fn conversations_list_fingerprint(
             }
         })
         .collect();
-    let mut dbs: Vec<(String, Option<DbFileFingerprint>)> = discover_sqlite_db_targets(roots)
+    // `list_conversations` reads only `conversation_summaries.db` plus each DB's mtime & size.
+    let mut dbs: Vec<(String, Option<i64>, u64)> = discover_sqlite_db_targets(roots)
         .into_iter()
-        .map(|t| {
-            let fp = db_file_fingerprint(&t.path);
-            (t.conversation_id, fp)
-        })
+        .map(|t| (t.conversation_id, t.db_mtime_secs, t.db_size_bytes))
         .collect();
     dbs.sort_by(|a, b| a.0.cmp(&b.0));
     ConversationsListFingerprint {
