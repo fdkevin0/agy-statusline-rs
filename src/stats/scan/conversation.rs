@@ -1,12 +1,14 @@
 //! Single-conversation stats reporting and historical conversation catalog.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use super::{
-    deduplicate_parent_priority_turns, discover_sqlite_db_targets, extract_sqlite_db_turns,
-    merge_raw_turn, valid_decode_speed, valid_ttft_secs, RawTurn, TurnPricer,
+    db_file_fingerprint, deduplicate_parent_priority_turns, discover_sqlite_db_targets,
+    extract_sqlite_db_turns, merge_raw_turn, valid_decode_speed, valid_ttft_secs,
+    DbFileFingerprint, RawTurn, TurnPricer,
 };
 use crate::agy::db::{
     compute_median, is_safe_sqlite_file, is_valid_uuid, open_readonly_db,
@@ -21,6 +23,103 @@ use crate::stats::{
 use crate::sys::fmt::sanitize_inline_text;
 use crate::sys::fs::modified_timestamp;
 use crate::sys::time::TimeZoneSpec;
+
+/// Lightweight metadata-only fingerprint for live-watching a single conversation and its subagents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::stats) struct ConversationWatchFingerprint {
+    root_idx: Option<usize>,
+    conv_dir_mtime: Option<(i64, u32)>,
+    summaries_fp: Option<DbFileFingerprint>,
+    main_fp: Option<DbFileFingerprint>,
+    subagent_fps: Vec<(String, Option<DbFileFingerprint>)>,
+}
+
+/// Computes a zero-SQLite-open change fingerprint for a conversation, its `conversation_summaries.db`,
+/// its `conversations/` directory, and all currently known descendant subagent DBs.
+pub(in crate::stats) fn conversation_watch_fingerprint(
+    roots: &[(&'static str, PathBuf)],
+    conv_id: &str,
+    known_subagent_ids: &[String],
+) -> ConversationWatchFingerprint {
+    for (idx, (_, root)) in roots.iter().enumerate() {
+        let Some(db_path) = resolve_conversation_db_path(root, conv_id) else {
+            continue;
+        };
+        let conv_dir_mtime = fs::symlink_metadata(root.join("conversations"))
+            .ok()
+            .map(|m| modified_timestamp(&m));
+        let summaries_fp = db_file_fingerprint(&root.join("conversation_summaries.db"));
+        let main_fp = db_file_fingerprint(&db_path);
+        let mut subagent_fps: Vec<(String, Option<DbFileFingerprint>)> = known_subagent_ids
+            .iter()
+            .map(|sub_id| {
+                let fp = resolve_conversation_db_path(root, sub_id)
+                    .and_then(|p| db_file_fingerprint(&p));
+                (sub_id.clone(), fp)
+            })
+            .collect();
+        subagent_fps.sort_by(|a, b| a.0.cmp(&b.0));
+        return ConversationWatchFingerprint {
+            root_idx: Some(idx),
+            conv_dir_mtime,
+            summaries_fp,
+            main_fp,
+            subagent_fps,
+        };
+    }
+
+    ConversationWatchFingerprint {
+        root_idx: None,
+        conv_dir_mtime: None,
+        summaries_fp: None,
+        main_fp: None,
+        subagent_fps: Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootWatchFingerprint {
+    dir_mtime: Option<(i64, u32)>,
+    summaries_fp: Option<DbFileFingerprint>,
+}
+
+/// Lightweight metadata-only fingerprint for live-watching the historical conversations list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::stats) struct ConversationsListFingerprint {
+    roots: Vec<RootWatchFingerprint>,
+    dbs: Vec<(String, Option<DbFileFingerprint>)>,
+}
+
+/// Computes a zero-SQLite-open change fingerprint across all AGY roots' conversation lists.
+pub(in crate::stats) fn conversations_list_fingerprint(
+    roots: &[(&'static str, PathBuf)],
+) -> ConversationsListFingerprint {
+    let root_fps = roots
+        .iter()
+        .map(|(_, root)| {
+            let dir_mtime = fs::symlink_metadata(root.join("conversations"))
+                .ok()
+                .map(|m| modified_timestamp(&m));
+            let summaries_fp = db_file_fingerprint(&root.join("conversation_summaries.db"));
+            RootWatchFingerprint {
+                dir_mtime,
+                summaries_fp,
+            }
+        })
+        .collect();
+    let mut dbs: Vec<(String, Option<DbFileFingerprint>)> = discover_sqlite_db_targets(roots)
+        .into_iter()
+        .map(|t| {
+            let fp = db_file_fingerprint(&t.path);
+            (t.conversation_id, fp)
+        })
+        .collect();
+    dbs.sort_by(|a, b| a.0.cmp(&b.0));
+    ConversationsListFingerprint {
+        roots: root_fps,
+        dbs,
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ResolvedConversationTarget {

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEventKind};
-use ratatui::layout::{Alignment, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Flex, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -22,11 +22,15 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use super::metric::StatsMetric;
+use super::metric::{ConversationSort, StatsMetric, StatsTuiPrefs, TurnSort};
 use super::pricing::{
     fetch_models_dev_via_curl, PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS,
 };
-use super::scan::{collect_conversation_stats_report, list_conversations};
+use super::scan::{
+    collect_conversation_stats_report, conversation_watch_fingerprint,
+    conversations_list_fingerprint, list_conversations, ConversationWatchFingerprint,
+    ConversationsListFingerprint,
+};
 use super::{ConversationStatsReport, PeriodSummary};
 use crate::sys::fmt::format_tokens_string as fmt_tok;
 use crate::sys::terminal::enter_tui;
@@ -173,6 +177,87 @@ impl Palette {
 
 pub(super) fn right_cell(text: impl Into<String>, style: Style) -> Cell<'static> {
     Cell::from(Text::from(text.into()).alignment(Alignment::Right)).style(style)
+}
+
+/// Exact horizontal click zone for a single table header column.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ColumnHit<C> {
+    pub(super) col: C,
+    pub(super) x0: u16,
+    pub(super) x1: u16,
+}
+
+/// Row and column bounds for clicking table headers to change sort order.
+#[derive(Debug, Clone)]
+pub(super) struct HeaderHits<C> {
+    pub(super) y: u16,
+    pub(super) cols: Vec<ColumnHit<C>>,
+}
+
+impl<C> Default for HeaderHits<C> {
+    fn default() -> Self {
+        Self {
+            y: u16::MAX,
+            cols: Vec::new(),
+        }
+    }
+}
+
+impl<C: Copy> HeaderHits<C> {
+    pub(super) fn col_at(&self, pos: Position) -> Option<C> {
+        if pos.y != self.y {
+            return None;
+        }
+        self.cols
+            .iter()
+            .find(|c| pos.x >= c.x0 && pos.x < c.x1)
+            .map(|c| c.col)
+    }
+}
+
+/// Computes horizontal column header click zones matching `ratatui::widgets::Table` layout.
+pub(super) fn compute_header_hits<C: Copy>(
+    table_area: Rect,
+    cols: &[C],
+    widths: &[Constraint],
+    chrome: TableChrome,
+    highlight_symbol_width: u16,
+) -> HeaderHits<C> {
+    if !chrome.header || cols.is_empty() || cols.len() != widths.len() {
+        return HeaderHits::default();
+    }
+    let border = u16::from(chrome.border);
+    let inner_x = table_area.x.saturating_add(border);
+    let inner_w = table_area.width.saturating_sub(border * 2);
+    let sym_w = if chrome.highlight {
+        highlight_symbol_width.min(inner_w)
+    } else {
+        0
+    };
+    let header_y = table_area.y.saturating_add(border);
+    let cols_area = Rect::new(
+        inner_x.saturating_add(sym_w),
+        header_y,
+        inner_w.saturating_sub(sym_w),
+        1,
+    );
+    let rects = Layout::horizontal(widths)
+        .spacing(1)
+        .flex(Flex::Start)
+        .split(cols_area);
+    let hits = cols
+        .iter()
+        .zip(rects.iter())
+        .map(|(&col, r)| ColumnHit {
+            col,
+            x0: r.x,
+            x1: r.right(),
+        })
+        .collect();
+    HeaderHits {
+        y: header_y,
+        cols: hits,
+    }
 }
 
 /// Shared hit-testing rectangle for any scrollable `ratatui::widgets::Table`.
@@ -367,12 +452,19 @@ enum Screen {
     Detail,
 }
 
+/// Interval between lightweight metadata-only live watch checks on Conversations / Detail screens.
+const LIVE_WATCH_INTERVAL: Duration = Duration::from_millis(500);
+
+type PrefsChangeCallback =
+    Box<dyn FnMut(Option<StatsMetric>, Option<TurnSort>, Option<ConversationSort>)>;
+
 struct StatsApp {
     roots: Vec<(&'static str, PathBuf)>,
     cache_dir: Option<PathBuf>,
     tz: TimeZoneSpec,
     timezone: String,
-    default_metric: StatsMetric,
+    prefs: StatsTuiPrefs,
+    on_prefs_change: Option<PrefsChangeCallback>,
     pricing: Option<PricingCatalog>,
     screen: Screen,
     origin: Screen,
@@ -380,13 +472,103 @@ struct StatsApp {
     dashboard: Option<DashboardScreen>,
     picker: Option<PickerScreen>,
     detail: Option<DetailScreen>,
+    last_watch_check: Instant,
+    detail_watch_fp: Option<ConversationWatchFingerprint>,
+    picker_watch_fp: Option<ConversationsListFingerprint>,
 }
 
 impl StatsApp {
     fn active_metric(&self) -> StatsMetric {
         self.dashboard
             .as_ref()
-            .map_or(self.default_metric, DashboardScreen::active_metric)
+            .map_or(self.prefs.metric, DashboardScreen::active_metric)
+    }
+
+    fn sync_prefs(&mut self) {
+        let mut changed_metric = None;
+        let mut changed_turn_sort = None;
+        let mut changed_conv_sort = None;
+
+        if let Some(d) = self.dashboard.as_ref() {
+            let m = d.active_metric();
+            if m != self.prefs.metric {
+                self.prefs.metric = m;
+                changed_metric = Some(m);
+            }
+        }
+        if let Some(d) = self.detail.as_ref() {
+            let ts = d.sort();
+            if ts != self.prefs.turn_sort {
+                self.prefs.turn_sort = ts;
+                changed_turn_sort = Some(ts);
+            }
+        }
+        if let Some(p) = self.picker.as_ref() {
+            let cs = p.sort();
+            if cs != self.prefs.conv_sort {
+                self.prefs.conv_sort = cs;
+                changed_conv_sort = Some(cs);
+            }
+        }
+        if (changed_metric.is_some() || changed_turn_sort.is_some() || changed_conv_sort.is_some())
+            && self.on_prefs_change.is_some()
+        {
+            if let Some(cb) = self.on_prefs_change.as_mut() {
+                cb(changed_metric, changed_turn_sort, changed_conv_sort);
+            }
+        }
+    }
+
+    fn refresh_detail_watch_fp(&mut self) {
+        self.detail_watch_fp = self.detail.as_ref().map(|d| {
+            let subs = d.subagent_ids();
+            conversation_watch_fingerprint(&self.roots, d.conversation_id(), &subs)
+        });
+    }
+
+    fn refresh_picker_watch_fp(&mut self) {
+        self.picker_watch_fp = Some(conversations_list_fingerprint(&self.roots));
+    }
+
+    fn poll_live_watch(&mut self) {
+        if self.last_watch_check.elapsed() < LIVE_WATCH_INTERVAL {
+            return;
+        }
+        self.last_watch_check = Instant::now();
+
+        match self.screen {
+            Screen::Detail => {
+                let Some((conv_id, sub_ids)) = self
+                    .detail
+                    .as_ref()
+                    .map(|d| (d.conversation_id().to_string(), d.subagent_ids()))
+                else {
+                    return;
+                };
+                let fp = conversation_watch_fingerprint(&self.roots, &conv_id, &sub_ids);
+                if self.detail_watch_fp.as_ref() == Some(&fp) {
+                    return;
+                }
+                if let Ok((updated, _)) = self.load_conversation_report(&conv_id) {
+                    if let Some(d) = self.detail.as_mut() {
+                        d.apply_live_report(updated);
+                    }
+                    self.refresh_detail_watch_fp();
+                }
+            }
+            Screen::Conversations => {
+                let fp = conversations_list_fingerprint(&self.roots);
+                if self.picker_watch_fp.as_ref() == Some(&fp) {
+                    return;
+                }
+                let refreshed = list_conversations(&self.roots, &self.tz);
+                if let Some(p) = self.picker.as_mut() {
+                    p.refresh_items_live(refreshed);
+                }
+                self.picker_watch_fp = Some(fp);
+            }
+            Screen::Dashboard => {}
+        }
     }
 
     fn back_screen(&self) -> Option<Screen> {
@@ -440,8 +622,18 @@ impl StatsApp {
         let items = list_conversations(&self.roots, &self.tz);
         match self.picker.as_mut() {
             Some(p) => p.replace_items(items, active_id.as_deref()),
-            None => self.picker = Some(PickerScreen::new(items, active_id.as_deref(), None, false)),
+            None => {
+                self.picker = Some(PickerScreen::new(
+                    items,
+                    active_id.as_deref(),
+                    None,
+                    false,
+                    self.prefs.conv_sort,
+                ))
+            }
         }
+        self.refresh_picker_watch_fp();
+        self.last_watch_check = Instant::now();
         self.screen = Screen::Conversations;
     }
 
@@ -457,9 +649,11 @@ impl StatsApp {
                 if let Some(p) = self.picker.as_mut() {
                     p.set_active_id(Some(&report.conversation_id));
                 }
-                let mut detail = DetailScreen::new(report);
+                let mut detail = DetailScreen::new(report, self.prefs.turn_sort);
                 detail.set_status_msg(msg);
                 self.detail = Some(detail);
+                self.refresh_detail_watch_fp();
+                self.last_watch_check = Instant::now();
                 self.opened_from_picker = true;
                 self.screen = Screen::Detail;
             }
@@ -479,12 +673,16 @@ impl StatsApp {
             if let (Some(p), Some(d)) = (self.picker.as_mut(), self.detail.as_ref()) {
                 p.set_active_id(Some(d.conversation_id()));
             }
+            self.refresh_picker_watch_fp();
+        } else if prev == Screen::Detail {
+            self.refresh_detail_watch_fp();
         }
+        self.last_watch_check = Instant::now();
         self.screen = prev;
         false
     }
 
-    fn run(mut self, pal: &Palette) -> io::Result<StatsMetric> {
+    fn run(mut self, pal: &Palette) -> io::Result<StatsTuiPrefs> {
         let (_guard, mut terminal) = enter_tui()?;
 
         loop {
@@ -492,6 +690,7 @@ impl StatsApp {
                 .dashboard
                 .as_mut()
                 .is_some_and(DashboardScreen::poll_scan);
+            self.poll_live_watch();
             let has_back = self.back_screen().is_some();
 
             terminal.draw(|frame| match self.screen {
@@ -512,9 +711,19 @@ impl StatsApp {
                 }
             })?;
 
-            // Poll only while a background scan is active; block at 0% CPU when idle.
-            if scanning && !event::poll(Duration::from_millis(50))? {
-                continue;
+            // Poll during background dashboard scans or active live-watch screens;
+            // block at 0% CPU when Dashboard is idle.
+            if scanning {
+                if !event::poll(Duration::from_millis(50))? {
+                    continue;
+                }
+            } else if matches!(self.screen, Screen::Conversations | Screen::Detail) {
+                let wait = LIVE_WATCH_INTERVAL
+                    .saturating_sub(self.last_watch_check.elapsed())
+                    .max(Duration::from_millis(20));
+                if !event::poll(wait)? {
+                    continue;
+                }
             }
 
             let evt = event::read()?;
@@ -535,6 +744,7 @@ impl StatsApp {
                         }
                         _ => StatsAction::Continue,
                     };
+                    self.sync_prefs();
                     match action {
                         StatsAction::Quit => break,
                         StatsAction::OpenConversations => self.open_conversations(),
@@ -558,6 +768,7 @@ impl StatsApp {
                             .map_or(PickerAction::Continue, |p| p.handle_mouse(mouse)),
                         _ => PickerAction::Continue,
                     };
+                    self.sync_prefs();
                     match action {
                         PickerAction::Continue => {}
                         PickerAction::Quit => break,
@@ -578,6 +789,8 @@ impl StatsApp {
                                     start.elapsed().as_secs_f64() * 1_000.0
                                 ));
                             }
+                            self.refresh_picker_watch_fp();
+                            self.last_watch_check = Instant::now();
                         }
                         PickerAction::Select(conv_id) => self.open_conversation(&conv_id),
                     }
@@ -597,6 +810,7 @@ impl StatsApp {
                         }
                         _ => DetailAction::Continue,
                     };
+                    self.sync_prefs();
                     match action {
                         DetailAction::Continue => {}
                         DetailAction::Quit => break,
@@ -622,6 +836,8 @@ impl StatsApp {
                                                 elapsed.as_secs_f64() * 1_000.0
                                             ));
                                         }
+                                        self.refresh_detail_watch_fp();
+                                        self.last_watch_check = Instant::now();
                                     }
                                     Err(err) => {
                                         if let Some(d) = self.detail.as_mut() {
@@ -638,7 +854,8 @@ impl StatsApp {
 
         drop(terminal);
         drop(_guard);
-        Ok(self.active_metric())
+        self.prefs.metric = self.active_metric();
+        Ok(self.prefs)
     }
 }
 
@@ -649,11 +866,16 @@ fn require_tty(msg: &'static str) -> io::Result<()> {
     Ok(())
 }
 
-/// Launches the interactive `agy-statusline stats` TUI dashboard and returns the final metric.
-pub fn run_stats_tui(
+/// Launches the interactive `agy-statusline stats` TUI dashboard and returns the final preferences.
+pub fn run_stats_tui<F>(
     roots: Vec<(&'static str, PathBuf)>,
     opts: &super::StatsOptions<'_>,
-) -> io::Result<StatsMetric> {
+    prefs: StatsTuiPrefs,
+    on_prefs_change: F,
+) -> io::Result<StatsTuiPrefs>
+where
+    F: FnMut(Option<StatsMetric>, Option<TurnSort>, Option<ConversationSort>) + 'static,
+{
     require_tty("interactive stats requires a TTY (use --plain or --json)")?;
     let tz = TimeZoneSpec::local();
     let timezone = tz.format_offset_at(opts.now_unix_secs as i64);
@@ -673,7 +895,11 @@ pub fn run_stats_tui(
         cache_dir: opts.cache_dir.map(Path::to_path_buf),
         tz,
         timezone,
-        default_metric: opts.metric,
+        prefs: StatsTuiPrefs {
+            metric: opts.metric,
+            ..prefs
+        },
+        on_prefs_change: Some(Box::new(on_prefs_change)),
         pricing: None,
         screen: Screen::Dashboard,
         origin: Screen::Dashboard,
@@ -681,16 +907,24 @@ pub fn run_stats_tui(
         dashboard: Some(dashboard),
         picker: None,
         detail: None,
+        last_watch_check: Instant::now(),
+        detail_watch_fp: None,
+        picker_watch_fp: None,
     }
     .run(&pal)
 }
 
 /// Launches the interactive single-conversation stats TUI (`agy-statusline stats <CONVERSATION_ID>`).
-pub fn run_conversation_stats_tui(
+pub fn run_conversation_stats_tui<F>(
     roots: &[(&'static str, PathBuf)],
     conversation_query: &str,
     opts: &super::StatsOptions<'_>,
-) -> io::Result<()> {
+    prefs: StatsTuiPrefs,
+    on_prefs_change: F,
+) -> io::Result<StatsTuiPrefs>
+where
+    F: FnMut(Option<StatsMetric>, Option<TurnSort>, Option<ConversationSort>) + 'static,
+{
     require_tty("interactive stats requires a TTY (use --plain, --all, or --json)")?;
     // Load synchronously before entering alternate screen so invalid/missing IDs
     // return a clean stderr error without flashing the terminal.
@@ -711,6 +945,9 @@ pub fn run_conversation_stats_tui(
         &pricing,
         opts.metric,
     )?;
+    let detail = DetailScreen::new(report, prefs.turn_sort);
+    let sub_ids = detail.subagent_ids();
+    let detail_fp = conversation_watch_fingerprint(roots, detail.conversation_id(), &sub_ids);
     let pal = Palette {
         no_color: opts.no_color,
         ascii: opts.ascii,
@@ -720,30 +957,42 @@ pub fn run_conversation_stats_tui(
         cache_dir: opts.cache_dir.map(Path::to_path_buf),
         tz,
         timezone,
-        default_metric: opts.metric,
+        prefs: StatsTuiPrefs {
+            metric: opts.metric,
+            ..prefs
+        },
+        on_prefs_change: Some(Box::new(on_prefs_change)),
         pricing: Some(pricing),
         screen: Screen::Detail,
         origin: Screen::Detail,
         opened_from_picker: false,
         dashboard: None,
         picker: None,
-        detail: Some(DetailScreen::new(report)),
+        detail: Some(detail),
+        last_watch_check: Instant::now(),
+        detail_watch_fp: Some(detail_fp),
+        picker_watch_fp: None,
     }
-    .run(&pal)?;
-    Ok(())
+    .run(&pal)
 }
 
 /// Launches the full-screen historical conversation picker TUI (`agy-statusline conversations`).
-pub fn run_conversations_tui(
+pub fn run_conversations_tui<F>(
     roots: &[(&'static str, PathBuf)],
     initial_query: Option<&str>,
     show_subagents: bool,
     opts: &super::StatsOptions<'_>,
-) -> io::Result<()> {
+    prefs: StatsTuiPrefs,
+    on_prefs_change: F,
+) -> io::Result<StatsTuiPrefs>
+where
+    F: FnMut(Option<StatsMetric>, Option<TurnSort>, Option<ConversationSort>) + 'static,
+{
     require_tty("interactive conversations requires a TTY (use --plain or --json)")?;
     let tz = TimeZoneSpec::local();
     let timezone = tz.format_offset_at(opts.now_unix_secs as i64);
     let items = list_conversations(roots, &tz);
+    let picker_fp = conversations_list_fingerprint(roots);
     let pal = Palette {
         no_color: opts.no_color,
         ascii: opts.ascii,
@@ -753,7 +1002,11 @@ pub fn run_conversations_tui(
         cache_dir: opts.cache_dir.map(Path::to_path_buf),
         tz,
         timezone,
-        default_metric: opts.metric,
+        prefs: StatsTuiPrefs {
+            metric: opts.metric,
+            ..prefs
+        },
+        on_prefs_change: Some(Box::new(on_prefs_change)),
         pricing: None,
         screen: Screen::Conversations,
         origin: Screen::Conversations,
@@ -764,16 +1017,29 @@ pub fn run_conversations_tui(
             None,
             initial_query,
             show_subagents,
+            prefs.conv_sort,
         )),
         detail: None,
+        last_watch_check: Instant::now(),
+        detail_watch_fp: None,
+        picker_watch_fp: Some(picker_fp),
     }
-    .run(&pal)?;
-    Ok(())
+    .run(&pal)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::fs;
+    use std::rc::Rc;
+
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use rusqlite::Connection;
+
     use super::*;
+    use crate::agy::protobuf::encode_step_meta_blob;
+    use crate::stats::metric::{ConversationSortField, SortDir, TurnSortField};
+    use crate::stats::test_helpers::build_gen_blob;
 
     fn test_app(origin: Screen) -> StatsApp {
         StatsApp {
@@ -781,7 +1047,8 @@ mod tests {
             cache_dir: None,
             tz: TimeZoneSpec::utc(),
             timezone: "UTC".to_string(),
-            default_metric: StatsMetric::Total,
+            prefs: StatsTuiPrefs::default(),
+            on_prefs_change: None,
             pricing: None,
             screen: origin,
             origin,
@@ -789,6 +1056,9 @@ mod tests {
             dashboard: None,
             picker: None,
             detail: None,
+            last_watch_check: Instant::now(),
+            detail_watch_fp: None,
+            picker_watch_fp: None,
         }
     }
 
@@ -831,5 +1101,175 @@ mod tests {
         assert!(!det.pop_or_quit());
         assert_eq!(det.screen, Screen::Conversations);
         assert!(det.pop_or_quit());
+    }
+
+    #[test]
+    fn live_watch_reloads_new_turns_and_persists_remembered_sort_across_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cli");
+        let conv_dir = root.join("conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+
+        let id_a = "11111111-1111-4111-8111-111111111111";
+        let id_b = "22222222-2222-4222-8222-222222222222";
+        let db_a = conv_dir.join(format!("{id_a}.db"));
+        let conn_a = Connection::open(&db_a).unwrap();
+        conn_a
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);
+                 CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+            )
+            .unwrap();
+        conn_a
+            .execute(
+                "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+                [encode_step_meta_blob(1_795_500_000)],
+            )
+            .unwrap();
+        conn_a
+            .execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+                [build_gen_blob(
+                    Some(1),
+                    1526,
+                    "model-alpha",
+                    "Model Alpha",
+                    1_000,
+                    4_000,
+                    500,
+                    100,
+                    5,
+                    800,
+                    Some(0.10),
+                )],
+            )
+            .unwrap();
+
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let saved_cb = Rc::clone(&saved);
+
+        let mut app = test_app(Screen::Conversations);
+        app.roots = vec![("cli", root.clone())];
+        app.pricing = Some(PricingCatalog::load_effective_with(
+            None,
+            SyncMode::Offline,
+            1_795_500_100,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| unreachable!(),
+        ));
+        app.on_prefs_change = Some(Box::new(move |m, ts, cs| {
+            saved_cb.borrow_mut().push((m, ts, cs));
+        }));
+
+        // Open Conversations list -> open conversation A -> change sort -> saved & remembered.
+        app.open_conversations();
+        app.open_conversation(id_a);
+        assert_eq!(app.detail.as_ref().unwrap().sort(), TurnSort::default());
+
+        app.detail
+            .as_mut()
+            .unwrap()
+            .handle_key(KeyCode::Char('S'), KeyModifiers::NONE, true);
+        app.sync_prefs();
+        let expected_turn_sort = TurnSort {
+            field: TurnSortField::Turn,
+            dir: SortDir::Desc,
+        };
+        assert_eq!(app.prefs.turn_sort, expected_turn_sort);
+        assert_eq!(
+            saved.borrow().last(),
+            Some(&(None, Some(expected_turn_sort), None))
+        );
+
+        // Write a second turn to conversation A (in WAL mode) and trigger live watch check.
+        conn_a
+            .execute(
+                "INSERT INTO steps (idx, metadata) VALUES (2, ?1)",
+                [encode_step_meta_blob(1_795_500_060)],
+            )
+            .unwrap();
+        conn_a
+            .execute(
+                "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
+                [build_gen_blob(
+                    Some(2),
+                    1526,
+                    "model-alpha",
+                    "Model Alpha",
+                    2_000,
+                    8_000,
+                    600,
+                    120,
+                    6,
+                    900,
+                    Some(0.20),
+                )],
+            )
+            .unwrap();
+        app.last_watch_check = Instant::now() - LIVE_WATCH_INTERVAL - Duration::from_millis(10);
+        app.poll_live_watch();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.detail.as_mut().unwrap().draw(
+                    frame,
+                    true,
+                    &Palette {
+                        no_color: true,
+                        ascii: false,
+                    },
+                )
+            })
+            .unwrap();
+        let detail_buf: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(detail_buf.contains("1. Turns (2 · # ↓)"), "{detail_buf}");
+
+        // Back to Conversations, add conversation B on disk, live watch picks it up automatically.
+        assert!(!app.pop_or_quit());
+        assert_eq!(app.screen, Screen::Conversations);
+        let conn_b = Connection::open(conv_dir.join(format!("{id_b}.db"))).unwrap();
+        conn_b
+            .execute_batch(
+                "CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);
+                 CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+            )
+            .unwrap();
+        drop(conn_b);
+        app.last_watch_check = Instant::now() - LIVE_WATCH_INTERVAL - Duration::from_millis(10);
+        app.poll_live_watch();
+
+        // Opening conversation B inherits the remembered `turn_sort` (`# ↓`).
+        app.open_conversation(id_b);
+        assert_eq!(app.detail.as_ref().unwrap().sort(), expected_turn_sort);
+
+        // Changing picker sort triggers persistence callback for `conv_sort`.
+        assert!(!app.pop_or_quit());
+        app.picker
+            .as_mut()
+            .unwrap()
+            .handle_key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('S'),
+                KeyModifiers::NONE,
+            ));
+        app.sync_prefs();
+        assert_eq!(
+            saved.borrow().last(),
+            Some(&(
+                None,
+                None,
+                Some(ConversationSort {
+                    field: ConversationSortField::Modified,
+                    dir: SortDir::Asc,
+                }),
+            ))
+        );
     }
 }

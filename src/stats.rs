@@ -16,7 +16,10 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-pub use metric::{MetricValue, StatsMetric};
+pub use metric::{
+    ConversationSort, ConversationSortField, MetricValue, SortDir, StatsMetric, StatsTuiPrefs,
+    TurnSort, TurnSortField,
+};
 pub use model::*;
 pub(crate) use pricing::{
     inspect_pricing_cache, is_pricing_fingerprint_fresh, maybe_spawn_pricing_sync_if_stale,

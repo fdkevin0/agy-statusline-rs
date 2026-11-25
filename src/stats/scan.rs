@@ -3,7 +3,11 @@
 mod conversation;
 mod cost_cache;
 
-pub(in crate::stats) use conversation::{collect_conversation_stats_report, list_conversations};
+pub(in crate::stats) use conversation::{
+    collect_conversation_stats_report, conversation_watch_fingerprint,
+    conversations_list_fingerprint, list_conversations, ConversationWatchFingerprint,
+    ConversationsListFingerprint,
+};
 pub(crate) use cost_cache::{
     estimate_conversation_cost_usd_with_parent_conn, lookup_cached_conversation_cost,
 };
@@ -12,11 +16,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use super::pricing::{is_effort_token, normalize_model_key, round_usd_6, PricingCatalog};
 use super::SqliteStats;
 use crate::agy::db::{
-    compute_median, is_real_dir, is_safe_sqlite_file, is_valid_uuid, open_readonly_db,
-    safe_sqlite_metadata,
+    compute_median, is_absent_or_real_file, is_real_dir, is_safe_sqlite_file, is_valid_uuid,
+    open_readonly_db, safe_sqlite_metadata, sidecar_path,
 };
 use crate::agy::protobuf::{
     extract_gen_metadata_record, extract_step_metadata_record, extract_trajectory_created_at_secs,
@@ -24,6 +30,88 @@ use crate::agy::protobuf::{
 };
 use crate::sys::fs::modified_timestamp;
 use crate::sys::time::TimeZoneSpec;
+
+/// File-level change fingerprint for a SQLite conversation DB and its `-wal` sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct DbFileFingerprint {
+    db_mtime_secs: i64,
+    db_mtime_nanos: u32,
+    db_ctime_secs: i64,
+    db_ctime_nanos: u32,
+    db_size: u64,
+    /// Normalized to `0` when `wal_size == 0` so AGY startup touching idle 0-byte
+    /// `-wal` files does not trigger redundant re-scans.
+    wal_mtime_secs: i64,
+    wal_mtime_nanos: u32,
+    wal_ctime_secs: i64,
+    wal_ctime_nanos: u32,
+    wal_size: u64,
+}
+
+#[cfg(unix)]
+fn status_change_timestamp(meta: &fs::Metadata) -> (i64, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let secs = meta.ctime();
+    let nanos = meta.ctime_nsec().clamp(0, 999_999_999) as u32;
+    (secs, nanos)
+}
+
+#[cfg(not(unix))]
+fn status_change_timestamp(_meta: &fs::Metadata) -> (i64, u32) {
+    (0, 0)
+}
+
+pub(super) fn db_file_fingerprint(db_path: &Path) -> Option<DbFileFingerprint> {
+    let db_meta = fs::symlink_metadata(db_path).ok()?;
+    let db_ft = db_meta.file_type();
+    if db_ft.is_symlink() || !db_ft.is_file() {
+        return None;
+    }
+    if !is_absent_or_real_file(&sidecar_path(db_path, "-shm")) {
+        return None;
+    }
+    let (db_mtime_secs, db_mtime_nanos) = modified_timestamp(&db_meta);
+    let (db_ctime_secs, db_ctime_nanos) = status_change_timestamp(&db_meta);
+    let db_size = db_meta.len();
+
+    let (wal_mtime_secs, wal_mtime_nanos, wal_ctime_secs, wal_ctime_nanos, wal_size) =
+        match fs::symlink_metadata(sidecar_path(db_path, "-wal")) {
+            Ok(wal_meta) => {
+                let wal_ft = wal_meta.file_type();
+                if wal_ft.is_symlink() || !wal_ft.is_file() {
+                    return None;
+                }
+                if wal_meta.len() > 0 {
+                    let (mtime_secs, mtime_nanos) = modified_timestamp(&wal_meta);
+                    let (ctime_secs, ctime_nanos) = status_change_timestamp(&wal_meta);
+                    (
+                        mtime_secs,
+                        mtime_nanos,
+                        ctime_secs,
+                        ctime_nanos,
+                        wal_meta.len(),
+                    )
+                } else {
+                    (0, 0, 0, 0, 0)
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0, 0, 0, 0, 0),
+            Err(_) => return None,
+        };
+
+    Some(DbFileFingerprint {
+        db_mtime_secs,
+        db_mtime_nanos,
+        db_ctime_secs,
+        db_ctime_nanos,
+        db_size,
+        wal_mtime_secs,
+        wal_mtime_nanos,
+        wal_ctime_secs,
+        wal_ctime_nanos,
+        wal_size,
+    })
+}
 
 fn is_effort_qualifier(tag: &str) -> bool {
     let norm: String = tag

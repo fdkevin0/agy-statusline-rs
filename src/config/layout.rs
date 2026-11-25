@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::stats::StatsMetric;
+use crate::stats::{ConversationSort, StatsMetric, StatsTuiPrefs, TurnSort};
 use crate::sys::fs::atomic_write;
 
 /// Maximum number of configurable statusline rows.
@@ -405,9 +405,23 @@ pub struct LayoutConfig {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_stats_metric"
+        deserialize_with = "deserialize_optional_from_str"
     )]
     pub stats_metric: Option<StatsMetric>,
+    /// Last selected single-conversation Turns table sort order (omitted when unset).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_from_str"
+    )]
+    pub conv_turn_sort: Option<TurnSort>,
+    /// Last selected historical conversations list sort order (omitted when unset).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_from_str"
+    )]
+    pub conv_list_sort: Option<ConversationSort>,
     /// Runtime `NO_COLOR` flag injected at the CLI boundary (not serialized).
     #[serde(skip)]
     pub no_color: bool,
@@ -436,6 +450,8 @@ impl LayoutConfig {
             smart_hide: true,
             show_git_diff: true,
             stats_metric: None,
+            conv_turn_sort: None,
+            conv_list_sort: None,
             no_color: false,
         };
         cfg.normalize_rows();
@@ -558,6 +574,8 @@ impl LayoutConfig {
             smart_hide,
             show_git_diff,
             stats_metric: _,
+            conv_turn_sort: _,
+            conv_list_sort: _,
             no_color: _,
         } = self;
         Preset::ALL.iter().copied().find(|p| {
@@ -600,15 +618,14 @@ pub fn save_layout_config(path: &Path, config: &LayoutConfig) -> io::Result<()> 
     atomic_write(path, json.as_bytes())
 }
 
-fn deserialize_optional_stats_metric<'de, D>(
-    deserializer: D,
-) -> Result<Option<StatsMetric>, D::Error>
+fn deserialize_optional_from_str<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: std::str::FromStr,
 {
     let raw = Option::<String>::deserialize(deserializer)?;
-    // Ignore unknown metric strings instead of invalidating config.json.
-    Ok(raw.and_then(|s| s.parse::<StatsMetric>().ok()))
+    // Ignore unknown/legacy values instead of invalidating config.json.
+    Ok(raw.and_then(|s| s.parse::<T>().ok()))
 }
 
 /// Loads the persisted `stats_metric` preference from `config.json`, if valid and set.
@@ -616,6 +633,17 @@ pub fn load_saved_stats_metric(path: &Path) -> Option<StatsMetric> {
     try_load_layout_config(path)
         .ok()
         .and_then(|cfg| cfg.stats_metric)
+}
+
+/// Loads all persisted `stats`/`conversations` TUI preferences from `config.json`.
+pub fn load_saved_stats_tui_prefs(path: &Path) -> StatsTuiPrefs {
+    try_load_layout_config(path)
+        .ok()
+        .map_or_else(StatsTuiPrefs::default, |cfg| StatsTuiPrefs {
+            metric: cfg.stats_metric.unwrap_or_default(),
+            turn_sort: cfg.conv_turn_sort.unwrap_or_default(),
+            conv_sort: cfg.conv_list_sort.unwrap_or_default(),
+        })
 }
 
 /// Persists `metric` into `config.json` without disturbing existing layout settings.
@@ -632,6 +660,44 @@ pub fn save_stats_metric(path: &Path, metric: StatsMetric) -> io::Result<()> {
         return Ok(());
     }
     cfg.stats_metric = Some(metric);
+    save_layout_config(path, &cfg)
+}
+
+/// Persists changed `stats`/`conversations` TUI preferences into `config.json`
+/// without disturbing layout settings or clobbering corrupt files.
+pub fn save_stats_tui_prefs(
+    path: &Path,
+    metric: Option<StatsMetric>,
+    turn_sort: Option<TurnSort>,
+    conv_sort: Option<ConversationSort>,
+) -> io::Result<()> {
+    let mut cfg = match try_load_layout_config(path) {
+        Ok(cfg) => cfg,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => LayoutConfig::default(),
+        Err(_) => return Ok(()),
+    };
+    let mut changed = false;
+    if let Some(m) = metric {
+        if cfg.stats_metric != Some(m) {
+            cfg.stats_metric = Some(m);
+            changed = true;
+        }
+    }
+    if let Some(ts) = turn_sort {
+        if cfg.conv_turn_sort != Some(ts) {
+            cfg.conv_turn_sort = Some(ts);
+            changed = true;
+        }
+    }
+    if let Some(cs) = conv_sort {
+        if cfg.conv_list_sort != Some(cs) {
+            cfg.conv_list_sort = Some(cs);
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
     save_layout_config(path, &cfg)
 }
 
@@ -760,5 +826,57 @@ mod tests {
         fs::write(&path, "{broken").unwrap();
         save_stats_metric(&path, StatsMetric::Turns).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "{broken");
+    }
+
+    #[test]
+    fn conv_sort_prefs_persist_and_degrade_gracefully_on_unknown_values() {
+        use crate::stats::{ConversationSortField, SortDir, TurnSortField};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        // Defaults when unset: turn ascending, modified descending.
+        let initial = load_saved_stats_tui_prefs(&path);
+        assert_eq!(
+            initial.turn_sort,
+            TurnSort {
+                field: TurnSortField::Turn,
+                dir: SortDir::Asc,
+            }
+        );
+        assert_eq!(
+            initial.conv_sort,
+            ConversationSort {
+                field: ConversationSortField::Modified,
+                dir: SortDir::Desc,
+            }
+        );
+
+        let cost_desc = TurnSort {
+            field: TurnSortField::Cost,
+            dir: SortDir::Desc,
+        };
+        let steps_asc = ConversationSort {
+            field: ConversationSortField::Steps,
+            dir: SortDir::Asc,
+        };
+        save_stats_tui_prefs(&path, None, Some(cost_desc), Some(steps_asc)).unwrap();
+        let loaded = load_saved_stats_tui_prefs(&path);
+        assert_eq!(loaded.turn_sort, cost_desc);
+        assert_eq!(loaded.conv_sort, steps_asc);
+        assert_eq!(
+            load_layout_config(&path).matching_preset(),
+            Some(Preset::Full)
+        );
+
+        // Unknown persisted sort strings degrade safely to defaults without discarding layout settings.
+        let raw = fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"cost:desc\"", "\"nonexistent:desc\"")
+            .replace("\"steps:asc\"", "\"badfield:asc\"");
+        fs::write(&path, raw).unwrap();
+        let degraded = load_saved_stats_tui_prefs(&path);
+        assert_eq!(degraded.turn_sort, TurnSort::default());
+        assert_eq!(degraded.conv_sort, ConversationSort::default());
     }
 }
