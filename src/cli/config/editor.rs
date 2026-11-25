@@ -182,8 +182,12 @@ impl TuiEditorState {
     /// Applies one of the built-in presets while preserving non-layout preferences.
     pub(super) fn apply_preset(&mut self, preset: Preset) {
         let saved_metric = self.config.stats_metric;
+        let saved_turn_sort = self.config.conv_turn_sort;
+        let saved_list_sort = self.config.conv_list_sort;
         self.config = preset.to_layout();
         self.config.stats_metric = saved_metric;
+        self.config.conv_turn_sort = saved_turn_sort;
+        self.config.conv_list_sort = saved_list_sort;
         self.preset = preset;
         self.canvas_row = 0;
         self.canvas_col = 0;

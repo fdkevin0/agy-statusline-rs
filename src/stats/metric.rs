@@ -266,6 +266,380 @@ impl<'de> Deserialize<'de> for StatsMetric {
     }
 }
 
+/// Sort direction for interactive conversation tables.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SortDir {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl SortDir {
+    pub const fn toggle(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+
+    pub const fn arrow(self, ascii: bool) -> &'static str {
+        match (self, ascii) {
+            (Self::Asc, false) => "↑",
+            (Self::Asc, true) => "^",
+            (Self::Desc, false) => "↓",
+            (Self::Desc, true) => "v",
+        }
+    }
+}
+
+impl fmt::Display for SortDir {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Asc => f.write_str("asc"),
+            Self::Desc => f.write_str("desc"),
+        }
+    }
+}
+
+impl FromStr for SortDir {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "asc" => Ok(Self::Asc),
+            "desc" => Ok(Self::Desc),
+            _ => Err(format!(
+                "unknown sort direction '{raw}'; expected asc or desc"
+            )),
+        }
+    }
+}
+
+/// Sortable column in the single-conversation Turns table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum TurnSortField {
+    #[default]
+    Turn,
+    Time,
+    Model,
+    Context,
+    Input,
+    Cache,
+    Output,
+    CacheHit,
+    Speed,
+    Ttft,
+    Cost,
+}
+
+impl TurnSortField {
+    /// Natural initial sort direction when switching to this column.
+    pub const fn default_dir(self) -> SortDir {
+        match self {
+            Self::Turn | Self::Time | Self::Model | Self::CacheHit => SortDir::Asc,
+            Self::Context
+            | Self::Input
+            | Self::Cache
+            | Self::Output
+            | Self::Speed
+            | Self::Ttft
+            | Self::Cost => SortDir::Desc,
+        }
+    }
+
+    /// Column header text shown in the Turns table.
+    pub const fn header_label(self) -> &'static str {
+        match self {
+            Self::Turn => "#",
+            Self::Time => "Time",
+            Self::Model => "Model",
+            Self::Context => "Ctx",
+            Self::Input => "Input",
+            Self::Cache => "Cache",
+            Self::Output => "Out",
+            Self::CacheHit => "Hit%",
+            Self::Speed => "tok/s",
+            Self::Ttft => "TTFT",
+            Self::Cost => "Cost",
+        }
+    }
+}
+
+impl fmt::Display for TurnSortField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Turn => f.write_str("turn"),
+            Self::Time => f.write_str("time"),
+            Self::Model => f.write_str("model"),
+            Self::Context => f.write_str("ctx"),
+            Self::Input => f.write_str("input"),
+            Self::Cache => f.write_str("cache"),
+            Self::Output => f.write_str("output"),
+            Self::CacheHit => f.write_str("cache_hit"),
+            Self::Speed => f.write_str("speed"),
+            Self::Ttft => f.write_str("ttft"),
+            Self::Cost => f.write_str("cost"),
+        }
+    }
+}
+
+impl FromStr for TurnSortField {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "turn" | "index" | "#" => Ok(Self::Turn),
+            "time" => Ok(Self::Time),
+            "model" => Ok(Self::Model),
+            "ctx" | "context" => Ok(Self::Context),
+            "input" => Ok(Self::Input),
+            "cache" => Ok(Self::Cache),
+            "output" | "out" => Ok(Self::Output),
+            "cache_hit" | "hit" => Ok(Self::CacheHit),
+            "speed" | "tok/s" => Ok(Self::Speed),
+            "ttft" => Ok(Self::Ttft),
+            "cost" => Ok(Self::Cost),
+            _ => Err(format!("unknown turn sort field '{raw}'")),
+        }
+    }
+}
+
+/// Active sort column and direction for the single-conversation Turns table (defaults to `# ↑`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TurnSort {
+    pub field: TurnSortField,
+    pub dir: SortDir,
+}
+
+impl Default for TurnSort {
+    fn default() -> Self {
+        Self {
+            field: TurnSortField::Turn,
+            dir: SortDir::Asc,
+        }
+    }
+}
+
+impl TurnSort {
+    /// Selects `field` with its natural direction, or toggles direction if already active.
+    pub const fn click(self, field: TurnSortField) -> Self {
+        if self.field as u8 == field as u8 {
+            Self {
+                field,
+                dir: self.dir.toggle(),
+            }
+        } else {
+            Self {
+                field,
+                dir: field.default_dir(),
+            }
+        }
+    }
+
+    pub const fn toggle_dir(self) -> Self {
+        Self {
+            field: self.field,
+            dir: self.dir.toggle(),
+        }
+    }
+
+    pub fn label(self, ascii: bool) -> String {
+        format!("{} {}", self.field.header_label(), self.dir.arrow(ascii))
+    }
+}
+
+impl fmt::Display for TurnSort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.field, self.dir)
+    }
+}
+
+impl FromStr for TurnSort {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let trimmed = raw.trim();
+        let (field_raw, dir_raw) = match trimmed.split_once(':') {
+            Some((f, d)) => (f, Some(d)),
+            None => (trimmed, None),
+        };
+        let field = field_raw.parse::<TurnSortField>()?;
+        let dir = match dir_raw {
+            Some(d) => d.parse::<SortDir>()?,
+            None => field.default_dir(),
+        };
+        Ok(Self { field, dir })
+    }
+}
+
+impl Serialize for TurnSort {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for TurnSort {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Sortable column in the historical conversations list table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ConversationSortField {
+    #[default]
+    Modified,
+    Id,
+    Title,
+    Workspace,
+    Steps,
+    Subagents,
+    Source,
+}
+
+impl ConversationSortField {
+    pub const fn default_dir(self) -> SortDir {
+        match self {
+            Self::Modified | Self::Steps | Self::Subagents => SortDir::Desc,
+            Self::Id | Self::Title | Self::Workspace | Self::Source => SortDir::Asc,
+        }
+    }
+
+    pub const fn header_label(self) -> &'static str {
+        match self {
+            Self::Modified => "Modified",
+            Self::Id => "ID",
+            Self::Title => "Title",
+            Self::Workspace => "Workspace",
+            Self::Steps => "Steps",
+            Self::Subagents => "Sub",
+            Self::Source => "Src",
+        }
+    }
+}
+
+impl fmt::Display for ConversationSortField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Modified => f.write_str("modified"),
+            Self::Id => f.write_str("id"),
+            Self::Title => f.write_str("title"),
+            Self::Workspace => f.write_str("workspace"),
+            Self::Steps => f.write_str("steps"),
+            Self::Subagents => f.write_str("subagents"),
+            Self::Source => f.write_str("source"),
+        }
+    }
+}
+
+impl FromStr for ConversationSortField {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "modified" | "time" => Ok(Self::Modified),
+            "id" => Ok(Self::Id),
+            "title" => Ok(Self::Title),
+            "workspace" | "ws" => Ok(Self::Workspace),
+            "steps" => Ok(Self::Steps),
+            "subagents" | "sub" => Ok(Self::Subagents),
+            "source" | "src" => Ok(Self::Source),
+            _ => Err(format!("unknown conversation sort field '{raw}'")),
+        }
+    }
+}
+
+/// Active sort column and direction for the conversations picker (defaults to `Modified ↓`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConversationSort {
+    pub field: ConversationSortField,
+    pub dir: SortDir,
+}
+
+impl Default for ConversationSort {
+    fn default() -> Self {
+        Self {
+            field: ConversationSortField::Modified,
+            dir: SortDir::Desc,
+        }
+    }
+}
+
+impl ConversationSort {
+    pub const fn click(self, field: ConversationSortField) -> Self {
+        if self.field as u8 == field as u8 {
+            Self {
+                field,
+                dir: self.dir.toggle(),
+            }
+        } else {
+            Self {
+                field,
+                dir: field.default_dir(),
+            }
+        }
+    }
+
+    pub const fn toggle_dir(self) -> Self {
+        Self {
+            field: self.field,
+            dir: self.dir.toggle(),
+        }
+    }
+
+    pub fn label(self, ascii: bool) -> String {
+        format!("{} {}", self.field.header_label(), self.dir.arrow(ascii))
+    }
+}
+
+impl fmt::Display for ConversationSort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.field, self.dir)
+    }
+}
+
+impl FromStr for ConversationSort {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let trimmed = raw.trim();
+        let (field_raw, dir_raw) = match trimmed.split_once(':') {
+            Some((f, d)) => (f, Some(d)),
+            None => (trimmed, None),
+        };
+        let field = field_raw.parse::<ConversationSortField>()?;
+        let dir = match dir_raw {
+            Some(d) => d.parse::<SortDir>()?,
+            None => field.default_dir(),
+        };
+        Ok(Self { field, dir })
+    }
+}
+
+impl Serialize for ConversationSort {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ConversationSort {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Persisted interactive TUI preferences shared across `stats` and `conversations`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatsTuiPrefs {
+    pub metric: StatsMetric,
+    pub turn_sort: TurnSort,
+    pub conv_sort: ConversationSort,
+}
+
 /// Typed scalar extracted for a [`StatsMetric`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MetricValue {
