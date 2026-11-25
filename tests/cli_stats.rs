@@ -610,3 +610,77 @@ fn cli_conversations_lists_filters_json_and_rejects_non_tty_tui() {
     let stderr = String::from_utf8_lossy(&tui_err.stderr);
     assert!(stderr.contains("requires a TTY"), "{stderr}");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_conv_tui_persists_sort_prefs_and_restores_on_next_launch() {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let now_secs = unix_now_secs();
+    seed_sqlite_fixtures(
+        &home.join(".gemini/antigravity-cli"),
+        now_secs,
+        now_secs.saturating_sub(120),
+    );
+    seed_alpha_rate(&home);
+
+    let bin = common::BIN;
+    let conv_cmd = format!("stty rows 36 cols 120 && exec '{bin}' conv --ascii");
+    let mut tui = common::isolated_cmd("/usr/bin/script", &home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("SHELL", "/bin/sh")
+        .args(["-qec", &conv_cmd, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // First byte confirms TUI started; 'S' flips conv list sort, Enter opens detail,
+    // 'S' flips turn sort (# ^ -> # v), 'q' quits.
+    tui.stdout.as_mut().unwrap().read_exact(&mut [0]).unwrap();
+    tui.stdin.as_mut().unwrap().write_all(b"S\rSq").unwrap();
+    let out1 = tui.wait_with_output().unwrap();
+    assert!(out1.status.success(), "{out1:?}");
+
+    let cfg_path = home.join("config/agy-statusline/config.json");
+    let cfg_raw = fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        cfg_raw.contains("\"conv_list_sort\": \"modified:asc\""),
+        "expected persisted conv_list_sort, got:\n{cfg_raw}"
+    );
+    assert!(
+        cfg_raw.contains("\"conv_turn_sort\": \"turn:desc\""),
+        "expected persisted conv_turn_sort, got:\n{cfg_raw}"
+    );
+
+    // Re-opening the conversation restores the remembered `# v` sort order.
+    let detail_cmd = format!("stty rows 36 cols 120 && exec '{bin}' stats 8d0371e1 --ascii");
+    let mut tui2 = common::isolated_cmd("/usr/bin/script", &home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("SHELL", "/bin/sh")
+        .args(["-qec", &detail_cmd, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    tui2.stdout.as_mut().unwrap().read_exact(&mut [0]).unwrap();
+    tui2.stdin.as_mut().unwrap().write_all(b"q").unwrap();
+    let out2 = tui2.wait_with_output().unwrap();
+    assert!(out2.status.success(), "{out2:?}");
+    let stripped = strip_ansi_escapes::strip_str(String::from_utf8_lossy(&out2.stdout));
+    assert!(
+        stripped.contains("# v"),
+        "expected restored turn:desc sort:\n{stripped}"
+    );
+    assert!(
+        stripped.contains("* Live"),
+        "expected Live indicator:\n{stripped}"
+    );
+}
