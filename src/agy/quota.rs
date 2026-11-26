@@ -1,14 +1,16 @@
 //! Atomic `quota_snapshot.json` persistence and ring-buffer quota burn-rate tracking.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::statusline::QuotaBucket;
-use crate::sys::fs::atomic_write_preserving_mode;
+use crate::sys::fmt::{ascii_values_conflict, trimmed_non_empty};
+use crate::sys::fs::{
+    atomic_write_preserving_mode, is_safe_cache_target, read_bounded_regular_file, BoundedReadError,
+};
 use crate::sys::time::parse_rfc3339_unix_secs;
 
 /// Filename stored under `$XDG_CACHE_HOME/agy-statusline/`.
@@ -204,7 +206,6 @@ pub struct QuotaSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ai_credits: Option<i64>,
     /// Latest normalized quota buckets keyed by bucket identifier.
-    #[serde(with = "quota_map_serde")]
     pub quota: BTreeMap<String, QuotaBucket>,
     /// Per-bucket ring-buffer sample history for burn-rate and depletion ETA calculation.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -215,24 +216,13 @@ impl QuotaSnapshot {
     /// Formats a human-readable tier label combining `plan_tier` and `ultra_tier_label`
     /// (e.g. `"Ultra 20x"`, `"Ultra 5x"`, `"Pro"`).
     pub fn display_plan_tier(&self) -> Option<String> {
-        let tier = self
-            .plan_tier
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let ultra = self
-            .ultra_tier_label
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        let tier = trimmed_non_empty(self.plan_tier.as_deref());
+        let ultra = trimmed_non_empty(self.ultra_tier_label.as_deref());
         match (tier, ultra) {
-            (Some(t), Some(u)) => {
-                if t.to_ascii_lowercase().contains(&u.to_ascii_lowercase()) {
-                    Some(t.to_string())
-                } else {
-                    Some(format!("{t} {u}"))
-                }
+            (Some(t), Some(u)) if t.to_ascii_lowercase().contains(&u.to_ascii_lowercase()) => {
+                Some(t.to_string())
             }
+            (Some(t), Some(u)) => Some(format!("{t} {u}")),
             (Some(t), None) => Some(t.to_string()),
             (None, Some(u)) => Some(format!("Ultra {u}")),
             (None, None) => None,
@@ -257,21 +247,7 @@ impl QuotaSnapshot {
     /// Merges an incoming observation into this snapshot, clearing history on account change
     /// and advancing per-bucket ring buffers.
     pub fn merge_observation(&mut self, incoming: QuotaSnapshot, now_unix_secs: u64) {
-        let account_changed = match (
-            self.email
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-            incoming
-                .email
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-        ) {
-            (Some(prev), Some(next)) => !prev.eq_ignore_ascii_case(next),
-            _ => false,
-        };
-        if account_changed {
+        if ascii_values_conflict(self.email.as_deref(), incoming.email.as_deref()) {
             self.history.clear();
             self.quota.clear();
             self.plan_tier = None;
@@ -361,35 +337,14 @@ pub fn quota_snapshot_path(cache_dir: &Path) -> PathBuf {
 /// Inspects and loads `quota_snapshot.json` from `cache_dir` with symlink and size-cap guards.
 pub fn inspect_quota_snapshot_file(cache_dir: &Path) -> SnapshotFileState {
     let path = quota_snapshot_path(cache_dir);
-    let meta = match fs::symlink_metadata(&path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return SnapshotFileState::Missing,
-        Err(e) => return SnapshotFileState::Invalid(e.to_string()),
+    let (bytes, _) = match read_bounded_regular_file(&path, MAX_QUOTA_SNAPSHOT_BYTES) {
+        Ok(read) => read,
+        Err(BoundedReadError::Missing) => return SnapshotFileState::Missing,
+        Err(BoundedReadError::Symlink) => return SnapshotFileState::Symlink,
+        Err(BoundedReadError::NotAFile) => return SnapshotFileState::NotAFile,
+        Err(BoundedReadError::Oversized(size)) => return SnapshotFileState::Oversized(size),
+        Err(BoundedReadError::Io(e)) => return SnapshotFileState::Invalid(e.to_string()),
     };
-    let ft = meta.file_type();
-    if ft.is_symlink() {
-        return SnapshotFileState::Symlink;
-    }
-    if !ft.is_file() {
-        return SnapshotFileState::NotAFile;
-    }
-    if meta.len() > MAX_QUOTA_SNAPSHOT_BYTES {
-        return SnapshotFileState::Oversized(meta.len());
-    }
-    let file = match File::open(&path) {
-        Ok(f) => f,
-        Err(e) => return SnapshotFileState::Invalid(e.to_string()),
-    };
-    let mut bytes = Vec::with_capacity(meta.len().min(MAX_QUOTA_SNAPSHOT_BYTES) as usize);
-    if let Err(e) = file
-        .take(MAX_QUOTA_SNAPSHOT_BYTES + 1)
-        .read_to_end(&mut bytes)
-    {
-        return SnapshotFileState::Invalid(e.to_string());
-    }
-    if bytes.len() as u64 > MAX_QUOTA_SNAPSHOT_BYTES {
-        return SnapshotFileState::Oversized(bytes.len() as u64);
-    }
     match serde_json::from_slice::<QuotaSnapshot>(&bytes) {
         Ok(snapshot) => SnapshotFileState::Loaded(snapshot),
         Err(e) => SnapshotFileState::Invalid(e.to_string()),
@@ -422,18 +377,11 @@ pub fn load_quota_snapshot(cache_dir: &Path) -> io::Result<Option<QuotaSnapshot>
 /// `atomic_write_preserving_mode`, rejecting symlinks/non-regular targets and payloads `> 64 KiB`.
 pub fn save_quota_snapshot(cache_dir: &Path, snapshot: &QuotaSnapshot) -> io::Result<()> {
     let path = quota_snapshot_path(cache_dir);
-    match fs::symlink_metadata(&path) {
-        Ok(meta) => {
-            let ft = meta.file_type();
-            if ft.is_symlink() || !ft.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "refusing to overwrite symlink or non-regular quota_snapshot.json",
-                ));
-            }
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+    if !is_safe_cache_target(&path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to overwrite symlink or non-regular quota_snapshot.json",
+        ));
     }
 
     let mut bytes = serde_json::to_vec(snapshot)
@@ -457,72 +405,10 @@ pub fn save_quota_snapshot(cache_dir: &Path, snapshot: &QuotaSnapshot) -> io::Re
     atomic_write_preserving_mode(&path, &bytes)
 }
 
-mod quota_map_serde {
-    use super::*;
-
-    #[derive(Default, Serialize, Deserialize)]
-    #[serde(default)]
-    struct QuotaBucketRepr {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        remaining_fraction: Option<f64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        remaining_amount: Option<i64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reset_in_seconds: Option<i64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reset_time: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        disabled: Option<bool>,
-    }
-
-    impl From<&QuotaBucket> for QuotaBucketRepr {
-        fn from(b: &QuotaBucket) -> Self {
-            Self {
-                remaining_fraction: b.remaining_fraction,
-                remaining_amount: b.remaining_amount,
-                reset_in_seconds: b.reset_in_seconds,
-                reset_time: b.reset_time.clone(),
-                disabled: b.disabled,
-            }
-        }
-    }
-
-    impl From<QuotaBucketRepr> for QuotaBucket {
-        fn from(r: QuotaBucketRepr) -> Self {
-            Self {
-                remaining_fraction: r.remaining_fraction,
-                remaining_amount: r.remaining_amount,
-                reset_in_seconds: r.reset_in_seconds,
-                reset_time: r.reset_time,
-                disabled: r.disabled,
-            }
-        }
-    }
-
-    pub(super) fn serialize<S>(
-        map: &BTreeMap<String, QuotaBucket>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.collect_map(map.iter().map(|(k, v)| (k, QuotaBucketRepr::from(v))))
-    }
-
-    pub(super) fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<BTreeMap<String, QuotaBucket>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = BTreeMap::<String, QuotaBucketRepr>::deserialize(deserializer)?;
-        Ok(raw.into_iter().map(|(k, v)| (k, v.into())).collect())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn bucket_history_computes_burn_rate_and_eta_projection() {

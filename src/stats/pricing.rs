@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -11,9 +11,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agy::db::is_absent_or_real_file;
 use crate::sys::fmt::sanitize_inline_text;
-use crate::sys::fs::{atomic_write, modified_timestamp};
+use crate::sys::fs::{
+    atomic_write, modified_timestamp, read_bounded_regular_file, safe_regular_metadata,
+    BoundedReadError,
+};
 use crate::sys::process::{run_command_stdout_bounded, BoundedCommandError};
 use crate::sys::time::{unix_now_secs, SECS_PER_DAY};
 
@@ -36,17 +38,15 @@ pub(crate) struct PricingFileFingerprint {
     pub(crate) len: u64,
 }
 
-/// Computes a metadata-only fingerprint for `models_dev_pricing.json` without reading or parsing it.
+/// Computes a metadata-only fingerprint for `models_dev_pricing.json` without reading or parsing it,
+/// rejecting symlinked parent directories, symlinked files, and non-regular files.
 pub(crate) fn pricing_cache_fingerprint(cache_dir: Option<&Path>) -> PricingFileFingerprint {
     let Some(dir) = cache_dir else {
         return PricingFileFingerprint::default();
     };
-    let Ok(meta) = fs::metadata(dir.join(MODELS_DEV_CACHE_FILE)) else {
+    let Ok(meta) = safe_regular_metadata(&dir.join(MODELS_DEV_CACHE_FILE)) else {
         return PricingFileFingerprint::default();
     };
-    if !meta.is_file() {
-        return PricingFileFingerprint::default();
-    }
     let (mtime_secs, mtime_nanos) = modified_timestamp(&meta);
     PricingFileFingerprint {
         exists: true,
@@ -576,70 +576,46 @@ pub(super) fn normalize_model_key(raw: &str) -> String {
     out
 }
 
+fn rates_valid(vals: [f64; 4]) -> bool {
+    vals.iter().all(|v| v.is_finite() && *v >= 0.0)
+}
+
 fn is_valid_rate(rate: &ModelPricingRate) -> bool {
-    [
+    rates_valid([
         rate.input_per_mtok,
         rate.cache_read_per_mtok,
         rate.cache_write_per_mtok,
         rate.output_per_mtok,
-    ]
-    .iter()
-    .all(|v| v.is_finite() && *v >= 0.0)
+    ])
 }
 
 fn is_valid_tier_rate(tier: &ContextPricingTier) -> bool {
     tier.min_context_tokens > 0
-        && [
+        && rates_valid([
             tier.input_per_mtok,
             tier.cache_read_per_mtok,
             tier.cache_write_per_mtok,
             tier.output_per_mtok,
-        ]
-        .iter()
-        .all(|v| v.is_finite() && *v >= 0.0)
-}
-
-fn read_cache_bytes_bounded(path: &Path) -> io::Result<Vec<u8>> {
-    let file = fs::File::open(path)?;
-    let mut buf = Vec::new();
-    file.take(MAX_PRICING_JSON_BYTES.saturating_add(1))
-        .read_to_end(&mut buf)?;
-    if (buf.len() as u64) > MAX_PRICING_JSON_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "exceeds maximum inspected size",
-        ));
-    }
-    Ok(buf)
+        ])
 }
 
 fn load_cached_file(path: &Path) -> Option<CachedPricingFile> {
-    if !is_absent_or_real_file(path) {
-        return None;
-    }
-    let bytes = read_cache_bytes_bounded(path).ok()?;
+    let (bytes, _) = read_bounded_regular_file(path, MAX_PRICING_JSON_BYTES).ok()?;
     serde_json::from_slice::<CachedPricingFile>(&bytes).ok()
 }
 
 /// Inspects `models_dev_pricing.json` under `cache_dir` and returns a concise diagnostic status.
 pub(crate) fn inspect_pricing_cache(cache_dir: &Path, now_unix_secs: u64) -> String {
     let path = cache_dir.join(MODELS_DEV_CACHE_FILE);
-    if !is_absent_or_real_file(&path) {
-        let is_symlink = fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
-        return if is_symlink {
-            "symlink (ignored)".to_string()
-        } else {
-            "not a regular file (ignored)".to_string()
-        };
-    }
-    match fs::symlink_metadata(&path) {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return "not found".to_string(),
-        Err(e) => return format!("unreadable ({e})"),
-    }
-    let bytes = match read_cache_bytes_bounded(&path) {
-        Ok(b) => b,
-        Err(e) => return format!("corrupt ({e})"),
+    let (bytes, _) = match read_bounded_regular_file(&path, MAX_PRICING_JSON_BYTES) {
+        Ok(read) => read,
+        Err(BoundedReadError::Missing) => return "not found".to_string(),
+        Err(BoundedReadError::Symlink) => return "symlink (ignored)".to_string(),
+        Err(BoundedReadError::NotAFile) => return "not a regular file (ignored)".to_string(),
+        Err(BoundedReadError::Oversized(_)) => {
+            return "corrupt (exceeds maximum inspected size)".to_string();
+        }
+        Err(BoundedReadError::Io(e)) => return format!("unreadable ({e})"),
     };
     #[derive(Deserialize)]
     struct Summary {
@@ -666,7 +642,10 @@ pub(crate) fn inspect_pricing_cache(cache_dir: &Path, now_unix_secs: u64) -> Str
 }
 
 fn in_retry_cooldown(cache_dir: &Path, now_secs: u64) -> bool {
-    let Ok(raw) = fs::read_to_string(cache_dir.join(MODELS_DEV_ERR_FILE)) else {
+    let Ok((bytes, _)) = read_bounded_regular_file(&cache_dir.join(MODELS_DEV_ERR_FILE), 64) else {
+        return false;
+    };
+    let Ok(raw) = std::str::from_utf8(&bytes) else {
         return false;
     };
     let Ok(ts) = raw.trim().parse::<u64>() else {
@@ -1699,5 +1678,45 @@ mod tests {
             .estimate_cost(&["claude-sonnet-legacy"], 100_001, 50_000, 50_000, 0)
             .unwrap();
         assert!((legacy_above_200k - 0.817506).abs() < 1e-6);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pricing_cache_fingerprint_and_loader_consistently_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        let real_file = real_dir.join(MODELS_DEV_CACHE_FILE);
+        fs::write(&real_file, r#"{"fetched_at":1000,"models":{}}"#).unwrap();
+        assert!(pricing_cache_fingerprint(Some(&real_dir)).exists);
+
+        // Symlinked pricing file is rejected by fingerprint, loader, and inspector.
+        let file_link_dir = dir.path().join("file_link");
+        fs::create_dir_all(&file_link_dir).unwrap();
+        symlink(&real_file, file_link_dir.join(MODELS_DEV_CACHE_FILE)).unwrap();
+        assert_eq!(
+            pricing_cache_fingerprint(Some(&file_link_dir)),
+            PricingFileFingerprint::default()
+        );
+        assert!(load_cached_file(&file_link_dir.join(MODELS_DEV_CACHE_FILE)).is_none());
+        assert_eq!(
+            inspect_pricing_cache(&file_link_dir, 1000),
+            "symlink (ignored)"
+        );
+
+        // Symlinked cache parent directory is also rejected consistently.
+        let sym_parent = dir.path().join("sym_parent");
+        symlink(&real_dir, &sym_parent).unwrap();
+        assert_eq!(
+            pricing_cache_fingerprint(Some(&sym_parent)),
+            PricingFileFingerprint::default()
+        );
+        assert!(load_cached_file(&sym_parent.join(MODELS_DEV_CACHE_FILE)).is_none());
+        assert_eq!(
+            inspect_pricing_cache(&sym_parent, 1000),
+            "symlink (ignored)"
+        );
     }
 }

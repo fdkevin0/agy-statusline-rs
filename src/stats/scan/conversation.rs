@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use super::{
     db_file_fingerprint, deduplicate_parent_priority_turns, discover_sqlite_db_targets,
-    extract_sqlite_db_data, merge_raw_turn, valid_decode_speed, valid_ttft_secs, DbFileFingerprint,
-    RawTurn, TurnPricer,
+    extract_sqlite_db_data, merge_raw_turn, table_columns, valid_decode_speed, valid_ttft_secs,
+    DbFileFingerprint, RawTurn, TurnPricer,
 };
 use crate::agy::db::{
     compute_median, is_safe_sqlite_file, is_sqlite_db_ready_for_read, is_valid_uuid,
@@ -23,7 +23,7 @@ use crate::stats::{
 };
 use crate::sys::fmt::sanitize_inline_text;
 use crate::sys::fs::modified_timestamp;
-use crate::sys::time::TimeZoneSpec;
+use crate::sys::time::{parse_rfc3339_unix_secs, TimeZoneSpec};
 
 /// Lightweight metadata-only fingerprint for live-watching a single conversation and its subagents.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,18 +236,12 @@ impl IndexedSummaryRow {
 fn parse_summary_timestamp_secs(raw: Option<String>) -> Option<i64> {
     let raw = raw?;
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let normalized = if trimmed.as_bytes().get(10) == Some(&b' ') {
-        format!("{}T{}", &trimmed[..10], &trimmed[11..])
+    if trimmed.as_bytes().get(10) == Some(&b' ') {
+        let normalized = format!("{}T{}", &trimmed[..10], &trimmed[11..]);
+        parse_rfc3339_unix_secs(&normalized)
     } else {
-        trimmed.to_string()
-    };
-    normalized
-        .parse::<jiff::Timestamp>()
-        .ok()
-        .map(jiff::Timestamp::as_second)
+        parse_rfc3339_unix_secs(trimmed)
+    }
 }
 
 fn extract_workspace_basename(raw_uris: Option<String>) -> Option<String> {
@@ -280,25 +274,16 @@ fn load_conversation_summaries(
     };
 
     // Probe schema columns so older/minimal conversation_summaries tables remain compatible.
-    let mut cols = HashSet::new();
-    if let Ok(mut pragma) = conn.prepare("PRAGMA table_info(conversation_summaries)") {
-        if let Ok(mut rows) = pragma.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let Ok(name) = row.get::<_, String>(1) {
-                    cols.insert(name);
-                }
-            }
-        }
-    }
+    let cols = table_columns(&conn, "conversation_summaries");
     if !cols.contains("conversation_id") {
         return out;
     }
 
-    let col_or = |name: &str, fallback: &str| -> String {
+    let col_or = |name: &'static str, fallback: &'static str| -> &'static str {
         if cols.contains(name) {
-            name.to_string()
+            name
         } else {
-            fallback.to_string()
+            fallback
         }
     };
     let sql = format!(

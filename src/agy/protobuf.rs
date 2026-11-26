@@ -46,6 +46,8 @@
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
+use crate::sys::fmt::{ascii_values_conflict, trimmed_non_empty};
+
 /// Maximum character length preserved for decoded `RetryAttempt.error` excerpts.
 const MAX_RETRY_ERROR_CHARS: usize = 320;
 
@@ -346,15 +348,7 @@ pub(crate) fn is_foreign_cascade_id(
     origin_cascade_id: Option<&str>,
     expected_conversation_id: Option<&str>,
 ) -> bool {
-    match (
-        origin_cascade_id.map(str::trim).filter(|s| !s.is_empty()),
-        expected_conversation_id
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-    ) {
-        (Some(origin), Some(expected)) => !origin.eq_ignore_ascii_case(expected),
-        _ => false,
-    }
+    ascii_values_conflict(origin_cascade_id, expected_conversation_id)
 }
 
 fn has_ascii_word(haystack_lower: &str, needle: &str) -> bool {
@@ -377,14 +371,17 @@ fn has_ascii_word(haystack_lower: &str, needle: &str) -> bool {
     false
 }
 
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
 /// Classifies a `RetryAttempt`'s `error` text and `reason_code` into a [`RetryStatusClass`]
 /// and optional HTTP status code (`429`, `503`, `500`, `502`, `504`, etc.).
 pub fn classify_retry_attempt(
     error: Option<&str>,
     reason_code: u32,
 ) -> (RetryStatusClass, Option<u16>) {
-    let trimmed = error.map(str::trim).unwrap_or("");
-    let lower = trimmed.to_ascii_lowercase();
+    let lower = error.map(str::trim).unwrap_or("").to_ascii_lowercase();
 
     if lower.contains("context canceled by user")
         || (lower.contains("stream reading error:") && lower.contains("context canceled"))
@@ -393,50 +390,66 @@ pub fn classify_retry_attempt(
     }
 
     if reason_code == 2
-        || lower.contains("model output error")
-        || lower.contains("model produced invalid output")
-        || lower.contains("invalid tool call")
+        || contains_any(
+            &lower,
+            &[
+                "model output error",
+                "model produced invalid output",
+                "invalid tool call",
+            ],
+        )
     {
         return (RetryStatusClass::ModelOutput, None);
     }
 
     if reason_code == 429
         || has_ascii_word(&lower, "429")
-        || lower.contains("resource_exhausted")
-        || lower.contains("quota reached")
-        || lower.contains("rate limit")
-        || lower.contains("rate-limit")
-        || lower.contains("rate_limit")
-        || lower.contains("ratelimit")
+        || contains_any(
+            &lower,
+            &[
+                "resource_exhausted",
+                "quota reached",
+                "rate limit",
+                "rate-limit",
+                "rate_limit",
+                "ratelimit",
+            ],
+        )
     {
         return (RetryStatusClass::RateLimit429, Some(429));
     }
 
     if reason_code == 503
         || has_ascii_word(&lower, "503")
-        || lower.contains("unavailable")
-        || lower.contains("no capacity available")
-        || lower.contains("overloaded")
-        || lower.contains("high demand")
+        || contains_any(
+            &lower,
+            &[
+                "unavailable",
+                "no capacity available",
+                "overloaded",
+                "high demand",
+            ],
+        )
     {
         return (RetryStatusClass::Capacity503, Some(503));
     }
 
-    if reason_code == 500 || has_ascii_word(&lower, "500") {
-        return (RetryStatusClass::Upstream5xx, Some(500));
-    }
-    if reason_code == 502 || has_ascii_word(&lower, "502") {
-        return (RetryStatusClass::Upstream5xx, Some(502));
-    }
-    if reason_code == 504 || has_ascii_word(&lower, "504") {
-        return (RetryStatusClass::Upstream5xx, Some(504));
+    for (code, word) in [(500u16, "500"), (502, "502"), (504, "504")] {
+        if reason_code == u32::from(code) || has_ascii_word(&lower, word) {
+            return (RetryStatusClass::Upstream5xx, Some(code));
+        }
     }
 
-    if lower.contains("stream idle timeout")
-        || lower.contains("tls handshake timeout")
-        || lower.contains("i/o timeout")
-        || lower.contains("context deadline exceeded")
-        || has_ascii_word(&lower, "timeout")
+    if has_ascii_word(&lower, "timeout")
+        || contains_any(
+            &lower,
+            &[
+                "stream idle timeout",
+                "tls handshake timeout",
+                "i/o timeout",
+                "context deadline exceeded",
+            ],
+        )
     {
         return (RetryStatusClass::Timeout, None);
     }
@@ -445,17 +458,21 @@ pub fn classify_retry_attempt(
         return (RetryStatusClass::Upstream5xx, None);
     }
 
-    if lower.contains("wsarecv")
-        || lower.contains("wsasend")
-        || lower.contains("forcibly closed")
-        || lower.contains("connection reset")
-        || lower.contains("broken pipe")
-        || lower.contains("econnreset")
-        || lower.contains("unexpected eof")
-        || lower.contains("the stream was interrupted")
-        || lower.contains("no such host")
-        || lower.contains("dial tcp")
-    {
+    if contains_any(
+        &lower,
+        &[
+            "wsarecv",
+            "wsasend",
+            "forcibly closed",
+            "connection reset",
+            "broken pipe",
+            "econnreset",
+            "unexpected eof",
+            "the stream was interrupted",
+            "no such host",
+            "dial tcp",
+        ],
+    ) {
         return (RetryStatusClass::Disconnect, None);
     }
 
@@ -477,16 +494,15 @@ fn truncate_error_excerpt(value: Option<String>) -> Option<String> {
 }
 
 fn extract_origin_cascade_id(entries: &[ProtoStringMapEntry]) -> Option<String> {
-    let mut found: Option<&str> = None;
-    for entry in entries {
-        if entry.key == "cascade_id" {
-            let trimmed = entry.value.trim();
-            if !trimmed.is_empty() {
-                found = Some(trimmed);
-            }
-        }
-    }
-    found.map(str::to_string)
+    entries
+        .iter()
+        .rev()
+        .find_map(|entry| {
+            (entry.key == "cascade_id")
+                .then(|| trimmed_non_empty(Some(&entry.value)))
+                .flatten()
+        })
+        .map(str::to_string)
 }
 
 fn decode_retry_attempts(
@@ -894,9 +910,8 @@ pub(crate) struct GenBlobSpec<'a> {
 }
 
 #[cfg(test)]
-pub(crate) fn encode_gen_blob(spec: GenBlobSpec<'_>) -> Vec<u8> {
-    let mut retries: Vec<RetryAttempt> = spec
-        .retries
+fn encode_test_retries(usages: &[UsageSpec<'_>], records: &[RetrySpec<'_>]) -> Vec<RetryAttempt> {
+    usages
         .iter()
         .map(|u| RetryAttempt {
             usage: Some(u.to_proto()),
@@ -904,8 +919,13 @@ pub(crate) fn encode_gen_blob(spec: GenBlobSpec<'_>) -> Vec<u8> {
             reason_code: 0,
             retry_delay: None,
         })
-        .collect();
-    retries.extend(spec.retry_records.iter().map(RetrySpec::to_proto));
+        .chain(records.iter().map(RetrySpec::to_proto))
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn encode_gen_blob(spec: GenBlobSpec<'_>) -> Vec<u8> {
+    let retries = encode_test_retries(&spec.retries, &spec.retry_records);
 
     let extra_meta = spec
         .origin_cascade_id
@@ -979,17 +999,7 @@ pub(crate) fn encode_step_blob(spec: StepBlobSpec<'_>) -> Vec<u8> {
     let has_info = spec.model_info_enum != 0
         || spec.model_display_name.is_some()
         || spec.response_model.is_some();
-    let mut retries: Vec<RetryAttempt> = spec
-        .retries
-        .iter()
-        .map(|u| RetryAttempt {
-            usage: Some(u.to_proto()),
-            error: None,
-            reason_code: 0,
-            retry_delay: None,
-        })
-        .collect();
-    retries.extend(spec.retry_records.iter().map(RetrySpec::to_proto));
+    let retries = encode_test_retries(&spec.retries, &spec.retry_records);
     StepMetadataBlob {
         created_at: spec
             .created_at_secs

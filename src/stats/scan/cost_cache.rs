@@ -1,6 +1,5 @@
 //! Per-conversation SQLite cost estimation and bounded LRU cost cache (`conv_cost_cache.json`).
 
-use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -12,7 +11,7 @@ use super::{
 };
 use crate::agy::db::{is_valid_uuid, resolve_conversation_db_path};
 use crate::stats::pricing::{round_usd_6, PricingCatalog, PricingFileFingerprint};
-use crate::sys::fs::atomic_write;
+use crate::sys::fs::{atomic_write, read_bounded_regular_file};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ConversationCost {
@@ -55,12 +54,7 @@ fn summaries_db_fingerprint(cli_dir: &Path) -> Option<DbFileFingerprint> {
 
 fn read_conv_cost_cache_file(cache_dir: &Path) -> Option<ConvCostCacheFile> {
     let path = cache_dir.join(CONV_COST_CACHE_FILE);
-    let meta = fs::symlink_metadata(&path).ok()?;
-    let ft = meta.file_type();
-    if ft.is_symlink() || !ft.is_file() || meta.len() > MAX_CONV_COST_CACHE_BYTES {
-        return None;
-    }
-    let bytes = fs::read(&path).ok()?;
+    let (bytes, _) = read_bounded_regular_file(&path, MAX_CONV_COST_CACHE_BYTES).ok()?;
     let parsed = serde_json::from_slice::<ConvCostCacheFile>(&bytes).ok()?;
     (parsed.schema_version == CONV_COST_CACHE_SCHEMA_VERSION).then_some(parsed)
 }

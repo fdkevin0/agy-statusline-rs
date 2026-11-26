@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::agy::quota::{BucketHistory, BurnProjection};
 use crate::statusline::{QuotaBucket, StatuslinePayload};
-use crate::sys::time::{parse_rfc3339_unix_secs, SECS_PER_DAY as SECS_PER_DAY_I64};
+use crate::sys::fmt::{format_duration_compact, tokenize_alnum_lower};
+use crate::sys::time::{parse_rfc3339_unix_secs, SECS_PER_DAY as SECS_PER_DAY_I64, SECS_PER_HOUR};
 
-const SECS_PER_HOUR: u64 = 3_600;
 const SECS_PER_DAY: u64 = SECS_PER_DAY_I64 as u64;
 const SECS_PER_WEEK: u64 = 7 * SECS_PER_DAY;
 const SECS_PER_MONTH: u64 = 30 * SECS_PER_DAY;
@@ -153,8 +153,6 @@ pub(crate) fn current_context_tokens(payload: &StatuslinePayload) -> Option<u64>
     Some(inp.saturating_add(read).saturating_add(create))
 }
 
-use crate::sys::fmt::format_duration_compact;
-
 /// Formats a validated remaining quota percentage (`0.0..=100.0`) without rounding sub-1% values to `0%`.
 ///
 /// Returns `"0%"` strictly when `remaining_pct <= 0.0`, `"<0.1%"`
@@ -170,13 +168,6 @@ pub(crate) fn format_quota_pct(remaining_pct: f64) -> String {
     } else {
         format!("{:.0}%", remaining_pct.round())
     }
-}
-
-fn tokenize_alnum_lower(raw: &str) -> Vec<String> {
-    raw.split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|tok| !tok.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect()
 }
 
 fn parse_window_token(token: &str) -> Option<(u64, String)> {
@@ -266,15 +257,8 @@ fn collect_model_tokens(payload: &StatuslinePayload) -> BTreeSet<String> {
     tokens
 }
 
-/// Resolves remaining seconds until quota reset, suppressing rolling `now + window_secs`
-/// timestamps on untouched 100% buckets so idle ticks do not render a synthetic full-window countdown.
-fn resolve_remaining_reset_secs(
-    bucket: &QuotaBucket,
-    now_unix_secs: u64,
-    remaining_frac: Option<f64>,
-    window_secs: u64,
-) -> Option<u64> {
-    let remaining_secs = match bucket.reset_in_seconds {
+fn raw_remaining_reset_secs(bucket: &QuotaBucket, now_unix_secs: u64) -> Option<u64> {
+    match bucket.reset_in_seconds {
         Some(secs) if secs <= 0 => None,
         Some(secs) => Some(secs as u64),
         None => bucket
@@ -285,7 +269,18 @@ fn resolve_remaining_reset_secs(
                 let diff = i128::from(reset_unix) - i128::from(now_unix_secs);
                 (diff > 0).then(|| diff.min(i128::from(u64::MAX)) as u64)
             }),
-    };
+    }
+}
+
+/// Resolves remaining seconds until quota reset, suppressing rolling `now + window_secs`
+/// timestamps on untouched 100% buckets so idle ticks do not render a synthetic full-window countdown.
+fn resolve_remaining_reset_secs(
+    bucket: &QuotaBucket,
+    now_unix_secs: u64,
+    remaining_frac: Option<f64>,
+    window_secs: u64,
+) -> Option<u64> {
+    let remaining_secs = raw_remaining_reset_secs(bucket, now_unix_secs);
     let is_untouched_full = remaining_frac.is_some_and(|frac| frac >= UNTOUCHED_FULL_FRAC_MIN)
         && remaining_secs
             .is_some_and(|s| s.abs_diff(window_secs) <= UNTOUCHED_WINDOW_TOLERANCE_SECS);
@@ -369,9 +364,9 @@ enum ModelAffinity {
     Unknown,
 }
 
-fn resolve_model_affinity(
+fn resolve_model_affinity<'a>(
     model_tokens: &BTreeSet<String>,
-    all_descriptors: &[(BucketDescriptor, &QuotaBucket)],
+    all_descriptors: impl IntoIterator<Item = &'a BucketDescriptor>,
 ) -> ModelAffinity {
     if model_tokens.is_empty() {
         return ModelAffinity::Unknown;
@@ -380,7 +375,7 @@ fn resolve_model_affinity(
     // Infer 1p provider affinity across both active and disabled buckets so disabling all
     // 1p buckets for a model still identifies it as 1p instead of falling back to `3p-*`.
     let mut effective_providers = BTreeSet::new();
-    for (desc, _) in all_descriptors {
+    for desc in all_descriptors {
         let Some(ref p) = desc.provider else {
             continue;
         };
@@ -488,14 +483,19 @@ struct Candidate {
     view: QuotaView,
 }
 
-fn is_tighter_equal_score(cand: &Candidate, cur: &Candidate) -> bool {
-    if cand.has_frac != cur.has_frac {
-        return cand.has_frac;
+fn is_tighter_view(
+    cand_view: &QuotaView,
+    cand_has_frac: bool,
+    cur_view: &QuotaView,
+    cur_has_frac: bool,
+) -> bool {
+    if cand_has_frac != cur_has_frac {
+        return cand_has_frac;
     }
-    if cand.has_frac {
-        cand.view.remaining_pct < cur.view.remaining_pct
+    if cand_has_frac {
+        cand_view.remaining_pct < cur_view.remaining_pct
     } else {
-        cand.view.remaining_amount < cur.view.remaining_amount
+        cand_view.remaining_amount < cur_view.remaining_amount
     }
 }
 
@@ -504,7 +504,8 @@ fn update_best_candidate(slot: &mut Option<Candidate>, cand: Candidate) {
         None => true,
         Some(cur) => {
             cand.score > cur.score
-                || (cand.score == cur.score && is_tighter_equal_score(&cand, cur))
+                || (cand.score == cur.score
+                    && is_tighter_view(&cand.view, cand.has_frac, &cur.view, cur.has_frac))
         }
     };
     if replace {
@@ -538,22 +539,6 @@ fn format_credit_label(key: &str) -> String {
     }
 }
 
-fn resolve_credit_reset_compact(bucket: &QuotaBucket, now_unix_secs: u64) -> Option<String> {
-    let remaining_secs = match bucket.reset_in_seconds {
-        Some(secs) if secs <= 0 => None,
-        Some(secs) => Some(secs as u64),
-        None => bucket
-            .reset_time
-            .as_deref()
-            .and_then(parse_rfc3339_unix_secs)
-            .and_then(|reset_unix| {
-                let diff = i128::from(reset_unix) - i128::from(now_unix_secs);
-                (diff > 0).then(|| diff.min(i128::from(u64::MAX)) as u64)
-            }),
-    };
-    remaining_secs.map(format_duration_compact)
-}
-
 /// Extracts all active non-windowed credit buckets (`ai_credits`, `prompt_credits`,
 /// `flow_credits`, `google_one_ai`, and other amount-only credit entries).
 pub(crate) fn resolve_credit_views(
@@ -578,7 +563,8 @@ pub(crate) fn resolve_credit_views(
             key: key.clone(),
             label: format_credit_label(key),
             remaining_amount: amount,
-            reset_compact: resolve_credit_reset_compact(bucket, now_unix_secs),
+            reset_compact: raw_remaining_reset_secs(bucket, now_unix_secs)
+                .map(format_duration_compact),
             severity: classify_credit_severity(amount),
         });
     }
@@ -660,15 +646,7 @@ fn classify_pool_kind(key: &str, desc: &BucketDescriptor) -> (QuotaPoolKind, Str
 fn update_tightest_view(slot: &mut Option<(QuotaView, bool)>, view: QuotaView, has_frac: bool) {
     let replace = match slot {
         None => true,
-        Some((cur, cur_has_frac)) => {
-            if has_frac != *cur_has_frac {
-                has_frac
-            } else if has_frac {
-                view.remaining_pct < cur.remaining_pct
-            } else {
-                view.remaining_amount < cur.remaining_amount
-            }
-        }
+        Some((cur, cur_has_frac)) => is_tighter_view(&view, has_frac, cur, *cur_has_frac),
     };
     if replace {
         *slot = Some((view, has_frac));
@@ -677,7 +655,7 @@ fn update_tightest_view(slot: &mut Option<(QuotaView, bool)>, view: QuotaView, h
 
 /// Groups all active windowed quota pools (`Gemini`, `Argon`, `Carbon`, `Claude/3P`, plus other
 /// pools) and non-windowed credit buckets for `doctor` and `stats` summaries.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn summarize_quota_pools(
     quota: &BTreeMap<String, QuotaBucket>,
     now_unix_secs: u64,
@@ -741,16 +719,14 @@ pub(crate) fn resolve_quota_views_for_map(
     now_unix_secs: u64,
 ) -> (Option<QuotaView>, Option<QuotaView>) {
     let model_tokens = collect_model_tokens(payload);
-
     let all_descriptors: Vec<(&String, BucketDescriptor, &QuotaBucket)> = quota
         .iter()
         .filter_map(|(key, bucket)| parse_bucket_descriptor(key).map(|desc| (key, desc, bucket)))
         .collect();
-    let affinity_input: Vec<(BucketDescriptor, &QuotaBucket)> = all_descriptors
-        .iter()
-        .map(|(_, desc, bucket)| (desc.clone(), *bucket))
-        .collect();
-    let affinity = resolve_model_affinity(&model_tokens, &affinity_input);
+    let affinity = resolve_model_affinity(
+        &model_tokens,
+        all_descriptors.iter().map(|(_, desc, _)| desc),
+    );
 
     let mut best_short: Option<Candidate> = None;
     let mut best_multi: Option<Candidate> = None;
@@ -783,7 +759,7 @@ pub(crate) fn resolve_quota_views_for_map(
 
 /// Resolves both the active short-window (`< 24h`) and multi-day (`>= 24h`) quota buckets
 /// in a single pass over `payload.quota`, enriching views with sample history when available.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn resolve_quota_views_with_history(
     payload: &StatuslinePayload,
     history: Option<&BTreeMap<String, BucketHistory>>,
