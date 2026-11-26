@@ -599,3 +599,64 @@ fn live_git_cli_probe_extracts_branch_and_diff_stats() {
         "rendered stdout was: {rendered}"
     );
 }
+
+#[test]
+fn cli_statusline_persists_quota_snapshot_falls_back_on_empty_tick_and_shows_retry_anomaly() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let cli = home.join(".gemini/antigravity-cli");
+    let uuid = "55555555-5555-4555-8555-555555555555";
+
+    let mut cfg = LayoutConfig::preset_minimal();
+    cfg.theme = ThemeStyle::Mono;
+    cfg.glyph_mode = GlyphMode::Ascii;
+    cfg.no_color = true;
+    cfg.responsive = false;
+    cfg.rows = vec![vec![WidgetId::Speed, WidgetId::Quota5h]];
+    save_layout_config(&home.join("config/agy-statusline/config.json"), &cfg).unwrap();
+
+    seed_conv_turn(
+        &cli,
+        uuid,
+        1,
+        TestGenSpec {
+            step_idx: 1,
+            output_tok: 120,
+            dur_secs: 2,
+            retry_error: Some("HTTP 429 RESOURCE_EXHAUSTED"),
+            retry_delay_secs: 5,
+            ..Default::default()
+        },
+    );
+
+    // Tick 1: stdin carries quota -> persists quota_snapshot.json and shows retry anomaly on speed.
+    let active_payload = serde_json::json!({
+        "conversation_id": uuid,
+        "model": {"id": "gemini-4"},
+        "quota": {
+            "gemini-5h": {
+                "remaining_fraction": 0.72,
+                "reset_in_seconds": 7200
+            }
+        }
+    })
+    .to_string();
+    let out1 = run_statusline_stdin(home, &[], &active_payload);
+    assert!(out1.contains("spd 60 tok/s ! 429"), "out1: {out1:?}");
+    assert!(out1.contains("5h 72% r:2h"), "out1: {out1:?}");
+    assert!(
+        home.join("cache/agy-statusline/quota_snapshot.json")
+            .is_file(),
+        "expected quota_snapshot.json to be written in isolated XDG_CACHE_HOME"
+    );
+
+    // Tick 2: idle tick with empty quota -> falls back cleanly to cached quota_snapshot.json.
+    let idle_payload = serde_json::json!({
+        "conversation_id": uuid,
+        "model": {"id": "gemini-4"},
+        "quota": {}
+    })
+    .to_string();
+    let out2 = run_statusline_stdin(home, &[], &idle_payload);
+    assert!(out2.contains("5h 72%"), "out2: {out2:?}");
+}

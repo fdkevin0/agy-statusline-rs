@@ -92,6 +92,16 @@ struct GenMetadataBlob {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct RetryAttempt {
+    #[prost(string, optional, tag = "3")]
+    error: Option<String>,
+    #[prost(uint32, tag = "5")]
+    reason_code: u32,
+    #[prost(message, optional, tag = "7")]
+    retry_delay: Option<ProtoDuration>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct ChatModelMetadata {
     #[prost(uint64, tag = "3")]
     model: u64,
@@ -103,6 +113,8 @@ struct ChatModelMetadata {
     time_to_first_token: Option<ProtoDuration>,
     #[prost(message, optional, tag = "12")]
     streaming_duration: Option<ProtoDuration>,
+    #[prost(message, repeated, tag = "17")]
+    retries: Vec<RetryAttempt>,
     #[prost(string, tag = "19")]
     response_model: String,
     #[prost(string, tag = "21")]
@@ -181,9 +193,23 @@ pub struct TestGenSpec<'a> {
     pub estimated_context_tokens: i64,
     pub dur_secs: u64,
     pub ttft_ms: u64,
+    pub retry_error: Option<&'a str>,
+    pub retry_delay_secs: i64,
 }
 
 pub fn build_gen_blob(spec: TestGenSpec<'_>) -> Vec<u8> {
+    let retries = spec
+        .retry_error
+        .map(|err| RetryAttempt {
+            error: Some(err.to_owned()),
+            reason_code: 1,
+            retry_delay: (spec.retry_delay_secs > 0).then_some(ProtoDuration {
+                seconds: spec.retry_delay_secs,
+                nanos: 0,
+            }),
+        })
+        .into_iter()
+        .collect();
     GenMetadataBlob {
         chat_model: Some(ChatModelMetadata {
             model: spec.model_enum,
@@ -208,6 +234,7 @@ pub fn build_gen_blob(spec: TestGenSpec<'_>) -> Vec<u8> {
                 seconds: spec.dur_secs as i64,
                 nanos: 0,
             }),
+            retries,
             response_model: spec.resp_model.to_owned(),
             model_display_name: spec.disp_name.to_owned(),
         }),

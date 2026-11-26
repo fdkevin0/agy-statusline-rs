@@ -21,9 +21,13 @@ use crate::stats::metric::{
 };
 use crate::stats::pricing::round_usd_6;
 use crate::stats::render::{
-    format_subagent_short_label, format_time_span, format_ttft_compact, format_turn_time,
+    format_retry_compact, format_subagent_short_label, format_time_span, format_ttft_compact,
+    format_turn_time,
 };
-use crate::stats::{ConversationStatsReport, ConversationTurnStats, PeriodSummary, UsageDelta};
+use crate::stats::{
+    mid_session_miss_flags, ConversationStatsReport, ConversationTurnStats, PeriodSummary,
+    UsageDelta,
+};
 use crate::sys::fmt::{format_tokens_string as fmt_tok, truncate_to_width};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,12 +340,13 @@ impl DetailScreen {
     }
 
     fn recompute_view(&mut self) {
+        let miss_flags = mid_session_miss_flags(&self.report.turns);
         let mut turn_indices: Vec<usize> = self
             .report
             .turns
             .iter()
             .enumerate()
-            .filter(|(_, t)| !self.misses_only || t.cache_hit_pct.is_some_and(|p| p < 50.0))
+            .filter(|(idx, _)| !self.misses_only || miss_flags[*idx])
             .filter(|(_, t)| self.model_filter.as_deref().is_none_or(|m| t.model == m))
             .filter(|(_, t)| {
                 self.subagent_filter
@@ -963,6 +968,33 @@ impl DetailScreen {
                 pal.bold(Color::Red),
                 Some(DetailClick::ToggleMisses),
             );
+        }
+        if !filtered {
+            let diag = &self.report.diagnostics.total;
+            if diag.compaction_steps > 0 {
+                push_segment(
+                    "",
+                    format!("{} compact", diag.compaction_steps),
+                    pal.bold(Color::Yellow),
+                    None,
+                );
+            }
+            if let Some(retries) = format_retry_compact(diag, pal.ascii) {
+                let color = if diag.retries_429 > 0 {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                };
+                push_segment("", retries, pal.bold(color), None);
+            }
+            if diag.error_steps > 0 {
+                push_segment(
+                    "",
+                    format!("{} err", diag.error_steps),
+                    pal.bold(Color::Red),
+                    None,
+                );
+            }
         }
 
         frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
@@ -2181,5 +2213,135 @@ mod tests {
         screen.apply_live_report(updated);
         assert_eq!(screen.view.turn_indices.len(), 5);
         assert_eq!(screen.turn_idx, 0);
+    }
+
+    #[test]
+    fn detail_screen_aligns_miss_filter_with_mid_session_misses_and_renders_diagnostics() {
+        use crate::stats::{ConversationDiagnostics, ScanDiagnostics};
+
+        let root_id = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
+        let report = ConversationStatsReport {
+            conversation_id: root_id.to_string(),
+            title: Some("Diagnostics & Miss Alignment".to_string()),
+            source: "cli".to_string(),
+            timezone: "UTC".to_string(),
+            first_turn_local: Some("2026-11-24 10:00:00".to_string()),
+            last_turn_local: Some("2026-11-24 10:15:00".to_string()),
+            duration_secs: Some(900),
+            peak_context_tokens: Some(20_000),
+            mid_session_misses: 1,
+            mid_session_miss_usd: 0.40,
+            totals: PeriodSummary {
+                requests: 4,
+                input_tokens: 47_000,
+                cache_read_tokens: 23_000,
+                output_tokens: 2_000,
+                total_tokens: 72_000,
+                priced_usd: 0.85,
+                priced_requests: 4,
+                ..Default::default()
+            },
+            turns: vec![
+                // Turn #1: initial cold turn (0% hit) -> NOT a mid-session miss.
+                make_turn(
+                    1,
+                    root_id,
+                    false,
+                    "2026-11-24 10:00:00",
+                    "Model Alpha",
+                    10_000,
+                    0,
+                    500,
+                    0.20,
+                ),
+                // Turn #2: warm cache hit (90% hit).
+                make_turn(
+                    2,
+                    root_id,
+                    false,
+                    "2026-11-24 10:05:00",
+                    "Model Alpha",
+                    2_000,
+                    18_000,
+                    500,
+                    0.05,
+                ),
+                // Turn #3: partial cache read (25% hit < 50%) -> NOT a mid-session miss.
+                make_turn(
+                    3,
+                    root_id,
+                    false,
+                    "2026-11-24 10:10:00",
+                    "Model Alpha",
+                    15_000,
+                    5_000,
+                    500,
+                    0.20,
+                ),
+                // Turn #4: true mid-session cache miss (0% hit after earlier prompt).
+                make_turn(
+                    4,
+                    root_id,
+                    false,
+                    "2026-11-24 10:15:00",
+                    "Model Alpha",
+                    20_000,
+                    0,
+                    500,
+                    0.40,
+                ),
+            ],
+            diagnostics: ConversationDiagnostics {
+                total: ScanDiagnostics {
+                    retry_count: 3,
+                    retries_429: 2,
+                    retries_503: 1,
+                    total_retry_delay_secs: 12.0,
+                    error_steps: 1,
+                    compaction_steps: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut screen = DetailScreen::new(report, TurnSort::default());
+        let pal = Palette {
+            no_color: true,
+            ascii: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 32)).unwrap();
+        terminal
+            .draw(|frame| screen.draw(frame, false, &pal))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("1 miss (~$0.40)"), "{rendered}");
+        assert!(rendered.contains("2 compact"), "{rendered}");
+        assert!(rendered.contains("2×429 1×503 (12s)"), "{rendered}");
+        assert!(rendered.contains("1 err"), "{rendered}");
+
+        // Clicking KPI "1 miss" badge filters strictly to Turn #4 (index 3), matching count == 1.
+        let miss_kpi = screen
+            .kpi_hits
+            .find(|c| *c == DetailClick::ToggleMisses)
+            .unwrap();
+        screen.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: miss_kpi.x + 1,
+                row: miss_kpi.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            false,
+        );
+        assert!(screen.misses_only);
+        assert_eq!(screen.view.turn_indices, vec![3]);
     }
 }

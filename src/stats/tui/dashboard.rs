@@ -24,8 +24,12 @@ use crate::stats::metric::{
 use crate::stats::query::{
     DailySort, HeatmapWeek, RangePreset, SourceFilter, StatsDataset, StatsView, WEEKDAY_NAMES,
 };
-use crate::stats::render::{build_month_header, ASCII_HEATMAP, UNICODE_HEATMAP};
-use crate::sys::fmt::{format_tokens_string as fmt_tok, truncate_to_width};
+use crate::stats::render::{
+    build_month_header, format_diagnostics_compact, format_quota_source_age,
+    format_quota_window_brief, ASCII_HEATMAP, UNICODE_HEATMAP,
+};
+use crate::stats::{QuotaWindowReport, ScanDiagnostics, StatsQuotaReport};
+use crate::sys::fmt::{format_tokens_string as fmt_tok, sanitize_inline_text, truncate_to_width};
 
 const UNICODE_BAR_EIGHTHS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
 
@@ -81,13 +85,21 @@ pub(super) struct DashboardScreen {
 
 fn spawn_dataset_scan(
     roots: Vec<(&'static str, PathBuf)>,
+    daemon_dirs: Vec<PathBuf>,
     cache_dir: Option<PathBuf>,
     now_unix_secs: u64,
+    force_quota_refresh: bool,
 ) -> mpsc::Receiver<(StatsDataset, Duration)> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let start = Instant::now();
-        let ds = StatsDataset::collect(&roots, cache_dir.as_deref(), now_unix_secs);
+        let ds = StatsDataset::collect(
+            &roots,
+            &daemon_dirs,
+            cache_dir.as_deref(),
+            now_unix_secs,
+            force_quota_refresh,
+        );
         let _ = tx.send((ds, start.elapsed()));
     });
     rx
@@ -96,6 +108,7 @@ fn spawn_dataset_scan(
 impl DashboardScreen {
     pub(super) fn new(
         roots: &[(&'static str, PathBuf)],
+        daemon_dirs: &[PathBuf],
         cache_dir: Option<&Path>,
         days: Option<u32>,
         metric: StatsMetric,
@@ -109,8 +122,10 @@ impl DashboardScreen {
             hit_map: DashboardHitMap::default(),
             pending_scan: Some(spawn_dataset_scan(
                 roots.to_vec(),
+                daemon_dirs.to_vec(),
                 cache_dir.map(Path::to_path_buf),
                 now_unix_secs,
+                false,
             )),
         }
     }
@@ -158,6 +173,7 @@ impl DashboardScreen {
     pub(super) fn trigger_refresh(
         &mut self,
         roots: &[(&'static str, PathBuf)],
+        daemon_dirs: &[PathBuf],
         cache_dir: Option<&Path>,
     ) {
         if self.pending_scan.is_none() {
@@ -165,8 +181,10 @@ impl DashboardScreen {
             let now = crate::sys::time::unix_now_secs();
             self.pending_scan = Some(spawn_dataset_scan(
                 roots.to_vec(),
+                daemon_dirs.to_vec(),
                 cache_dir.map(Path::to_path_buf),
                 now,
+                true,
             ));
         }
     }
@@ -352,38 +370,70 @@ fn draw_stats_ui(
 ) -> DashboardHitMap {
     let area = frame.area();
     let show_heatmap = state.heatmap_visible(area.height) && area.width >= 96;
+    let quota_opt = dataset
+        .and_then(|d| d.quota.as_ref())
+        .filter(|q| q.has_visible_content());
+    let quota_h: u16 = if quota_opt.is_some() && area.height >= 20 {
+        if area.height >= 26 {
+            3
+        } else {
+            1
+        }
+    } else {
+        0
+    };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(if show_heatmap { 11 } else { 3 }),
-            Constraint::Min(8),
-            Constraint::Length(1),
-        ])
-        .split(area);
+    let (ctrl_area, quota_area, summary_area, main_area, footer_area) = if quota_h > 0 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(quota_h),
+                Constraint::Length(if show_heatmap { 11 } else { 3 }),
+                Constraint::Min(8),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        (chunks[0], Some(chunks[1]), chunks[2], chunks[3], chunks[4])
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(if show_heatmap { 11 } else { 3 }),
+                Constraint::Min(8),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        (chunks[0], None, chunks[1], chunks[2], chunks[3])
+    };
 
     let mut hit_map = DashboardHitMap {
-        controls: draw_control_bar(frame, chunks[0], state, dataset, pal),
+        controls: draw_control_bar(frame, ctrl_area, state, dataset, pal),
         ..Default::default()
     };
+    if let (Some(q), Some(q_area)) = (quota_opt, quota_area) {
+        draw_quota_strip(frame, q_area, q, pal);
+    }
+
+    let diag = dataset.map_or_else(ScanDiagnostics::default, |d| d.diagnostics);
     if let Some(v) = view {
         if show_heatmap {
             let top = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-                .split(chunks[1]);
-            draw_summary_card(frame, top[0], state, v, pal);
+                .split(summary_area);
+            draw_summary_card(frame, top[0], state, v, &diag, pal);
             hit_map.heatmap = draw_heatmap_pane(frame, top[1], state, v, pal);
         } else {
-            draw_compact_summary(frame, chunks[1], state, v, pal);
+            draw_compact_summary(frame, summary_area, state, v, &diag, pal);
         }
 
         if area.width >= 96 {
             let main = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-                .split(chunks[2]);
+                .split(main_area);
             let (daily, daily_headers) =
                 draw_daily_pane(frame, main[0], state, &mut tables.daily, v, pal);
             hit_map.daily = daily;
@@ -402,7 +452,7 @@ fn draw_stats_ui(
             match state.active_pane() {
                 StatsPane::Daily => {
                     let (daily, daily_headers) =
-                        draw_daily_pane(frame, chunks[2], state, &mut tables.daily, v, pal);
+                        draw_daily_pane(frame, main_area, state, &mut tables.daily, v, pal);
                     hit_map.daily = daily;
                     hit_map.daily_headers = daily_headers;
                 }
@@ -410,10 +460,10 @@ fn draw_stats_ui(
                     let stacked = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints([
-                            Constraint::Length(if chunks[2].height >= 16 { 9 } else { 7 }),
+                            Constraint::Length(if main_area.height >= 16 { 9 } else { 7 }),
                             Constraint::Min(5),
                         ])
-                        .split(chunks[2]);
+                        .split(main_area);
                     draw_day_detail_pane(frame, stacked[0], v, pal);
                     hit_map.models =
                         draw_models_pane(frame, stacked[1], state, &mut tables.models, v, pal);
@@ -428,11 +478,167 @@ fn draw_stats_ui(
         };
         let loading = Paragraph::new(Line::styled(format!("  {msg}"), pal.bold(Color::Yellow)))
             .block(pal.pane_block(" Loading ".to_string(), true));
-        frame.render_widget(loading, chunks[2]);
+        frame.render_widget(loading, main_area);
     }
 
-    hit_map.footer = draw_footer_bar(frame, chunks[3], state, dataset, pal);
+    hit_map.footer = draw_footer_bar(frame, footer_area, state, dataset, pal);
     hit_map
+}
+
+fn quota_win_style(win: &QuotaWindowReport, pal: &Palette) -> Style {
+    if let Some(amt) = win.remaining_amount {
+        if amt <= 0 {
+            return pal.bold(Color::Red);
+        } else if amt <= crate::statusline::metrics::LOW_CREDIT_WARN_THRESHOLD {
+            return pal.fg(Color::Yellow);
+        }
+        return pal.fg(Color::Green);
+    }
+    if win.remaining_pct <= 10.0 {
+        pal.bold(Color::Red)
+    } else if win.will_exhaust_before_reset {
+        pal.bold(Color::Yellow)
+    } else if win.remaining_pct <= 30.0 {
+        pal.fg(Color::Yellow)
+    } else {
+        pal.fg(Color::Green)
+    }
+}
+
+fn draw_quota_strip(frame: &mut Frame<'_>, area: Rect, q: &StatsQuotaReport, pal: &Palette) {
+    let sep = pal.sep();
+    let sep_spaced = format!(" {sep} ");
+    let mut header_meta = Vec::new();
+    if let Some(tier) = q.plan_tier.as_deref() {
+        let clean = sanitize_inline_text(tier);
+        if !clean.is_empty() {
+            header_meta.push(clean);
+        }
+    }
+    if let Some(credits) = q.ai_credits {
+        header_meta.push(format!("AI credits {credits}"));
+    }
+    header_meta.push(format_quota_source_age(q));
+
+    let bordered = area.height >= 3;
+    let inner_w = if bordered {
+        usize::from(area.width.saturating_sub(2))
+    } else {
+        usize::from(area.width)
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+
+    let mut try_push_group = |group: Vec<Span<'static>>| {
+        let prefix = if spans.is_empty() {
+            " "
+        } else {
+            sep_spaced.as_str()
+        };
+        let group_w: usize = group.iter().map(|s| s.content.width()).sum();
+        let total_w = prefix.width() + group_w;
+        if !spans.is_empty() && used + total_w > inner_w {
+            return;
+        }
+        spans.push(Span::styled(
+            prefix.to_string(),
+            if spans.is_empty() {
+                Style::default()
+            } else {
+                pal.dim()
+            },
+        ));
+        spans.extend(group);
+        used += total_w;
+    };
+
+    if !bordered {
+        let mut head = vec![Span::styled("Quota ", pal.bold(Color::Cyan))];
+        if let Some(tier) = q.plan_tier.as_deref() {
+            let clean = sanitize_inline_text(tier);
+            if !clean.is_empty() {
+                head.push(Span::styled(format!("{clean} "), pal.bold(Color::White)));
+            }
+        }
+        if let Some(credits) = q.ai_credits {
+            let color = if credits <= 0 {
+                Color::Red
+            } else if credits <= crate::statusline::metrics::LOW_CREDIT_WARN_THRESHOLD {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+            head.push(Span::styled(format!("cr:{credits} "), pal.bold(color)));
+        }
+        head.push(Span::styled(
+            format!("[{}]", format_quota_source_age(q)),
+            pal.dim(),
+        ));
+        try_push_group(head);
+    }
+
+    for pool in &q.pools {
+        let mut group = vec![Span::styled(
+            format!("{} ", pool.name),
+            pal.bold(Color::White),
+        )];
+        let mut added_win = false;
+        if let Some(ref short) = pool.short_window {
+            group.push(Span::styled(
+                format_quota_window_brief(&pool.name, short, false),
+                quota_win_style(short, pal),
+            ));
+            added_win = true;
+        }
+        if let Some(ref long) = pool.long_window {
+            if added_win {
+                group.push(Span::styled(", ", pal.dim()));
+            }
+            group.push(Span::styled(
+                format_quota_window_brief(&pool.name, long, true),
+                quota_win_style(long, pal),
+            ));
+            added_win = true;
+        }
+        if added_win {
+            try_push_group(group);
+        }
+    }
+
+    for credit in &q.credits {
+        if q.ai_credits.is_some()
+            && (credit.key.eq_ignore_ascii_case("google_one_ai")
+                || credit.key.eq_ignore_ascii_case("ai_credits"))
+        {
+            continue;
+        }
+        let style = match credit.severity.as_str() {
+            "critical" => pal.bold(Color::Red),
+            "low" => pal.fg(Color::Yellow),
+            _ => pal.fg(Color::Green),
+        };
+        try_push_group(vec![
+            Span::styled(format!("{} ", credit.label), pal.dim()),
+            Span::styled(credit.remaining_amount.to_string(), style),
+        ]);
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(
+            format!(" {}", header_meta.join(&sep_spaced)),
+            pal.fg(Color::White),
+        ));
+    }
+
+    if bordered {
+        let title = format!(" Quota ({}) ", header_meta.join(&sep_spaced));
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).block(pal.pane_block(title, false)),
+            area,
+        );
+    } else {
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
 }
 
 fn draw_control_bar(
@@ -545,6 +751,7 @@ fn draw_summary_card(
     area: Rect,
     state: &StatsTuiState,
     view: &StatsView,
+    diag: &ScanDiagnostics,
     pal: &Palette,
 ) {
     let metric = state.query().metric;
@@ -629,6 +836,14 @@ fn draw_summary_card(
             pal.dim(),
         ));
     }
+    if let Some(diag_str) = format_diagnostics_compact(diag, pal.ascii) {
+        let color = if diag.retries_429 > 0 || diag.error_steps > 0 {
+            Color::Red
+        } else {
+            Color::Yellow
+        };
+        lines.push(kv("Diag", diag_str, color));
+    }
 
     frame.render_widget(
         Paragraph::new(lines).block(pal.pane_block(title, false)),
@@ -641,6 +856,7 @@ fn draw_compact_summary(
     area: Rect,
     state: &StatsTuiState,
     view: &StatsView,
+    diag: &ScanDiagnostics,
     pal: &Palette,
 ) {
     let metric = state.query().metric;
@@ -703,6 +919,14 @@ fn draw_compact_summary(
         format!("{}/{}d", view.active_days, view.span_days),
         pal.bold(Color::White),
     );
+    if let Some(diag_str) = format_diagnostics_compact(diag, pal.ascii) {
+        let color = if diag.retries_429 > 0 || diag.error_steps > 0 {
+            Color::Red
+        } else {
+            Color::Yellow
+        };
+        push_segment("Diag ", diag_str, pal.bold(color));
+    }
 
     let title = format!(
         " Summary ({} {} {}) ",
@@ -1774,5 +1998,134 @@ mod tests {
             24,
         );
         assert_eq!(screen.state.query().range, RangePreset::Days(7));
+    }
+
+    #[test]
+    fn dashboard_renders_quota_strip_diagnostics_and_preserves_mouse_hit_alignment() {
+        use crate::stats::{QuotaPoolReport, QuotaWindowReport, ScanDiagnostics, StatsQuotaReport};
+
+        let mut ds = test_dataset();
+        ds.quota = Some(StatsQuotaReport {
+            source: "hub_rpc".to_string(),
+            from_cache: false,
+            updated_at: 1_700_000_000,
+            age_secs: 0,
+            plan_tier: Some("Ultra 20x".to_string()),
+            ai_credits: Some(1250),
+            pools: vec![
+                QuotaPoolReport {
+                    name: "Gemini".to_string(),
+                    short_window: Some(QuotaWindowReport {
+                        label: "5h".to_string(),
+                        remaining_pct: 65.0,
+                        reset_compact: Some("2h10m".to_string()),
+                        ..Default::default()
+                    }),
+                    long_window: Some(QuotaWindowReport {
+                        label: "7d".to_string(),
+                        remaining_pct: 90.0,
+                        reset_compact: Some("4d".to_string()),
+                        ..Default::default()
+                    }),
+                },
+                QuotaPoolReport {
+                    name: "Argon".to_string(),
+                    short_window: None,
+                    long_window: Some(QuotaWindowReport {
+                        label: "argon".to_string(),
+                        remaining_pct: 55.0,
+                        reset_compact: Some("5d".to_string()),
+                        ..Default::default()
+                    }),
+                },
+                QuotaPoolReport {
+                    name: "Claude/3P".to_string(),
+                    short_window: Some(QuotaWindowReport {
+                        label: "3p 5h".to_string(),
+                        remaining_pct: 40.0,
+                        reset_compact: Some("1h".to_string()),
+                        ..Default::default()
+                    }),
+                    long_window: None,
+                },
+            ],
+            credits: Vec::new(),
+        });
+        ds.diagnostics = ScanDiagnostics {
+            retry_count: 3,
+            retries_429: 2,
+            retries_503: 1,
+            total_retry_delay_secs: 12.0,
+            compaction_steps: 2,
+            ..Default::default()
+        };
+
+        let mut screen = DashboardScreen {
+            state: StatsTuiState::new(None, StatsMetric::Total),
+            dataset: Some(ds),
+            view: None,
+            tables: DashboardTables::default(),
+            hit_map: DashboardHitMap::default(),
+            pending_scan: None,
+        };
+        screen.state.finish_scan(None);
+        screen.poll_scan();
+
+        let pal = Palette {
+            no_color: true,
+            ascii: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|frame| screen.draw(frame, &pal)).unwrap();
+        let wide: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            wide.contains("Quota (Ultra 20x · AI credits 1250 · live)"),
+            "{wide}"
+        );
+        assert!(
+            wide.contains("Gemini 5h 65% (2h10m), 7d 90% (4d)"),
+            "{wide}"
+        );
+        assert!(wide.contains("Argon 7d 55% (5d)"), "{wide}");
+        assert!(wide.contains("Claude/3P 5h 40% (1h)"), "{wide}");
+        assert!(wide.contains("2×429 1×503 (12s) · 2 cmp"), "{wide}");
+
+        // Verify mouse hit-testing remains aligned below the 3-row quota strip.
+        let m = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let daily_y = screen.hit_map.daily.data_y0 + 1;
+        let daily_x = screen.hit_map.daily.pane.x + 3;
+        screen.handle_mouse(
+            m(MouseEventKind::Down(MouseButton::Left), daily_x, daily_y),
+            36,
+        );
+        assert_eq!(screen.state.daily_idx(), 1);
+        assert_eq!(screen.state.selected_date(), Some("2026-11-19"));
+
+        // Verify compact 80x24 viewport renders the 1-line borderless quota strip cleanly.
+        let mut narrow = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        narrow.draw(|frame| screen.draw(frame, &pal)).unwrap();
+        let compact: String = narrow
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            compact.contains("Quota Ultra 20x cr:1250 [live]"),
+            "{compact}"
+        );
+        assert!(compact.contains("Gemini 5h 65% (2h10m)"), "{compact}");
     }
 }

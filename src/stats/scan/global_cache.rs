@@ -8,12 +8,11 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use super::{DbFileFingerprint, ScannedDbData};
-use crate::agy::paths::xdg_cache_dir;
 use crate::sys::fs::atomic_write_preserving_mode;
 
 pub(crate) const STATS_SCAN_CACHE_FILE: &str = "stats_scan_cache.json";
@@ -40,19 +39,6 @@ struct StatsScanCacheFile {
 pub(super) struct GlobalStatsCache {
     entries: BTreeMap<String, CachedDbEntry>,
     dirty: bool,
-}
-
-/// Resolves the default persistent global scan cache path (`$XDG_CACHE_HOME/agy-statusline/stats_scan_cache.json`).
-#[cfg(not(test))]
-pub(super) fn default_stats_scan_cache_path() -> Option<PathBuf> {
-    xdg_cache_dir().map(|dir| dir.join(STATS_SCAN_CACHE_FILE))
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub(super) fn default_stats_scan_cache_path() -> Option<PathBuf> {
-    let _ = xdg_cache_dir;
-    None
 }
 
 fn is_safe_cache_target(cache_path: &Path) -> bool {

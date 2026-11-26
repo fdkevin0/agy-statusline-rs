@@ -583,6 +583,7 @@ type PrefsChangeCallback =
 
 struct StatsApp {
     roots: Vec<(&'static str, PathBuf)>,
+    daemon_dirs: Vec<PathBuf>,
     cache_dir: Option<PathBuf>,
     tz: TimeZoneSpec,
     timezone: String,
@@ -879,7 +880,11 @@ impl StatsApp {
                         StatsAction::OpenConversations => self.open_conversations(),
                         StatsAction::Refresh => {
                             if let Some(d) = self.dashboard.as_mut() {
-                                d.trigger_refresh(&self.roots, self.cache_dir.as_deref());
+                                d.trigger_refresh(
+                                    &self.roots,
+                                    &self.daemon_dirs,
+                                    self.cache_dir.as_deref(),
+                                );
                             }
                         }
                         StatsAction::Continue => {}
@@ -1008,6 +1013,7 @@ where
     let timezone = tz.format_offset_at(opts.now_unix_secs as i64);
     let dashboard = DashboardScreen::new(
         &roots,
+        opts.daemon_dirs,
         opts.cache_dir,
         opts.days,
         opts.metric,
@@ -1019,6 +1025,7 @@ where
     };
     StatsApp {
         roots,
+        daemon_dirs: opts.daemon_dirs.to_vec(),
         cache_dir: opts.cache_dir.map(Path::to_path_buf),
         tz,
         timezone,
@@ -1081,6 +1088,7 @@ where
     };
     StatsApp {
         roots: roots.to_vec(),
+        daemon_dirs: opts.daemon_dirs.to_vec(),
         cache_dir: opts.cache_dir.map(Path::to_path_buf),
         tz,
         timezone,
@@ -1126,6 +1134,7 @@ where
     };
     StatsApp {
         roots: roots.to_vec(),
+        daemon_dirs: opts.daemon_dirs.to_vec(),
         cache_dir: opts.cache_dir.map(Path::to_path_buf),
         tz,
         timezone,
@@ -1171,6 +1180,7 @@ mod tests {
     fn test_app(origin: Screen) -> StatsApp {
         StatsApp {
             roots: Vec::new(),
+            daemon_dirs: Vec::new(),
             cache_dir: None,
             tz: TimeZoneSpec::utc(),
             timezone: "UTC".to_string(),

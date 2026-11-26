@@ -585,14 +585,12 @@ pub(crate) fn resolve_credit_views(
     credits
 }
 
-/// Resolves the primary credit view from `payload.quota`, preferring `ai_credits` /
+/// Resolves the primary credit view from a quota map, preferring `ai_credits` /
 /// `google_one_ai`, then the lowest remaining credit balance.
-#[allow(dead_code)]
-pub(crate) fn resolve_primary_credit_view(
-    payload: &StatuslinePayload,
+pub(crate) fn resolve_primary_credit_from_map(
+    quota: &BTreeMap<String, QuotaBucket>,
     now_unix_secs: u64,
 ) -> Option<CreditView> {
-    let quota = payload.quota.as_ref()?;
     let credits = resolve_credit_views(quota, now_unix_secs);
     credits
         .iter()
@@ -602,6 +600,17 @@ pub(crate) fn resolve_primary_credit_view(
         })
         .cloned()
         .or_else(|| credits.into_iter().min_by_key(|c| c.remaining_amount))
+}
+
+/// Resolves the primary credit view from `payload.quota`, preferring `ai_credits` /
+/// `google_one_ai`, then the lowest remaining credit balance.
+#[cfg(test)]
+pub(crate) fn resolve_primary_credit_view(
+    payload: &StatuslinePayload,
+    now_unix_secs: u64,
+) -> Option<CreditView> {
+    let quota = payload.quota.as_ref()?;
+    resolve_primary_credit_from_map(quota, now_unix_secs)
 }
 
 fn classify_pool_kind(key: &str, desc: &BucketDescriptor) -> (QuotaPoolKind, String) {
@@ -724,15 +733,13 @@ pub(crate) fn summarize_quota_pools_with_history(
 }
 
 /// Resolves both the active short-window (`< 24h`) and multi-day (`>= 24h`) quota buckets
-/// in a single pass over `payload.quota`, enriching views with sample history when available.
-pub(crate) fn resolve_quota_views_with_history(
+/// against an explicit `quota` map and optional sample `history`.
+pub(crate) fn resolve_quota_views_for_map(
     payload: &StatuslinePayload,
+    quota: &BTreeMap<String, QuotaBucket>,
     history: Option<&BTreeMap<String, BucketHistory>>,
     now_unix_secs: u64,
 ) -> (Option<QuotaView>, Option<QuotaView>) {
-    let Some(quota) = payload.quota.as_ref() else {
-        return (None, None);
-    };
     let model_tokens = collect_model_tokens(payload);
 
     let all_descriptors: Vec<(&String, BucketDescriptor, &QuotaBucket)> = quota
@@ -775,7 +782,22 @@ pub(crate) fn resolve_quota_views_with_history(
 }
 
 /// Resolves both the active short-window (`< 24h`) and multi-day (`>= 24h`) quota buckets
+/// in a single pass over `payload.quota`, enriching views with sample history when available.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn resolve_quota_views_with_history(
+    payload: &StatuslinePayload,
+    history: Option<&BTreeMap<String, BucketHistory>>,
+    now_unix_secs: u64,
+) -> (Option<QuotaView>, Option<QuotaView>) {
+    let Some(quota) = payload.quota.as_ref() else {
+        return (None, None);
+    };
+    resolve_quota_views_for_map(payload, quota, history, now_unix_secs)
+}
+
+/// Resolves both the active short-window (`< 24h`) and multi-day (`>= 24h`) quota buckets
 /// in a single pass over `payload.quota`.
+#[cfg(test)]
 pub(crate) fn resolve_quota_views(
     payload: &StatuslinePayload,
     now_unix_secs: u64,

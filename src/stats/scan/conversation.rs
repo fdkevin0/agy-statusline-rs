@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use super::{
     db_file_fingerprint, deduplicate_parent_priority_turns, discover_sqlite_db_targets,
     extract_sqlite_db_data, merge_raw_turn, valid_decode_speed, valid_ttft_secs, DbFileFingerprint,
-    RawTurn, ScanDiagnostics, TurnPricer,
+    RawTurn, TurnPricer,
 };
 use crate::agy::db::{
     compute_median, is_safe_sqlite_file, is_sqlite_db_ready_for_read, is_valid_uuid,
@@ -17,8 +17,9 @@ use crate::agy::db::{
 use crate::stats::metric::{cache_hit_pct, StatsMetric};
 use crate::stats::pricing::{round_usd_6, PricingCatalog};
 use crate::stats::{
-    finalize_models, ConversationListItem, ConversationStatsReport, ConversationTurnStats,
-    ModelAccumulator, PeriodSummary, SqliteStats, SubagentConversationStats, UsageDelta,
+    finalize_models, ConversationDiagnostics, ConversationListItem, ConversationStatsReport,
+    ConversationTurnStats, ModelAccumulator, PeriodSummary, SqliteStats, SubagentConversationStats,
+    UsageDelta,
 };
 use crate::sys::fmt::sanitize_inline_text;
 use crate::sys::fs::modified_timestamp;
@@ -492,19 +493,6 @@ struct SubagentAccumulator {
     ttfts: Vec<f64>,
 }
 
-/// Aggregated retry, error-step, and compaction diagnostics for a single conversation
-/// and its descendant subagents.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-#[allow(dead_code)]
-pub(crate) struct ConversationDiagnostics {
-    /// Combined diagnostics across the main conversation and descendant subagents.
-    pub(crate) total: ScanDiagnostics,
-    /// Diagnostics attributed strictly to the target conversation.
-    pub(crate) main: ScanDiagnostics,
-    /// Combined diagnostics attributed to descendant subagents.
-    pub(crate) subagents: ScanDiagnostics,
-}
-
 fn load_conversation_turn_slots(
     target: &ResolvedConversationTarget,
     desc_ids: &[String],
@@ -812,6 +800,7 @@ pub(crate) fn collect_conversation_stats_with_diagnostics(
             subagents,
             turns: turns_out,
             sqlite,
+            diagnostics,
         },
         diagnostics,
     ))

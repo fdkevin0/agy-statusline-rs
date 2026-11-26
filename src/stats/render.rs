@@ -12,11 +12,13 @@ use super::metric::{
 };
 use super::query::{HeatmapWeek, WEEKDAY_NAMES};
 use super::{
-    ConversationListItem, ConversationStatsReport, DailyUsage, PeriodSummary, StatsReport,
-    ACTIVITY_WEEKS,
+    ConversationListItem, ConversationStatsReport, DailyUsage, PeriodSummary, QuotaWindowReport,
+    ScanDiagnostics, StatsQuotaReport, StatsReport, ACTIVITY_WEEKS,
 };
+use crate::statusline::metrics::format_quota_pct;
 use crate::sys::fmt::{
-    format_duration_compact, format_tokens_string as fmt_tok, truncate_to_width,
+    format_duration_compact, format_tokens_string as fmt_tok, sanitize_inline_text,
+    truncate_to_width,
 };
 
 const MONTH_NAMES: [&str; 12] = [
@@ -358,6 +360,263 @@ fn write_daily_table<W: Write>(
     Ok(())
 }
 
+pub(super) fn format_quota_source_age(q: &StatsQuotaReport) -> String {
+    if !q.from_cache {
+        "live".to_string()
+    } else {
+        format!("cached {}", format_duration_compact(q.age_secs))
+    }
+}
+
+pub(super) fn format_quota_window_brief(
+    pool_name: &str,
+    win: &QuotaWindowReport,
+    is_long_window: bool,
+) -> String {
+    let metric = match win.remaining_amount {
+        Some(amt) => amt.to_string(),
+        None => format_quota_pct(win.remaining_pct),
+    };
+    let display_label = if win.label.eq_ignore_ascii_case(pool_name) {
+        if is_long_window {
+            "7d"
+        } else {
+            "5h"
+        }
+    } else if pool_name.eq_ignore_ascii_case("Claude/3P") {
+        win.label.strip_prefix("3p ").unwrap_or(&win.label)
+    } else {
+        win.label.as_str()
+    };
+    let mut out = format!("{display_label} {metric}");
+    if let Some(ref reset) = win.reset_compact {
+        out.push_str(" (");
+        out.push_str(reset);
+        out.push(')');
+    }
+    if win.remaining_amount.is_none() && win.will_exhaust_before_reset && win.remaining_pct > 0.0 {
+        out.push_str(" !");
+    }
+    out
+}
+
+/// Compact retry anomaly label for tight TUI strips (e.g. `2×429 1×503 (12s)`).
+pub(super) fn format_retry_compact(diag: &ScanDiagnostics, ascii: bool) -> Option<String> {
+    if diag.retry_count == 0 {
+        return None;
+    }
+    let times = if ascii { "x" } else { "×" };
+    let mut parts = Vec::new();
+    if diag.retries_429 > 0 {
+        parts.push(format!("{}{times}429", diag.retries_429));
+    }
+    if diag.retries_503 > 0 {
+        parts.push(format!("{}{times}503", diag.retries_503));
+    }
+    let other = diag.retries_non_429_503();
+    if other > 0 {
+        parts.push(format!("{other}{times}err"));
+    }
+    let mut out = if parts.is_empty() {
+        format!("{} retry", diag.retry_count)
+    } else {
+        parts.join(" ")
+    };
+    if diag.total_retry_delay_secs.is_finite() && diag.total_retry_delay_secs >= 0.5 {
+        let secs = diag.total_retry_delay_secs.round().max(1.0) as u64;
+        out.push_str(&format!(" ({})", format_duration_compact(secs)));
+    }
+    Some(out)
+}
+
+/// Compact diagnostics summary for TUI summary cards (e.g. `2×429 1×503 (12s) · 2 cmp`).
+pub(super) fn format_diagnostics_compact(diag: &ScanDiagnostics, ascii: bool) -> Option<String> {
+    if diag.is_empty() {
+        return None;
+    }
+    let sep = if ascii { " | " } else { " · " };
+    let mut parts = Vec::new();
+    if let Some(retries) = format_retry_compact(diag, ascii) {
+        parts.push(retries);
+    }
+    if diag.compaction_steps > 0 {
+        parts.push(format!("{} cmp", diag.compaction_steps));
+    }
+    if diag.error_steps > 0 {
+        parts.push(format!("{} err", diag.error_steps));
+    }
+    (!parts.is_empty()).then(|| parts.join(sep))
+}
+
+pub(super) fn format_retry_breakdown(diag: &ScanDiagnostics, ascii: bool) -> Option<String> {
+    if diag.retry_count == 0 {
+        return None;
+    }
+    let times = if ascii { "x" } else { "×" };
+    let mut parts = Vec::new();
+    if diag.retries_429 > 0 {
+        parts.push(format!("{}{times}429", diag.retries_429));
+    }
+    if diag.retries_503 > 0 {
+        parts.push(format!("{}{times}503", diag.retries_503));
+    }
+    let other = diag.retries_non_429_503();
+    if other > 0 {
+        parts.push(format!("{other}{times}other"));
+    }
+    if diag.total_retry_delay_secs.is_finite() && diag.total_retry_delay_secs >= 0.5 {
+        let secs = diag.total_retry_delay_secs;
+        let delay = if secs >= 60.0 {
+            format_duration_compact(secs.round() as u64)
+        } else {
+            format!("{secs:.1}s")
+        };
+        parts.push(format!("{delay} delay"));
+    }
+    let noun = if diag.retry_count == 1 {
+        "retry"
+    } else {
+        "retries"
+    };
+    if parts.is_empty() {
+        Some(format!("{} {noun}", diag.retry_count))
+    } else {
+        Some(format!(
+            "{} {noun} ({})",
+            diag.retry_count,
+            parts.join(", ")
+        ))
+    }
+}
+
+pub(super) fn format_diagnostics_summary(diag: &ScanDiagnostics, ascii: bool) -> Option<String> {
+    if diag.is_empty() {
+        return None;
+    }
+    let sep = if ascii { " | " } else { " · " };
+    let mut parts = Vec::new();
+    if let Some(retries) = format_retry_breakdown(diag, ascii) {
+        parts.push(retries);
+    }
+    if diag.compaction_steps > 0 {
+        let noun = if diag.compaction_steps == 1 {
+            "compaction"
+        } else {
+            "compactions"
+        };
+        parts.push(format!("{} {noun}", diag.compaction_steps));
+    }
+    if diag.error_steps > 0 {
+        let noun = if diag.error_steps == 1 {
+            "error"
+        } else {
+            "errors"
+        };
+        parts.push(format!("{} {noun}", diag.error_steps));
+    }
+    (!parts.is_empty()).then(|| parts.join(sep))
+}
+
+fn quota_window_ansi(win: &QuotaWindowReport) -> &'static str {
+    if let Some(amt) = win.remaining_amount {
+        if amt <= 0 {
+            return "1;38;5;203";
+        } else if amt <= crate::statusline::metrics::LOW_CREDIT_WARN_THRESHOLD {
+            return "38;5;221";
+        }
+        return "38;5;78";
+    }
+    if win.remaining_pct <= 10.0 {
+        "1;38;5;203"
+    } else if win.remaining_pct <= 30.0 || win.will_exhaust_before_reset {
+        "38;5;221"
+    } else {
+        "38;5;78"
+    }
+}
+
+fn write_quota_section<W: Write>(
+    out: &mut W,
+    q: &StatsQuotaReport,
+    no_color: bool,
+    ascii: bool,
+) -> io::Result<()> {
+    if !q.has_visible_content() {
+        return Ok(());
+    }
+    let sep = if ascii { " | " } else { " · " };
+    let mut meta = Vec::new();
+    if let Some(tier) = q.plan_tier.as_deref() {
+        let clean = sanitize_inline_text(tier);
+        if !clean.is_empty() {
+            meta.push(clean);
+        }
+    }
+    if let Some(credits) = q.ai_credits {
+        let tag = if credits <= 0 {
+            " [empty]"
+        } else if credits <= crate::statusline::metrics::LOW_CREDIT_WARN_THRESHOLD {
+            " [low]"
+        } else {
+            ""
+        };
+        meta.push(format!("AI credits {credits}{tag}"));
+    }
+    meta.push(format_quota_source_age(q));
+
+    let hdr = format!("Quota ({}):", meta.join(sep));
+    writeln!(out, "\n{}", style_wrap(no_color, "38;5;117", &hdr))?;
+
+    let mut items = Vec::new();
+    for pool in &q.pools {
+        let mut wins = Vec::new();
+        if let Some(ref short) = pool.short_window {
+            wins.push(style_wrap(
+                no_color,
+                quota_window_ansi(short),
+                &format_quota_window_brief(&pool.name, short, false),
+            ));
+        }
+        if let Some(ref long) = pool.long_window {
+            wins.push(style_wrap(
+                no_color,
+                quota_window_ansi(long),
+                &format_quota_window_brief(&pool.name, long, true),
+            ));
+        }
+        if !wins.is_empty() {
+            items.push(format!(
+                "{} {}",
+                style_wrap(no_color, "1", &pool.name),
+                wins.join(", ")
+            ));
+        }
+    }
+    for credit in &q.credits {
+        if q.ai_credits.is_some()
+            && (credit.key.eq_ignore_ascii_case("google_one_ai")
+                || credit.key.eq_ignore_ascii_case("ai_credits"))
+        {
+            continue;
+        }
+        let code = match credit.severity.as_str() {
+            "critical" => "1;38;5;203",
+            "low" => "38;5;221",
+            _ => "38;5;78",
+        };
+        items.push(style_wrap(
+            no_color,
+            code,
+            &format!("{} {}", credit.label, credit.remaining_amount),
+        ));
+    }
+
+    if !items.is_empty() {
+        writeln!(out, "  {}", items.join(sep))?;
+    }
+    Ok(())
+}
+
 /// Renders [`StatsReport`] using `metric` for the daily usage table and optional metric-colored heatmap.
 pub(super) fn render_stats_report_with_metric<W: Write>(
     report: &StatsReport,
@@ -398,6 +657,10 @@ pub(super) fn render_stats_report_with_metric<W: Write>(
     write_window_row(out, "7d", &report.windows.last_7d, show_cost)?;
     write_window_row(out, "30d", &report.windows.last_30d, show_cost)?;
     write_window_row(out, "All-Time", &report.windows.all_time, show_cost)?;
+
+    if let Some(quota) = report.quota.as_ref() {
+        write_quota_section(out, quota, no_color, ascii)?;
+    }
 
     match (metric, metric_heatmap) {
         (m, Some(weeks)) if m != StatsMetric::Total => {
@@ -471,6 +734,19 @@ pub(super) fn render_stats_report_with_metric<W: Write>(
         "\nSQLite Turns: {} turns across {} DBs {sep} med {} {sep} TTFT {}",
         report.sqlite.completed_turns, report.sqlite.db_files, db_speed, db_ttft
     )?;
+    if let Some(diag_line) = format_diagnostics_summary(&report.diagnostics, ascii) {
+        let diag_code = if report.diagnostics.retries_429 > 0 || report.diagnostics.error_steps > 0
+        {
+            "38;5;203"
+        } else {
+            "38;5;221"
+        };
+        writeln!(
+            out,
+            "Diagnostics:  {}",
+            style_wrap(no_color, diag_code, &diag_line)
+        )?;
+    }
 
     Ok(())
 }
@@ -692,6 +968,39 @@ pub(super) fn render_conversation_stats_report<W: Write>(
             format!("{} {noun}", report.mid_session_misses)
         };
         info_segments.push(style_wrap(no_color, "38;5;203", &text));
+    }
+    let diag = &report.diagnostics.total;
+    if diag.compaction_steps > 0 {
+        let noun = if diag.compaction_steps == 1 {
+            "compaction"
+        } else {
+            "compactions"
+        };
+        info_segments.push(style_wrap(
+            no_color,
+            "38;5;221",
+            &format!("{} {noun}", diag.compaction_steps),
+        ));
+    }
+    if let Some(retries) = format_retry_breakdown(diag, ascii) {
+        let code = if diag.retries_429 > 0 {
+            "38;5;203"
+        } else {
+            "38;5;221"
+        };
+        info_segments.push(style_wrap(no_color, code, &retries));
+    }
+    if diag.error_steps > 0 {
+        let noun = if diag.error_steps == 1 {
+            "error"
+        } else {
+            "errors"
+        };
+        info_segments.push(style_wrap(
+            no_color,
+            "38;5;203",
+            &format!("{} {noun}", diag.error_steps),
+        ));
     }
     if !info_segments.is_empty() {
         let joiner = style_wrap(no_color, "2", &format!(" {sep} "));

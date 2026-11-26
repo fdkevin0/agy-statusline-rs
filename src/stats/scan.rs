@@ -4,19 +4,16 @@ mod conversation;
 mod cost_cache;
 mod global_cache;
 
+#[allow(unused_imports)]
+pub(crate) use conversation::collect_conversation_stats_with_diagnostics;
 pub(in crate::stats) use conversation::{
     collect_conversation_stats_report, conversation_watch_fingerprint,
     conversations_list_fingerprint, list_conversations, ConversationWatchFingerprint,
     ConversationsListFingerprint,
 };
-#[allow(unused_imports)]
-pub(crate) use conversation::{
-    collect_conversation_stats_with_diagnostics, ConversationDiagnostics,
-};
 pub(crate) use cost_cache::{
     estimate_conversation_cost_usd_with_parent_conn, lookup_cached_conversation_cost,
 };
-#[allow(unused_imports)]
 pub(crate) use global_cache::STATS_SCAN_CACHE_FILE;
 
 use std::collections::{HashMap, HashSet};
@@ -125,7 +122,6 @@ impl ScanDiagnostics {
     }
 
     /// Count of non-429, non-503 actionable retries (`5xx + timeout + other`).
-    #[allow(dead_code)]
     pub fn retries_non_429_503(&self) -> u64 {
         self.retries_5xx
             .saturating_add(self.retries_timeout)
@@ -133,7 +129,6 @@ impl ScanDiagnostics {
     }
 
     /// Returns `true` when no retries, error steps, or compaction checkpoints were recorded.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.retry_count == 0 && self.error_steps == 0 && self.compaction_steps == 0
     }
@@ -150,12 +145,13 @@ pub(super) struct ScannedDbData {
 
 /// Full output of a global SQLite scan including diagnostics and per-DB cache stats.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct GlobalScanResult {
     pub(crate) sqlite: SqliteStats,
     pub(crate) events: Vec<UsageEvent>,
     pub(crate) diagnostics: ScanDiagnostics,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) cache_hits: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) cache_misses: usize,
 }
 
@@ -1496,16 +1492,6 @@ pub(crate) fn scan_sqlite_conversations_with_cache(
         cache_hits,
         cache_misses,
     }
-}
-
-pub(super) fn scan_sqlite_conversations(
-    roots: &[(&'static str, PathBuf)],
-    tz: &TimeZoneSpec,
-    pricing: &PricingCatalog,
-) -> (SqliteStats, Vec<UsageEvent>) {
-    let default_cache = global_cache::default_stats_scan_cache_path();
-    let res = scan_sqlite_conversations_with_cache(roots, tz, pricing, default_cache.as_deref());
-    (res.sqlite, res.events)
 }
 
 fn resolve_descendant_conversation_ids(cli_dir: &Path, root_id: &str) -> Vec<String> {

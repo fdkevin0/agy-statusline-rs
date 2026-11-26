@@ -6,7 +6,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A `#![forbid(unsafe_code)]` Rust statusline and local usage dashboard for Antigravity CLI (`agy >= 1.5.15`), with quota pacing, real compaction-threshold sniffing, subagent-aware `models.dev` cost estimation, pure-Rust `.git/HEAD` + worktree awareness, and an interactive 3-pane TUI configurator.
+A `#![forbid(unsafe_code)]` Rust statusline and local usage dashboard for Antigravity CLI (`agy >= 1.5.15`), with burn-rate quota pacing & multi-pool/AI credits visibility, real compaction-threshold sniffing, fork-deduplicated SQLite stats with persistent scan caching & retry/compaction diagnostics, subagent-aware `models.dev` cost estimation, pure-Rust `.git/HEAD` + worktree awareness, and an interactive 3-pane TUI configurator.
 
 ![agy-statusline built-in presets](docs/assets/presets.png)
 
@@ -45,7 +45,7 @@ agy-statusline apply --yes
 agy-statusline doctor
 ```
 
-3. Inspect local CLI & desktop daily/model token usage, cache hit rates, speed, TTFT, and estimated API cost interactively (or pass `--plain` / `--json` for static output):
+3. Inspect local CLI & desktop daily/model token usage, live/cached multi-pool quota & AI credits, cache hit rates, speed, TTFT, retry/compaction diagnostics, and estimated API cost interactively (or pass `--plain` / `--json` for static output):
 
 ```sh
 agy-statusline stats

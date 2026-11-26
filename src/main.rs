@@ -9,7 +9,8 @@ use std::process::ExitCode;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use agy_statusline::agy::paths::{
-    agy_settings_path, resolve_agy_cli_dir, resolve_agy_roots, xdg_cache_dir, xdg_config_dir,
+    agy_settings_path, resolve_agy_cli_dir, resolve_agy_daemon_dirs, resolve_agy_roots,
+    xdg_cache_dir, xdg_config_dir,
 };
 use agy_statusline::cli::apply::{
     resolve_invoked_binary_path, run_apply_command, set_statusline_enabled,
@@ -163,6 +164,7 @@ impl OutputModeArgs {
 
 struct StatsContext {
     roots: Vec<(&'static str, std::path::PathBuf)>,
+    daemon_dirs: Vec<std::path::PathBuf>,
     cache_dir: Option<std::path::PathBuf>,
     config_path: Option<std::path::PathBuf>,
     prefs: StatsTuiPrefs,
@@ -176,6 +178,7 @@ fn resolve_stats_context(metric_override: Option<StatsMetric>) -> io::Result<Sta
             "no AGY data roots found (set HOME, USERPROFILE, ANTIGRAVITY_CLI_HOME, or ANTIGRAVITY_DATA_DIR)",
         ));
     }
+    let daemon_dirs = resolve_agy_daemon_dirs();
     let cache_dir = xdg_cache_dir();
     let config_path = xdg_config_dir().ok().map(|d| d.join("config.json"));
     let mut prefs = config_path
@@ -187,6 +190,7 @@ fn resolve_stats_context(metric_override: Option<StatsMetric>) -> io::Result<Sta
     }
     Ok(StatsContext {
         roots,
+        daemon_dirs,
         cache_dir,
         config_path,
         prefs,
@@ -299,6 +303,7 @@ fn run_subcommand(command: Command, no_color: bool) -> io::Result<()> {
             let ctx = resolve_stats_context(metric)?;
             let opts = StatsOptions {
                 cache_dir: ctx.cache_dir.as_deref(),
+                daemon_dirs: &ctx.daemon_dirs,
                 days,
                 metric: ctx.prefs.metric,
                 no_color,
@@ -347,6 +352,7 @@ fn run_subcommand(command: Command, no_color: bool) -> io::Result<()> {
             let ctx = resolve_stats_context(None)?;
             let opts = StatsOptions {
                 cache_dir: ctx.cache_dir.as_deref(),
+                daemon_dirs: &ctx.daemon_dirs,
                 days: None,
                 metric: ctx.prefs.metric,
                 no_color,

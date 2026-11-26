@@ -16,6 +16,9 @@ use crate::agy::db::{
     open_readonly_db, query_session_metadata_from_conn, query_session_metadata_in,
     resolve_conversation_db_path, SessionMetadata, SpeedReader,
 };
+use crate::agy::quota::{
+    load_quota_snapshot, save_quota_snapshot, BucketHistory, QuotaSnapshot, QuotaSource,
+};
 use crate::config::layout::{LayoutConfig, WidgetId};
 use crate::stats::{
     estimate_conversation_cost_usd_with_parent_conn, is_pricing_fingerprint_fresh,
@@ -23,7 +26,12 @@ use crate::stats::{
     PricingCatalog, SyncMode,
 };
 use crate::statusline::git::{GitInfo, GitProbe};
-use crate::statusline::render::write_statusline_at;
+use crate::statusline::metrics::resolve_credit_views;
+use crate::statusline::render::{write_statusline_with, RenderExtras};
+use crate::sys::time::parse_rfc3339_unix_secs;
+
+/// Maximum age (6 hours) for falling back to cached `quota_snapshot.json` on empty statusline ticks.
+pub(crate) const MAX_QUOTA_FALLBACK_AGE_SECS: u64 = 6 * 3_600;
 
 /// Active AI model metadata (`"model": null` before a model is selected).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -511,6 +519,289 @@ fn layout_needs_session_metadata(cfg: &LayoutConfig) -> bool {
     })
 }
 
+fn layout_needs_quota_or_plan(cfg: &LayoutConfig) -> bool {
+    cfg.rows.iter().flatten().any(|w| {
+        matches!(
+            w,
+            WidgetId::Quota5h | WidgetId::QuotaWeekly | WidgetId::Plan
+        )
+    })
+}
+
+fn emails_conflict(a: Option<&str>, b: Option<&str>) -> bool {
+    match (
+        a.map(str::trim).filter(|s| !s.is_empty()),
+        b.map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (Some(ea), Some(eb)) => !ea.eq_ignore_ascii_case(eb),
+        _ => false,
+    }
+}
+
+fn filter_fresh_fallback_quota(
+    snap: &QuotaSnapshot,
+    now_unix_secs: u64,
+) -> BTreeMap<String, QuotaBucket> {
+    let elapsed = now_unix_secs.saturating_sub(snap.updated_at);
+    let mut out = BTreeMap::new();
+    for (key, bucket) in &snap.quota {
+        if bucket.disabled == Some(true) {
+            continue;
+        }
+        if let Some(reset_unix) = bucket
+            .reset_time
+            .as_deref()
+            .and_then(parse_rfc3339_unix_secs)
+        {
+            if reset_unix <= now_unix_secs as i64 {
+                continue;
+            }
+            let mut adjusted = bucket.clone();
+            // Drop stale snapshot-relative countdown so renderer derives live remaining time from `reset_time`.
+            adjusted.reset_in_seconds = None;
+            out.insert(key.clone(), adjusted);
+        } else if let Some(secs) = bucket.reset_in_seconds {
+            let rem = secs.saturating_sub(elapsed.min(i64::MAX as u64) as i64);
+            if rem <= 0 {
+                continue;
+            }
+            let mut adjusted = bucket.clone();
+            adjusted.reset_in_seconds = Some(rem);
+            out.insert(key.clone(), adjusted);
+        } else {
+            out.insert(key.clone(), bucket.clone());
+        }
+    }
+    out
+}
+
+fn extract_payload_ai_credits(
+    quota: &BTreeMap<String, QuotaBucket>,
+    now_unix_secs: u64,
+) -> Option<i64> {
+    resolve_credit_views(quota, now_unix_secs)
+        .into_iter()
+        .find(|c| {
+            c.key.eq_ignore_ascii_case("google_one_ai") || c.key.eq_ignore_ascii_case("ai_credits")
+        })
+        .map(|c| c.remaining_amount)
+}
+
+fn should_enrich_plan_with_ultra(payload_tier: Option<&str>, snap: &QuotaSnapshot) -> bool {
+    if snap.ultra_tier_label.is_none() {
+        return false;
+    }
+    match payload_tier {
+        None => true,
+        Some(t) => t.eq_ignore_ascii_case("pro") || t.eq_ignore_ascii_case("ultra"),
+    }
+}
+
+struct StatuslineQuotaState {
+    fallback_quota: Option<BTreeMap<String, QuotaBucket>>,
+    history: Option<BTreeMap<String, BucketHistory>>,
+    plan_tier_override: Option<String>,
+    ai_credits_fallback: Option<i64>,
+}
+
+fn resolve_statusline_quota_state(
+    payload: &StatuslinePayload,
+    cache_dir: Option<&Path>,
+    now_unix_secs: u64,
+    cfg: &LayoutConfig,
+) -> StatuslineQuotaState {
+    let Some(dir) = cache_dir else {
+        return StatuslineQuotaState {
+            fallback_quota: None,
+            history: None,
+            plan_tier_override: None,
+            ai_credits_fallback: None,
+        };
+    };
+
+    let payload_quota = payload.quota.as_ref().filter(|q| !q.is_empty());
+    let payload_tier = payload
+        .plan_tier
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let payload_email = payload
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let has_observation =
+        payload_quota.is_some() || payload_tier.is_some() || payload_email.is_some();
+    let needs_fallback = payload_quota.is_none() && layout_needs_quota_or_plan(cfg);
+
+    if !has_observation && !needs_fallback {
+        return StatuslineQuotaState {
+            fallback_quota: None,
+            history: None,
+            plan_tier_override: None,
+            ai_credits_fallback: None,
+        };
+    }
+
+    let prev = load_quota_snapshot(dir).ok().flatten();
+
+    if let Some(quota_map) = payload_quota {
+        // Stdin upstream often reports "Pro" for Google AI Ultra users and never carries
+        // `ultra_tier_label`; preserve the cached Hub RPC Ultra multiplier for the same account.
+        let (eff_tier, eff_ultra) = match prev.as_ref() {
+            Some(p)
+                if !emails_conflict(p.email.as_deref(), payload_email)
+                    && should_enrich_plan_with_ultra(payload_tier, p) =>
+            {
+                (
+                    p.plan_tier.clone().or_else(|| Some("Ultra".to_string())),
+                    p.ultra_tier_label.clone(),
+                )
+            }
+            _ => (payload_tier.map(str::to_string), None),
+        };
+        let incoming = QuotaSnapshot {
+            updated_at: now_unix_secs,
+            source: QuotaSource::Stdin,
+            plan_tier: eff_tier,
+            ultra_tier_label: eff_ultra,
+            email: payload_email.map(str::to_string),
+            ai_credits: extract_payload_ai_credits(quota_map, now_unix_secs),
+            quota: quota_map.clone(),
+            history: BTreeMap::new(),
+        };
+        let merged = match prev {
+            Some(mut existing) => {
+                existing.merge_observation(incoming, now_unix_secs);
+                existing
+            }
+            None => {
+                let mut fresh = incoming;
+                fresh.record_bucket_samples(now_unix_secs);
+                fresh
+            }
+        };
+        let _ = save_quota_snapshot(dir, &merged);
+        let plan_tier_override = if merged.ultra_tier_label.is_some() || payload_tier.is_none() {
+            merged.display_plan_tier()
+        } else {
+            None
+        };
+        return StatuslineQuotaState {
+            fallback_quota: None,
+            history: (!merged.history.is_empty()).then_some(merged.history),
+            plan_tier_override,
+            ai_credits_fallback: merged.ai_credits,
+        };
+    }
+
+    // Payload has no quota buckets. Update account/tier metadata without refreshing stale
+    // bucket timestamps, and load a fresh-enough (<= 6h) cached snapshot as fallback.
+    let active_snap = match prev {
+        Some(mut existing) => {
+            if emails_conflict(existing.email.as_deref(), payload_email) {
+                let fresh = QuotaSnapshot {
+                    updated_at: now_unix_secs,
+                    source: QuotaSource::Stdin,
+                    plan_tier: payload_tier.map(str::to_string),
+                    ultra_tier_label: None,
+                    email: payload_email.map(str::to_string),
+                    ai_credits: None,
+                    quota: BTreeMap::new(),
+                    history: BTreeMap::new(),
+                };
+                let _ = save_quota_snapshot(dir, &fresh);
+                Some(fresh)
+            } else {
+                let mut dirty = false;
+                if let Some(em) = payload_email {
+                    if existing.email.as_deref() != Some(em) {
+                        existing.email = Some(em.to_string());
+                        dirty = true;
+                    }
+                }
+                if let Some(tier) = payload_tier {
+                    let preserve_ultra = should_enrich_plan_with_ultra(Some(tier), &existing);
+                    if !preserve_ultra && existing.plan_tier.as_deref() != Some(tier) {
+                        existing.plan_tier = Some(tier.to_string());
+                        existing.ultra_tier_label = None;
+                        dirty = true;
+                    }
+                }
+                if dirty {
+                    let _ = save_quota_snapshot(dir, &existing);
+                }
+                Some(existing)
+            }
+        }
+        None if has_observation => {
+            let fresh = QuotaSnapshot {
+                updated_at: now_unix_secs,
+                source: QuotaSource::Stdin,
+                plan_tier: payload_tier.map(str::to_string),
+                ultra_tier_label: None,
+                email: payload_email.map(str::to_string),
+                ai_credits: None,
+                quota: BTreeMap::new(),
+                history: BTreeMap::new(),
+            };
+            let _ = save_quota_snapshot(dir, &fresh);
+            Some(fresh)
+        }
+        None => None,
+    };
+
+    let Some(snap) = active_snap else {
+        return StatuslineQuotaState {
+            fallback_quota: None,
+            history: None,
+            plan_tier_override: None,
+            ai_credits_fallback: None,
+        };
+    };
+
+    let is_fresh = now_unix_secs.saturating_sub(snap.updated_at) <= MAX_QUOTA_FALLBACK_AGE_SECS;
+    if !is_fresh {
+        return StatuslineQuotaState {
+            fallback_quota: None,
+            history: None,
+            plan_tier_override: None,
+            ai_credits_fallback: None,
+        };
+    }
+
+    let plan_tier_override =
+        if payload_tier.is_none() || should_enrich_plan_with_ultra(payload_tier, &snap) {
+            snap.display_plan_tier()
+        } else {
+            None
+        };
+
+    if !needs_fallback {
+        return StatuslineQuotaState {
+            fallback_quota: None,
+            history: None,
+            plan_tier_override,
+            ai_credits_fallback: None,
+        };
+    }
+
+    let filtered = filter_fresh_fallback_quota(&snap, now_unix_secs);
+    let fallback_quota = (!filtered.is_empty()).then_some(filtered);
+    let history = if fallback_quota.is_some() && !snap.history.is_empty() {
+        Some(snap.history)
+    } else {
+        None
+    };
+
+    StatuslineQuotaState {
+        fallback_quota,
+        history,
+        plan_tier_override,
+        ai_credits_fallback: snap.ai_credits,
+    }
+}
+
 fn probe_git(payload: &StatuslinePayload, git_probe: &dyn GitProbe, cfg: &LayoutConfig) -> GitInfo {
     let has_vcs = cfg
         .rows
@@ -692,11 +983,21 @@ pub fn process_statusline<W: Write>(
         }
     }
 
-    write_statusline_at(
+    let quota_state =
+        resolve_statusline_quota_state(&payload, runtime.cache_dir, runtime.now_unix_secs, cfg);
+    let extras = RenderExtras {
+        unpriced_turns,
+        quota_override: quota_state.fallback_quota.as_ref(),
+        quota_history: quota_state.history.as_ref(),
+        plan_tier_override: quota_state.plan_tier_override.as_deref(),
+        ai_credits_fallback: quota_state.ai_credits_fallback,
+    };
+
+    write_statusline_with(
         &payload,
         &meta,
         &git_info,
-        unpriced_turns,
+        &extras,
         runtime.now_unix_secs,
         cfg,
         out,
@@ -1184,5 +1485,116 @@ mod tests {
             text_summaries.contains("~$17.50 (sub $10.50)"),
             "summaries invalidation: {text_summaries:?}"
         );
+    }
+
+    #[test]
+    fn quota_snapshot_persists_burn_rate_falls_back_when_empty_and_enriches_ultra_tier() {
+        use crate::agy::quota::BucketHistory;
+        use crate::config::layout::{GlyphMode, ThemeStyle};
+
+        let cache = tempfile::tempdir().unwrap();
+        let t0 = 1_700_000_000u64;
+        // Seed a Hub RPC snapshot with Ultra 20x, low AI credits, one active bucket, and one expired bucket.
+        let mut hist = BucketHistory::default();
+        hist.record_sample(t0, 0.80, Some((t0 + 18_000) as i64));
+        let seeded = QuotaSnapshot {
+            updated_at: t0,
+            source: QuotaSource::HubRpc,
+            plan_tier: Some("Ultra".to_string()),
+            ultra_tier_label: Some("20x".to_string()),
+            email: Some("dev@example.com".to_string()),
+            ai_credits: Some(30),
+            quota: BTreeMap::from([
+                (
+                    "gemini-5h".to_string(),
+                    QuotaBucket {
+                        remaining_fraction: Some(0.80),
+                        reset_in_seconds: Some(18_000),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "3p-5h".to_string(),
+                    QuotaBucket {
+                        remaining_fraction: Some(0.10),
+                        reset_time: Some("2020-01-01T00:00:00Z".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            history: BTreeMap::from([("gemini-5h".to_string(), hist)]),
+        };
+        save_quota_snapshot(cache.path(), &seeded).unwrap();
+
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.glyph_mode = GlyphMode::Ascii;
+        cfg.no_color = true;
+        cfg.responsive = false;
+        cfg.rows = vec![vec![
+            WidgetId::Plan,
+            WidgetId::Quota5h,
+            WidgetId::QuotaWeekly,
+        ]];
+        let reader = StubReader(None);
+        let git = NoopGit;
+
+        // Tick 1: empty quota payload (10 min after Hub RPC) -> falls back to fresh snapshot,
+        // enriches "Pro" -> "Ultra 20x", adjusts reset countdown, skips expired 3p-5h, surfaces credits.
+        let rt1 = StatuslineRuntime {
+            session: SessionSource::Reader(&reader),
+            git_probe: &git,
+            cache_dir: Some(cache.path()),
+            pricing: PricingSource::Disabled,
+            now_unix_secs: t0 + 600,
+        };
+        let idle_json =
+            r#"{"plan_tier":"Pro","email":"dev@example.com","model":{"id":"gemini-4"},"quota":{}}"#;
+        let mut out1 = Vec::new();
+        process_statusline(idle_json, &rt1, &cfg, &mut out1).unwrap();
+        let text1 = String::from_utf8(out1).unwrap();
+        assert!(text1.contains("Ultra 20x"), "text1: {text1:?}");
+        assert!(text1.contains("5h 80% r:4h50m"), "text1: {text1:?}");
+        assert!(text1.contains("credits 30"), "text1: {text1:?}");
+        assert!(!text1.contains("3p 5h"), "expired bucket leaked: {text1:?}");
+
+        // Tick 2: stdin observation 1h later at 60% remaining (20%/hr burn rate -> 3h ETA < 4h reset).
+        let rt2 = StatuslineRuntime {
+            session: SessionSource::Reader(&reader),
+            git_probe: &git,
+            cache_dir: Some(cache.path()),
+            pricing: PricingSource::Disabled,
+            now_unix_secs: t0 + 3_600,
+        };
+        let active_json = r#"{
+            "plan_tier":"Pro",
+            "email":"dev@example.com",
+            "model":{"id":"gemini-4"},
+            "quota":{"gemini-5h":{"remaining_fraction":0.60,"reset_in_seconds":14400}}
+        }"#;
+        let mut out2 = Vec::new();
+        process_statusline(active_json, &rt2, &cfg, &mut out2).unwrap();
+        let text2 = String::from_utf8(out2).unwrap();
+        assert!(text2.contains("Ultra 20x"), "text2: {text2:?}");
+        assert!(text2.contains("5h 60% r:4h !3h"), "text2: {text2:?}");
+
+        let persisted = load_quota_snapshot(cache.path()).unwrap().unwrap();
+        assert_eq!(persisted.source, QuotaSource::Stdin);
+        assert_eq!(persisted.display_plan_tier().as_deref(), Some("Ultra 20x"));
+        assert_eq!(persisted.history["gemini-5h"].samples.len(), 2);
+
+        // Tick 3: > 6h later with empty quota -> stale fallback is skipped cleanly.
+        let rt3 = StatuslineRuntime {
+            session: SessionSource::Reader(&reader),
+            git_probe: &git,
+            cache_dir: Some(cache.path()),
+            pricing: PricingSource::Disabled,
+            now_unix_secs: t0 + 3_600 + MAX_QUOTA_FALLBACK_AGE_SECS + 60,
+        };
+        let empty_json = r#"{"email":"dev@example.com","model":{"id":"gemini-4"}}"#;
+        let mut out3 = Vec::new();
+        process_statusline(empty_json, &rt3, &cfg, &mut out3).unwrap();
+        let text3 = String::from_utf8(out3).unwrap();
+        assert!(!text3.contains("5h 60%"), "stale quota leaked: {text3:?}");
     }
 }

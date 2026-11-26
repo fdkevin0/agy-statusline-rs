@@ -684,3 +684,173 @@ fn cli_conv_tui_persists_sort_prefs_and_restores_on_next_launch() {
         "expected Live indicator:\n{stripped}"
     );
 }
+
+#[test]
+fn cli_stats_persists_global_scan_cache_and_surfaces_quota_and_diagnostics() {
+    use std::collections::BTreeMap;
+
+    use agy_statusline::agy::quota::{save_quota_snapshot, QuotaSnapshot, QuotaSource};
+    use agy_statusline::statusline::QuotaBucket;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let cli_root = home.join(".gemini/antigravity-cli");
+    let uuid = "77777777-7777-4777-8777-777777777777";
+    let now_secs = unix_now_secs();
+
+    let db_path = cli_root.join("conversations").join(format!("{uuid}.db"));
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, metadata) VALUES (1, 1, ?1)",
+        [build_step_meta_blob(now_secs)],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, metadata) VALUES (2, 23, NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO steps (idx, step_type, metadata) VALUES (3, 17, NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+        [build_gen_blob(TestGenSpec {
+            step_idx: 1,
+            model_enum: 1526,
+            resp_model: "model-alpha",
+            disp_name: "Model Alpha",
+            input_tok: 10_000,
+            cache_read_tok: 30_000,
+            output_tok: 400,
+            dur_secs: 2,
+            ttft_ms: 500,
+            retry_error: Some("HTTP 429 RESOURCE_EXHAUSTED"),
+            retry_delay_secs: 8,
+            ..Default::default()
+        })],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Seed cached quota snapshot in isolated XDG_CACHE_HOME/agy-statusline.
+    let cache_dir = home.join("cache/agy-statusline");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let snap = QuotaSnapshot {
+        updated_at: now_secs.saturating_sub(180),
+        source: QuotaSource::HubRpc,
+        plan_tier: Some("Ultra".to_string()),
+        ultra_tier_label: Some("20x".to_string()),
+        email: Some("dev@example.com".to_string()),
+        ai_credits: Some(1250),
+        quota: BTreeMap::from([
+            (
+                "gemini-5h".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(0.65),
+                    reset_in_seconds: Some(7_200),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gemini-argon-weekly".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(0.55),
+                    reset_in_seconds: Some(345_600),
+                    ..Default::default()
+                },
+            ),
+            (
+                "3p-5h".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(0.40),
+                    reset_in_seconds: Some(3_600),
+                    ..Default::default()
+                },
+            ),
+        ]),
+        history: BTreeMap::new(),
+    };
+    save_quota_snapshot(&cache_dir, &snap).unwrap();
+
+    // Global `stats --plain --ascii`: writes persistent `stats_scan_cache.json` and renders Quota + Diagnostics.
+    let plain_out = isolated_agy_cmd(home)
+        .env("NO_COLOR", "1")
+        .args(["stats", "--plain", "--ascii"])
+        .output()
+        .unwrap();
+    assert!(plain_out.status.success(), "{plain_out:?}");
+    let plain_text = String::from_utf8(plain_out.stdout).unwrap();
+    assert!(
+        plain_text.contains("Quota (Ultra 20x | AI credits 1250 | cached "),
+        "{plain_text}"
+    );
+    assert!(plain_text.contains("Gemini 5h 65%"), "{plain_text}");
+    assert!(plain_text.contains("Argon 7d 55%"), "{plain_text}");
+    assert!(plain_text.contains("Claude/3P 5h 40%"), "{plain_text}");
+    assert!(
+        plain_text.contains("Diagnostics:  1 retry (1x429, 8.0s delay) | 1 compaction | 1 error"),
+        "{plain_text}"
+    );
+    assert!(
+        cache_dir.join("stats_scan_cache.json").is_file(),
+        "expected stats_scan_cache.json to be persisted in isolated XDG_CACHE_HOME"
+    );
+
+    // Global `stats --json`: exposes structured `quota` and `diagnostics`.
+    let json_out = isolated_agy_cmd(home)
+        .args(["stats", "--json"])
+        .output()
+        .unwrap();
+    assert!(json_out.status.success(), "{json_out:?}");
+    let report: StatsReport = serde_json::from_slice(&json_out.stdout).unwrap();
+    let quota = report
+        .quota
+        .expect("expected quota summary in StatsReport JSON");
+    assert_eq!(quota.plan_tier.as_deref(), Some("Ultra 20x"));
+    assert_eq!(quota.ai_credits, Some(1250));
+    assert!(quota.from_cache);
+    assert_eq!(quota.pools.len(), 3);
+    assert_eq!(report.diagnostics.retry_count, 1);
+    assert_eq!(report.diagnostics.retries_429, 1);
+    assert_eq!(report.diagnostics.compaction_steps, 1);
+    assert_eq!(report.diagnostics.error_steps, 1);
+
+    // Single-conversation `stats <uuid>` plain + JSON surfaces conversation diagnostics.
+    let conv_plain = isolated_agy_cmd(home)
+        .env("NO_COLOR", "1")
+        .args(["stats", uuid, "--plain", "--ascii"])
+        .output()
+        .unwrap();
+    assert!(conv_plain.status.success(), "{conv_plain:?}");
+    let conv_text = String::from_utf8(conv_plain.stdout).unwrap();
+    assert!(conv_text.contains("1 compaction"), "{conv_text}");
+    assert!(
+        conv_text.contains("1 retry (1x429, 8.0s delay)"),
+        "{conv_text}"
+    );
+    assert!(conv_text.contains("1 error"), "{conv_text}");
+
+    let conv_json = isolated_agy_cmd(home)
+        .args(["stats", uuid, "--json"])
+        .output()
+        .unwrap();
+    assert!(conv_json.status.success(), "{conv_json:?}");
+    let conv_report: ConversationStatsReport = serde_json::from_slice(&conv_json.stdout).unwrap();
+    assert_eq!(conv_report.diagnostics.total.retries_429, 1);
+    assert_eq!(conv_report.diagnostics.total.compaction_steps, 1);
+    assert_eq!(conv_report.diagnostics.total.error_steps, 1);
+}

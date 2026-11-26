@@ -4,16 +4,19 @@ mod emit;
 mod fit;
 mod widgets;
 
+use std::collections::BTreeMap;
 use std::io::{self, Write as IoWrite};
 
-use crate::agy::db::SessionMetadata;
+use crate::agy::db::{RetryAnomalySummary, SessionMetadata};
+use crate::agy::quota::BucketHistory;
 use crate::config::layout::{LayoutConfig, SpeedMode, WidgetId, DEFAULT_SPEED_WARN_THRESHOLD};
 use crate::statusline::git::GitInfo;
 use crate::statusline::metrics::{
-    current_context_tokens, resolve_quota_views, valid_cache_usage, QuotaView,
+    classify_credit_severity, current_context_tokens, resolve_primary_credit_from_map,
+    resolve_quota_views_for_map, valid_cache_usage, CreditView, QuotaView,
 };
 use crate::statusline::theme::{glyphs_for, palette_for, GlyphSet, Palette};
-use crate::statusline::{valid_cost_usd, StatuslinePayload};
+use crate::statusline::{valid_cost_usd, QuotaBucket, StatuslinePayload};
 use crate::sys::time::unix_now_secs;
 
 use emit::{compute_geometry, StyleGeometry};
@@ -24,6 +27,7 @@ enum CompactStage {
     VcsTruncate,
     SubagentsDropLabel,
     CostStripSuffix,
+    SpeedStripRetry,
     QuotaStripReset,
     CtxDropLimit,
     CtxCollapseBar,
@@ -127,6 +131,16 @@ enum ResolvedCost {
     },
 }
 
+/// Optional snapshot/cache enrichments passed from the statusline pipeline into the renderer.
+#[derive(Default)]
+pub(crate) struct RenderExtras<'a> {
+    pub(crate) unpriced_turns: u64,
+    pub(crate) quota_override: Option<&'a BTreeMap<String, QuotaBucket>>,
+    pub(crate) quota_history: Option<&'a BTreeMap<String, BucketHistory>>,
+    pub(crate) plan_tier_override: Option<&'a str>,
+    pub(crate) ai_credits_fallback: Option<i64>,
+}
+
 struct RenderContext<'a> {
     cache: Option<(f64, u64)>,
     used_pct: f64,
@@ -134,11 +148,16 @@ struct RenderContext<'a> {
     eff_limit: Option<u64>,
     speed: Option<f64>,
     speed_warn_threshold: f64,
+    retry_anomaly: Option<RetryAnomalySummary>,
     ttft_secs: Option<f64>,
     thinking_tokens: Option<u64>,
     cost: Option<ResolvedCost>,
     quota_5h: Option<QuotaView>,
     quota_weekly: Option<QuotaView>,
+    primary_credit: Option<CreditView>,
+    layout_has_quota_5h: bool,
+    layout_has_quota_weekly: bool,
+    plan_tier_override: Option<&'a str>,
     git: &'a GitInfo,
 }
 
@@ -148,7 +167,8 @@ impl<'a> RenderContext<'a> {
         meta: &SessionMetadata,
         git: &'a GitInfo,
         (quota_5h, quota_weekly): (Option<QuotaView>, Option<QuotaView>),
-        unpriced_turns: u64,
+        primary_credit: Option<CreditView>,
+        extras: &RenderExtras<'a>,
         cfg: &LayoutConfig,
     ) -> Self {
         let cache = valid_cache_usage(payload);
@@ -200,9 +220,19 @@ impl<'a> RenderContext<'a> {
                     subagent_usd: meta
                         .estimated_subagent_cost_usd
                         .filter(|&s| s.is_finite() && s >= 0.01),
-                    unpriced_turns,
+                    unpriced_turns: extras.unpriced_turns,
                 })
         };
+        let layout_has_quota_5h = cfg
+            .rows
+            .iter()
+            .flatten()
+            .any(|w| matches!(w, WidgetId::Quota5h));
+        let layout_has_quota_weekly = cfg
+            .rows
+            .iter()
+            .flatten()
+            .any(|w| matches!(w, WidgetId::QuotaWeekly));
         Self {
             cache,
             used_pct,
@@ -210,11 +240,16 @@ impl<'a> RenderContext<'a> {
             eff_limit,
             speed,
             speed_warn_threshold,
+            retry_anomaly: meta.retry_anomaly.filter(|r| r.retry_count > 0),
             ttft_secs: meta.ttft_secs.filter(|t| t.is_finite() && *t >= 0.0),
             thinking_tokens: meta.thinking_tokens.filter(|&t| t > 0),
             cost,
             quota_5h,
             quota_weekly,
+            primary_credit,
+            layout_has_quota_5h,
+            layout_has_quota_weekly,
+            plan_tier_override: extras.plan_tier_override,
             git,
         }
     }
@@ -265,20 +300,44 @@ pub fn write_statusline<W: IoWrite>(
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
-    write_statusline_at(payload, meta, git, 0, unix_now_secs(), cfg, out)
+    write_statusline_with(
+        payload,
+        meta,
+        git,
+        &RenderExtras::default(),
+        unix_now_secs(),
+        cfg,
+        out,
+    )
 }
 
 fn layout_statusline_rows<'a>(
     payload: &StatuslinePayload,
     meta: &SessionMetadata,
     git: &'a GitInfo,
-    unpriced_turns: u64,
+    extras: &RenderExtras<'a>,
     now_unix_secs: u64,
     cfg: &'a LayoutConfig,
 ) -> (Renderer<'a>, Vec<Vec<Vec<Segment>>>) {
-    let quotas = resolve_quota_views(payload, now_unix_secs);
+    let effective_quota = extras
+        .quota_override
+        .or_else(|| payload.quota.as_ref().filter(|q| !q.is_empty()));
+    let quotas = effective_quota.map_or((None, None), |q| {
+        resolve_quota_views_for_map(payload, q, extras.quota_history, now_unix_secs)
+    });
+    let primary_credit = effective_quota
+        .and_then(|q| resolve_primary_credit_from_map(q, now_unix_secs))
+        .or_else(|| {
+            extras.ai_credits_fallback.map(|amt| CreditView {
+                key: "google_one_ai".to_string(),
+                label: "AI credits".to_string(),
+                remaining_amount: amt,
+                reset_compact: None,
+                severity: classify_credit_severity(amt),
+            })
+        });
     let renderer = Renderer::new(cfg);
-    let ctx = RenderContext::build(payload, meta, git, quotas, unpriced_turns, cfg);
+    let ctx = RenderContext::build(payload, meta, git, quotas, primary_credit, extras, cfg);
     let max_width = cfg.responsive.then_some(payload.terminal_width).flatten();
 
     let rows = cfg
@@ -296,18 +355,17 @@ fn layout_statusline_rows<'a>(
     (renderer, rows)
 }
 
-/// Renders all non-empty configured rows using an explicit unpriced-turn count and timestamp.
-pub(crate) fn write_statusline_at<W: IoWrite>(
+/// Renders all non-empty configured rows using explicit snapshot/cache enrichments and timestamp.
+pub(crate) fn write_statusline_with<W: IoWrite>(
     payload: &StatuslinePayload,
     meta: &SessionMetadata,
     git: &GitInfo,
-    unpriced_turns: u64,
+    extras: &RenderExtras<'_>,
     now_unix_secs: u64,
     cfg: &LayoutConfig,
     out: &mut W,
 ) -> io::Result<()> {
-    let (renderer, rows) =
-        layout_statusline_rows(payload, meta, git, unpriced_turns, now_unix_secs, cfg);
+    let (renderer, rows) = layout_statusline_rows(payload, meta, git, extras, now_unix_secs, cfg);
     for fitted in &rows {
         renderer.write_row_groups(fitted, payload.terminal_width, out)?;
     }
@@ -321,7 +379,9 @@ pub(crate) fn render_statusline_lines(
     git: &GitInfo,
     cfg: &LayoutConfig,
 ) -> Vec<ratatui::text::Line<'static>> {
-    let (renderer, rows) = layout_statusline_rows(payload, meta, git, 0, unix_now_secs(), cfg);
+    let extras = RenderExtras::default();
+    let (renderer, rows) =
+        layout_statusline_rows(payload, meta, git, &extras, unix_now_secs(), cfg);
     rows.iter()
         .filter_map(|fitted| renderer.render_row_groups_line(fitted, payload.terminal_width))
         .collect()
@@ -993,11 +1053,14 @@ mod tests {
         assert_eq!(String::from_utf8(out_tiny).unwrap(), "~$1.23\n");
 
         let mut out_partial_sub = Vec::new();
-        write_statusline_at(
+        write_statusline_with(
             &payload,
             &meta_sub,
             &GitInfo::default(),
-            2,
+            &RenderExtras {
+                unpriced_turns: 2,
+                ..Default::default()
+            },
             0,
             &cfg,
             &mut out_partial_sub,
@@ -1009,11 +1072,14 @@ mod tests {
         );
 
         let mut out_partial_only = Vec::new();
-        write_statusline_at(
+        write_statusline_with(
             &payload,
             &meta,
             &GitInfo::default(),
-            2,
+            &RenderExtras {
+                unpriced_turns: 2,
+                ..Default::default()
+            },
             0,
             &cfg,
             &mut out_partial_only,
@@ -1865,11 +1931,11 @@ mod tests {
                 ..Default::default()
             };
             let mut out = Vec::new();
-            write_statusline_at(
+            write_statusline_with(
                 &payload,
                 &SessionMetadata::default(),
                 &GitInfo::default(),
-                0,
+                &RenderExtras::default(),
                 0,
                 &cfg,
                 &mut out,
@@ -1979,5 +2045,288 @@ mod tests {
         assert!(row2.contains("~$0.42"), "row2: {row2:?}");
         assert!(row2.contains("5h 84% ↻3h10m"), "row2: {row2:?}");
         assert!(row2.contains("7d 92% ↻5d"), "row2: {row2:?}");
+    }
+
+    #[test]
+    fn renders_burn_rate_eta_credit_severity_retry_anomaly_and_cache_hit_warnings() {
+        use crate::agy::db::RetryAnomalySummary;
+        use crate::agy::protobuf::RetryStatusClass;
+        use crate::agy::quota::BucketHistory;
+
+        // 1) Burn-rate ETA suffix vs linear pace_behind vs responsive QuotaStripReset.
+        let t0 = 1_700_000_000u64;
+        let mut hist = BucketHistory::default();
+        hist.record_sample(t0, 0.80, Some((t0 + 18_000) as i64));
+        hist.record_sample(t0 + 3_600, 0.60, Some((t0 + 18_000) as i64));
+        let history = BTreeMap::from([("gemini-5h".to_string(), hist)]);
+
+        let quota = BTreeMap::from([
+            (
+                "gemini-5h".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(0.60),
+                    reset_in_seconds: Some(14_400),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gemini-weekly".to_string(),
+                QuotaBucket {
+                    remaining_fraction: Some(0.25),
+                    reset_in_seconds: Some(86_400),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let payload = StatuslinePayload {
+            model: Some(ModelInfo {
+                id: Some("gemini-4".to_string()),
+                ..Default::default()
+            }),
+            quota: Some(quota),
+            terminal_width: Some(80),
+            ..Default::default()
+        };
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Default;
+        cfg.glyph_mode = GlyphMode::Unicode;
+        cfg.no_color = false;
+        cfg.responsive = true;
+        cfg.rows = vec![vec![WidgetId::Quota5h, WidgetId::QuotaWeekly]];
+        let extras = RenderExtras {
+            quota_history: Some(&history),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        write_statusline_with(
+            &payload,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &extras,
+            t0 + 3_600,
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        let raw = String::from_utf8(out).unwrap();
+        let plain = strip_ansi_escapes::strip_str(&raw);
+        assert!(plain.contains("5h 60% ↻4h !3h"), "plain: {plain:?}");
+        assert!(plain.contains("7d 25% ↻1d"), "plain: {plain:?}");
+        assert!(!plain.contains("7d 25% ↻1d !"), "plain: {plain:?}");
+        // Exhausting quota uses bold warn (ANSI 1 + 220); ordinary <= 30% uses non-bold warn.
+        assert!(
+            raw.contains("\x1b[1m\x1b[38;5;220m5h 60% ↻4h !3h"),
+            "raw: {raw:?}"
+        );
+
+        // Narrow terminal strips reset + ETA cleanly via QuotaStripReset.
+        let mut narrow_payload = payload.clone();
+        narrow_payload.terminal_width = Some(18);
+        let mut out_narrow = Vec::new();
+        write_statusline_with(
+            &narrow_payload,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &extras,
+            t0 + 3_600,
+            &cfg,
+            &mut out_narrow,
+        )
+        .unwrap();
+        let plain_narrow = strip_ansi_escapes::strip_str(String::from_utf8(out_narrow).unwrap());
+        assert_eq!(plain_narrow, "5h 60% · 7d 25%\n");
+
+        // 2) CreditSeverity (Low -> ctx_warn 220, Critical -> bold ctx_crit 203) & standalone fallback.
+        let low_credit_payload = StatuslinePayload {
+            quota: Some(BTreeMap::from([(
+                "google_one_ai".to_string(),
+                QuotaBucket {
+                    remaining_amount: Some(25),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let mut out_low = Vec::new();
+        write_statusline(
+            &low_credit_payload,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out_low,
+        )
+        .unwrap();
+        let raw_low = String::from_utf8(out_low).unwrap();
+        assert!(
+            raw_low.contains("\x1b[38;5;220mcredits 25"),
+            "raw_low: {raw_low:?}"
+        );
+        assert!(!raw_low.contains("7d --"), "raw_low: {raw_low:?}");
+
+        let crit_credit_payload = StatuslinePayload {
+            quota: Some(BTreeMap::from([(
+                "google_one_ai".to_string(),
+                QuotaBucket {
+                    remaining_amount: Some(0),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let mut out_crit = Vec::new();
+        write_statusline(
+            &crit_credit_payload,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cfg,
+            &mut out_crit,
+        )
+        .unwrap();
+        let raw_crit = String::from_utf8(out_crit).unwrap();
+        assert!(
+            raw_crit.contains("\x1b[1m\x1b[38;5;203mcredits 0"),
+            "raw_crit: {raw_crit:?}"
+        );
+
+        // 3) Speed retry anomaly badge (! 429×2 / ! 503) and responsive SpeedStripRetry fallback.
+        let mut spd_cfg = LayoutConfig::preset_minimal();
+        spd_cfg.theme = ThemeStyle::Default;
+        spd_cfg.glyph_mode = GlyphMode::Unicode;
+        spd_cfg.no_color = false;
+        spd_cfg.responsive = true;
+        spd_cfg.rows = vec![vec![WidgetId::Speed]];
+        let meta_429 = SessionMetadata {
+            speed: Some(64.0),
+            retry_anomaly: Some(RetryAnomalySummary {
+                retry_count: 2,
+                retries_429: 2,
+                latest_class: RetryStatusClass::RateLimit429,
+                latest_status_code: Some(429),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut out_429 = Vec::new();
+        write_statusline(
+            &StatuslinePayload {
+                terminal_width: Some(80),
+                ..Default::default()
+            },
+            &meta_429,
+            &GitInfo::default(),
+            &spd_cfg,
+            &mut out_429,
+        )
+        .unwrap();
+        let raw_429 = String::from_utf8(out_429).unwrap();
+        assert!(
+            raw_429.contains("\x1b[1m\x1b[38;5;203m⚡ 64 tok/s ! 429×2"),
+            "raw_429: {raw_429:?}"
+        );
+
+        // Narrow terminal strips `! 429×2` cleanly via SpeedStripRetry.
+        let mut out_429_narrow = Vec::new();
+        write_statusline(
+            &StatuslinePayload {
+                terminal_width: Some(12),
+                ..Default::default()
+            },
+            &meta_429,
+            &GitInfo::default(),
+            &spd_cfg,
+            &mut out_429_narrow,
+        )
+        .unwrap();
+        let plain_429_narrow =
+            strip_ansi_escapes::strip_str(String::from_utf8(out_429_narrow).unwrap());
+        assert_eq!(plain_429_narrow, "⚡ 64 tok/s\n");
+
+        // 4) CacheHit semantic warning color only on non-trivial context (>= 10_000 tokens).
+        let mut cache_cfg = LayoutConfig::preset_minimal();
+        cache_cfg.theme = ThemeStyle::Default;
+        cache_cfg.no_color = false;
+        cache_cfg.responsive = false;
+        cache_cfg.rows = vec![vec![WidgetId::CacheHit]];
+
+        let small_low = StatuslinePayload {
+            context_window: Some(ContextWindow {
+                current_usage: Some(JsonUsage {
+                    input_tokens: Some(1_800),
+                    cache_read_input_tokens: Some(200),
+                    cache_creation_input_tokens: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut out_small = Vec::new();
+        write_statusline(
+            &small_low,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cache_cfg,
+            &mut out_small,
+        )
+        .unwrap();
+        let raw_small = String::from_utf8(out_small).unwrap();
+        assert!(
+            raw_small.contains("\x1b[38;5;111m◈ cache 10.0%"),
+            "raw_small: {raw_small:?}"
+        );
+
+        let large_warn = StatuslinePayload {
+            context_window: Some(ContextWindow {
+                current_usage: Some(JsonUsage {
+                    input_tokens: Some(32_500),
+                    cache_read_input_tokens: Some(17_500),
+                    cache_creation_input_tokens: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut out_warn = Vec::new();
+        write_statusline(
+            &large_warn,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cache_cfg,
+            &mut out_warn,
+        )
+        .unwrap();
+        let raw_warn = String::from_utf8(out_warn).unwrap();
+        assert!(
+            raw_warn.contains("\x1b[38;5;220m◈ cache 35.0%"),
+            "raw_warn: {raw_warn:?}"
+        );
+
+        let large_crit = StatuslinePayload {
+            context_window: Some(ContextWindow {
+                current_usage: Some(JsonUsage {
+                    input_tokens: Some(45_000),
+                    cache_read_input_tokens: Some(5_000),
+                    cache_creation_input_tokens: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut out_cache_crit = Vec::new();
+        write_statusline(
+            &large_crit,
+            &SessionMetadata::default(),
+            &GitInfo::default(),
+            &cache_cfg,
+            &mut out_cache_crit,
+        )
+        .unwrap();
+        let raw_cache_crit = String::from_utf8(out_cache_crit).unwrap();
+        assert!(
+            raw_cache_crit.contains("\x1b[1m\x1b[38;5;203m◈ cache 10.0%"),
+            "raw_cache_crit: {raw_cache_crit:?}"
+        );
     }
 }

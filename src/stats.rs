@@ -26,6 +26,7 @@ pub(crate) use pricing::{
     pricing_cache_fingerprint, DEFAULT_PRICING_TTL_SECS, MODELS_DEV_CACHE_FILE,
 };
 pub use pricing::{run_pricing_command, PricingCatalog, SyncMode};
+pub use scan::ScanDiagnostics;
 pub(crate) use scan::{
     estimate_conversation_cost_usd_with_parent_conn, lookup_cached_conversation_cost,
 };
@@ -196,8 +197,10 @@ fn collect_stats_with_tz(
 /// Shared runtime options for `agy-statusline stats` (static output and interactive TUI).
 #[derive(Debug, Clone, Copy)]
 pub struct StatsOptions<'a> {
-    /// Optional XDG cache directory for `models_dev_pricing.json`.
+    /// Optional XDG cache directory for `models_dev_pricing.json`, `stats_scan_cache.json`, and `quota_snapshot.json`.
     pub cache_dir: Option<&'a Path>,
+    /// Candidate AGY `daemon/` directories for opportunistic loopback Hub RPC quota probing.
+    pub daemon_dirs: &'a [PathBuf],
     /// Optional trailing day window (`--days N`).
     pub days: Option<u32>,
     /// Primary aggregation metric (`--metric`).
@@ -217,7 +220,13 @@ pub fn run_stats_command<W: Write>(
     json: bool,
     out: &mut W,
 ) -> io::Result<()> {
-    let dataset = StatsDataset::collect(roots, opts.cache_dir, opts.now_unix_secs);
+    let dataset = StatsDataset::collect(
+        roots,
+        opts.daemon_dirs,
+        opts.cache_dir,
+        opts.now_unix_secs,
+        false,
+    );
     let report = dataset.to_report_with_metric(
         opts.days,
         if json {
