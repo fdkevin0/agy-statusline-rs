@@ -4,6 +4,7 @@
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+use std::process::ExitCode;
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
@@ -235,103 +236,80 @@ enum PricingCommand {
     },
 }
 
-fn main() -> io::Result<()> {
-    let cli = Cli::parse();
-    let no_color = env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-
-    if let Some(command) = cli.command {
-        match command {
-            Command::Apply {
+fn run_subcommand(command: Command, no_color: bool) -> io::Result<()> {
+    match command {
+        Command::Apply {
+            yes,
+            stack,
+            replace,
+            disable,
+        } => {
+            let settings_path = agy_settings_path()?;
+            if disable {
+                set_statusline_enabled(&settings_path, false)?;
+                println!("Disabled statusLine in {}", settings_path.display());
+                return Ok(());
+            }
+            let stack_override = if stack {
+                Some(true)
+            } else if replace {
+                Some(false)
+            } else {
+                None
+            };
+            let stack_with_default = stack_override.unwrap_or_else(|| {
+                xdg_config_dir()
+                    .map(|d| load_layout_config(&d.join("config.json")).stack_with_default)
+                    .unwrap_or(false)
+            });
+            let command_path = resolve_invoked_binary_path()?;
+            let mut stdin = io::stdin().lock();
+            let mut stdout = io::stdout().lock();
+            run_apply_command(
                 yes,
-                stack,
-                replace,
-                disable,
-            } => {
-                let settings_path = agy_settings_path()?;
-                if disable {
-                    set_statusline_enabled(&settings_path, false)?;
-                    println!("Disabled statusLine in {}", settings_path.display());
-                    return Ok(());
-                }
-                let stack_override = if stack {
-                    Some(true)
-                } else if replace {
-                    Some(false)
-                } else {
-                    None
-                };
-                let stack_with_default = stack_override.unwrap_or_else(|| {
-                    xdg_config_dir()
-                        .map(|d| load_layout_config(&d.join("config.json")).stack_with_default)
-                        .unwrap_or(false)
-                });
-                let command_path = resolve_invoked_binary_path()?;
-                let mut stdin = io::stdin().lock();
-                let mut stdout = io::stdout().lock();
-                return run_apply_command(
-                    yes,
-                    stack_with_default,
-                    &settings_path,
-                    &command_path,
-                    &mut stdin,
-                    &mut stdout,
-                );
-            }
-            Command::Doctor => {
-                let config_path = xdg_config_dir()?.join("config.json");
-                let settings_path = agy_settings_path()?;
-                let cache_dir = xdg_cache_dir();
-                let path_env = env::var_os("PATH");
-                let mut stdout = io::stdout().lock();
-                return run_doctor(
-                    &config_path,
-                    &settings_path,
-                    cache_dir.as_deref(),
-                    path_env.as_deref(),
-                    no_color,
-                    &mut stdout,
-                );
-            }
-            Command::Stats {
-                conversation,
-                all,
+                stack_with_default,
+                &settings_path,
+                &command_path,
+                &mut stdin,
+                &mut stdout,
+            )
+        }
+        Command::Doctor => {
+            let config_path = xdg_config_dir()?.join("config.json");
+            let settings_path = agy_settings_path()?;
+            let cache_dir = xdg_cache_dir();
+            let path_env = env::var_os("PATH");
+            let mut stdout = io::stdout().lock();
+            run_doctor(
+                &config_path,
+                &settings_path,
+                cache_dir.as_deref(),
+                path_env.as_deref(),
+                no_color,
+                &mut stdout,
+            )
+        }
+        Command::Stats {
+            conversation,
+            all,
+            days,
+            metric,
+            output,
+        } => {
+            let ctx = resolve_stats_context(metric)?;
+            let opts = StatsOptions {
+                cache_dir: ctx.cache_dir.as_deref(),
                 days,
-                metric,
-                output,
-            } => {
-                let ctx = resolve_stats_context(metric)?;
-                let opts = StatsOptions {
-                    cache_dir: ctx.cache_dir.as_deref(),
-                    days,
-                    metric: ctx.prefs.metric,
-                    no_color,
-                    ascii: output.ascii,
-                    now_unix_secs: unix_now_secs(),
-                };
-                if let Some(conv_id) = conversation.as_deref() {
-                    if output.is_interactive(all) {
-                        run_conversation_stats_tui(
-                            &ctx.roots,
-                            conv_id,
-                            &opts,
-                            ctx.prefs,
-                            make_prefs_saver(ctx.config_path),
-                        )?;
-                        return Ok(());
-                    }
-                    let mut stdout = io::stdout().lock();
-                    return run_conversation_stats_command(
+                metric: ctx.prefs.metric,
+                no_color,
+                ascii: output.ascii,
+                now_unix_secs: unix_now_secs(),
+            };
+            if let Some(conv_id) = conversation.as_deref() {
+                if output.is_interactive(all) {
+                    run_conversation_stats_tui(
                         &ctx.roots,
                         conv_id,
-                        all,
-                        &opts,
-                        output.json,
-                        &mut stdout,
-                    );
-                }
-                if output.is_interactive(false) {
-                    run_stats_tui(
-                        ctx.roots,
                         &opts,
                         ctx.prefs,
                         make_prefs_saver(ctx.config_path),
@@ -339,98 +317,144 @@ fn main() -> io::Result<()> {
                     return Ok(());
                 }
                 let mut stdout = io::stdout().lock();
-                return run_stats_command(&ctx.roots, &opts, output.json, &mut stdout);
-            }
-            Command::Conversations {
-                query,
-                subagents,
-                limit,
-                output,
-            } => {
-                let ctx = resolve_stats_context(None)?;
-                let opts = StatsOptions {
-                    cache_dir: ctx.cache_dir.as_deref(),
-                    days: None,
-                    metric: ctx.prefs.metric,
-                    no_color,
-                    ascii: output.ascii,
-                    now_unix_secs: unix_now_secs(),
-                };
-                if output.is_interactive(limit.is_some()) {
-                    run_conversations_tui(
-                        &ctx.roots,
-                        query.as_deref(),
-                        subagents,
-                        &opts,
-                        ctx.prefs,
-                        make_prefs_saver(ctx.config_path),
-                    )?;
-                    return Ok(());
-                }
-                let mut stdout = io::stdout().lock();
-                return run_conversations_command(
+                return run_conversation_stats_command(
                     &ctx.roots,
-                    query.as_deref(),
-                    subagents,
-                    limit.map(|n| n as usize),
+                    conv_id,
+                    all,
                     &opts,
                     output.json,
                     &mut stdout,
                 );
             }
-            Command::Config(args) => {
-                let config_path = xdg_config_dir()?.join("config.json");
-                if args.show {
-                    let cfg = load_layout_config(&config_path);
-                    let json = serde_json::to_string_pretty(&cfg)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    println!("{json}");
-                    return Ok(());
-                }
-                if args.reset {
-                    if config_path.exists() {
-                        fs::remove_file(&config_path)?;
-                        println!("Removed {}", config_path.display());
-                    } else {
-                        println!("No config file at {}", config_path.display());
-                    }
-                    return Ok(());
-                }
-                if let Some(preset) = args.preset {
-                    let existing = load_layout_config(&config_path);
-                    let mut layout = preset.to_layout();
-                    layout.stats_metric = existing.stats_metric;
-                    layout.conv_turn_sort = existing.conv_turn_sort;
-                    layout.conv_list_sort = existing.conv_list_sort;
-                    save_layout_config(&config_path, &layout)?;
-                    println!(
-                        "Applied preset '{}' to {}",
-                        preset.name(),
-                        config_path.display()
-                    );
-                    return Ok(());
-                }
-                return run_tui_config(&config_path);
-            }
-            Command::Pricing { action } => {
-                let cache_dir = xdg_cache_dir().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "unable to resolve pricing cache directory",
-                    )
-                })?;
-                let (sync, if_stale) = match action {
-                    None | Some(PricingCommand::Status) => (false, false),
-                    Some(PricingCommand::Sync { if_stale }) => (true, if_stale),
-                };
-                let mut stdout = io::stdout().lock();
-                return run_pricing_command(&cache_dir, sync, if_stale, &mut stdout);
-            }
-            Command::Version => {
-                println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            if output.is_interactive(false) {
+                run_stats_tui(
+                    ctx.roots,
+                    &opts,
+                    ctx.prefs,
+                    make_prefs_saver(ctx.config_path),
+                )?;
                 return Ok(());
             }
+            let mut stdout = io::stdout().lock();
+            run_stats_command(&ctx.roots, &opts, output.json, &mut stdout)
         }
+        Command::Conversations {
+            query,
+            subagents,
+            limit,
+            output,
+        } => {
+            let ctx = resolve_stats_context(None)?;
+            let opts = StatsOptions {
+                cache_dir: ctx.cache_dir.as_deref(),
+                days: None,
+                metric: ctx.prefs.metric,
+                no_color,
+                ascii: output.ascii,
+                now_unix_secs: unix_now_secs(),
+            };
+            if output.is_interactive(limit.is_some()) {
+                run_conversations_tui(
+                    &ctx.roots,
+                    query.as_deref(),
+                    subagents,
+                    &opts,
+                    ctx.prefs,
+                    make_prefs_saver(ctx.config_path),
+                )?;
+                return Ok(());
+            }
+            let mut stdout = io::stdout().lock();
+            run_conversations_command(
+                &ctx.roots,
+                query.as_deref(),
+                subagents,
+                limit.map(|n| n as usize),
+                &opts,
+                output.json,
+                &mut stdout,
+            )
+        }
+        Command::Config(args) => {
+            let config_path = xdg_config_dir()?.join("config.json");
+            if args.show {
+                let cfg = load_layout_config(&config_path);
+                let json = serde_json::to_string_pretty(&cfg)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                println!("{json}");
+                return Ok(());
+            }
+            if args.reset {
+                if config_path.exists() {
+                    fs::remove_file(&config_path)?;
+                    println!("Removed {}", config_path.display());
+                } else {
+                    println!("No config file at {}", config_path.display());
+                }
+                return Ok(());
+            }
+            if let Some(preset) = args.preset {
+                let existing = load_layout_config(&config_path);
+                let mut layout = preset.to_layout();
+                layout.stats_metric = existing.stats_metric;
+                layout.conv_turn_sort = existing.conv_turn_sort;
+                layout.conv_list_sort = existing.conv_list_sort;
+                save_layout_config(&config_path, &layout)?;
+                println!(
+                    "Applied preset '{}' to {}",
+                    preset.name(),
+                    config_path.display()
+                );
+                return Ok(());
+            }
+            run_tui_config(&config_path)
+        }
+        Command::Pricing { action } => {
+            let cache_dir = xdg_cache_dir().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "unable to resolve pricing cache directory",
+                )
+            })?;
+            let (sync, if_stale) = match action {
+                None | Some(PricingCommand::Status) => (false, false),
+                Some(PricingCommand::Sync { if_stale }) => (true, if_stale),
+            };
+            let mut stdout = io::stdout().lock();
+            run_pricing_command(&cache_dir, sync, if_stale, &mut stdout)
+        }
+        Command::Version => {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+    }
+}
+
+/// Renders the stdin statusline while absorbing transient I/O errors and always returning
+/// `ExitCode::SUCCESS` (`0`) so `agy`'s 30-failure circuit breaker is never tripped.
+fn run_statusline_guarded<W: Write>(
+    input: &str,
+    runtime: &StatuslineRuntime<'_>,
+    cfg: &LayoutConfig,
+    out: &mut W,
+) -> ExitCode {
+    let _ = process_statusline(input, runtime, cfg, out);
+    let _ = out.flush();
+    ExitCode::SUCCESS
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let no_color = env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+
+    if let Some(command) = cli.command {
+        return match run_subcommand(command, no_color) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     let preset_override: Option<LayoutConfig> = if cli.full {
@@ -440,8 +464,8 @@ fn main() -> io::Result<()> {
     };
 
     if preset_override.is_none() && io::stdin().is_terminal() {
-        Cli::command().print_help()?;
-        return Ok(());
+        let _ = Cli::command().print_help();
+        return ExitCode::SUCCESS;
     }
 
     let mut cfg = match preset_override {
@@ -469,9 +493,7 @@ fn main() -> io::Result<()> {
         now_unix_secs: unix_now_secs(),
     };
     let mut stdout = io::stdout().lock();
-    let result = process_statusline(&input, &runtime, &cfg, &mut stdout);
-    let _ = stdout.flush();
-    result
+    run_statusline_guarded(&input, &runtime, &cfg, &mut stdout)
 }
 
 #[cfg(test)]
@@ -677,5 +699,55 @@ mod tests {
         assert!(
             Cli::try_parse_from(["agy-statusline", "pricing", "status", "--if-stale"]).is_err()
         );
+    }
+
+    struct FailingWriter;
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "simulated broken pipe",
+            ))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "simulated flush failure",
+            ))
+        }
+    }
+
+    struct NoopGit;
+    impl agy_statusline::statusline::git::GitProbe for NoopGit {
+        fn probe(
+            &self,
+            _dir: &std::path::Path,
+            _include_diff: bool,
+        ) -> agy_statusline::statusline::git::GitInfo {
+            Default::default()
+        }
+    }
+
+    struct NoopSpeed;
+    impl agy_statusline::agy::db::SpeedReader for NoopSpeed {
+        fn session_metadata(&self, _id: &str) -> agy_statusline::agy::db::SessionMetadata {
+            Default::default()
+        }
+    }
+
+    #[test]
+    fn statusline_exit_guard_absorbs_write_errors_and_returns_success() {
+        let reader = NoopSpeed;
+        let git = NoopGit;
+        let runtime = StatuslineRuntime::minimal(&reader, &git);
+        let cfg = LayoutConfig::preset_minimal();
+        let mut failing_out = FailingWriter;
+        let code = run_statusline_guarded(
+            r#"{"agent_state":"idle"}"#,
+            &runtime,
+            &cfg,
+            &mut failing_out,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 }

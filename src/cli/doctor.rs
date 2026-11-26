@@ -1,5 +1,6 @@
 //! Configuration, runtime environment, AGY hook, storage, and live preview diagnostics (`doctor`).
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
@@ -10,12 +11,18 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::agy::db::{is_safe_sqlite_file, is_valid_uuid};
+use crate::agy::hub::{fetch_or_load_quota_snapshot, HubQuotaResult};
+use crate::agy::paths::{resolve_agy_daemon_dirs, resolve_agy_roots};
+use crate::agy::quota::{inspect_quota_snapshot_file, SnapshotFileState};
 use crate::agy::settings::read_settings_object;
 use crate::config::layout::try_load_layout_config;
 use crate::stats::{inspect_pricing_cache, MODELS_DEV_CACHE_FILE};
+use crate::statusline::metrics::{
+    format_quota_pct, summarize_quota_pools_with_history, CreditSeverity, QuotaView,
+};
 use crate::statusline::render::write_statusline;
 use crate::statusline::{sample_preview_git, sample_preview_metadata, sample_preview_payload};
-use crate::sys::fmt::sanitize_inline_text;
+use crate::sys::fmt::{format_duration_compact, sanitize_inline_text};
 use crate::sys::process::{run_command_stdout_bounded, BoundedCommandError};
 use crate::sys::time::unix_now_secs;
 
@@ -24,7 +31,8 @@ const MAX_AGY_VERSION_BYTES: u64 = 4096;
 
 #[derive(Debug, Default)]
 struct DoctorEnv<'a> {
-    conv_dir: Option<&'a Path>,
+    roots: Vec<(&'static str, PathBuf)>,
+    daemon_dirs: Vec<PathBuf>,
     cache_dir: Option<&'a Path>,
     path_env: Option<&'a OsStr>,
     now_unix_secs: u64,
@@ -183,6 +191,145 @@ fn inspect_conversations_dir(conv_dir: &Path) -> String {
     format!("found, {db_count} session .db {noun}")
 }
 
+fn probe_tool_presence(tool: &str, path_env: Option<&OsStr>) -> &'static str {
+    if path_env.is_some_and(|paths| which::which_in(tool, Some(paths), ".").is_ok()) {
+        "found"
+    } else {
+        "not found"
+    }
+}
+
+fn format_quota_window_brief(view: &QuotaView) -> String {
+    let metric = match view.remaining_amount {
+        Some(amt) => amt.to_string(),
+        None => format_quota_pct(view.remaining_pct),
+    };
+    let mut out = format!("{} {metric}", view.label);
+    if let Some(ref reset) = view.reset_compact {
+        out.push_str(" (");
+        out.push_str(reset);
+        out.push(')');
+    }
+    out
+}
+
+fn format_credit_severity_tag(severity: CreditSeverity) -> &'static str {
+    match severity {
+        CreditSeverity::Ok => "",
+        CreditSeverity::Low => " [low]",
+        CreditSeverity::Critical => " [empty]",
+    }
+}
+
+fn write_quota_section<W: Write>(env: &DoctorEnv<'_>, out: &mut W) -> io::Result<()> {
+    let hub_result: Option<HubQuotaResult> =
+        if !env.daemon_dirs.is_empty() || env.cache_dir.is_some() {
+            fetch_or_load_quota_snapshot(&env.daemon_dirs, env.cache_dir, env.now_unix_secs, false)
+        } else {
+            None
+        };
+
+    let Some(res) = hub_result else {
+        let detail = match env.cache_dir.map(inspect_quota_snapshot_file) {
+            Some(SnapshotFileState::Symlink) => "snapshot symlink (ignored)".to_string(),
+            Some(SnapshotFileState::NotAFile) => "snapshot not a file".to_string(),
+            Some(SnapshotFileState::Oversized(n)) => format!("snapshot oversized ({n}B)"),
+            Some(SnapshotFileState::Invalid(msg)) => {
+                format!("snapshot invalid: {}", sanitize_inline_text(&msg))
+            }
+            Some(SnapshotFileState::Missing) | Some(SnapshotFileState::Loaded(_)) => {
+                "no active Hub daemon, no cached snapshot".to_string()
+            }
+            None => "no active Hub daemon, cache dir unavailable".to_string(),
+        };
+        writeln!(out, "Quota:    unavailable [{detail}]")?;
+        return Ok(());
+    };
+
+    let snap = &res.snapshot;
+    let age_secs = env.now_unix_secs.saturating_sub(snap.updated_at);
+    let source_desc = if !res.from_cache {
+        "live Hub RPC (fresh)".to_string()
+    } else {
+        format!(
+            "cached {} ({} ago)",
+            snap.source.label(),
+            format_duration_compact(age_secs)
+        )
+    };
+
+    let mut header_parts = vec![source_desc];
+    if let Some(tier) = snap.display_plan_tier() {
+        header_parts.push(format!("tier={}", sanitize_inline_text(&tier)));
+    }
+    if let Some(credits) = snap.ai_credits {
+        let sev = crate::statusline::metrics::classify_credit_severity(credits);
+        header_parts.push(format!(
+            "credits={credits}{}",
+            format_credit_severity_tag(sev)
+        ));
+    }
+    writeln!(out, "Quota:    {}", header_parts.join(" · "))?;
+
+    let summary =
+        summarize_quota_pools_with_history(&snap.quota, Some(&snap.history), env.now_unix_secs);
+    let mut pool_parts = Vec::new();
+    for pool in &summary.pools {
+        let mut windows = Vec::new();
+        if let Some(ref short) = pool.short_window {
+            windows.push(format_quota_window_brief(short));
+        }
+        if let Some(ref long) = pool.long_window {
+            windows.push(format_quota_window_brief(long));
+        }
+        if !windows.is_empty() {
+            pool_parts.push(format!("{} {}", pool.name, windows.join(", ")));
+        }
+    }
+    for credit in &summary.credits {
+        // Avoid duplicating `google_one_ai` when already displayed in the `Quota:` header.
+        if snap.ai_credits.is_some()
+            && (credit.key.eq_ignore_ascii_case("google_one_ai")
+                || credit.key.eq_ignore_ascii_case("ai_credits"))
+        {
+            continue;
+        }
+        pool_parts.push(format!(
+            "{} {}{}",
+            credit.label,
+            credit.remaining_amount,
+            format_credit_severity_tag(credit.severity)
+        ));
+    }
+
+    if !pool_parts.is_empty() {
+        writeln!(out, "Pools:    {}", pool_parts.join(" · "))?;
+    }
+    Ok(())
+}
+
+fn collect_doctor_roots(settings_path: &Path) -> Vec<(&'static str, PathBuf)> {
+    let mut roots = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    if let Some(parent) = settings_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let owned = parent.to_path_buf();
+        let key = fs::canonicalize(&owned).unwrap_or_else(|_| owned.clone());
+        if seen.insert(key) {
+            roots.push(("cli", owned));
+        }
+    }
+
+    for (source, root) in resolve_agy_roots() {
+        let key = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        if seen.insert(key) {
+            roots.push((source, root));
+        }
+    }
+
+    roots
+}
+
 fn run_doctor_with<W: Write>(
     config_path: &Path,
     settings_path: &Path,
@@ -225,6 +372,12 @@ fn run_doctor_with<W: Write>(
         "AGY CLI:  {}",
         probe_agy_version(env.path_env, AGY_VERSION_TIMEOUT)
     )?;
+    writeln!(
+        out,
+        "Tools:    git={} · curl={}",
+        probe_tool_presence("git", env.path_env),
+        probe_tool_presence("curl", env.path_env)
+    )?;
 
     match read_settings_object(settings_path, false) {
         Ok(root) => match root.get("statusLine").and_then(Value::as_object) {
@@ -258,13 +411,13 @@ fn run_doctor_with<W: Write>(
         }
     }
 
-    match env.conv_dir {
-        Some(dir) => {
-            let state = inspect_conversations_dir(dir);
-            writeln!(out, "Sessions: {} [{state}]", dir.display())?;
-        }
-        None => {
-            writeln!(out, "Sessions: unavailable [AGY CLI directory unresolved]")?;
+    if env.roots.is_empty() {
+        writeln!(out, "Sessions: unavailable [AGY data roots unresolved]")?;
+    } else {
+        for (source, root) in &env.roots {
+            let conv_dir = root.join("conversations");
+            let state = inspect_conversations_dir(&conv_dir);
+            writeln!(out, "Sessions ({source}): {} [{state}]", conv_dir.display())?;
         }
     }
 
@@ -286,6 +439,8 @@ fn run_doctor_with<W: Write>(
         }
     }
 
+    write_quota_section(env, out)?;
+
     writeln!(out, "Preview:")?;
     let sample = sample_preview_payload(100);
     let meta = sample_preview_metadata();
@@ -295,7 +450,8 @@ fn run_doctor_with<W: Write>(
 }
 
 /// Inspects XDG config, runtime environment, AGY `settings.json` wiring, local
-/// AGY/cache storage, optional `agy --version`, and prints a live sample preview.
+/// AGY/cache storage, optional `agy --version`, `git`/`curl`, live Hub RPC / cached
+/// quota status, and prints a live sample preview.
 pub fn run_doctor<W: Write>(
     config_path: &Path,
     settings_path: &Path,
@@ -304,12 +460,9 @@ pub fn run_doctor<W: Write>(
     no_color: bool,
     out: &mut W,
 ) -> io::Result<()> {
-    let conv_dir: Option<PathBuf> = settings_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.join("conversations"));
     let doctor_env = DoctorEnv {
-        conv_dir: conv_dir.as_deref(),
+        roots: collect_doctor_roots(settings_path),
+        daemon_dirs: resolve_agy_daemon_dirs(),
         cache_dir,
         path_env,
         now_unix_secs: unix_now_secs(),
@@ -338,13 +491,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let cfg_path = home.path().join("config.json");
         let settings = agy_settings_path_for_home(home.path());
-        let conv_dir = settings.parent().unwrap().join("conversations");
         let cache_dir = home.path().join("cache");
         apply_statusline_config(&settings, Path::new("/nonexistent/agy-statusline"), false)
             .unwrap();
 
         let doctor_env = DoctorEnv {
-            conv_dir: Some(&conv_dir),
+            roots: vec![("cli", settings.parent().unwrap().to_path_buf())],
+            daemon_dirs: Vec::new(),
             cache_dir: Some(&cache_dir),
             path_env: None,
             now_unix_secs: 1_700_000_000,
@@ -354,9 +507,11 @@ mod tests {
         run_doctor_with(&cfg_path, &settings, &doctor_env, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("NO_COLOR: active"));
+        assert!(text.contains("Tools:    git=not found · curl=not found"));
         assert!(text.contains("enabled=true"));
         assert!(text.contains("bin_exists=false"));
         assert!(text.contains("Pricing:"));
+        assert!(text.contains("Quota:    unavailable"));
         assert!(text.contains("Preview:"));
         assert!(!text.contains('\x1b'));
     }
@@ -415,10 +570,10 @@ mod tests {
         // Also verify run_doctor_with reports bin_exists=true for command-with-args.
         let cfg_path = home.path().join("config.json");
         let settings = agy_settings_path_for_home(home.path());
-        let conv_dir = settings.parent().unwrap().join("conversations");
         apply_statusline_config(&settings, Path::new(&with_args), false).unwrap();
         let doctor_env = DoctorEnv {
-            conv_dir: Some(&conv_dir),
+            roots: vec![("cli", settings.parent().unwrap().to_path_buf())],
+            daemon_dirs: Vec::new(),
             cache_dir: None,
             path_env: Some(path_env.as_os_str()),
             now_unix_secs: 1_700_000_000,
@@ -605,5 +760,100 @@ mod tests {
         symlink(&target, dir.path().join(MODELS_DEV_CACHE_FILE)).unwrap();
 
         assert_eq!(inspect_pricing_cache(dir.path(), 100), "symlink (ignored)");
+    }
+
+    #[test]
+    fn doctor_reports_multi_root_sessions_tools_and_cached_quota_snapshot() {
+        use std::collections::BTreeMap;
+
+        use crate::agy::quota::{save_quota_snapshot, QuotaSnapshot, QuotaSource};
+        use crate::statusline::QuotaBucket;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cli_root = dir.path().join("cli_root");
+        let desk_root = dir.path().join("desk_root");
+        let cache_dir = dir.path().join("cache");
+        let bin_dir = dir.path().join("bin");
+        fs::create_dir_all(cli_root.join("conversations")).unwrap();
+        fs::create_dir_all(desk_root.join("conversations")).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(
+            desk_root
+                .join("conversations")
+                .join("11111111-1111-4111-8111-111111111111.db"),
+            b"db",
+        )
+        .unwrap();
+
+        let git_bin = bin_dir.join("git");
+        fs::write(&git_bin, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&git_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let snap = QuotaSnapshot {
+            updated_at: 1_700_000_000 - 120,
+            source: QuotaSource::HubRpc,
+            plan_tier: Some("Ultra".to_string()),
+            ultra_tier_label: Some("5x".to_string()),
+            email: Some("dev@example.com".to_string()),
+            ai_credits: Some(25),
+            quota: BTreeMap::from([
+                (
+                    "gemini-5h".to_string(),
+                    QuotaBucket {
+                        remaining_fraction: Some(0.80),
+                        reset_in_seconds: Some(7_200),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "3p-5h".to_string(),
+                    QuotaBucket {
+                        remaining_fraction: Some(0.50),
+                        reset_in_seconds: Some(3_600),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "google_one_ai".to_string(),
+                    QuotaBucket {
+                        remaining_amount: Some(25),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            history: BTreeMap::new(),
+        };
+        save_quota_snapshot(&cache_dir, &snap).unwrap();
+
+        let path_env = env::join_paths([&bin_dir]).unwrap();
+        let doctor_env = DoctorEnv {
+            roots: vec![("cli", cli_root), ("desktop", desk_root)],
+            daemon_dirs: Vec::new(),
+            cache_dir: Some(&cache_dir),
+            path_env: Some(path_env.as_os_str()),
+            now_unix_secs: 1_700_000_000,
+            no_color: true,
+        };
+        let mut out = Vec::new();
+        run_doctor_with(
+            &dir.path().join("config.json"),
+            &dir.path().join("settings.json"),
+            &doctor_env,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("Tools:    git=found · curl=not found"));
+        assert!(text.contains("Sessions (cli):"));
+        assert!(text.contains("Sessions (desktop):"));
+        assert!(text.contains("found, 1 session .db file"));
+        assert!(
+            text.contains("Quota:    cached hub rpc (2m ago) · tier=Ultra 5x · credits=25 [low]")
+        );
+        assert!(text.contains("Pools:    Gemini 5h 80% (2h) · Claude/3P 3p 5h 50% (1h)"));
     }
 }
