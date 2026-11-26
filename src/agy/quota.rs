@@ -286,8 +286,8 @@ impl QuotaSnapshot {
         }
         if incoming.plan_tier.is_some() {
             self.plan_tier = incoming.plan_tier;
-        }
-        if incoming.ultra_tier_label.is_some() {
+            self.ultra_tier_label = incoming.ultra_tier_label;
+        } else if incoming.ultra_tier_label.is_some() {
             self.ultra_tier_label = incoming.ultra_tier_label;
         }
         if incoming.ai_credits.is_some() {
@@ -524,16 +524,6 @@ mod quota_map_serde {
 mod tests {
     use super::*;
 
-    fn push_spaced_samples(history: &mut BucketHistory, count: usize, start_ts: u64) {
-        let mut idx = 0usize;
-        while idx < count {
-            let ts = start_ts + (idx as u64) * 120;
-            let frac = (1.0 - (idx as f64) * 0.02).max(0.0);
-            history.record_sample(ts, frac, Some((start_ts + 18_000) as i64));
-            idx += 1;
-        }
-    }
-
     #[test]
     fn bucket_history_computes_burn_rate_and_eta_projection() {
         let mut hist = BucketHistory::default();
@@ -561,10 +551,28 @@ mod tests {
     #[test]
     fn bucket_history_resets_on_rollover_and_caps_ring_at_16_points() {
         let mut hist = BucketHistory::default();
-        push_spaced_samples(&mut hist, 20, 1_000);
+        let reset = Some(19_000);
+        hist.record_sample(1_000, 1.00, reset);
+        hist.record_sample(1_120, 0.98, reset);
+        hist.record_sample(1_240, 0.96, reset);
+        hist.record_sample(1_360, 0.94, reset);
+        hist.record_sample(1_480, 0.92, reset);
+        hist.record_sample(1_600, 0.90, reset);
+        hist.record_sample(1_720, 0.88, reset);
+        hist.record_sample(1_840, 0.86, reset);
+        hist.record_sample(1_960, 0.84, reset);
+        hist.record_sample(2_080, 0.82, reset);
+        hist.record_sample(2_200, 0.80, reset);
+        hist.record_sample(2_320, 0.78, reset);
+        hist.record_sample(2_440, 0.76, reset);
+        hist.record_sample(2_560, 0.74, reset);
+        hist.record_sample(2_680, 0.72, reset);
+        hist.record_sample(2_800, 0.70, reset);
+        hist.record_sample(2_920, 0.68, reset);
+        hist.record_sample(3_040, 0.66, reset);
         assert_eq!(hist.samples.len(), MAX_HISTORY_SAMPLES);
-        assert_eq!(hist.samples.first().unwrap().ts, 1_000 + 4 * 120);
-        assert_eq!(hist.samples.last().unwrap().ts, 1_000 + 19 * 120);
+        assert_eq!(hist.samples.first().unwrap().ts, 1_240);
+        assert_eq!(hist.samples.last().unwrap().ts, 3_040);
 
         // Reset time advances significantly -> clears ring.
         hist.record_sample(5_000, 0.95, Some(37_000));
@@ -578,6 +586,46 @@ mod tests {
         hist.record_sample(6_200, 0.90, Some(37_000));
         assert_eq!(hist.samples.len(), 1);
         assert!((hist.samples[0].remaining_fraction - 0.90).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merge_observation_clears_ultra_label_on_tier_downgrade_and_preserves_when_absent() {
+        let mut snap = QuotaSnapshot {
+            updated_at: 1_000,
+            source: QuotaSource::HubRpc,
+            plan_tier: Some("Ultra".to_string()),
+            ultra_tier_label: Some("20x".to_string()),
+            email: Some("dev@example.com".to_string()),
+            ..Default::default()
+        };
+
+        // Update without plan_tier preserves existing tier and ultra label.
+        let partial = QuotaSnapshot {
+            updated_at: 1_100,
+            source: QuotaSource::Stdin,
+            plan_tier: None,
+            ultra_tier_label: None,
+            email: Some("dev@example.com".to_string()),
+            ..Default::default()
+        };
+        snap.merge_observation(partial, 1_100);
+        assert_eq!(snap.plan_tier.as_deref(), Some("Ultra"));
+        assert_eq!(snap.ultra_tier_label.as_deref(), Some("20x"));
+        assert_eq!(snap.display_plan_tier().as_deref(), Some("Ultra 20x"));
+
+        // Tier downgrade to Pro with ultra_tier_label=None clears stale "20x".
+        let downgrade = QuotaSnapshot {
+            updated_at: 1_200,
+            source: QuotaSource::HubRpc,
+            plan_tier: Some("Pro".to_string()),
+            ultra_tier_label: None,
+            email: Some("dev@example.com".to_string()),
+            ..Default::default()
+        };
+        snap.merge_observation(downgrade, 1_200);
+        assert_eq!(snap.plan_tier.as_deref(), Some("Pro"));
+        assert_eq!(snap.ultra_tier_label, None);
+        assert_eq!(snap.display_plan_tier().as_deref(), Some("Pro"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Opportunistic zero-dependency `daemon/hub_*.json` discovery and loopback HTTP/1.1 Connect RPC client.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -31,7 +32,7 @@ const SHARED_QUOTA_FRAC_EPS: f64 = 0.015;
 const SHARED_QUOTA_RESET_EPS_SECS: i64 = 120;
 
 /// Discovered local Antigravity Hub / Language Server loopback endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HubEndpoint {
     /// Owning Hub daemon process ID (`0` if unspecified).
     pub pid: u32,
@@ -42,6 +43,18 @@ pub struct HubEndpoint {
     /// Source `hub_*.json` path on disk.
     pub path: PathBuf,
     mtime: (i64, u32),
+}
+
+impl fmt::Debug for HubEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HubEndpoint")
+            .field("pid", &self.pid)
+            .field("http_port", &self.http_port)
+            .field("csrf_token", &"<redacted>")
+            .field("path", &self.path)
+            .field("mtime", &self.mtime)
+            .finish()
+    }
 }
 
 /// Outcome of [`fetch_or_load_quota_snapshot`].
@@ -1322,6 +1335,9 @@ mod tests {
         assert_eq!(eps.len(), 1);
         assert_eq!(eps[0].http_port, 41001);
         assert_eq!(eps[0].csrf_token, "tok-good");
+        let dbg = format!("{:?}", eps[0]);
+        assert!(dbg.contains("<redacted>"));
+        assert!(!dbg.contains("tok-good"));
     }
 
     #[cfg(unix)]
