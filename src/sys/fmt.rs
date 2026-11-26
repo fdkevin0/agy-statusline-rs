@@ -174,6 +174,27 @@ pub(crate) fn truncate_to_width(s: &str, max_cols: usize, ellipsis: &str) -> Str
     out
 }
 
+/// Returns `raw` trimmed when non-empty.
+pub(crate) fn trimmed_non_empty(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Returns `true` when both optional strings are non-empty after trimming and differ ASCII case-insensitively.
+pub(crate) fn ascii_values_conflict(a: Option<&str>, b: Option<&str>) -> bool {
+    matches!(
+        (trimmed_non_empty(a), trimmed_non_empty(b)),
+        (Some(lhs), Some(rhs)) if !lhs.eq_ignore_ascii_case(rhs)
+    )
+}
+
+/// Splits `raw` on non-ASCII-alphanumeric boundaries into lowercase non-empty tokens.
+pub(crate) fn tokenize_alnum_lower(raw: &str) -> Vec<String> {
+    raw.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|tok| !tok.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 /// Strips ANSI escapes and control characters, collapsing runs of whitespace into single spaces.
 pub(crate) fn sanitize_inline_text(raw: &str) -> String {
     // Normalize non-CR/LF whitespace (such as `\t` and NEL) before `strip_ansi_escapes`,

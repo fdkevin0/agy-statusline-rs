@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -12,7 +12,8 @@ use serde_json::Value;
 
 use crate::agy::quota::{load_quota_snapshot, save_quota_snapshot, QuotaSnapshot, QuotaSource};
 use crate::statusline::QuotaBucket;
-use crate::sys::fs::modified_timestamp;
+use crate::sys::fmt::{tokenize_alnum_lower, trimmed_non_empty};
+use crate::sys::fs::{is_real_dir, modified_timestamp, read_bounded_regular_file};
 use crate::sys::time::parse_rfc3339_unix_secs;
 
 /// Freshness TTL (seconds) before cached Hub RPC snapshots trigger a new loopback probe.
@@ -111,37 +112,16 @@ fn is_safe_header_token(token: &str) -> bool {
     !token.is_empty() && !token.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0'))
 }
 
-fn parse_port_value(v: &Value) -> Option<u16> {
-    let n = v
-        .as_u64()
-        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))?;
-    u16::try_from(n).ok().filter(|&p| p > 0)
-}
-
-fn parse_pid_value(v: &Value) -> Option<u32> {
-    let n = v
-        .as_u64()
-        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))?;
-    u32::try_from(n).ok()
+fn parse_u64_flexible(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
 }
 
 fn read_hub_endpoint_file<F>(path: &Path, is_alive: &F) -> Option<HubEndpoint>
 where
     F: Fn(u32) -> bool,
 {
-    let meta = fs::symlink_metadata(path).ok()?;
-    let ft = meta.file_type();
-    if ft.is_symlink() || !ft.is_file() || meta.len() > MAX_HUB_DISCOVERY_FILE_BYTES {
-        return None;
-    }
-    let file = File::open(path).ok()?;
-    let mut bytes = Vec::with_capacity(meta.len().min(MAX_HUB_DISCOVERY_FILE_BYTES) as usize);
-    file.take(MAX_HUB_DISCOVERY_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_HUB_DISCOVERY_FILE_BYTES {
-        return None;
-    }
+    let (bytes, meta) = read_bounded_regular_file(path, MAX_HUB_DISCOVERY_FILE_BYTES).ok()?;
 
     let parsed: Value = serde_json::from_slice(&bytes).ok()?;
     let obj = parsed.as_object()?;
@@ -157,9 +137,15 @@ where
         .get("httpPort")
         .or_else(|| obj.get("http_port"))
         .or_else(|| obj.get("port"))
-        .and_then(parse_port_value)?;
+        .and_then(parse_u64_flexible)
+        .and_then(|n| u16::try_from(n).ok())
+        .filter(|&p| p > 0)?;
 
-    let pid = obj.get("pid").and_then(parse_pid_value).unwrap_or(0);
+    let pid = obj
+        .get("pid")
+        .and_then(parse_u64_flexible)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0);
     if pid > 0 && !is_alive(pid) {
         return None;
     }
@@ -188,11 +174,7 @@ where
     let mut seen: HashSet<(u16, String)> = HashSet::new();
 
     for dir in daemon_dirs {
-        let Ok(dir_meta) = fs::symlink_metadata(dir) else {
-            continue;
-        };
-        let dir_ft = dir_meta.file_type();
-        if dir_ft.is_symlink() || !dir_ft.is_dir() {
+        if !is_real_dir(dir) {
             continue;
         }
         let Ok(entries) = fs::read_dir(dir) else {
@@ -200,10 +182,7 @@ where
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(name_str) = name.to_str() else {
-                continue;
-            };
-            if !is_hub_discovery_filename(name_str) {
+            if !name.to_str().is_some_and(is_hub_discovery_filename) {
                 continue;
             }
             if let Some(ep) = read_hub_endpoint_file(&entry.path(), &is_alive) {
@@ -513,13 +492,6 @@ fn parse_f64_flexible(v: &Value) -> Option<f64> {
         .filter(|f| f.is_finite())
 }
 
-fn tokenize_lower(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect()
-}
-
 fn contains_any_token(tokens: &[String], needles: &[&str]) -> bool {
     tokens
         .iter()
@@ -528,7 +500,7 @@ fn contains_any_token(tokens: &[String], needles: &[&str]) -> bool {
 
 fn is_third_party_text(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    let tokens = tokenize_lower(&lower);
+    let tokens = tokenize_alnum_lower(&lower);
     contains_any_token(
         &tokens,
         &["claude", "gpt", "anthropic", "openai", "3p", "other"],
@@ -548,19 +520,16 @@ fn classify_rpc_pool_slug(
     let gname_trim = group_name.trim();
     let is_generic_gemini_group = gname_trim.eq_ignore_ascii_case("gemini models");
 
-    let desc_tokens = tokenize_lower(&desc_lower);
-    if primary_lower.contains("carbon")
-        || (contains_any_token(&desc_tokens, &["carbon"])
+    let desc_tokens = tokenize_alnum_lower(&desc_lower);
+    let desc_has_named_pool = |pool: &str| {
+        contains_any_token(&desc_tokens, &[pool])
             && !contains_any_token(&desc_tokens, &["flash"])
-            && !is_generic_gemini_group)
-    {
+            && !is_generic_gemini_group
+    };
+    if primary_lower.contains("carbon") || desc_has_named_pool("carbon") {
         return "gemini-carbon".to_string();
     }
-    if primary_lower.contains("argon")
-        || (contains_any_token(&desc_tokens, &["argon"])
-            && !contains_any_token(&desc_tokens, &["flash"])
-            && !is_generic_gemini_group)
-    {
+    if primary_lower.contains("argon") || desc_has_named_pool("argon") {
         return "gemini-argon".to_string();
     }
     if is_third_party_text(&primary)
@@ -572,13 +541,10 @@ fn classify_rpc_pool_slug(
         return "gemini".to_string();
     }
 
-    let fallback_tokens = tokenize_lower(if !gname_trim.is_empty() {
-        gname_trim
-    } else if !bucket_id.trim().is_empty() {
-        bucket_id.trim()
-    } else {
-        "other"
-    });
+    let fallback_src = trimmed_non_empty(Some(gname_trim))
+        .or_else(|| trimmed_non_empty(Some(bucket_id)))
+        .unwrap_or("other");
+    let fallback_tokens = tokenize_alnum_lower(fallback_src);
     if fallback_tokens.is_empty() {
         "other".to_string()
     } else {
@@ -602,8 +568,8 @@ fn classify_rpc_bucket_window(bucket: &Value, now_unix_secs: u64) -> &'static st
     )
     .to_ascii_lowercase();
 
-    let win_tokens = tokenize_lower(&win);
-    let id_tokens = tokenize_lower(&id_and_name);
+    let win_tokens = tokenize_alnum_lower(&win);
+    let id_tokens = tokenize_alnum_lower(&id_and_name);
     if contains_any_token(&win_tokens, &["5h"])
         || win.contains("five-hour")
         || win.contains("five_hour")
@@ -749,7 +715,7 @@ fn extract_tier_and_account(
 
     let tier_id_lower = raw_tier_id.to_ascii_lowercase();
     let tier_text = format!("{raw_tier_id} {raw_tier_name} {raw_tier_desc}").to_ascii_lowercase();
-    let tier_tokens = tokenize_lower(&tier_text);
+    let tier_tokens = tokenize_alnum_lower(&tier_text);
 
     let is_5x = contains_any_token(&tier_tokens, &["5x"])
         || tier_text.contains("ultra-lite")
@@ -771,7 +737,7 @@ fn extract_tier_and_account(
         None
     };
 
-    let name_tokens = tokenize_lower(raw_tier_name);
+    let name_tokens = tokenize_alnum_lower(raw_tier_name);
     let is_ultra = contains_any_token(&name_tokens, &["ultra"])
         || tier_id_lower.contains("ultra")
         || ultra_tier_label.is_some();
@@ -849,180 +815,182 @@ fn insert_pool_bucket(
     quota.insert(key, bucket);
 }
 
+fn collect_summary_buckets(
+    raw_summary: &Value,
+    quota: &mut BTreeMap<String, QuotaBucket>,
+    now_unix_secs: u64,
+) {
+    let mut push_bucket = |group_name: &str, group_desc: &str, b: &Value| {
+        let Some(norm) = normalize_rpc_quota_bucket(b, now_unix_secs) else {
+            return;
+        };
+        let bucket_id = b.get("bucketId").and_then(Value::as_str).unwrap_or("");
+        let bucket_name = b.get("displayName").and_then(Value::as_str).unwrap_or("");
+        let slug = classify_rpc_pool_slug(group_name, group_desc, bucket_id, bucket_name);
+        let window = classify_rpc_bucket_window(b, now_unix_secs);
+        insert_pool_bucket(quota, &slug, window, norm, now_unix_secs);
+    };
+
+    if let Some(groups) = raw_summary.get("groups").and_then(Value::as_array) {
+        for grp in groups {
+            let group_name = grp.get("displayName").and_then(Value::as_str).unwrap_or("");
+            let group_desc = grp.get("description").and_then(Value::as_str).unwrap_or("");
+            for b in grp
+                .get("buckets")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_bucket(group_name, group_desc, b);
+            }
+        }
+    } else if let Some(buckets) = raw_summary.get("buckets").and_then(Value::as_array) {
+        for b in buckets {
+            push_bucket("", "", b);
+        }
+    }
+}
+
+fn infer_window_from_reset(bucket: &QuotaBucket, now_unix_secs: u64) -> &'static str {
+    let is_long = bucket
+        .reset_time
+        .as_deref()
+        .and_then(parse_rfc3339_unix_secs)
+        .is_some_and(|r| r - (now_unix_secs as i64) > SIX_HOURS_SECS);
+    if is_long {
+        "weekly"
+    } else {
+        "5h"
+    }
+}
+
+fn infer_fallback_model_pools(
+    user_status: &Value,
+    quota: &mut BTreeMap<String, QuotaBucket>,
+    now_unix_secs: u64,
+) {
+    let Some(configs) = user_status
+        .get("cascadeModelConfigData")
+        .and_then(|d| d.get("clientModelConfigs"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+
+    let mut sample_std_gemini: Option<QuotaBucket> = None;
+    let mut sample_argon: Option<QuotaBucket> = None;
+    let mut sample_carbon: Option<QuotaBucket> = None;
+    let mut sample_3p: Option<QuotaBucket> = None;
+
+    for cfg in configs {
+        let Some(norm) = cfg
+            .get("quotaInfo")
+            .and_then(|q| normalize_rpc_quota_bucket(q, now_unix_secs))
+        else {
+            continue;
+        };
+        let ident = format!(
+            "{} {} {}",
+            cfg.get("modelOrAlias")
+                .and_then(|m| m.get("model"))
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            cfg.get("modelId").and_then(Value::as_str).unwrap_or(""),
+            cfg.get("label").and_then(Value::as_str).unwrap_or("")
+        )
+        .to_ascii_lowercase();
+        let target = if ident.contains("carbon") {
+            &mut sample_carbon
+        } else if ident.contains("argon") {
+            &mut sample_argon
+        } else if ident.contains("gemini") {
+            &mut sample_std_gemini
+        } else if is_third_party_text(&ident) {
+            &mut sample_3p
+        } else {
+            continue;
+        };
+        target.get_or_insert(norm);
+    }
+
+    if let Some(argon) = sample_argon.as_ref() {
+        let has_argon =
+            quota.contains_key("gemini-argon-5h") || quota.contains_key("gemini-argon-weekly");
+        let baselines = [
+            sample_std_gemini.as_ref(),
+            quota.get("gemini-5h"),
+            quota.get("gemini-weekly"),
+        ];
+        if !has_argon
+            && baselines.iter().any(Option::is_some)
+            && !baselines
+                .into_iter()
+                .flatten()
+                .any(|g| quotas_match_shared_pool(argon, g))
+        {
+            quota.insert("gemini-argon-weekly".to_string(), argon.clone());
+        }
+    }
+
+    if let Some(carbon) = sample_carbon.as_ref() {
+        let has_carbon =
+            quota.contains_key("gemini-carbon-5h") || quota.contains_key("gemini-carbon-weekly");
+        let baselines = [
+            sample_std_gemini.as_ref(),
+            sample_argon.as_ref(),
+            quota.get("gemini-5h"),
+            quota.get("gemini-weekly"),
+            quota.get("gemini-argon-weekly"),
+        ];
+        let has_baseline = sample_std_gemini.is_some()
+            || sample_argon.is_some()
+            || quota.contains_key("gemini-5h")
+            || quota.contains_key("gemini-weekly");
+        if !has_carbon
+            && has_baseline
+            && !baselines
+                .into_iter()
+                .flatten()
+                .any(|other| quotas_match_shared_pool(carbon, other))
+        {
+            quota.insert("gemini-carbon-weekly".to_string(), carbon.clone());
+        }
+    }
+
+    for (slug, sample) in [("gemini", sample_std_gemini), ("3p", sample_3p)] {
+        if !quota.contains_key(&format!("{slug}-5h"))
+            && !quota.contains_key(&format!("{slug}-weekly"))
+        {
+            if let Some(bucket) = sample {
+                let win = infer_window_from_reset(&bucket, now_unix_secs);
+                quota.insert(format!("{slug}-{win}"), bucket);
+            }
+        }
+    }
+}
+
 /// Parses `RetrieveUserQuotaSummary` and `GetUserStatus` JSON responses into a unified [`QuotaSnapshot`].
 pub fn parse_hub_quota_responses(
     quota_summary_resp: Option<&Value>,
     user_status_resp: Option<&Value>,
     now_unix_secs: u64,
 ) -> QuotaSnapshot {
-    let mut quota: BTreeMap<String, QuotaBucket> = BTreeMap::new();
-
+    let mut quota = BTreeMap::new();
     if let Some(raw_summary) = quota_summary_resp.map(unwrap_rpc_response) {
-        if let Some(groups) = raw_summary.get("groups").and_then(Value::as_array) {
-            for grp in groups {
-                let group_name = grp.get("displayName").and_then(Value::as_str).unwrap_or("");
-                let group_desc = grp.get("description").and_then(Value::as_str).unwrap_or("");
-                let Some(buckets) = grp.get("buckets").and_then(Value::as_array) else {
-                    continue;
-                };
-                for b in buckets {
-                    let Some(norm) = normalize_rpc_quota_bucket(b, now_unix_secs) else {
-                        continue;
-                    };
-                    let bucket_id = b.get("bucketId").and_then(Value::as_str).unwrap_or("");
-                    let bucket_name = b.get("displayName").and_then(Value::as_str).unwrap_or("");
-                    let slug =
-                        classify_rpc_pool_slug(group_name, group_desc, bucket_id, bucket_name);
-                    let window = classify_rpc_bucket_window(b, now_unix_secs);
-                    insert_pool_bucket(&mut quota, &slug, window, norm, now_unix_secs);
-                }
-            }
-        } else if let Some(buckets) = raw_summary.get("buckets").and_then(Value::as_array) {
-            for b in buckets {
-                let Some(norm) = normalize_rpc_quota_bucket(b, now_unix_secs) else {
-                    continue;
-                };
-                let bucket_id = b.get("bucketId").and_then(Value::as_str).unwrap_or("");
-                let bucket_name = b.get("displayName").and_then(Value::as_str).unwrap_or("");
-                let slug = classify_rpc_pool_slug("", "", bucket_id, bucket_name);
-                let window = classify_rpc_bucket_window(b, now_unix_secs);
-                insert_pool_bucket(&mut quota, &slug, window, norm, now_unix_secs);
-            }
-        }
+        collect_summary_buckets(raw_summary, &mut quota, now_unix_secs);
     }
 
     let user_status = user_status_resp
         .map(unwrap_rpc_response)
         .and_then(|v| v.get("userStatus").or(Some(v)));
-
     let (email, plan_tier, ultra_tier_label, ai_credits) = user_status
         .map(extract_tier_and_account)
         .unwrap_or((None, None, None, None));
 
     // Fallback inference from `clientModelConfigs.quotaInfo` for Pro Argon/Carbon pools
     // or when `RetrieveUserQuotaSummary` returned no buckets for a family.
-    if let Some(configs) = user_status
-        .and_then(|u| u.get("cascadeModelConfigData"))
-        .and_then(|d| d.get("clientModelConfigs"))
-        .and_then(Value::as_array)
-    {
-        let mut sample_std_gemini: Option<QuotaBucket> = None;
-        let mut sample_argon: Option<QuotaBucket> = None;
-        let mut sample_carbon: Option<QuotaBucket> = None;
-        let mut sample_3p: Option<QuotaBucket> = None;
-
-        for cfg in configs {
-            let Some(qinfo) = cfg.get("quotaInfo") else {
-                continue;
-            };
-            let Some(norm) = normalize_rpc_quota_bucket(qinfo, now_unix_secs) else {
-                continue;
-            };
-            let ident = format!(
-                "{} {} {}",
-                cfg.get("modelOrAlias")
-                    .and_then(|m| m.get("model"))
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
-                cfg.get("modelId").and_then(Value::as_str).unwrap_or(""),
-                cfg.get("label").and_then(Value::as_str).unwrap_or("")
-            )
-            .to_ascii_lowercase();
-            if ident.contains("carbon") {
-                if sample_carbon.is_none() {
-                    sample_carbon = Some(norm);
-                }
-            } else if ident.contains("argon") {
-                if sample_argon.is_none() {
-                    sample_argon = Some(norm);
-                }
-            } else if ident.contains("gemini") {
-                if sample_std_gemini.is_none() {
-                    sample_std_gemini = Some(norm);
-                }
-            } else if is_third_party_text(&ident) && sample_3p.is_none() {
-                sample_3p = Some(norm);
-            }
-        }
-
-        if let Some(argon) = sample_argon.as_ref() {
-            let has_argon =
-                quota.contains_key("gemini-argon-5h") || quota.contains_key("gemini-argon-weekly");
-            let matches_gemini = sample_std_gemini
-                .as_ref()
-                .is_some_and(|g| quotas_match_shared_pool(argon, g))
-                || quota
-                    .get("gemini-5h")
-                    .is_some_and(|g| quotas_match_shared_pool(argon, g))
-                || quota
-                    .get("gemini-weekly")
-                    .is_some_and(|g| quotas_match_shared_pool(argon, g));
-            let has_baseline = sample_std_gemini.is_some()
-                || quota.contains_key("gemini-5h")
-                || quota.contains_key("gemini-weekly");
-            if !has_argon && has_baseline && !matches_gemini {
-                quota.insert("gemini-argon-weekly".to_string(), argon.clone());
-            }
-        }
-
-        if let Some(carbon) = sample_carbon.as_ref() {
-            let has_carbon = quota.contains_key("gemini-carbon-5h")
-                || quota.contains_key("gemini-carbon-weekly");
-            let matches_other = sample_std_gemini
-                .as_ref()
-                .is_some_and(|g| quotas_match_shared_pool(carbon, g))
-                || sample_argon
-                    .as_ref()
-                    .is_some_and(|a| quotas_match_shared_pool(carbon, a))
-                || quota
-                    .get("gemini-5h")
-                    .is_some_and(|g| quotas_match_shared_pool(carbon, g))
-                || quota
-                    .get("gemini-weekly")
-                    .is_some_and(|g| quotas_match_shared_pool(carbon, g))
-                || quota
-                    .get("gemini-argon-weekly")
-                    .is_some_and(|a| quotas_match_shared_pool(carbon, a));
-            let has_baseline = sample_std_gemini.is_some()
-                || sample_argon.is_some()
-                || quota.contains_key("gemini-5h")
-                || quota.contains_key("gemini-weekly");
-            if !has_carbon && has_baseline && !matches_other {
-                quota.insert("gemini-carbon-weekly".to_string(), carbon.clone());
-            }
-        }
-
-        if !quota.contains_key("gemini-5h") && !quota.contains_key("gemini-weekly") {
-            if let Some(g) = sample_std_gemini {
-                let win = if g
-                    .reset_time
-                    .as_deref()
-                    .and_then(parse_rfc3339_unix_secs)
-                    .is_some_and(|r| r - (now_unix_secs as i64) > SIX_HOURS_SECS)
-                {
-                    "weekly"
-                } else {
-                    "5h"
-                };
-                quota.insert(format!("gemini-{win}"), g);
-            }
-        }
-
-        if !quota.contains_key("3p-5h") && !quota.contains_key("3p-weekly") {
-            if let Some(tp) = sample_3p {
-                let win = if tp
-                    .reset_time
-                    .as_deref()
-                    .and_then(parse_rfc3339_unix_secs)
-                    .is_some_and(|r| r - (now_unix_secs as i64) > SIX_HOURS_SECS)
-                {
-                    "weekly"
-                } else {
-                    "5h"
-                };
-                quota.insert(format!("3p-{win}"), tp);
-            }
-        }
+    if let Some(status) = user_status {
+        infer_fallback_model_pools(status, &mut quota, now_unix_secs);
     }
 
     if let Some(credits) = ai_credits {

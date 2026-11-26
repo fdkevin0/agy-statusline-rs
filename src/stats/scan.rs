@@ -25,15 +25,16 @@ use serde::{Deserialize, Serialize};
 use super::pricing::{is_effort_token, normalize_model_key, round_usd_6, PricingCatalog};
 use super::SqliteStats;
 use crate::agy::db::{
-    compute_median, conversation_id_from_db_path, is_absent_or_real_file, is_real_dir,
-    is_safe_sqlite_file, is_valid_uuid, open_readonly_db, safe_sqlite_metadata, sidecar_path,
+    compute_median, conversation_id_from_db_path, is_safe_sqlite_file, is_valid_uuid,
+    open_readonly_db, safe_sqlite_metadata, sidecar_path,
 };
 use crate::agy::protobuf::{
     extract_gen_metadata_record, extract_step_metadata_record, extract_trajectory_created_at_secs,
     is_foreign_cascade_id, RetryAttemptRecord, RetryStatusClass, UsageAttemptRecord, MAX_TTFT_SECS,
     MAX_TURN_SPEED_TPS,
 };
-use crate::sys::fs::modified_timestamp;
+use crate::sys::fmt::trimmed_non_empty;
+use crate::sys::fs::{canonical_or_self, is_absent_or_real_file, is_real_dir, modified_timestamp};
 use crate::sys::time::TimeZoneSpec;
 
 const STEP_TYPE_ERROR_MESSAGE: i64 = 17;
@@ -256,7 +257,7 @@ fn derive_model_name(
     response_model: Option<&str>,
     model_enum: u64,
 ) -> String {
-    if let Some(disp) = model_display_name.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(disp) = trimmed_non_empty(model_display_name) {
         if let Some(open_idx) = disp.rfind(" (") {
             if let Some(inner) = disp[open_idx + 2..].strip_suffix(')') {
                 if is_effort_qualifier(inner) {
@@ -269,7 +270,7 @@ fn derive_model_name(
         }
         return disp.to_string();
     }
-    if let Some(resp) = response_model.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(resp) = trimmed_non_empty(response_model) {
         return resp.to_string();
     }
     if model_enum > 0 {
@@ -310,10 +311,6 @@ pub(super) struct UsageEvent {
     pub(super) cost_usd: Option<f64>,
     pub(super) decode_speed: Option<f64>,
     pub(super) ttft_secs: Option<f64>,
-}
-
-fn canonical_or_self(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn root_path_key(root: &Path) -> String {
@@ -442,7 +439,7 @@ impl UnionFind {
 }
 
 fn display_name_rank(disp: Option<&str>) -> u8 {
-    match disp.map(str::trim).filter(|s| !s.is_empty()) {
+    match trimmed_non_empty(disp) {
         None => 0,
         Some(s) if PricingCatalog::has_specific_model_qualifier(None, Some(s)) => 2,
         Some(_) => 1,
@@ -450,7 +447,7 @@ fn display_name_rank(disp: Option<&str>) -> u8 {
 }
 
 fn response_model_rank(resp: Option<&str>) -> u8 {
-    match resp.map(str::trim).filter(|s| !s.is_empty()) {
+    match trimmed_non_empty(resp) {
         None => 0,
         Some(s) if PricingCatalog::has_specific_model_qualifier(Some(s), None) => 2,
         Some(_) => 1,
@@ -691,25 +688,244 @@ fn fallback_timestamp(trajectory_ts: Option<i64>, db_mtime_secs: Option<i64>) ->
     }
 }
 
-fn steps_table_columns(conn: &rusqlite::Connection) -> (bool, bool, bool) {
-    let mut has_table = false;
-    let mut has_metadata = false;
-    let mut has_step_type = false;
-    if let Ok(mut pragma) = conn.prepare("PRAGMA table_info(steps)") {
-        if let Ok(mut rows) = pragma.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                has_table = true;
-                if let Ok(name) = row.get::<_, String>(1) {
-                    if name.eq_ignore_ascii_case("metadata") {
-                        has_metadata = true;
-                    } else if name.eq_ignore_ascii_case("step_type") {
-                        has_step_type = true;
-                    }
-                }
+/// Returns the lowercase column names present on `table` (empty when the table does not exist).
+pub(super) fn table_columns(conn: &rusqlite::Connection, table: &str) -> HashSet<String> {
+    let mut cols = HashSet::new();
+    let sql = format!("PRAGMA table_info({table})");
+    let Ok(mut pragma) = conn.prepare(&sql) else {
+        return cols;
+    };
+    let Ok(mut rows) = pragma.query([]) else {
+        return cols;
+    };
+    while let Ok(Some(row)) = rows.next() {
+        if let Ok(name) = row.get::<_, String>(1) {
+            cols.insert(name.to_ascii_lowercase());
+        }
+    }
+    cols
+}
+
+#[derive(Default)]
+struct StepsScanOutput {
+    has_table: bool,
+    timestamps: HashMap<u64, (i64, u8)>,
+    turn_candidates: Vec<(u64, RawTurn)>,
+    retry_candidates: Vec<(u64, Vec<RetryAttemptRecord>)>,
+}
+
+fn scan_steps_table(
+    conn: &rusqlite::Connection,
+    trajectory_ts: Option<i64>,
+    db_mtime_secs: Option<i64>,
+    expected_conversation_id: Option<&str>,
+    diagnostics: &mut ScanDiagnostics,
+) -> StepsScanOutput {
+    let mut out = StepsScanOutput::default();
+    let cols = table_columns(conn, "steps");
+    let has_metadata = cols.contains("metadata");
+    let has_step_type = cols.contains("step_type");
+    let step_sql = match (has_step_type, has_metadata) {
+        (true, true) => {
+            "SELECT idx, step_type, metadata FROM steps WHERE metadata IS NOT NULL OR step_type IN (17, 23) ORDER BY idx ASC"
+        }
+        (false, true) => {
+            "SELECT idx, NULL, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC"
+        }
+        (true, false) => {
+            "SELECT idx, step_type, NULL FROM steps WHERE step_type IN (17, 23) ORDER BY idx ASC"
+        }
+        (false, false) => return out,
+    };
+    let Ok(mut step_stmt) = conn.prepare(step_sql) else {
+        return out;
+    };
+    let Ok(mut step_rows) = step_stmt.query([]) else {
+        return out;
+    };
+
+    out.has_table = true;
+    while let Ok(Some(row)) = step_rows.next() {
+        let Ok(idx) = row.get::<_, i64>(0) else {
+            continue;
+        };
+        if idx < 0 {
+            continue;
+        }
+        let step_idx = idx as u64;
+        let step_type = row.get::<_, Option<i64>>(1).ok().flatten();
+        let step_rec = row
+            .get::<_, Option<Vec<u8>>>(2)
+            .ok()
+            .flatten()
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .and_then(extract_step_metadata_record);
+
+        if step_rec.as_ref().is_some_and(|rec| {
+            is_foreign_cascade_id(rec.origin_cascade_id.as_deref(), expected_conversation_id)
+        }) {
+            continue;
+        }
+
+        match step_type {
+            Some(STEP_TYPE_ERROR_MESSAGE) => {
+                diagnostics.error_steps = diagnostics.error_steps.saturating_add(1);
+            }
+            Some(STEP_TYPE_CHECKPOINT) => {
+                diagnostics.compaction_steps = diagnostics.compaction_steps.saturating_add(1);
+            }
+            _ => {}
+        }
+
+        let Some(step_rec) = step_rec else {
+            continue;
+        };
+        if !step_rec.retry_attempts.is_empty() {
+            out.retry_candidates
+                .push((step_idx, step_rec.retry_attempts));
+        }
+
+        let step_ts = if let Some(ts) = step_rec.created_at_secs {
+            out.timestamps
+                .insert(step_idx, (ts, TS_QUALITY_STEP_PRIMARY));
+            (Some(ts), TS_QUALITY_STEP_PRIMARY)
+        } else if let Some(ts) = step_rec.secondary_created_at_secs {
+            out.timestamps.insert(step_idx, (ts, TS_QUALITY_SECONDARY));
+            (Some(ts), TS_QUALITY_SECONDARY)
+        } else {
+            fallback_timestamp(trajectory_ts, db_mtime_secs)
+        };
+
+        if let Some(usage) = step_rec.usage {
+            let turn = RawTurn::from_attempt(
+                usage,
+                step_ts,
+                step_rec.model_enum,
+                step_rec.response_model.as_deref(),
+                step_rec.model_display_name.as_deref(),
+                true,
+            );
+            if turn.has_signal() {
+                out.turn_candidates.push((step_idx, turn));
+            }
+        }
+        for retry in step_rec.retry_usages {
+            let turn = RawTurn::from_attempt(
+                retry,
+                step_ts,
+                step_rec.model_enum,
+                step_rec.response_model.as_deref(),
+                step_rec.model_display_name.as_deref(),
+                false,
+            );
+            if turn.has_signal() {
+                out.turn_candidates.push((step_idx, turn));
             }
         }
     }
-    (has_table, has_metadata, has_step_type)
+    out
+}
+
+#[derive(Default)]
+struct GenScanOutput {
+    has_table: bool,
+    covered_steps: HashSet<u64>,
+    retry_covered_steps: HashSet<u64>,
+    turns: Vec<RawTurn>,
+}
+
+fn scan_gen_metadata_table(
+    conn: &rusqlite::Connection,
+    step_timestamps: &HashMap<u64, (i64, u8)>,
+    trajectory_ts: Option<i64>,
+    db_mtime_secs: Option<i64>,
+    expected_conversation_id: Option<&str>,
+    diagnostics: &mut ScanDiagnostics,
+) -> GenScanOutput {
+    let mut out = GenScanOutput::default();
+    let Ok(mut stmt) =
+        conn.prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx ASC")
+    else {
+        return out;
+    };
+    let Ok(mut rows) = stmt.query([]) else {
+        return out;
+    };
+
+    out.has_table = true;
+    while let Ok(Some(row)) = rows.next() {
+        let Ok(blob) = row.get::<_, Vec<u8>>(0) else {
+            continue;
+        };
+        let Some(rec) = extract_gen_metadata_record(&blob) else {
+            continue;
+        };
+        if is_foreign_cascade_id(rec.origin_cascade_id.as_deref(), expected_conversation_id) {
+            continue;
+        }
+        let mut recorded_gen_retry = false;
+        for attempt in &rec.retry_attempts {
+            if attempt.is_anomaly() {
+                recorded_gen_retry = true;
+                diagnostics.record_retry(attempt);
+            }
+        }
+        if recorded_gen_retry {
+            out.retry_covered_steps
+                .extend(rec.step_indices.iter().copied());
+        }
+        out.covered_steps.extend(rec.step_indices.iter().copied());
+
+        let (ts_secs, ts_quality) = rec
+            .step_indices
+            .iter()
+            .find_map(|idx| step_timestamps.get(idx).copied())
+            .map(|(ts, q)| (Some(ts), q))
+            .or_else(|| {
+                rec.chat_start_created_at_secs
+                    .map(|ts| (Some(ts), TS_QUALITY_SECONDARY))
+            })
+            .unwrap_or_else(|| fallback_timestamp(trajectory_ts, db_mtime_secs));
+
+        let decode_speed = rec.decode_speed_tps();
+        let main_turn = RawTurn {
+            ts_secs,
+            ts_quality,
+            model_enum: rec.model_enum,
+            response_model: rec.response_model.clone(),
+            model_display_name: rec.model_display_name.clone(),
+            input_tokens: rec.input_tokens,
+            cache_read_tokens: rec.cache_read_tokens,
+            cache_write_tokens: rec.cache_write_tokens,
+            output_tokens: rec.output_tokens,
+            thinking_tokens: rec.thinking_output_tokens,
+            native_cost_usd: rec.model_cost_usd,
+            decode_speed,
+            ttft_secs: rec.ttft_secs,
+            id_11: rec.identity.id_11,
+            id_12: rec.identity.id_12,
+            id_7: rec.identity.id_7,
+        };
+        if main_turn.has_signal() {
+            out.turns.push(main_turn);
+        }
+
+        for retry in rec.retry_usages {
+            let retry_turn = RawTurn::from_attempt(
+                retry,
+                (ts_secs, ts_quality),
+                rec.model_enum,
+                rec.response_model.as_deref(),
+                rec.model_display_name.as_deref(),
+                false,
+            );
+            if retry_turn.has_signal() {
+                out.turns.push(retry_turn);
+            }
+        }
+    }
+    out
 }
 
 /// Extracts and intra-DB deduplicates all turns plus retry/error/compaction diagnostics from one
@@ -734,203 +950,30 @@ pub(super) fn extract_sqlite_db_data(
         .and_then(|blob| extract_trajectory_created_at_secs(&blob));
 
     let mut diagnostics = ScanDiagnostics::default();
-    let (steps_exists, steps_has_metadata, steps_has_step_type) = steps_table_columns(conn);
-    let mut has_steps_table = false;
-    let mut step_timestamps: HashMap<u64, (i64, u8)> = HashMap::new();
-    let mut step_candidates: Vec<(u64, RawTurn)> = Vec::new();
-    let mut step_retry_candidates: Vec<(u64, Vec<RetryAttemptRecord>)> = Vec::new();
-    if steps_exists && (steps_has_metadata || steps_has_step_type) {
-        let step_sql = match (steps_has_step_type, steps_has_metadata) {
-            (true, true) => {
-                "SELECT idx, step_type, metadata FROM steps WHERE metadata IS NOT NULL OR step_type IN (17, 23) ORDER BY idx ASC"
-            }
-            (false, true) => {
-                "SELECT idx, NULL, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC"
-            }
-            (true, false) => {
-                "SELECT idx, step_type, NULL FROM steps WHERE step_type IN (17, 23) ORDER BY idx ASC"
-            }
-            (false, false) => unreachable!(),
-        };
-        if let Ok(mut step_stmt) = conn.prepare(step_sql) {
-            if let Ok(mut step_rows) = step_stmt.query([]) {
-                has_steps_table = true;
-                while let Ok(Some(row)) = step_rows.next() {
-                    let Ok(idx) = row.get::<_, i64>(0) else {
-                        continue;
-                    };
-                    if idx < 0 {
-                        continue;
-                    }
-                    let step_idx = idx as u64;
-                    let step_type = row.get::<_, Option<i64>>(1).ok().flatten();
-                    let meta_blob = row.get::<_, Option<Vec<u8>>>(2).ok().flatten();
-                    let step_rec = meta_blob
-                        .as_deref()
-                        .filter(|b| !b.is_empty())
-                        .and_then(extract_step_metadata_record);
+    let steps = scan_steps_table(
+        conn,
+        trajectory_ts,
+        db_mtime_secs,
+        expected_conversation_id,
+        &mut diagnostics,
+    );
+    let mut gen_out = scan_gen_metadata_table(
+        conn,
+        &steps.timestamps,
+        trajectory_ts,
+        db_mtime_secs,
+        expected_conversation_id,
+        &mut diagnostics,
+    );
 
-                    if let Some(ref rec) = step_rec {
-                        if is_foreign_cascade_id(
-                            rec.origin_cascade_id.as_deref(),
-                            expected_conversation_id,
-                        ) {
-                            continue;
-                        }
-                    }
-
-                    match step_type {
-                        Some(STEP_TYPE_ERROR_MESSAGE) => {
-                            diagnostics.error_steps = diagnostics.error_steps.saturating_add(1);
-                        }
-                        Some(STEP_TYPE_CHECKPOINT) => {
-                            diagnostics.compaction_steps =
-                                diagnostics.compaction_steps.saturating_add(1);
-                        }
-                        _ => {}
-                    }
-
-                    let Some(step_rec) = step_rec else {
-                        continue;
-                    };
-
-                    if !step_rec.retry_attempts.is_empty() {
-                        step_retry_candidates.push((step_idx, step_rec.retry_attempts));
-                    }
-
-                    let step_ts = if let Some(ts) = step_rec.created_at_secs {
-                        step_timestamps.insert(step_idx, (ts, TS_QUALITY_STEP_PRIMARY));
-                        (Some(ts), TS_QUALITY_STEP_PRIMARY)
-                    } else if let Some(ts) = step_rec.secondary_created_at_secs {
-                        step_timestamps.insert(step_idx, (ts, TS_QUALITY_SECONDARY));
-                        (Some(ts), TS_QUALITY_SECONDARY)
-                    } else {
-                        fallback_timestamp(trajectory_ts, db_mtime_secs)
-                    };
-
-                    if let Some(usage) = step_rec.usage {
-                        let turn = RawTurn::from_attempt(
-                            usage,
-                            step_ts,
-                            step_rec.model_enum,
-                            step_rec.response_model.as_deref(),
-                            step_rec.model_display_name.as_deref(),
-                            true,
-                        );
-                        if turn.has_signal() {
-                            step_candidates.push((step_idx, turn));
-                        }
-                    }
-
-                    for retry in step_rec.retry_usages {
-                        let turn = RawTurn::from_attempt(
-                            retry,
-                            step_ts,
-                            step_rec.model_enum,
-                            step_rec.response_model.as_deref(),
-                            step_rec.model_display_name.as_deref(),
-                            false,
-                        );
-                        if turn.has_signal() {
-                            step_candidates.push((step_idx, turn));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut has_gen_table = false;
-    let mut covered_step_indices: HashSet<u64> = HashSet::new();
-    let mut gen_retry_covered_steps: HashSet<u64> = HashSet::new();
-    let mut turns = Vec::new();
-    if let Ok(mut stmt) =
-        conn.prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx ASC")
-    {
-        if let Ok(mut rows) = stmt.query([]) {
-            has_gen_table = true;
-            while let Ok(Some(row)) = rows.next() {
-                let Ok(blob) = row.get::<_, Vec<u8>>(0) else {
-                    continue;
-                };
-                let Some(rec) = extract_gen_metadata_record(&blob) else {
-                    continue;
-                };
-                if is_foreign_cascade_id(rec.origin_cascade_id.as_deref(), expected_conversation_id)
-                {
-                    continue;
-                }
-                let mut recorded_gen_retry = false;
-                for attempt in &rec.retry_attempts {
-                    if attempt.is_anomaly() {
-                        recorded_gen_retry = true;
-                        diagnostics.record_retry(attempt);
-                    }
-                }
-                if recorded_gen_retry {
-                    gen_retry_covered_steps.extend(rec.step_indices.iter().copied());
-                }
-                covered_step_indices.extend(rec.step_indices.iter().copied());
-
-                let (ts_secs, ts_quality) = rec
-                    .step_indices
-                    .iter()
-                    .find_map(|idx| step_timestamps.get(idx).copied())
-                    .map(|(ts, q)| (Some(ts), q))
-                    .or_else(|| {
-                        rec.chat_start_created_at_secs
-                            .map(|ts| (Some(ts), TS_QUALITY_SECONDARY))
-                    })
-                    .unwrap_or_else(|| fallback_timestamp(trajectory_ts, db_mtime_secs));
-
-                let decode_speed = rec.decode_speed_tps();
-                let main_turn = RawTurn {
-                    ts_secs,
-                    ts_quality,
-                    model_enum: rec.model_enum,
-                    response_model: rec.response_model.clone(),
-                    model_display_name: rec.model_display_name.clone(),
-                    input_tokens: rec.input_tokens,
-                    cache_read_tokens: rec.cache_read_tokens,
-                    cache_write_tokens: rec.cache_write_tokens,
-                    output_tokens: rec.output_tokens,
-                    thinking_tokens: rec.thinking_output_tokens,
-                    native_cost_usd: rec.model_cost_usd,
-                    decode_speed,
-                    ttft_secs: rec.ttft_secs,
-                    id_11: rec.identity.id_11,
-                    id_12: rec.identity.id_12,
-                    id_7: rec.identity.id_7,
-                };
-                if main_turn.has_signal() {
-                    turns.push(main_turn);
-                }
-
-                for retry in rec.retry_usages {
-                    let retry_turn = RawTurn::from_attempt(
-                        retry,
-                        (ts_secs, ts_quality),
-                        rec.model_enum,
-                        rec.response_model.as_deref(),
-                        rec.model_display_name.as_deref(),
-                        false,
-                    );
-                    if retry_turn.has_signal() {
-                        turns.push(retry_turn);
-                    }
-                }
-            }
-        }
-    }
-
-    if !has_gen_table && !has_steps_table {
+    if !gen_out.has_table && !steps.has_table {
         return None;
     }
 
     // Avoid double-counting retries mirrored onto both `gen_metadata.chat(17)` and
     // `steps.metadata(28)` for the same step while retaining uncovered/step-only retries.
-    for (step_idx, attempts) in step_retry_candidates {
-        if gen_retry_covered_steps.contains(&step_idx) {
+    for (step_idx, attempts) in steps.retry_candidates {
+        if gen_out.retry_covered_steps.contains(&step_idx) {
             continue;
         }
         for attempt in &attempts {
@@ -938,15 +981,15 @@ pub(super) fn extract_sqlite_db_data(
         }
     }
 
-    for (step_idx, turn) in step_candidates {
-        if !turn.has_any_identity() && covered_step_indices.contains(&step_idx) {
+    for (step_idx, turn) in steps.turn_candidates {
+        if !turn.has_any_identity() && gen_out.covered_steps.contains(&step_idx) {
             continue;
         }
-        turns.push(turn);
+        gen_out.turns.push(turn);
     }
 
     Some(ScannedDbData {
-        turns: deduplicate_turns_by(turns, |t| t, |_, _| false, merge_raw_turn),
+        turns: deduplicate_turns_by(gen_out.turns, |t| t, |_, _| false, merge_raw_turn),
         diagnostics,
     })
 }
@@ -1124,124 +1167,154 @@ impl<'a, 'b> TurnPricer<'a, 'b> {
         (group, entry_idx, specific)
     }
 
+    fn observe_model_enum(
+        enum_states: &mut HashMap<u64, LearnedModelEnum<'b>>,
+        model_enum: u64,
+        resp: Option<&'b str>,
+        disp: Option<&'b str>,
+        group: &str,
+        entry_idx: Option<usize>,
+    ) {
+        if model_enum == 0 || (resp.is_none() && disp.is_none()) {
+            return;
+        }
+
+        let disp_rank = display_name_rank(disp);
+        let resp_rank = response_model_rank(resp);
+        let quality = (disp_rank, resp_rank);
+        let is_concrete = entry_idx.is_some()
+            || disp_rank == 2
+            || PricingCatalog::has_specific_model_qualifier(None, resp);
+        let new_identity = is_concrete.then(|| match entry_idx {
+            Some(idx) => ModelEnumIdentity::CatalogEntry(idx),
+            None => ModelEnumIdentity::NormalizedName(normalized_fallback_model_identity(group)),
+        });
+
+        match enum_states.get_mut(&model_enum) {
+            None => {
+                let state = match new_identity {
+                    Some(identity) => LearnedModelEnum::Concrete {
+                        identity,
+                        response_model: resp,
+                        model_display_name: disp,
+                        quality,
+                    },
+                    None => LearnedModelEnum::Generic {
+                        response_model: resp,
+                        model_display_name: disp,
+                        quality,
+                    },
+                };
+                enum_states.insert(model_enum, state);
+            }
+            Some(LearnedModelEnum::Poisoned) => {}
+            Some(slot @ LearnedModelEnum::Generic { .. }) => {
+                if let Some(identity) = new_identity {
+                    *slot = LearnedModelEnum::Concrete {
+                        identity,
+                        response_model: resp,
+                        model_display_name: disp,
+                        quality,
+                    };
+                } else if let LearnedModelEnum::Generic {
+                    response_model,
+                    model_display_name,
+                    quality: prev_q,
+                } = slot
+                {
+                    if quality > *prev_q {
+                        *response_model = resp;
+                        *model_display_name = disp;
+                        *prev_q = quality;
+                    }
+                }
+            }
+            Some(slot @ LearnedModelEnum::Concrete { .. }) => {
+                // Generic-only observations (e.g. legacy "Gemini Flash") never poison a concrete enum.
+                let Some(identity) = new_identity else {
+                    return;
+                };
+                let same_identity = matches!(
+                    slot,
+                    LearnedModelEnum::Concrete {
+                        identity: prev_id,
+                        ..
+                    } if *prev_id == identity
+                );
+                if !same_identity {
+                    *slot = LearnedModelEnum::Poisoned;
+                } else if let LearnedModelEnum::Concrete {
+                    response_model,
+                    model_display_name,
+                    quality: prev_q,
+                    ..
+                } = slot
+                {
+                    if quality > *prev_q {
+                        if resp.is_some() {
+                            *response_model = resp;
+                        }
+                        if disp_rank >= display_name_rank(*model_display_name) && disp.is_some() {
+                            *model_display_name = disp;
+                        }
+                        *prev_q = (
+                            display_name_rank(*model_display_name),
+                            response_model_rank(*response_model),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn build_inferred_response_models(
+        resolution_cache: &HashMap<ModelLookupKey<'b>, ResolvedModelInfo>,
+    ) -> HashMap<&'b str, Option<usize>> {
+        // Map response_models that uniquely resolved to one catalog entry elsewhere in the
+        // dataset, poisoning ambiguous or explicitly-qualified unpriced variants.
+        let mut inferred: HashMap<&'b str, Option<usize>> = HashMap::new();
+        for ((resp_opt, _, _), (_, entry_idx, has_specific_qualifier)) in resolution_cache {
+            let Some(resp) = *resp_opt else {
+                continue;
+            };
+            match (*entry_idx, *has_specific_qualifier) {
+                (Some(idx), _) => {
+                    inferred
+                        .entry(resp)
+                        .and_modify(|slot| {
+                            if *slot != Some(idx) {
+                                *slot = None;
+                            }
+                        })
+                        .or_insert(Some(idx));
+                }
+                (None, true) => {
+                    inferred.insert(resp, None);
+                }
+                (None, false) => {}
+            }
+        }
+        inferred
+    }
+
     fn build(pricing: &'a PricingCatalog, turns: impl IntoIterator<Item = &'b RawTurn>) -> Self {
         let mut resolution_cache: HashMap<ModelLookupKey<'b>, ResolvedModelInfo> = HashMap::new();
         let mut enum_states: HashMap<u64, LearnedModelEnum<'b>> = HashMap::new();
 
         for turn in turns {
-            let resp = turn
-                .response_model
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let disp = turn
-                .model_display_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-
+            let resp = trimmed_non_empty(turn.response_model.as_deref());
+            let disp = trimmed_non_empty(turn.model_display_name.as_deref());
             let (group, entry_idx, _) = resolution_cache
                 .entry((resp, disp, turn.model_enum))
                 .or_insert_with(|| Self::resolve_uncached(pricing, resp, disp, turn.model_enum));
-
-            if turn.model_enum == 0 || (resp.is_none() && disp.is_none()) {
-                continue;
-            }
-
-            let disp_rank = display_name_rank(disp);
-            let resp_rank = response_model_rank(resp);
-            let quality = (disp_rank, resp_rank);
-            let is_concrete = entry_idx.is_some()
-                || disp_rank == 2
-                || PricingCatalog::has_specific_model_qualifier(None, resp);
-
-            let new_identity = if is_concrete {
-                Some(match *entry_idx {
-                    Some(idx) => ModelEnumIdentity::CatalogEntry(idx),
-                    None => {
-                        ModelEnumIdentity::NormalizedName(normalized_fallback_model_identity(group))
-                    }
-                })
-            } else {
-                None
-            };
-
-            match enum_states.get_mut(&turn.model_enum) {
-                None => {
-                    let state = match new_identity {
-                        Some(identity) => LearnedModelEnum::Concrete {
-                            identity,
-                            response_model: resp,
-                            model_display_name: disp,
-                            quality,
-                        },
-                        None => LearnedModelEnum::Generic {
-                            response_model: resp,
-                            model_display_name: disp,
-                            quality,
-                        },
-                    };
-                    enum_states.insert(turn.model_enum, state);
-                }
-                Some(LearnedModelEnum::Poisoned) => {}
-                Some(slot @ LearnedModelEnum::Generic { .. }) => {
-                    if let Some(identity) = new_identity {
-                        *slot = LearnedModelEnum::Concrete {
-                            identity,
-                            response_model: resp,
-                            model_display_name: disp,
-                            quality,
-                        };
-                    } else if let LearnedModelEnum::Generic {
-                        response_model,
-                        model_display_name,
-                        quality: prev_q,
-                    } = slot
-                    {
-                        if quality > *prev_q {
-                            *response_model = resp;
-                            *model_display_name = disp;
-                            *prev_q = quality;
-                        }
-                    }
-                }
-                Some(slot @ LearnedModelEnum::Concrete { .. }) => {
-                    // Generic-only observations (e.g. legacy "Gemini Flash") never poison a concrete enum.
-                    let Some(identity) = new_identity else {
-                        continue;
-                    };
-                    let same_identity = matches!(
-                        slot,
-                        LearnedModelEnum::Concrete {
-                            identity: prev_id,
-                            ..
-                        } if *prev_id == identity
-                    );
-                    if !same_identity {
-                        *slot = LearnedModelEnum::Poisoned;
-                    } else if let LearnedModelEnum::Concrete {
-                        response_model,
-                        model_display_name,
-                        quality: prev_q,
-                        ..
-                    } = slot
-                    {
-                        if quality > *prev_q {
-                            if resp.is_some() {
-                                *response_model = resp;
-                            }
-                            if disp_rank >= display_name_rank(*model_display_name) && disp.is_some()
-                            {
-                                *model_display_name = disp;
-                            }
-                            *prev_q = (
-                                display_name_rank(*model_display_name),
-                                response_model_rank(*response_model),
-                            );
-                        }
-                    }
-                }
-            }
+            Self::observe_model_enum(
+                &mut enum_states,
+                turn.model_enum,
+                resp,
+                disp,
+                group,
+                *entry_idx,
+            );
         }
 
         let mut learned_enums = HashMap::new();
@@ -1273,32 +1346,7 @@ impl<'a, 'b> TurnPricer<'a, 'b> {
             }
         }
 
-        // Round 1 dynamic inference: map response_models that uniquely resolved to one
-        // catalog entry elsewhere in the dataset, poisoning ambiguous or explicitly-qualified
-        // unpriced variants.
-        let mut inferred_response_models: HashMap<&'b str, Option<usize>> = HashMap::new();
-        for ((resp_opt, _, _), (_, entry_idx, has_specific_qualifier)) in &resolution_cache {
-            let Some(resp) = *resp_opt else {
-                continue;
-            };
-            match (*entry_idx, *has_specific_qualifier) {
-                (Some(idx), _) => {
-                    inferred_response_models
-                        .entry(resp)
-                        .and_modify(|slot| {
-                            if *slot != Some(idx) {
-                                *slot = None;
-                            }
-                        })
-                        .or_insert(Some(idx));
-                }
-                (None, true) => {
-                    inferred_response_models.insert(resp, None);
-                }
-                (None, false) => {}
-            }
-        }
-
+        let inferred_response_models = Self::build_inferred_response_models(&resolution_cache);
         Self {
             pricing,
             learned_enums,
@@ -1308,16 +1356,8 @@ impl<'a, 'b> TurnPricer<'a, 'b> {
     }
 
     fn price_turn(&self, turn: &RawTurn) -> ResolvedTurnPricing {
-        let raw_resp = turn
-            .response_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let raw_disp = turn
-            .model_display_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        let raw_resp = trimmed_non_empty(turn.response_model.as_deref());
+        let raw_disp = trimmed_non_empty(turn.model_display_name.as_deref());
 
         let (eff_resp, eff_disp) =
             if raw_resp.is_none() && raw_disp.is_none() && turn.model_enum > 0 {

@@ -6,14 +6,14 @@
 //! timezone and pricing catalog projection still run fresh in memory.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
-use std::io::{self, Read};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use super::{DbFileFingerprint, ScannedDbData};
-use crate::sys::fs::atomic_write_preserving_mode;
+use crate::sys::fs::{
+    atomic_write_preserving_mode, is_safe_cache_target, read_bounded_regular_file,
+};
 
 pub(crate) const STATS_SCAN_CACHE_FILE: &str = "stats_scan_cache.json";
 const STATS_SCAN_CACHE_SCHEMA_VERSION: u32 = 1;
@@ -41,60 +41,14 @@ pub(super) struct GlobalStatsCache {
     dirty: bool,
 }
 
-fn is_safe_cache_target(cache_path: &Path) -> bool {
-    if let Some(parent) = cache_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            match fs::symlink_metadata(parent) {
-                Ok(meta) => {
-                    let ft = meta.file_type();
-                    if ft.is_symlink() || !ft.is_dir() {
-                        return false;
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => return false,
-            }
-        }
-    }
-
-    match fs::symlink_metadata(cache_path) {
-        Ok(meta) => {
-            let ft = meta.file_type();
-            !ft.is_symlink() && ft.is_file()
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => true,
-        Err(_) => false,
-    }
-}
-
 impl GlobalStatsCache {
     /// Loads the cache from `cache_path`, rejecting symlinked parents/files, oversized payloads,
     /// and mismatched schemas using a bounded read (`MAX_STATS_SCAN_CACHE_BYTES + 1`).
     pub(super) fn load(cache_path: &Path) -> Self {
-        if !is_safe_cache_target(cache_path) {
-            return Self::default();
-        }
-        let Ok(meta) = fs::symlink_metadata(cache_path) else {
+        let Ok((bytes, _)) = read_bounded_regular_file(cache_path, MAX_STATS_SCAN_CACHE_BYTES)
+        else {
             return Self::default();
         };
-        let ft = meta.file_type();
-        if ft.is_symlink() || !ft.is_file() || meta.len() > MAX_STATS_SCAN_CACHE_BYTES {
-            return Self::default();
-        }
-        let Ok(file) = fs::File::open(cache_path) else {
-            return Self::default();
-        };
-        let mut bytes = Vec::with_capacity((meta.len() as usize).min(64 * 1024));
-        if file
-            .take(MAX_STATS_SCAN_CACHE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .is_err()
-        {
-            return Self::default();
-        }
-        if bytes.len() as u64 > MAX_STATS_SCAN_CACHE_BYTES {
-            return Self::default();
-        }
         let Ok(parsed) = serde_json::from_slice::<StatsScanCacheFile>(&bytes) else {
             return Self::default();
         };
@@ -181,6 +135,8 @@ impl GlobalStatsCache {
 mod tests {
     use super::*;
     use crate::stats::scan::{RawTurn, ScanDiagnostics};
+    #[cfg(unix)]
+    use std::fs;
 
     fn sample_fp(size: u64, wal_size: u64, wal_ts: i64) -> DbFileFingerprint {
         DbFileFingerprint {

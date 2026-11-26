@@ -12,8 +12,10 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::agy::protobuf::{
-    extract_gen_metadata_summary, is_foreign_cascade_id, RetryStatusClass, TurnMetrics,
+    extract_gen_metadata_summary, is_foreign_cascade_id, RetryAttemptRecord, RetryStatusClass,
+    TurnMetrics,
 };
+use crate::sys::fs::{is_absent_or_real_file, is_real_dir};
 
 const SQLITE_HEADER_BYTES: usize = 100;
 const SQLITE_WAL_HEADER_BYTES: u64 = 32;
@@ -90,23 +92,6 @@ impl SqliteSpeedReader {
 impl SpeedReader for SqliteSpeedReader {
     fn session_metadata(&self, conversation_id: &str) -> SessionMetadata {
         query_session_metadata_in(&self.cli_dir, conversation_id)
-    }
-}
-
-pub(crate) fn is_real_dir(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|meta| {
-        let ft = meta.file_type();
-        !ft.is_symlink() && ft.is_dir()
-    })
-}
-
-pub(crate) fn is_absent_or_real_file(path: &Path) -> bool {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => {
-            let ft = meta.file_type();
-            !ft.is_symlink() && ft.is_file()
-        }
-        Err(err) => err.kind() == io::ErrorKind::NotFound,
     }
 }
 
@@ -316,6 +301,34 @@ pub(crate) fn query_session_metadata_from_conn(conn: &Connection) -> SessionMeta
     query_session_metadata_from_conn_for_id(conn, expected_id.as_deref())
 }
 
+fn record_retry_anomaly(summary: &mut RetryAnomalySummary, attempt: &RetryAttemptRecord) {
+    if !attempt.is_anomaly() {
+        return;
+    }
+    if summary.retry_count == 0 {
+        summary.latest_class = attempt.status_class;
+        summary.latest_status_code = attempt.status_code;
+    }
+    summary.retry_count = summary.retry_count.saturating_add(1);
+    match attempt.status_class {
+        RetryStatusClass::RateLimit429 => {
+            summary.retries_429 = summary.retries_429.saturating_add(1);
+        }
+        RetryStatusClass::Capacity503 => {
+            summary.retries_503 = summary.retries_503.saturating_add(1);
+        }
+        _ => {
+            summary.retries_other = summary.retries_other.saturating_add(1);
+        }
+    }
+    if let Some(delay) = attempt
+        .retry_delay_secs
+        .filter(|d| d.is_finite() && *d > 0.0)
+    {
+        summary.total_retry_delay_secs += delay;
+    }
+}
+
 fn query_session_metadata_from_conn_for_id(
     conn: &Connection,
     expected_conversation_id: Option<&str>,
@@ -354,35 +367,9 @@ fn query_session_metadata_from_conn_for_id(
         meta.estimated_context_tokens = meta
             .estimated_context_tokens
             .or(summary.estimated_context_tokens);
-
         for attempt in summary.retry_attempts.iter().rev() {
-            if !attempt.is_anomaly() {
-                continue;
-            }
-            if retry_summary.retry_count == 0 {
-                retry_summary.latest_class = attempt.status_class;
-                retry_summary.latest_status_code = attempt.status_code;
-            }
-            retry_summary.retry_count = retry_summary.retry_count.saturating_add(1);
-            match attempt.status_class {
-                RetryStatusClass::RateLimit429 => {
-                    retry_summary.retries_429 = retry_summary.retries_429.saturating_add(1);
-                }
-                RetryStatusClass::Capacity503 => {
-                    retry_summary.retries_503 = retry_summary.retries_503.saturating_add(1);
-                }
-                _ => {
-                    retry_summary.retries_other = retry_summary.retries_other.saturating_add(1);
-                }
-            }
-            if let Some(delay) = attempt
-                .retry_delay_secs
-                .filter(|d| d.is_finite() && *d > 0.0)
-            {
-                retry_summary.total_retry_delay_secs += delay;
-            }
+            record_retry_anomaly(&mut retry_summary, attempt);
         }
-
         if own_rows_seen >= 9 {
             break;
         }
