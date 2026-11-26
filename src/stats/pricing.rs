@@ -13,8 +13,8 @@ use serde_json::Value;
 
 use crate::sys::fmt::sanitize_inline_text;
 use crate::sys::fs::{
-    atomic_write, modified_timestamp, read_bounded_regular_file, safe_regular_metadata,
-    BoundedReadError,
+    atomic_write, is_safe_cache_target, modified_timestamp, read_bounded_regular_file,
+    safe_regular_metadata, BoundedReadError,
 };
 use crate::sys::process::{run_command_stdout_bounded, BoundedCommandError};
 use crate::sys::time::{unix_now_secs, SECS_PER_DAY};
@@ -63,17 +63,32 @@ pub(crate) fn is_pricing_fingerprint_fresh(fp: PricingFileFingerprint, now_secs:
         && now_secs.saturating_sub(fp.mtime_secs as u64) < DEFAULT_PRICING_TTL_SECS
 }
 
-/// Spawns a detached background `pricing sync --if-stale` when `models_dev_pricing.json` is
-/// missing or its file mtime is past the default TTL, without reading or parsing the JSON file.
-pub(crate) fn maybe_spawn_pricing_sync_if_stale(cache_dir: Option<&Path>, now_secs: u64) {
+fn is_safe_pricing_cache_dir(cache_dir: &Path) -> bool {
+    is_safe_cache_target(&cache_dir.join(MODELS_DEV_CACHE_FILE))
+        && is_safe_cache_target(&cache_dir.join(MODELS_DEV_ERR_FILE))
+}
+
+fn maybe_spawn_pricing_sync_if_stale_with<F>(cache_dir: Option<&Path>, now_secs: u64, spawn: F)
+where
+    F: FnOnce(),
+{
     let Some(dir) = cache_dir else {
         return;
     };
+    if !is_safe_pricing_cache_dir(dir) {
+        return;
+    }
     let fp = pricing_cache_fingerprint(Some(dir));
     if !is_pricing_fingerprint_fresh(fp, now_secs) && !in_retry_cooldown(dir, now_secs) {
         record_retry_cooldown(dir, now_secs);
-        spawn_background_pricing_sync();
+        spawn();
     }
+}
+
+/// Spawns a detached background `pricing sync --if-stale` when `models_dev_pricing.json` is
+/// missing or its file mtime is past the default TTL, without reading or parsing the JSON file.
+pub(crate) fn maybe_spawn_pricing_sync_if_stale(cache_dir: Option<&Path>, now_secs: u64) {
+    maybe_spawn_pricing_sync_if_stale_with(cache_dir, now_secs, spawn_background_pricing_sync);
 }
 
 /// Controls how [`PricingCatalog`] cache loading handles missing or expired pricing data.
@@ -245,7 +260,7 @@ impl PricingCatalog {
                 match mode {
                     SyncMode::Offline => cached,
                     SyncMode::BlockingIfStale => {
-                        if in_retry_cooldown(dir, now_secs) {
+                        if !is_safe_pricing_cache_dir(dir) || in_retry_cooldown(dir, now_secs) {
                             cached
                         } else {
                             match sync_models_dev_to_dir(dir, now_secs, fetcher) {
@@ -258,7 +273,7 @@ impl PricingCatalog {
                         }
                     }
                     SyncMode::SpawnIfStale => {
-                        if !in_retry_cooldown(dir, now_secs) {
+                        if is_safe_pricing_cache_dir(dir) && !in_retry_cooldown(dir, now_secs) {
                             record_retry_cooldown(dir, now_secs);
                             spawn_background_pricing_sync();
                         }
@@ -655,10 +670,11 @@ fn in_retry_cooldown(cache_dir: &Path, now_secs: u64) -> bool {
 }
 
 fn record_retry_cooldown(cache_dir: &Path, now_secs: u64) {
-    let _ = atomic_write(
-        &cache_dir.join(MODELS_DEV_ERR_FILE),
-        format!("{now_secs}\n").as_bytes(),
-    );
+    let err_path = cache_dir.join(MODELS_DEV_ERR_FILE);
+    if !is_safe_cache_target(&err_path) {
+        return;
+    }
+    let _ = atomic_write(&err_path, format!("{now_secs}\n").as_bytes());
 }
 
 fn spawn_background_pricing_sync() {
@@ -884,17 +900,29 @@ fn sync_models_dev_to_dir<F>(
 where
     F: FnOnce(&str) -> io::Result<String>,
 {
+    let target = cache_dir.join(MODELS_DEV_CACHE_FILE);
+    if !is_safe_cache_target(&target) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to write pricing cache to unsafe target {}",
+                target.display()
+            ),
+        ));
+    }
     let raw = fetcher(MODELS_DEV_API_URL)?;
     let models = parse_models_dev_json(&raw)?;
     let cached = CachedPricingFile {
         fetched_at: now_secs,
         models,
     };
-    let target = cache_dir.join(MODELS_DEV_CACHE_FILE);
     let encoded = serde_json::to_string(&cached)
         .map_err(|e| io::Error::other(format!("serialize pricing cache: {e}")))?;
     atomic_write(&target, encoded.as_bytes())?;
-    let _ = fs::remove_file(cache_dir.join(MODELS_DEV_ERR_FILE));
+    let err_path = cache_dir.join(MODELS_DEV_ERR_FILE);
+    if is_safe_cache_target(&err_path) {
+        let _ = fs::remove_file(&err_path);
+    }
     Ok(cached)
 }
 
@@ -1718,5 +1746,91 @@ mod tests {
             inspect_pricing_cache(&sym_parent, 1000),
             "symlink (ignored)"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pricing_writes_cooldown_and_background_spawn_reject_symlinks() {
+        use std::cell::Cell;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        let sym_dir = dir.path().join("sym_dir");
+        symlink(&real_dir, &sym_dir).unwrap();
+
+        // Symlinked cache dir: never spawns background sync, never writes .err, never fetches.
+        let spawns = Cell::new(0usize);
+        maybe_spawn_pricing_sync_if_stale_with(Some(&sym_dir), 10_000, || {
+            spawns.set(spawns.get() + 1);
+        });
+        assert_eq!(spawns.get(), 0);
+        assert!(!real_dir.join(MODELS_DEV_ERR_FILE).exists());
+
+        let fetches = Cell::new(0usize);
+        let sync_err = sync_models_dev_to_dir(&sym_dir, 10_000, |_| {
+            fetches.set(fetches.get() + 1);
+            Ok("{}".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(sync_err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fetches.get(), 0);
+        assert!(!real_dir.join(MODELS_DEV_CACHE_FILE).exists());
+
+        // Symlinked cache file inside real dir: rejects spawn, cooldown write, and sync.
+        let file_link_dir = dir.path().join("file_link");
+        fs::create_dir_all(&file_link_dir).unwrap();
+        let sentinel_cache = dir.path().join("sentinel_cache.json");
+        fs::write(&sentinel_cache, b"sentinel").unwrap();
+        symlink(&sentinel_cache, file_link_dir.join(MODELS_DEV_CACHE_FILE)).unwrap();
+
+        maybe_spawn_pricing_sync_if_stale_with(Some(&file_link_dir), 10_000, || {
+            spawns.set(spawns.get() + 1);
+        });
+        assert_eq!(spawns.get(), 0);
+        assert!(!file_link_dir.join(MODELS_DEV_ERR_FILE).exists());
+        assert_eq!(
+            sync_models_dev_to_dir(&file_link_dir, 10_000, |_| {
+                fetches.set(fetches.get() + 1);
+                Ok("{}".to_string())
+            })
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fetches.get(), 0);
+        assert_eq!(fs::read(&sentinel_cache).unwrap(), b"sentinel");
+
+        // Symlinked .err file inside real dir: rejects spawn/overwrite and sync does not unlink it.
+        let err_link_dir = dir.path().join("err_link");
+        fs::create_dir_all(&err_link_dir).unwrap();
+        let sentinel_err = dir.path().join("sentinel.err");
+        fs::write(&sentinel_err, b"keep").unwrap();
+        let err_symlink = err_link_dir.join(MODELS_DEV_ERR_FILE);
+        symlink(&sentinel_err, &err_symlink).unwrap();
+
+        maybe_spawn_pricing_sync_if_stale_with(Some(&err_link_dir), 10_000, || {
+            spawns.set(spawns.get() + 1);
+        });
+        assert_eq!(spawns.get(), 0);
+        assert_eq!(fs::read(&sentinel_err).unwrap(), b"keep");
+
+        sync_models_dev_to_dir(&err_link_dir, 10_000, |_| Ok("{}".to_string())).unwrap();
+        assert!(fs::symlink_metadata(&err_symlink)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&sentinel_err).unwrap(), b"keep");
+
+        // Regular cache dir spawns once and respects cooldown on subsequent ticks.
+        maybe_spawn_pricing_sync_if_stale_with(Some(&real_dir), 10_000, || {
+            spawns.set(spawns.get() + 1);
+        });
+        maybe_spawn_pricing_sync_if_stale_with(Some(&real_dir), 10_050, || {
+            spawns.set(spawns.get() + 1);
+        });
+        assert_eq!(spawns.get(), 1);
+        assert!(real_dir.join(MODELS_DEV_ERR_FILE).is_file());
     }
 }

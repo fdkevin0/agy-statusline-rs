@@ -11,7 +11,7 @@ use super::{
 };
 use crate::agy::db::{is_valid_uuid, resolve_conversation_db_path};
 use crate::stats::pricing::{round_usd_6, PricingCatalog, PricingFileFingerprint};
-use crate::sys::fs::{atomic_write, read_bounded_regular_file};
+use crate::sys::fs::{atomic_write, is_safe_cache_target, read_bounded_regular_file};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ConversationCost {
@@ -64,6 +64,10 @@ fn write_conv_cost_cache_entry_with_limit(
     entry: ConvCostCacheEntry,
     max_entries: usize,
 ) {
+    let cache_path = cache_dir.join(CONV_COST_CACHE_FILE);
+    if !is_safe_cache_target(&cache_path) {
+        return;
+    }
     let mut file = read_conv_cost_cache_file(cache_dir).unwrap_or(ConvCostCacheFile {
         schema_version: CONV_COST_CACHE_SCHEMA_VERSION,
         entries: Vec::new(),
@@ -73,7 +77,7 @@ fn write_conv_cost_cache_entry_with_limit(
     file.entries.insert(0, entry);
     file.entries.truncate(max_entries);
     if let Ok(bytes) = serde_json::to_vec(&file) {
-        let _ = atomic_write(&cache_dir.join(CONV_COST_CACHE_FILE), &bytes);
+        let _ = atomic_write(&cache_path, &bytes);
     }
 }
 
@@ -622,5 +626,41 @@ mod tests {
         assert_eq!(est.usd, Some(0.25));
         assert_eq!(est.subagent_usd, None);
         assert_eq!(est.unpriced_turns, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conv_cost_cache_skips_writes_into_symlinked_cache_dir_or_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_cache = dir.path().join("real_cache");
+        fs::create_dir_all(&real_cache).unwrap();
+        let sym_cache = dir.path().join("sym_cache");
+        symlink(&real_cache, &sym_cache).unwrap();
+
+        let entry = ConvCostCacheEntry {
+            cli_dir: "/isolated/cli".to_string(),
+            conversation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            parent_fp: None,
+            summaries_fp: None,
+            descendants: Vec::new(),
+            pricing_fp: PricingFileFingerprint::default(),
+            cost: ConversationCost {
+                usd: Some(1.0),
+                subagent_usd: None,
+                unpriced_turns: 0,
+            },
+        };
+
+        write_conv_cost_cache_entry_with_limit(&sym_cache, entry.clone(), 4);
+        assert!(!real_cache.join(CONV_COST_CACHE_FILE).exists());
+
+        let sentinel = dir.path().join("sentinel.json");
+        fs::write(&sentinel, b"sentinel").unwrap();
+        symlink(&sentinel, real_cache.join(CONV_COST_CACHE_FILE)).unwrap();
+
+        write_conv_cost_cache_entry_with_limit(&real_cache, entry, 4);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
     }
 }

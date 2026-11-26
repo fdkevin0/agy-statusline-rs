@@ -6,8 +6,8 @@ use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::sys::fs::{
-    atomic_write, is_real_dir, modified_timestamp, read_bounded_file_to_string,
-    read_bounded_regular_file,
+    atomic_write, is_real_dir, is_safe_cache_target, modified_timestamp,
+    read_bounded_file_to_string, read_bounded_regular_file,
 };
 use crate::sys::process::run_command_stdout_bounded;
 use crate::sys::time::{unix_now_secs, SECS_PER_DAY, SECS_PER_HOUR};
@@ -255,9 +255,11 @@ where
         ),
         None => (format!("{idx_mtime} {now_secs} timeout\n"), (0, 0)),
     };
-    let _ = atomic_write(&cache_path, payload.as_bytes());
-    if should_prune {
-        prune_stale_diff_caches(cache_dir, &file_name, now_secs);
+    if is_safe_cache_target(&cache_path) {
+        let _ = atomic_write(&cache_path, payload.as_bytes());
+        if should_prune {
+            prune_stale_diff_caches(cache_dir, &file_name, now_secs);
+        }
     }
     result
 }
@@ -498,5 +500,36 @@ mod tests {
         );
         fs::write(repo_git.join("HEAD"), oversized_head).unwrap();
         assert_eq!(read_head_branch(&repo_git), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_diff_cached_skips_writes_into_symlinked_cache_dir_or_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let gitdir = root.join(".git");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("index"), b"v1").unwrap();
+
+        let real_cache = dir.path().join("real_cache");
+        fs::create_dir_all(&real_cache).unwrap();
+        let sym_cache = dir.path().join("sym_cache");
+        symlink(&real_cache, &sym_cache).unwrap();
+
+        let got = probe_diff_cached(&root, &gitdir, &sym_cache, 100, 3, || Some((4, 2)));
+        assert_eq!(got, (4, 2));
+        assert_eq!(fs::read_dir(&real_cache).unwrap().count(), 0);
+
+        let hash = fnv1a_64(root.to_string_lossy().as_bytes());
+        let file_name = format!("diff_{hash:016x}.txt");
+        let sentinel = dir.path().join("sentinel.txt");
+        fs::write(&sentinel, b"sentinel").unwrap();
+        symlink(&sentinel, real_cache.join(&file_name)).unwrap();
+
+        let got2 = probe_diff_cached(&root, &gitdir, &real_cache, 100, 3, || Some((6, 1)));
+        assert_eq!(got2, (6, 1));
+        assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
     }
 }
