@@ -742,6 +742,7 @@ pub(super) fn extract_sqlite_db_data(
     let mut has_steps_table = false;
     let mut step_timestamps: HashMap<u64, (i64, u8)> = HashMap::new();
     let mut step_candidates: Vec<(u64, RawTurn)> = Vec::new();
+    let mut step_retry_candidates: Vec<(u64, Vec<RetryAttemptRecord>)> = Vec::new();
     if steps_exists && (steps_has_metadata || steps_has_step_type) {
         let step_sql = match (steps_has_step_type, steps_has_metadata) {
             (true, true) => {
@@ -797,8 +798,8 @@ pub(super) fn extract_sqlite_db_data(
                         continue;
                     };
 
-                    for attempt in &step_rec.retry_attempts {
-                        diagnostics.record_retry(attempt);
+                    if !step_rec.retry_attempts.is_empty() {
+                        step_retry_candidates.push((step_idx, step_rec.retry_attempts));
                     }
 
                     let step_ts = if let Some(ts) = step_rec.created_at_secs {
@@ -845,6 +846,7 @@ pub(super) fn extract_sqlite_db_data(
 
     let mut has_gen_table = false;
     let mut covered_step_indices: HashSet<u64> = HashSet::new();
+    let mut gen_retry_covered_steps: HashSet<u64> = HashSet::new();
     let mut turns = Vec::new();
     if let Ok(mut stmt) =
         conn.prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx ASC")
@@ -862,8 +864,15 @@ pub(super) fn extract_sqlite_db_data(
                 {
                     continue;
                 }
+                let mut recorded_gen_retry = false;
                 for attempt in &rec.retry_attempts {
-                    diagnostics.record_retry(attempt);
+                    if attempt.is_anomaly() {
+                        recorded_gen_retry = true;
+                        diagnostics.record_retry(attempt);
+                    }
+                }
+                if recorded_gen_retry {
+                    gen_retry_covered_steps.extend(rec.step_indices.iter().copied());
                 }
                 covered_step_indices.extend(rec.step_indices.iter().copied());
 
@@ -920,6 +929,17 @@ pub(super) fn extract_sqlite_db_data(
 
     if !has_gen_table && !has_steps_table {
         return None;
+    }
+
+    // Avoid double-counting retries mirrored onto both `gen_metadata.chat(17)` and
+    // `steps.metadata(28)` for the same step while retaining uncovered/step-only retries.
+    for (step_idx, attempts) in step_retry_candidates {
+        if gen_retry_covered_steps.contains(&step_idx) {
+            continue;
+        }
+        for attempt in &attempts {
+            diagnostics.record_retry(attempt);
+        }
     }
 
     for (step_idx, turn) in step_candidates {
@@ -2271,5 +2291,81 @@ mod tests {
         assert_eq!(third.cache_misses, 1);
         assert_eq!(third.events.len(), 3);
         drop(conn);
+    }
+
+    #[test]
+    fn extract_sqlite_db_data_dedups_mirrored_gen_and_step_retries_while_keeping_compaction_retries(
+    ) {
+        use crate::agy::protobuf::{
+            encode_gen_blob, encode_step_blob, GenBlobSpec, RetrySpec, StepBlobSpec,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mirrored_retries.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB);
+             CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .unwrap();
+
+        // Step 1 is covered by gen_metadata(1), and BOTH mirror the same 429 retry -> count ONCE.
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (1, 15, ?1)",
+            [encode_step_blob(StepBlobSpec {
+                created_at_secs: Some(1_795_000_100),
+                retry_records: vec![RetrySpec {
+                    error: Some("HTTP 429 rate limit"),
+                    reason_code: 429,
+                    delay_secs: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [encode_gen_blob(GenBlobSpec {
+                step_indices: vec![1],
+                model_enum: 1669,
+                input_tok: 1_000,
+                output_tok: 100,
+                dur_secs: 1,
+                retry_records: vec![RetrySpec {
+                    error: Some("HTTP 429 rate limit"),
+                    reason_code: 429,
+                    delay_secs: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+
+        // Step 2 is an uncovered compaction checkpoint (step_type = 23) with a 503 retry -> counted.
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (2, 23, ?1)",
+            [encode_step_blob(StepBlobSpec {
+                created_at_secs: Some(1_795_000_200),
+                retry_records: vec![RetrySpec {
+                    error: Some("HTTP 503 overloaded"),
+                    reason_code: 503,
+                    delay_secs: 3,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+
+        let data = extract_sqlite_db_data(&conn, None, None).unwrap();
+        assert_eq!(data.diagnostics.retry_count, 2);
+        assert_eq!(data.diagnostics.retries_429, 1);
+        assert_eq!(data.diagnostics.retries_503, 1);
+        assert_eq!(data.diagnostics.retries_non_429_503(), 0);
+        assert!((data.diagnostics.total_retry_delay_secs - 5.0).abs() < 1e-6);
+        assert_eq!(data.diagnostics.compaction_steps, 1);
+        assert!(!data.diagnostics.is_empty());
     }
 }

@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -82,8 +82,12 @@ fn is_safe_cache_target(cache_path: &Path) -> bool {
 }
 
 impl GlobalStatsCache {
-    /// Loads the cache from `cache_path`, rejecting symlinks, oversized files, and mismatched schemas.
+    /// Loads the cache from `cache_path`, rejecting symlinked parents/files, oversized payloads,
+    /// and mismatched schemas using a bounded read (`MAX_STATS_SCAN_CACHE_BYTES + 1`).
     pub(super) fn load(cache_path: &Path) -> Self {
+        if !is_safe_cache_target(cache_path) {
+            return Self::default();
+        }
         let Ok(meta) = fs::symlink_metadata(cache_path) else {
             return Self::default();
         };
@@ -91,9 +95,20 @@ impl GlobalStatsCache {
         if ft.is_symlink() || !ft.is_file() || meta.len() > MAX_STATS_SCAN_CACHE_BYTES {
             return Self::default();
         }
-        let Ok(bytes) = fs::read(cache_path) else {
+        let Ok(file) = fs::File::open(cache_path) else {
             return Self::default();
         };
+        let mut bytes = Vec::with_capacity((meta.len() as usize).min(64 * 1024));
+        if file
+            .take(MAX_STATS_SCAN_CACHE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            return Self::default();
+        }
+        if bytes.len() as u64 > MAX_STATS_SCAN_CACHE_BYTES {
+            return Self::default();
+        }
         let Ok(parsed) = serde_json::from_slice::<StatsScanCacheFile>(&bytes) else {
             return Self::default();
         };
@@ -181,16 +196,16 @@ mod tests {
     use super::*;
     use crate::stats::scan::{RawTurn, ScanDiagnostics};
 
-    fn sample_fp(size: u64, wal_size: u64) -> DbFileFingerprint {
+    fn sample_fp(size: u64, wal_size: u64, wal_ts: i64) -> DbFileFingerprint {
         DbFileFingerprint {
             db_mtime_secs: 1_795_000_000,
             db_mtime_nanos: 0,
             db_ctime_secs: 1_795_000_000,
             db_ctime_nanos: 0,
             db_size: size,
-            wal_mtime_secs: if wal_size > 0 { 1_795_000_010 } else { 0 },
+            wal_mtime_secs: wal_ts,
             wal_mtime_nanos: 0,
-            wal_ctime_secs: if wal_size > 0 { 1_795_000_010 } else { 0 },
+            wal_ctime_secs: wal_ts,
             wal_ctime_nanos: 0,
             wal_size,
         }
@@ -236,8 +251,8 @@ mod tests {
         assert!(!cache.save_if_dirty(&cache_path));
         assert!(!cache_path.exists());
 
-        let fp_a = sample_fp(4096, 0);
-        let fp_b = sample_fp(8192, 512);
+        let fp_a = sample_fp(4096, 0, 0);
+        let fp_b = sample_fp(8192, 512, 1_795_000_010);
         cache.upsert("/db/a.db".to_string(), fp_a, sample_data(1_000));
         cache.upsert("/db/b.db".to_string(), fp_b, sample_data(2_000));
         assert!(cache.save_if_dirty(&cache_path));
@@ -257,7 +272,7 @@ mod tests {
             2
         );
         assert!(reloaded
-            .get_matching("/db/a.db", sample_fp(4096, 64))
+            .get_matching("/db/a.db", sample_fp(4096, 64, 1_795_000_010))
             .is_none());
 
         let live = HashSet::from(["/db/a.db".to_string()]);
@@ -281,8 +296,39 @@ mod tests {
         symlink(&real_target, &link_path).unwrap();
 
         let mut cache = GlobalStatsCache::load(&link_path);
-        cache.upsert("/db/a.db".to_string(), sample_fp(4096, 0), sample_data(500));
+        cache.upsert(
+            "/db/a.db".to_string(),
+            sample_fp(4096, 0, 0),
+            sample_data(500),
+        );
         assert!(!cache.save_if_dirty(&link_path));
         assert_eq!(fs::read(&real_target).unwrap(), b"sentinel");
+
+        // Symlinked parent directory is also rejected on both read and write.
+        let real_dir = dir.path().join("real_cache_dir");
+        fs::create_dir_all(&real_dir).unwrap();
+        let valid_cache = real_dir.join("stats_scan_cache.json");
+        let mut seed = GlobalStatsCache::default();
+        seed.upsert(
+            "/db/a.db".to_string(),
+            sample_fp(4096, 0, 0),
+            sample_data(500),
+        );
+        assert!(seed.save_if_dirty(&valid_cache));
+
+        let sym_dir = dir.path().join("sym_cache_dir");
+        symlink(&real_dir, &sym_dir).unwrap();
+        let via_sym_parent = sym_dir.join("stats_scan_cache.json");
+        let loaded = GlobalStatsCache::load(&via_sym_parent);
+        assert!(loaded
+            .get_matching("/db/a.db", sample_fp(4096, 0, 0))
+            .is_none());
+        let mut writer = GlobalStatsCache::default();
+        writer.upsert(
+            "/db/c.db".to_string(),
+            sample_fp(4096, 0, 0),
+            sample_data(999),
+        );
+        assert!(!writer.save_if_dirty(&via_sym_parent));
     }
 }
