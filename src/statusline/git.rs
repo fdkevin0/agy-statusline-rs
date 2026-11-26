@@ -242,18 +242,14 @@ where
 
     let should_prune =
         previous_ts.is_none_or(|t| now_secs.saturating_sub(t) >= DIFF_CACHE_PRUNE_INTERVAL_SECS);
-    let result = match runner() {
-        Some((added, deleted)) => {
-            let payload = format!("{idx_mtime} {now_secs} {added} {deleted}\n");
-            let _ = atomic_write(&cache_path, payload.as_bytes());
-            (added, deleted)
-        }
-        None => {
-            let payload = format!("{idx_mtime} {now_secs} timeout\n");
-            let _ = atomic_write(&cache_path, payload.as_bytes());
-            (0, 0)
-        }
+    let (payload, result) = match runner() {
+        Some((added, deleted)) => (
+            format!("{idx_mtime} {now_secs} {added} {deleted}\n"),
+            (added, deleted),
+        ),
+        None => (format!("{idx_mtime} {now_secs} timeout\n"), (0, 0)),
     };
+    let _ = atomic_write(&cache_path, payload.as_bytes());
     if should_prune {
         prune_stale_diff_caches(cache_dir, &file_name, now_secs);
     }

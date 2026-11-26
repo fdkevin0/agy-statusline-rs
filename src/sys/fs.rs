@@ -47,19 +47,10 @@ pub(crate) fn is_absent_or_real_file(path: &Path) -> bool {
 /// Returns `true` when `path`'s immediate parent (if any) is absent or a non-symlink directory,
 /// and `path` itself is absent or a non-symlink regular file.
 pub(crate) fn is_safe_cache_target(path: &Path) -> bool {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        match fs::symlink_metadata(parent) {
-            Ok(meta) => {
-                let ft = meta.file_type();
-                if ft.is_symlink() || !ft.is_dir() {
-                    return false;
-                }
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => return false,
-        }
-    }
-    is_absent_or_real_file(path)
+    matches!(
+        safe_regular_metadata(path),
+        Ok(_) | Err(BoundedReadError::Missing)
+    )
 }
 
 /// Inspects `path` via `symlink_metadata`, rejecting symlinked immediate parent directories,

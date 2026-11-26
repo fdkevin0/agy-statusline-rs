@@ -588,17 +588,6 @@ pub(crate) fn resolve_primary_credit_from_map(
         .or_else(|| credits.into_iter().min_by_key(|c| c.remaining_amount))
 }
 
-/// Resolves the primary credit view from `payload.quota`, preferring `ai_credits` /
-/// `google_one_ai`, then the lowest remaining credit balance.
-#[cfg(test)]
-pub(crate) fn resolve_primary_credit_view(
-    payload: &StatuslinePayload,
-    now_unix_secs: u64,
-) -> Option<CreditView> {
-    let quota = payload.quota.as_ref()?;
-    resolve_primary_credit_from_map(quota, now_unix_secs)
-}
-
 fn classify_pool_kind(key: &str, desc: &BucketDescriptor) -> (QuotaPoolKind, String) {
     let tokens = tokenize_alnum_lower(key);
     if tokens.iter().any(|t| t == "carbon") {
@@ -651,16 +640,6 @@ fn update_tightest_view(slot: &mut Option<(QuotaView, bool)>, view: QuotaView, h
     if replace {
         *slot = Some((view, has_frac));
     }
-}
-
-/// Groups all active windowed quota pools (`Gemini`, `Argon`, `Carbon`, `Claude/3P`, plus other
-/// pools) and non-windowed credit buckets for `doctor` and `stats` summaries.
-#[cfg(test)]
-pub(crate) fn summarize_quota_pools(
-    quota: &BTreeMap<String, QuotaBucket>,
-    now_unix_secs: u64,
-) -> QuotaSummary {
-    summarize_quota_pools_with_history(quota, None, now_unix_secs)
 }
 
 type WindowSlot = Option<(QuotaView, bool)>;
@@ -757,35 +736,22 @@ pub(crate) fn resolve_quota_views_for_map(
     (best_short.map(|c| c.view), best_multi.map(|c| c.view))
 }
 
-/// Resolves both the active short-window (`< 24h`) and multi-day (`>= 24h`) quota buckets
-/// in a single pass over `payload.quota`, enriching views with sample history when available.
-#[cfg(test)]
-pub(crate) fn resolve_quota_views_with_history(
-    payload: &StatuslinePayload,
-    history: Option<&BTreeMap<String, BucketHistory>>,
-    now_unix_secs: u64,
-) -> (Option<QuotaView>, Option<QuotaView>) {
-    let Some(quota) = payload.quota.as_ref() else {
-        return (None, None);
-    };
-    resolve_quota_views_for_map(payload, quota, history, now_unix_secs)
-}
-
-/// Resolves both the active short-window (`< 24h`) and multi-day (`>= 24h`) quota buckets
-/// in a single pass over `payload.quota`.
-#[cfg(test)]
-pub(crate) fn resolve_quota_views(
-    payload: &StatuslinePayload,
-    now_unix_secs: u64,
-) -> (Option<QuotaView>, Option<QuotaView>) {
-    resolve_quota_views_with_history(payload, None, now_unix_secs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::statusline::{ContextWindow, JsonUsage, ModelInfo};
     use std::collections::BTreeMap;
+
+    fn resolve_quota_views(
+        payload: &StatuslinePayload,
+        now_unix_secs: u64,
+    ) -> (Option<QuotaView>, Option<QuotaView>) {
+        payload
+            .quota
+            .as_ref()
+            .map(|q| resolve_quota_views_for_map(payload, q, None, now_unix_secs))
+            .unwrap_or((None, None))
+    }
 
     fn resolve_quota_5h_at(payload: &StatuslinePayload, now_unix_secs: u64) -> Option<QuotaView> {
         resolve_quota_views(payload, now_unix_secs).0
@@ -1571,11 +1537,7 @@ mod tests {
         assert_eq!(views[3].label, "Prompt credits");
         assert_eq!(views[3].severity, CreditSeverity::Critical);
 
-        let payload = StatuslinePayload {
-            quota: Some(quota),
-            ..Default::default()
-        };
-        let primary = resolve_primary_credit_view(&payload, 1_700_000_000).unwrap();
+        let primary = resolve_primary_credit_from_map(&quota, 1_700_000_000).unwrap();
         assert_eq!(primary.key, "ai_credits");
         assert_eq!(primary.severity, CreditSeverity::Low);
     }
@@ -1632,7 +1594,7 @@ mod tests {
             ),
         ]);
 
-        let summary = summarize_quota_pools(&quota, 1_700_000_000);
+        let summary = summarize_quota_pools_with_history(&quota, None, 1_700_000_000);
         assert_eq!(summary.pools.len(), 4);
         assert_eq!(summary.pools[0].kind, QuotaPoolKind::Gemini);
         assert_eq!(summary.pools[0].name, "Gemini");
@@ -1675,9 +1637,14 @@ mod tests {
             ..Default::default()
         };
 
-        let q_with_hist = resolve_quota_views_with_history(&payload, Some(&history_map), 4_600)
-            .0
-            .unwrap();
+        let q_with_hist = resolve_quota_views_for_map(
+            &payload,
+            payload.quota.as_ref().unwrap(),
+            Some(&history_map),
+            4_600,
+        )
+        .0
+        .unwrap();
         assert!((q_with_hist.burn_rate_pct_per_hr.unwrap() - 20.0).abs() < 1e-6);
         assert_eq!(q_with_hist.eta_secs, Some(10_800));
         assert!(q_with_hist.will_exhaust_before_reset);
