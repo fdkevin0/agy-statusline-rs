@@ -41,17 +41,15 @@ pub(super) fn compute_geometry(cfg: &LayoutConfig, glyphs: &GlyphSet) -> StyleGe
     } else {
         cfg.separator.as_str()
     };
-    if mono || cfg.style == VisualStyle::Plain {
-        return StyleGeometry {
+    match (mono, cfg.style) {
+        (true, _) | (false, VisualStyle::Plain) => StyleGeometry {
             pad_per_seg: 0,
             sep_w: sep_str.width(),
             slice_trail_w: 0,
             mono,
             sep_str,
-        };
-    }
-    match cfg.style {
-        VisualStyle::Pill => {
+        },
+        (false, VisualStyle::Pill) => {
             let pad = match glyphs.pill_caps {
                 Some((l, r)) => l.width() + r.width(),
                 None => 2,
@@ -64,7 +62,7 @@ pub(super) fn compute_geometry(cfg: &LayoutConfig, glyphs: &GlyphSet) -> StyleGe
                 sep_str,
             }
         }
-        VisualStyle::Powerline => {
+        (false, VisualStyle::Powerline) => {
             let arrow_w = glyphs.pl_right.width();
             StyleGeometry {
                 pad_per_seg: 2,
@@ -74,7 +72,6 @@ pub(super) fn compute_geometry(cfg: &LayoutConfig, glyphs: &GlyphSet) -> StyleGe
                 sep_str,
             }
         }
-        VisualStyle::Plain => unreachable!(),
     }
 }
 

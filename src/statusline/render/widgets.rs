@@ -491,7 +491,7 @@ impl Renderer<'_> {
                 Segment::plain(widget, buf, pal.cache, false)
             }),
             WidgetId::Speed => {
-                let slow = ctx.speed.is_some_and(|s| s < ctx.speed_warn_threshold);
+                let slow = ctx.speed.is_some_and(|s| s < self.cfg.speed_warn_threshold);
                 let base = ctx.speed.map_or_else(
                     || format!("{} --", glyphs.speed),
                     |s| format!("{} {s:.0} tok/s", glyphs.speed),

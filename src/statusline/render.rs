@@ -9,10 +9,7 @@ use std::io::{self, Write as IoWrite};
 
 use crate::agy::db::{RetryAnomalySummary, SessionMetadata};
 use crate::agy::quota::BucketHistory;
-use crate::config::layout::{
-    LayoutConfig, SpeedMode, WidgetId, DEFAULT_SPEED_WARN_THRESHOLD, MAX_BAR_LENGTH,
-    MAX_SPEED_WARN_THRESHOLD, MIN_BAR_LENGTH, MIN_SPEED_WARN_THRESHOLD,
-};
+use crate::config::layout::{LayoutConfig, SpeedMode, WidgetId, MAX_BAR_LENGTH, MIN_BAR_LENGTH};
 use crate::statusline::git::GitInfo;
 use crate::statusline::metrics::{
     classify_credit_severity, current_context_tokens, resolve_primary_credit_from_map,
@@ -150,7 +147,6 @@ struct RenderContext<'a> {
     cur_ctx: Option<u64>,
     eff_limit: Option<u64>,
     speed: Option<f64>,
-    speed_warn_threshold: f64,
     retry_anomaly: Option<RetryAnomalySummary>,
     ttft_secs: Option<f64>,
     thinking_tokens: Option<u64>,
@@ -200,14 +196,6 @@ impl<'a> RenderContext<'a> {
             SpeedMode::E2e => meta.e2e_speed.or(meta.speed),
         }
         .filter(|s| s.is_finite() && *s >= 0.0);
-        let speed_warn_threshold = if cfg.speed_warn_threshold.is_finite()
-            && cfg.speed_warn_threshold >= MIN_SPEED_WARN_THRESHOLD
-        {
-            cfg.speed_warn_threshold
-                .clamp(MIN_SPEED_WARN_THRESHOLD, MAX_SPEED_WARN_THRESHOLD)
-        } else {
-            DEFAULT_SPEED_WARN_THRESHOLD
-        };
         let cost = if let Some(total_usd) = valid_cost_usd(payload) {
             let payload_cost = payload.cost.as_ref();
             Some(ResolvedCost::Payload {
@@ -244,7 +232,6 @@ impl<'a> RenderContext<'a> {
             cur_ctx,
             eff_limit,
             speed,
-            speed_warn_threshold,
             retry_anomaly: meta.retry_anomaly.filter(|r| r.retry_count > 0),
             ttft_secs: meta.ttft_secs.filter(|t| t.is_finite() && *t >= 0.0),
             thinking_tokens: meta.thinking_tokens.filter(|&t| t > 0),

@@ -31,7 +31,7 @@ cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo
 ## Intentional Non-Bugs
 
 - Stdin statusline mode silently absorbs transient read/write errors and returns exit code `0`.
-- Pricing refresh on the statusline path is background-only (`SpawnIfStale`); only `stats` and `pricing sync` refresh synchronously.
+- Pricing refresh on the statusline path is background-only (`SpawnIfStale`); interactive/report commands (`stats`, conversation detail, `pricing sync`) may refresh synchronously.
 - Foreign forked rows (`origin_cascade_id != conversation_id`), symlinked DBs/sidecars, and non-UUID `.db` files are intentionally ignored.
 
 ## Contextual Documentation

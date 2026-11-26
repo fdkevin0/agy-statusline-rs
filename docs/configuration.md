@@ -11,7 +11,7 @@ Requires **Antigravity CLI `>= 1.5.15`** (and **Antigravity Desktop `>= 2.35.0`*
 | `XDG_CONFIG_HOME` | Root for `agy-statusline/config.json` | `<home>/.config` |
 | `XDG_CACHE_HOME` | Root for `agy-statusline/` cache files | `<home>/.cache` |
 | `ANTIGRAVITY_CLI_HOME` | AGY CLI data & `settings.json` directory | `<home>/.gemini/antigravity-cli` |
-| `ANTIGRAVITY_DATA_DIR` | Optional comma-separated extra AGY roots scanned by `stats` & `doctor` | *(unset)* |
+| `ANTIGRAVITY_DATA_DIR` | Optional comma-separated extra AGY roots scanned by `stats`, `conversations` & `doctor` (also probes `<dir>/daemon` for Hub RPC) | *(unset)* |
 | `NO_COLOR` | Disables ANSI color escapes when non-empty | *(unset)* |
 
 `<home>` resolves from `HOME` (or `USERPROFILE` on Windows).
