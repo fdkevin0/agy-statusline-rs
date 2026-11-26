@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 
 use super::{
     db_file_fingerprint, deduplicate_parent_priority_turns, discover_sqlite_db_targets,
-    extract_sqlite_db_turns, merge_raw_turn, valid_decode_speed, valid_ttft_secs,
-    DbFileFingerprint, RawTurn, TurnPricer,
+    extract_sqlite_db_data, merge_raw_turn, valid_decode_speed, valid_ttft_secs, DbFileFingerprint,
+    RawTurn, ScanDiagnostics, TurnPricer,
 };
 use crate::agy::db::{
-    compute_median, is_safe_sqlite_file, is_valid_uuid, open_readonly_db,
-    resolve_conversation_db_path, safe_sqlite_metadata,
+    compute_median, is_safe_sqlite_file, is_sqlite_db_ready_for_read, is_valid_uuid,
+    open_readonly_db, resolve_conversation_db_path, safe_sqlite_metadata,
 };
 use crate::stats::metric::{cache_hit_pct, StatsMetric};
 use crate::stats::pricing::{round_usd_6, PricingCatalog};
@@ -492,28 +492,55 @@ struct SubagentAccumulator {
     ttfts: Vec<f64>,
 }
 
+/// Aggregated retry, error-step, and compaction diagnostics for a single conversation
+/// and its descendant subagents.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct ConversationDiagnostics {
+    /// Combined diagnostics across the main conversation and descendant subagents.
+    pub(crate) total: ScanDiagnostics,
+    /// Diagnostics attributed strictly to the target conversation.
+    pub(crate) main: ScanDiagnostics,
+    /// Combined diagnostics attributed to descendant subagents.
+    pub(crate) subagents: ScanDiagnostics,
+}
+
 fn load_conversation_turn_slots(
     target: &ResolvedConversationTarget,
     desc_ids: &[String],
-) -> io::Result<(Vec<ConversationTurnSlot>, Vec<String>, u64)> {
+) -> io::Result<(
+    Vec<ConversationTurnSlot>,
+    Vec<String>,
+    u64,
+    ConversationDiagnostics,
+)> {
     let mut tagged_turns: Vec<ConversationTurnSlot> = Vec::new();
     let mut db_files: u64 = 1;
+    let mut diagnostics = ConversationDiagnostics::default();
 
-    let parent_conn = open_readonly_db(&target.db_path).map_err(|err| {
-        io::Error::other(format!(
-            "failed to open conversation '{}': {err}",
-            target.conversation_id
-        ))
-    })?;
-    if let Some(turns) = extract_sqlite_db_turns(&parent_conn, target.db_mtime_secs) {
-        for turn in turns {
-            let order = tagged_turns.len();
-            tagged_turns.push(ConversationTurnSlot {
-                conversation_id: target.conversation_id.clone(),
-                is_subagent: false,
-                order,
-                turn,
-            });
+    if is_sqlite_db_ready_for_read(&target.db_path) {
+        let parent_conn = open_readonly_db(&target.db_path).map_err(|err| {
+            io::Error::other(format!(
+                "failed to open conversation '{}': {err}",
+                target.conversation_id
+            ))
+        })?;
+        if let Some(data) = extract_sqlite_db_data(
+            &parent_conn,
+            target.db_mtime_secs,
+            Some(&target.conversation_id),
+        ) {
+            diagnostics.main.merge(&data.diagnostics);
+            diagnostics.total.merge(&data.diagnostics);
+            for turn in data.turns {
+                let order = tagged_turns.len();
+                tagged_turns.push(ConversationTurnSlot {
+                    conversation_id: target.conversation_id.clone(),
+                    is_subagent: false,
+                    order,
+                    turn,
+                });
+            }
         }
     }
 
@@ -531,8 +558,10 @@ fn load_conversation_turn_slots(
         let lower_desc_id = desc_id.to_ascii_lowercase();
         db_files += 1;
         active_subagent_ids.push(lower_desc_id.clone());
-        if let Some(turns) = extract_sqlite_db_turns(&desc_conn, desc_mtime) {
-            for turn in turns {
+        if let Some(data) = extract_sqlite_db_data(&desc_conn, desc_mtime, Some(&lower_desc_id)) {
+            diagnostics.subagents.merge(&data.diagnostics);
+            diagnostics.total.merge(&data.diagnostics);
+            for turn in data.turns {
                 let order = tagged_turns.len();
                 tagged_turns.push(ConversationTurnSlot {
                     conversation_id: lower_desc_id.clone(),
@@ -544,26 +573,26 @@ fn load_conversation_turn_slots(
         }
     }
 
-    Ok((tagged_turns, active_subagent_ids, db_files))
+    Ok((tagged_turns, active_subagent_ids, db_files, diagnostics))
 }
 
 /// Scans a single conversation (and any descendant subagent conversations) and produces
-/// a complete [`ConversationStatsReport`].
-pub(in crate::stats) fn collect_conversation_stats_report(
+/// both the [`ConversationStatsReport`] and [`ConversationDiagnostics`].
+pub(crate) fn collect_conversation_stats_with_diagnostics(
     roots: &[(&'static str, PathBuf)],
     conversation_query: &str,
     now_unix_secs: u64,
     tz: &TimeZoneSpec,
     pricing: &PricingCatalog,
     sort_metric: StatsMetric,
-) -> io::Result<ConversationStatsReport> {
+) -> io::Result<(ConversationStatsReport, ConversationDiagnostics)> {
     let target = resolve_conversation_target(roots, conversation_query)?;
     let timezone = tz.format_offset_at(now_unix_secs as i64);
 
     // Open `conversation_summaries.db` once to resolve both descendants and display metadata.
     let summary_meta = load_conversation_summaries(&target.root, None);
     let desc_ids = descendant_ids_from_summaries(&summary_meta, &target.conversation_id);
-    let (tagged_turns, active_subagent_ids, db_files) =
+    let (tagged_turns, active_subagent_ids, db_files, diagnostics) =
         load_conversation_turn_slots(&target, &desc_ids)?;
 
     let mut deduped = deduplicate_parent_priority_turns(
@@ -758,31 +787,55 @@ pub(in crate::stats) fn collect_conversation_stats_report(
     });
 
     let root_meta = summary_meta.get(&target.conversation_id);
-    Ok(ConversationStatsReport {
-        conversation_id: target.conversation_id,
-        title: root_meta.and_then(IndexedSummaryRow::display_title),
-        parent_conversation_id: root_meta.and_then(|m| m.parent_conversation_id.clone()),
-        agent_name: root_meta.and_then(|m| m.agent_name.clone()),
-        source: target.source.to_string(),
-        timezone,
-        first_turn_local: first_ts.map(|ts| tz.local_datetime_string(ts)),
-        last_turn_local: last_ts.map(|ts| tz.local_datetime_string(ts)),
-        duration_secs,
-        peak_context_tokens,
-        mid_session_misses,
-        mid_session_miss_usd: round_usd_6(mid_session_miss_usd),
-        totals,
-        main,
-        subagents_summary,
-        main_median_tok_per_sec: compute_median(&main_speeds),
-        main_median_ttft_secs: compute_median(&main_ttfts),
-        subagents_median_tok_per_sec: compute_median(&sub_speeds),
-        subagents_median_ttft_secs: compute_median(&sub_ttfts),
-        models,
-        subagents,
-        turns: turns_out,
-        sqlite,
-    })
+    Ok((
+        ConversationStatsReport {
+            conversation_id: target.conversation_id,
+            title: root_meta.and_then(IndexedSummaryRow::display_title),
+            parent_conversation_id: root_meta.and_then(|m| m.parent_conversation_id.clone()),
+            agent_name: root_meta.and_then(|m| m.agent_name.clone()),
+            source: target.source.to_string(),
+            timezone,
+            first_turn_local: first_ts.map(|ts| tz.local_datetime_string(ts)),
+            last_turn_local: last_ts.map(|ts| tz.local_datetime_string(ts)),
+            duration_secs,
+            peak_context_tokens,
+            mid_session_misses,
+            mid_session_miss_usd: round_usd_6(mid_session_miss_usd),
+            totals,
+            main,
+            subagents_summary,
+            main_median_tok_per_sec: compute_median(&main_speeds),
+            main_median_ttft_secs: compute_median(&main_ttfts),
+            subagents_median_tok_per_sec: compute_median(&sub_speeds),
+            subagents_median_ttft_secs: compute_median(&sub_ttfts),
+            models,
+            subagents,
+            turns: turns_out,
+            sqlite,
+        },
+        diagnostics,
+    ))
+}
+
+/// Scans a single conversation (and any descendant subagent conversations) and produces
+/// a complete [`ConversationStatsReport`].
+pub(in crate::stats) fn collect_conversation_stats_report(
+    roots: &[(&'static str, PathBuf)],
+    conversation_query: &str,
+    now_unix_secs: u64,
+    tz: &TimeZoneSpec,
+    pricing: &PricingCatalog,
+    sort_metric: StatsMetric,
+) -> io::Result<ConversationStatsReport> {
+    collect_conversation_stats_with_diagnostics(
+        roots,
+        conversation_query,
+        now_unix_secs,
+        tz,
+        pricing,
+        sort_metric,
+    )
+    .map(|(report, _)| report)
 }
 
 #[cfg(test)]
@@ -1185,5 +1238,119 @@ mod tests {
         assert_eq!(counts[self_loop], 0);
         assert_eq!(counts[cycle_a], 1);
         assert_eq!(counts[cycle_b], 1);
+    }
+
+    #[test]
+    fn conversation_stats_filters_cloned_fork_turns_and_aggregates_diagnostics() {
+        use crate::agy::protobuf::{
+            encode_gen_blob, encode_step_blob, GenBlobSpec, RetrySpec, StepBlobSpec,
+        };
+        use crate::stats::pricing::{PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cli_root = dir.path().join(".gemini/antigravity-cli");
+        let conv_dir = cli_root.join("conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+
+        let parent_id = "aaaa1111-1111-4111-8111-111111111111";
+        let fork_id = "bbbb2222-2222-4222-8222-222222222222";
+        let ts = parse_rfc3339_unix_secs("2026-11-24T08:00:00Z").unwrap();
+
+        let conn = Connection::open(conv_dir.join(format!("{fork_id}.db"))).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB);
+             CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (1, 17, ?1)",
+            [encode_step_blob(StepBlobSpec {
+                created_at_secs: Some(ts),
+                origin_cascade_id: Some(parent_id),
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (2, 17, ?1)",
+            [encode_step_blob(StepBlobSpec {
+                created_at_secs: Some(ts + 10),
+                origin_cascade_id: Some(fork_id),
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (3, 23, ?1)",
+            [encode_step_blob(StepBlobSpec {
+                created_at_secs: Some(ts + 20),
+                origin_cascade_id: Some(fork_id),
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [encode_gen_blob(GenBlobSpec {
+                step_indices: vec![1],
+                origin_cascade_id: Some(parent_id),
+                model_enum: 1532,
+                resp_model: Some("model-alpha"),
+                input_tok: 50_000,
+                output_tok: 500,
+                dur_secs: 2,
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
+            [encode_gen_blob(GenBlobSpec {
+                step_indices: vec![2],
+                origin_cascade_id: Some(fork_id),
+                model_enum: 1532,
+                resp_model: Some("model-alpha"),
+                input_tok: 1_000,
+                output_tok: 100,
+                dur_secs: 1,
+                retry_records: vec![RetrySpec {
+                    error: Some("HTTP 429 rate limit"),
+                    reason_code: 429,
+                    delay_secs: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        drop(conn);
+
+        let roots = [("cli", cli_root)];
+        let pricing = PricingCatalog::load_effective_with(
+            None,
+            SyncMode::Offline,
+            ts as u64,
+            DEFAULT_PRICING_TTL_SECS,
+            |_| unreachable!(),
+        );
+        let (report, diag) = collect_conversation_stats_with_diagnostics(
+            &roots,
+            fork_id,
+            ts as u64,
+            &TimeZoneSpec::utc(),
+            &pricing,
+            StatsMetric::Total,
+        )
+        .unwrap();
+
+        assert_eq!(report.totals.requests, 1);
+        assert_eq!(report.totals.input_tokens, 1_000);
+        assert_eq!(diag.total.retry_count, 1);
+        assert_eq!(diag.total.retries_429, 1);
+        assert!((diag.total.total_retry_delay_secs - 2.0).abs() < 1e-6);
+        assert_eq!(diag.total.error_steps, 1);
+        assert_eq!(diag.total.compaction_steps, 1);
+        assert_eq!(diag.main, diag.total);
+        assert!(diag.subagents.is_empty());
     }
 }

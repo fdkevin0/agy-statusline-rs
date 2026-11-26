@@ -22,7 +22,7 @@ pub(crate) struct ConversationCost {
 }
 
 const CONV_COST_CACHE_FILE: &str = "conv_cost_cache.json";
-const CONV_COST_CACHE_SCHEMA_VERSION: u32 = 1;
+const CONV_COST_CACHE_SCHEMA_VERSION: u32 = 2;
 const CONV_COST_CACHE_MAX_ENTRIES: usize = 32;
 const MAX_CONV_COST_CACHE_BYTES: u64 = 512 * 1024;
 
@@ -202,11 +202,11 @@ pub(crate) fn estimate_conversation_cost_usd_with_parent_conn(
 
     let mut tagged_turns: Vec<(bool, RawTurn)> = Vec::new();
     if let Some(conn) = parent_conn {
-        for turn in extract_sqlite_db_turns(conn, None)? {
+        for turn in extract_sqlite_db_turns(conn, None, Some(conversation_id))? {
             tagged_turns.push((false, turn));
         }
     } else if let Some(db_path) = parent_db_path.as_deref() {
-        for turn in read_single_db_turns(db_path)? {
+        for turn in read_single_db_turns(db_path, Some(conversation_id))? {
             tagged_turns.push((false, turn));
         }
     }
@@ -218,7 +218,10 @@ pub(crate) fn estimate_conversation_cost_usd_with_parent_conn(
         let desc_db_path = resolve_conversation_db_path(cli_dir, &desc_id);
         let desc_fp = desc_db_path.as_deref().and_then(db_file_fingerprint);
         descendants.push((desc_id.to_ascii_lowercase(), desc_fp));
-        if let Some(turns) = desc_db_path.as_deref().and_then(read_single_db_turns) {
+        if let Some(turns) = desc_db_path
+            .as_deref()
+            .and_then(|p| read_single_db_turns(p, Some(&desc_id)))
+        {
             for turn in turns {
                 tagged_turns.push((true, turn));
             }
@@ -580,5 +583,50 @@ mod tests {
             "22222222-2222-4222-8222-222222222222"
         );
         assert_eq!(after_promote.entries[1].cost.usd, Some(2.5));
+    }
+
+    #[test]
+    fn estimate_conversation_cost_excludes_cloned_fork_turns() {
+        use crate::agy::protobuf::{encode_gen_blob, GenBlobSpec};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cli_dir = dir.path().join(".gemini/antigravity-cli");
+        let pricing = PricingCatalog::default();
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let fork_id = "22222222-2222-4222-8222-222222222222";
+
+        seed_cost_db(
+            &cli_dir,
+            fork_id,
+            1,
+            encode_gen_blob(GenBlobSpec {
+                origin_cascade_id: Some(parent_id),
+                model_enum: 10,
+                resp_model: Some("m-parent"),
+                input_tok: 100,
+                output_tok: 50,
+                model_cost: Some(9.00),
+                ..Default::default()
+            }),
+        );
+        seed_cost_db(
+            &cli_dir,
+            fork_id,
+            2,
+            encode_gen_blob(GenBlobSpec {
+                origin_cascade_id: Some(fork_id),
+                model_enum: 10,
+                resp_model: Some("m-fork"),
+                input_tok: 100,
+                output_tok: 50,
+                model_cost: Some(0.25),
+                ..Default::default()
+            }),
+        );
+
+        let est = estimate_conversation_cost_usd(&cli_dir, fork_id, &pricing).unwrap();
+        assert_eq!(est.usd, Some(0.25));
+        assert_eq!(est.subagent_usd, None);
+        assert_eq!(est.unpriced_turns, 0);
     }
 }

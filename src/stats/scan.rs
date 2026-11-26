@@ -2,15 +2,22 @@
 
 mod conversation;
 mod cost_cache;
+mod global_cache;
 
 pub(in crate::stats) use conversation::{
     collect_conversation_stats_report, conversation_watch_fingerprint,
     conversations_list_fingerprint, list_conversations, ConversationWatchFingerprint,
     ConversationsListFingerprint,
 };
+#[allow(unused_imports)]
+pub(crate) use conversation::{
+    collect_conversation_stats_with_diagnostics, ConversationDiagnostics,
+};
 pub(crate) use cost_cache::{
     estimate_conversation_cost_usd_with_parent_conn, lookup_cached_conversation_cost,
 };
+#[allow(unused_imports)]
+pub(crate) use global_cache::STATS_SCAN_CACHE_FILE;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -21,31 +28,152 @@ use serde::{Deserialize, Serialize};
 use super::pricing::{is_effort_token, normalize_model_key, round_usd_6, PricingCatalog};
 use super::SqliteStats;
 use crate::agy::db::{
-    compute_median, is_absent_or_real_file, is_real_dir, is_safe_sqlite_file, is_valid_uuid,
-    open_readonly_db, safe_sqlite_metadata, sidecar_path,
+    compute_median, conversation_id_from_db_path, is_absent_or_real_file, is_real_dir,
+    is_safe_sqlite_file, is_valid_uuid, open_readonly_db, safe_sqlite_metadata, sidecar_path,
 };
 use crate::agy::protobuf::{
     extract_gen_metadata_record, extract_step_metadata_record, extract_trajectory_created_at_secs,
-    UsageAttemptRecord, MAX_TTFT_SECS, MAX_TURN_SPEED_TPS,
+    is_foreign_cascade_id, RetryAttemptRecord, RetryStatusClass, UsageAttemptRecord, MAX_TTFT_SECS,
+    MAX_TURN_SPEED_TPS,
 };
 use crate::sys::fs::modified_timestamp;
 use crate::sys::time::TimeZoneSpec;
 
+const STEP_TYPE_ERROR_MESSAGE: i64 = 17;
+const STEP_TYPE_CHECKPOINT: i64 = 23;
+
+/// Aggregated retry, error-step, and compaction-checkpoint diagnostics extracted from SQLite DBs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScanDiagnostics {
+    /// Total actionable retry attempts (excluding user cancellations).
+    #[serde(default)]
+    pub retry_count: u64,
+    /// Actionable retries classified as HTTP 429 / rate limit / quota exhaustion.
+    #[serde(default)]
+    pub retries_429: u64,
+    /// Actionable retries classified as HTTP 503 / capacity / overloaded.
+    #[serde(default)]
+    pub retries_503: u64,
+    /// Actionable retries classified as HTTP 500/502/504 upstream errors.
+    #[serde(default)]
+    pub retries_5xx: u64,
+    /// Actionable retries classified as timeouts.
+    #[serde(default)]
+    pub retries_timeout: u64,
+    /// All other actionable retries (disconnect, model output, unclassified).
+    #[serde(default)]
+    pub retries_other: u64,
+    /// Cumulative retry backoff delay in seconds.
+    #[serde(default)]
+    pub total_retry_delay_secs: f64,
+    /// Count of own error steps (`steps.step_type == 17`).
+    #[serde(default)]
+    pub error_steps: u64,
+    /// Count of own compaction checkpoint steps (`steps.step_type == 23`).
+    #[serde(default)]
+    pub compaction_steps: u64,
+}
+
+impl ScanDiagnostics {
+    /// Records one decoded [`RetryAttemptRecord`] if it represents an actionable anomaly.
+    pub fn record_retry(&mut self, attempt: &RetryAttemptRecord) {
+        if !attempt.is_anomaly() {
+            return;
+        }
+        self.retry_count = self.retry_count.saturating_add(1);
+        match attempt.status_class {
+            RetryStatusClass::RateLimit429 => {
+                self.retries_429 = self.retries_429.saturating_add(1);
+            }
+            RetryStatusClass::Capacity503 => {
+                self.retries_503 = self.retries_503.saturating_add(1);
+            }
+            RetryStatusClass::Upstream5xx => {
+                self.retries_5xx = self.retries_5xx.saturating_add(1);
+            }
+            RetryStatusClass::Timeout => {
+                self.retries_timeout = self.retries_timeout.saturating_add(1);
+            }
+            RetryStatusClass::Canceled => {}
+            RetryStatusClass::Disconnect
+            | RetryStatusClass::ModelOutput
+            | RetryStatusClass::Other => {
+                self.retries_other = self.retries_other.saturating_add(1);
+            }
+        }
+        if let Some(delay) = attempt
+            .retry_delay_secs
+            .filter(|d| d.is_finite() && *d > 0.0)
+        {
+            self.total_retry_delay_secs += delay;
+        }
+    }
+
+    /// Merges another [`ScanDiagnostics`] accumulator into `self`.
+    pub fn merge(&mut self, other: &Self) {
+        self.retry_count = self.retry_count.saturating_add(other.retry_count);
+        self.retries_429 = self.retries_429.saturating_add(other.retries_429);
+        self.retries_503 = self.retries_503.saturating_add(other.retries_503);
+        self.retries_5xx = self.retries_5xx.saturating_add(other.retries_5xx);
+        self.retries_timeout = self.retries_timeout.saturating_add(other.retries_timeout);
+        self.retries_other = self.retries_other.saturating_add(other.retries_other);
+        if other.total_retry_delay_secs.is_finite() && other.total_retry_delay_secs > 0.0 {
+            self.total_retry_delay_secs += other.total_retry_delay_secs;
+        }
+        self.error_steps = self.error_steps.saturating_add(other.error_steps);
+        self.compaction_steps = self.compaction_steps.saturating_add(other.compaction_steps);
+    }
+
+    /// Count of non-429, non-503 actionable retries (`5xx + timeout + other`).
+    #[allow(dead_code)]
+    pub fn retries_non_429_503(&self) -> u64 {
+        self.retries_5xx
+            .saturating_add(self.retries_timeout)
+            .saturating_add(self.retries_other)
+    }
+
+    /// Returns `true` when no retries, error steps, or compaction checkpoints were recorded.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.retry_count == 0 && self.error_steps == 0 && self.compaction_steps == 0
+    }
+}
+
+/// Raw unpriced scan output for a single conversation SQLite database.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(super) struct ScannedDbData {
+    #[serde(default)]
+    pub(super) turns: Vec<RawTurn>,
+    #[serde(default)]
+    pub(super) diagnostics: ScanDiagnostics,
+}
+
+/// Full output of a global SQLite scan including diagnostics and per-DB cache stats.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct GlobalScanResult {
+    pub(crate) sqlite: SqliteStats,
+    pub(crate) events: Vec<UsageEvent>,
+    pub(crate) diagnostics: ScanDiagnostics,
+    pub(crate) cache_hits: usize,
+    pub(crate) cache_misses: usize,
+}
+
 /// File-level change fingerprint for a SQLite conversation DB and its `-wal` sidecar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct DbFileFingerprint {
-    db_mtime_secs: i64,
-    db_mtime_nanos: u32,
-    db_ctime_secs: i64,
-    db_ctime_nanos: u32,
-    db_size: u64,
+    pub(super) db_mtime_secs: i64,
+    pub(super) db_mtime_nanos: u32,
+    pub(super) db_ctime_secs: i64,
+    pub(super) db_ctime_nanos: u32,
+    pub(super) db_size: u64,
     /// Normalized to `0` when `wal_size == 0` so AGY startup touching idle 0-byte
     /// `-wal` files does not trigger redundant re-scans.
-    wal_mtime_secs: i64,
-    wal_mtime_nanos: u32,
-    wal_ctime_secs: i64,
-    wal_ctime_nanos: u32,
-    wal_size: u64,
+    pub(super) wal_mtime_secs: i64,
+    pub(super) wal_mtime_nanos: u32,
+    pub(super) wal_ctime_secs: i64,
+    pub(super) wal_ctime_nanos: u32,
+    pub(super) wal_size: u64,
 }
 
 #[cfg(unix)]
@@ -212,25 +340,49 @@ const TS_QUALITY_TRAJECTORY: u8 = 2;
 const TS_QUALITY_SECONDARY: u8 = 3;
 const TS_QUALITY_STEP_PRIMARY: u8 = 4;
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
 /// Timezone- and pricing-independent turn record extracted from a SQLite conversation DB.
-#[derive(Debug, Clone, PartialEq)]
-struct RawTurn {
-    ts_secs: Option<i64>,
-    ts_quality: u8,
-    model_enum: u64,
-    response_model: Option<String>,
-    model_display_name: Option<String>,
-    input_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    output_tokens: u64,
-    thinking_tokens: u64,
-    native_cost_usd: Option<f64>,
-    decode_speed: Option<f64>,
-    ttft_secs: Option<f64>,
-    id_11: Option<String>,
-    id_12: Option<String>,
-    id_7: Option<String>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct RawTurn {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) ts_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub(super) ts_quality: u8,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(super) model_enum: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) response_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) model_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(super) input_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(super) cache_read_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(super) cache_write_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(super) output_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(super) thinking_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) native_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) decode_speed: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) ttft_secs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) id_11: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) id_12: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) id_7: Option<String>,
 }
 
 impl RawTurn {
@@ -543,79 +695,149 @@ fn fallback_timestamp(trajectory_ts: Option<i64>, db_mtime_secs: Option<i64>) ->
     }
 }
 
-/// Extracts and intra-DB deduplicates all turns from one SQLite conversation DB across
-/// `gen_metadata` (main + `f17` retries), `steps.metadata` (`f1`/`f8` timestamps, `f9` usage,
-/// `f24` model info, `f28` retries), and `trajectory_metadata_blob` (`f2` fallback timestamp).
+fn steps_table_columns(conn: &rusqlite::Connection) -> (bool, bool, bool) {
+    let mut has_table = false;
+    let mut has_metadata = false;
+    let mut has_step_type = false;
+    if let Ok(mut pragma) = conn.prepare("PRAGMA table_info(steps)") {
+        if let Ok(mut rows) = pragma.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                has_table = true;
+                if let Ok(name) = row.get::<_, String>(1) {
+                    if name.eq_ignore_ascii_case("metadata") {
+                        has_metadata = true;
+                    } else if name.eq_ignore_ascii_case("step_type") {
+                        has_step_type = true;
+                    }
+                }
+            }
+        }
+    }
+    (has_table, has_metadata, has_step_type)
+}
+
+/// Extracts and intra-DB deduplicates all turns plus retry/error/compaction diagnostics from one
+/// SQLite conversation DB across `gen_metadata` (main + `f17` retries), `steps` (`step_type`,
+/// `metadata` `f1`/`f8` timestamps, `f9` usage, `f20` origin cascade ID, `f24` model info, `f28`
+/// retries), and `trajectory_metadata_blob` (`f2` fallback timestamp).
+///
+/// When `expected_conversation_id` is `Some`, rows whose decoded `origin_cascade_id` is non-empty
+/// and differs (ASCII case-insensitively) are skipped to prevent double-counting forked or
+/// side-question cloned turns.
 ///
 /// Returns `None` only when neither `gen_metadata` nor `steps` exists in the database.
-fn extract_sqlite_db_turns(
+pub(super) fn extract_sqlite_db_data(
     conn: &rusqlite::Connection,
     db_mtime_secs: Option<i64>,
-) -> Option<Vec<RawTurn>> {
+    expected_conversation_id: Option<&str>,
+) -> Option<ScannedDbData> {
     let trajectory_ts = conn
         .prepare("SELECT data FROM trajectory_metadata_blob WHERE data IS NOT NULL LIMIT 1")
         .ok()
         .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, Vec<u8>>(0)).ok())
         .and_then(|blob| extract_trajectory_created_at_secs(&blob));
 
+    let mut diagnostics = ScanDiagnostics::default();
+    let (steps_exists, steps_has_metadata, steps_has_step_type) = steps_table_columns(conn);
     let mut has_steps_table = false;
     let mut step_timestamps: HashMap<u64, (i64, u8)> = HashMap::new();
     let mut step_candidates: Vec<(u64, RawTurn)> = Vec::new();
-    if let Ok(mut step_stmt) =
-        conn.prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC")
-    {
-        if let Ok(mut step_rows) = step_stmt.query([]) {
-            has_steps_table = true;
-            while let Ok(Some(row)) = step_rows.next() {
-                let Ok(idx) = row.get::<_, i64>(0) else {
-                    continue;
-                };
-                let Ok(meta_blob) = row.get::<_, Vec<u8>>(1) else {
-                    continue;
-                };
-                if idx < 0 {
-                    continue;
-                }
-                let step_idx = idx as u64;
-                let Some(step_rec) = extract_step_metadata_record(&meta_blob) else {
-                    continue;
-                };
-
-                let step_ts = if let Some(ts) = step_rec.created_at_secs {
-                    step_timestamps.insert(step_idx, (ts, TS_QUALITY_STEP_PRIMARY));
-                    (Some(ts), TS_QUALITY_STEP_PRIMARY)
-                } else if let Some(ts) = step_rec.secondary_created_at_secs {
-                    step_timestamps.insert(step_idx, (ts, TS_QUALITY_SECONDARY));
-                    (Some(ts), TS_QUALITY_SECONDARY)
-                } else {
-                    fallback_timestamp(trajectory_ts, db_mtime_secs)
-                };
-
-                if let Some(usage) = step_rec.usage {
-                    let turn = RawTurn::from_attempt(
-                        usage,
-                        step_ts,
-                        step_rec.model_enum,
-                        step_rec.response_model.as_deref(),
-                        step_rec.model_display_name.as_deref(),
-                        true,
-                    );
-                    if turn.has_signal() {
-                        step_candidates.push((step_idx, turn));
+    let mut step_retry_candidates: Vec<(u64, Vec<RetryAttemptRecord>)> = Vec::new();
+    if steps_exists && (steps_has_metadata || steps_has_step_type) {
+        let step_sql = match (steps_has_step_type, steps_has_metadata) {
+            (true, true) => {
+                "SELECT idx, step_type, metadata FROM steps WHERE metadata IS NOT NULL OR step_type IN (17, 23) ORDER BY idx ASC"
+            }
+            (false, true) => {
+                "SELECT idx, NULL, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC"
+            }
+            (true, false) => {
+                "SELECT idx, step_type, NULL FROM steps WHERE step_type IN (17, 23) ORDER BY idx ASC"
+            }
+            (false, false) => unreachable!(),
+        };
+        if let Ok(mut step_stmt) = conn.prepare(step_sql) {
+            if let Ok(mut step_rows) = step_stmt.query([]) {
+                has_steps_table = true;
+                while let Ok(Some(row)) = step_rows.next() {
+                    let Ok(idx) = row.get::<_, i64>(0) else {
+                        continue;
+                    };
+                    if idx < 0 {
+                        continue;
                     }
-                }
+                    let step_idx = idx as u64;
+                    let step_type = row.get::<_, Option<i64>>(1).ok().flatten();
+                    let meta_blob = row.get::<_, Option<Vec<u8>>>(2).ok().flatten();
+                    let step_rec = meta_blob
+                        .as_deref()
+                        .filter(|b| !b.is_empty())
+                        .and_then(extract_step_metadata_record);
 
-                for retry in step_rec.retry_usages {
-                    let turn = RawTurn::from_attempt(
-                        retry,
-                        step_ts,
-                        step_rec.model_enum,
-                        step_rec.response_model.as_deref(),
-                        step_rec.model_display_name.as_deref(),
-                        false,
-                    );
-                    if turn.has_signal() {
-                        step_candidates.push((step_idx, turn));
+                    if let Some(ref rec) = step_rec {
+                        if is_foreign_cascade_id(
+                            rec.origin_cascade_id.as_deref(),
+                            expected_conversation_id,
+                        ) {
+                            continue;
+                        }
+                    }
+
+                    match step_type {
+                        Some(STEP_TYPE_ERROR_MESSAGE) => {
+                            diagnostics.error_steps = diagnostics.error_steps.saturating_add(1);
+                        }
+                        Some(STEP_TYPE_CHECKPOINT) => {
+                            diagnostics.compaction_steps =
+                                diagnostics.compaction_steps.saturating_add(1);
+                        }
+                        _ => {}
+                    }
+
+                    let Some(step_rec) = step_rec else {
+                        continue;
+                    };
+
+                    if !step_rec.retry_attempts.is_empty() {
+                        step_retry_candidates.push((step_idx, step_rec.retry_attempts));
+                    }
+
+                    let step_ts = if let Some(ts) = step_rec.created_at_secs {
+                        step_timestamps.insert(step_idx, (ts, TS_QUALITY_STEP_PRIMARY));
+                        (Some(ts), TS_QUALITY_STEP_PRIMARY)
+                    } else if let Some(ts) = step_rec.secondary_created_at_secs {
+                        step_timestamps.insert(step_idx, (ts, TS_QUALITY_SECONDARY));
+                        (Some(ts), TS_QUALITY_SECONDARY)
+                    } else {
+                        fallback_timestamp(trajectory_ts, db_mtime_secs)
+                    };
+
+                    if let Some(usage) = step_rec.usage {
+                        let turn = RawTurn::from_attempt(
+                            usage,
+                            step_ts,
+                            step_rec.model_enum,
+                            step_rec.response_model.as_deref(),
+                            step_rec.model_display_name.as_deref(),
+                            true,
+                        );
+                        if turn.has_signal() {
+                            step_candidates.push((step_idx, turn));
+                        }
+                    }
+
+                    for retry in step_rec.retry_usages {
+                        let turn = RawTurn::from_attempt(
+                            retry,
+                            step_ts,
+                            step_rec.model_enum,
+                            step_rec.response_model.as_deref(),
+                            step_rec.model_display_name.as_deref(),
+                            false,
+                        );
+                        if turn.has_signal() {
+                            step_candidates.push((step_idx, turn));
+                        }
                     }
                 }
             }
@@ -624,6 +846,7 @@ fn extract_sqlite_db_turns(
 
     let mut has_gen_table = false;
     let mut covered_step_indices: HashSet<u64> = HashSet::new();
+    let mut gen_retry_covered_steps: HashSet<u64> = HashSet::new();
     let mut turns = Vec::new();
     if let Ok(mut stmt) =
         conn.prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx ASC")
@@ -637,6 +860,20 @@ fn extract_sqlite_db_turns(
                 let Some(rec) = extract_gen_metadata_record(&blob) else {
                     continue;
                 };
+                if is_foreign_cascade_id(rec.origin_cascade_id.as_deref(), expected_conversation_id)
+                {
+                    continue;
+                }
+                let mut recorded_gen_retry = false;
+                for attempt in &rec.retry_attempts {
+                    if attempt.is_anomaly() {
+                        recorded_gen_retry = true;
+                        diagnostics.record_retry(attempt);
+                    }
+                }
+                if recorded_gen_retry {
+                    gen_retry_covered_steps.extend(rec.step_indices.iter().copied());
+                }
                 covered_step_indices.extend(rec.step_indices.iter().copied());
 
                 let (ts_secs, ts_quality) = rec
@@ -694,6 +931,17 @@ fn extract_sqlite_db_turns(
         return None;
     }
 
+    // Avoid double-counting retries mirrored onto both `gen_metadata.chat(17)` and
+    // `steps.metadata(28)` for the same step while retaining uncovered/step-only retries.
+    for (step_idx, attempts) in step_retry_candidates {
+        if gen_retry_covered_steps.contains(&step_idx) {
+            continue;
+        }
+        for attempt in &attempts {
+            diagnostics.record_retry(attempt);
+        }
+    }
+
     for (step_idx, turn) in step_candidates {
         if !turn.has_any_identity() && covered_step_indices.contains(&step_idx) {
             continue;
@@ -701,44 +949,60 @@ fn extract_sqlite_db_turns(
         turns.push(turn);
     }
 
-    Some(deduplicate_turns_by(
-        turns,
-        |t| t,
-        |_, _| false,
-        merge_raw_turn,
-    ))
+    Some(ScannedDbData {
+        turns: deduplicate_turns_by(turns, |t| t, |_, _| false, merge_raw_turn),
+        diagnostics,
+    })
 }
 
-fn scan_single_sqlite_db_raw(target: &DbTarget) -> Option<(&'static str, Vec<RawTurn>)> {
+pub(super) fn extract_sqlite_db_turns(
+    conn: &rusqlite::Connection,
+    db_mtime_secs: Option<i64>,
+    expected_conversation_id: Option<&str>,
+) -> Option<Vec<RawTurn>> {
+    extract_sqlite_db_data(conn, db_mtime_secs, expected_conversation_id).map(|data| data.turns)
+}
+
+fn scan_single_sqlite_db_raw(target: &DbTarget) -> Option<ScannedDbData> {
     let conn = open_readonly_db(&target.path).ok()?;
-    let turns = extract_sqlite_db_turns(&conn, target.db_mtime_secs)?;
-    Some((target.source, turns))
+    extract_sqlite_db_data(&conn, target.db_mtime_secs, Some(&target.conversation_id))
 }
 
-fn scan_sqlite_targets_raw(targets: &[DbTarget]) -> Vec<(&'static str, Vec<RawTurn>)> {
+fn scan_missed_targets_parallel(
+    misses: &[(usize, String, Option<DbFileFingerprint>, &DbTarget)],
+) -> Vec<(
+    usize,
+    String,
+    Option<DbFileFingerprint>,
+    Option<ScannedDbData>,
+)> {
     let workers = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .clamp(1, 8);
-    if targets.len() <= 8 || workers == 1 {
-        targets
+    if misses.len() <= 8 || workers == 1 {
+        misses
             .iter()
-            .filter_map(scan_single_sqlite_db_raw)
+            .map(|(slot, key, fp, target)| {
+                (*slot, key.clone(), *fp, scan_single_sqlite_db_raw(target))
+            })
             .collect()
     } else {
-        let chunk_size = targets.len().div_ceil(workers);
+        let chunk_size = misses.len().div_ceil(workers);
         std::thread::scope(|scope| {
-            let handles: Vec<_> = targets
+            let handles: Vec<_> = misses
                 .chunks(chunk_size)
                 .map(|chunk| {
                     scope.spawn(move || {
                         chunk
                             .iter()
-                            .filter_map(scan_single_sqlite_db_raw)
+                            .map(|(slot, key, fp, target)| {
+                                (*slot, key.clone(), *fp, scan_single_sqlite_db_raw(target))
+                            })
                             .collect::<Vec<_>>()
                     })
                 })
                 .collect();
-            let mut merged = Vec::new();
+            let mut merged = Vec::with_capacity(misses.len());
             for h in handles {
                 if let Ok(part) = h.join() {
                     merged.extend(part);
@@ -747,6 +1011,56 @@ fn scan_sqlite_targets_raw(targets: &[DbTarget]) -> Vec<(&'static str, Vec<RawTu
             merged
         })
     }
+}
+
+fn scan_sqlite_targets_with_cache(
+    targets: &[DbTarget],
+    cache_path: Option<&Path>,
+) -> (Vec<(&'static str, ScannedDbData)>, usize, usize) {
+    let mut cache = cache_path.map(global_cache::GlobalStatsCache::load);
+    let mut slots: Vec<Option<(&'static str, ScannedDbData)>> = vec![None; targets.len()];
+    let mut live_keys: HashSet<String> = HashSet::with_capacity(targets.len());
+    let mut misses: Vec<(usize, String, Option<DbFileFingerprint>, &DbTarget)> = Vec::new();
+    let mut cache_hits = 0usize;
+
+    for (idx, target) in targets.iter().enumerate() {
+        let key = canonical_or_self(&target.path)
+            .to_string_lossy()
+            .into_owned();
+        live_keys.insert(key.clone());
+        // Stat before opening so concurrent SQLite commits invalidate on the next scan.
+        let fp = db_file_fingerprint(&target.path);
+        if let (Some(c), Some(fp_val)) = (cache.as_ref(), fp) {
+            if let Some(hit) = c.get_matching(&key, fp_val) {
+                slots[idx] = Some((target.source, hit.clone()));
+                cache_hits += 1;
+                continue;
+            }
+        }
+        misses.push((idx, key, fp, target));
+    }
+
+    let cache_misses = misses.len();
+    let scanned_misses = scan_missed_targets_parallel(&misses);
+    for (slot_idx, key, fp, data_opt) in scanned_misses {
+        if let Some(data) = data_opt {
+            if let (Some(c), Some(fp_val)) = (cache.as_mut(), fp) {
+                c.upsert(key, fp_val, data.clone());
+            }
+            slots[slot_idx] = Some((targets[slot_idx].source, data));
+        }
+    }
+
+    if let (Some(mut c), Some(path)) = (cache, cache_path) {
+        c.prune_missing(&live_keys);
+        c.save_if_dirty(path);
+    }
+
+    (
+        slots.into_iter().flatten().collect(),
+        cache_hits,
+        cache_misses,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1153,20 +1467,45 @@ fn project_sqlite_conversations<'a>(
     (stats, events)
 }
 
+/// Scans all SQLite conversation DBs across `roots` using an optional explicit per-DB cache path,
+/// returning projected usage events, SQLite speed/TTFT stats, retry/error/compaction diagnostics,
+/// and per-DB cache hit/miss counts.
+pub(crate) fn scan_sqlite_conversations_with_cache(
+    roots: &[(&'static str, PathBuf)],
+    tz: &TimeZoneSpec,
+    pricing: &PricingCatalog,
+    cache_path: Option<&Path>,
+) -> GlobalScanResult {
+    let targets = discover_sqlite_db_targets(roots);
+    let (scanned, cache_hits, cache_misses) = scan_sqlite_targets_with_cache(&targets, cache_path);
+    let mut diagnostics = ScanDiagnostics::default();
+    for (_, data) in &scanned {
+        diagnostics.merge(&data.diagnostics);
+    }
+    let (sqlite, events) = project_sqlite_conversations(
+        scanned
+            .iter()
+            .map(|(source, data)| (*source, data.turns.as_slice())),
+        tz,
+        pricing,
+    );
+    GlobalScanResult {
+        sqlite,
+        events,
+        diagnostics,
+        cache_hits,
+        cache_misses,
+    }
+}
+
 pub(super) fn scan_sqlite_conversations(
     roots: &[(&'static str, PathBuf)],
     tz: &TimeZoneSpec,
     pricing: &PricingCatalog,
 ) -> (SqliteStats, Vec<UsageEvent>) {
-    let targets = discover_sqlite_db_targets(roots);
-    let scanned = scan_sqlite_targets_raw(&targets);
-    project_sqlite_conversations(
-        scanned
-            .iter()
-            .map(|(source, turns)| (*source, turns.as_slice())),
-        tz,
-        pricing,
-    )
+    let default_cache = global_cache::default_stats_scan_cache_path();
+    let res = scan_sqlite_conversations_with_cache(roots, tz, pricing, default_cache.as_deref());
+    (res.sqlite, res.events)
 }
 
 fn resolve_descendant_conversation_ids(cli_dir: &Path, root_id: &str) -> Vec<String> {
@@ -1214,9 +1553,15 @@ fn resolve_descendant_conversation_ids(cli_dir: &Path, root_id: &str) -> Vec<Str
     ids
 }
 
-fn read_single_db_turns(db_path: &Path) -> Option<Vec<RawTurn>> {
+fn read_single_db_turns(
+    db_path: &Path,
+    expected_conversation_id: Option<&str>,
+) -> Option<Vec<RawTurn>> {
     let conn = open_readonly_db(db_path).ok()?;
-    extract_sqlite_db_turns(&conn, None)
+    let inferred = expected_conversation_id
+        .map(str::to_string)
+        .or_else(|| conversation_id_from_db_path(db_path));
+    extract_sqlite_db_turns(&conn, None, inferred.as_deref())
 }
 
 /// Deduplicates tagged turns across parent + descendant DBs via Union-Find, preferring
@@ -1594,7 +1939,7 @@ mod tests {
         )
         .unwrap();
 
-        let turns = extract_sqlite_db_turns(&conn, Some(1_795_000_999)).unwrap();
+        let turns = extract_sqlite_db_turns(&conn, Some(1_795_000_999), None).unwrap();
         assert_eq!(turns.len(), 4);
 
         // Turn 0: merged gen_metadata(1) + steps(1).f28 retry via id_11="r1".
@@ -1780,5 +2125,247 @@ mod tests {
         assert_eq!(events[8].model_group, "model#9999");
         assert_eq!(events[8].pricing_key, None);
         assert_eq!(events[8].cost_usd, None);
+    }
+
+    #[test]
+    fn global_scan_filters_forks_aggregates_diagnostics_and_caches_with_wal_invalidation() {
+        use crate::agy::protobuf::{
+            encode_gen_blob, encode_step_blob, GenBlobSpec, RetrySpec, StepBlobSpec, UsageSpec,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cli_root = dir.path().join(".gemini/antigravity-cli");
+        let conv_dir = cli_root.join("conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let fork_id = "22222222-2222-4222-8222-222222222222";
+        let fork_db = conv_dir.join(format!("{fork_id}.db"));
+
+        // WAL-mode fork DB with cloned parent turn (parent DB deleted) + own turn + step_type 17/23 + retries.
+        let conn = Connection::open(&fork_db).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB);
+             CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (1, 17, ?1)",
+            [encode_step_blob(StepBlobSpec {
+                created_at_secs: Some(1_795_000_100),
+                origin_cascade_id: Some(parent_id),
+                retry_records: vec![RetrySpec {
+                    error: Some("HTTP 429 cloned"),
+                    reason_code: 429,
+                    delay_secs: 5,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (2, 17, ?1)",
+            [encode_step_blob(StepBlobSpec {
+                created_at_secs: Some(1_795_000_200),
+                origin_cascade_id: Some(fork_id),
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (3, 23, ?1)",
+            [encode_step_blob(StepBlobSpec {
+                created_at_secs: Some(1_795_000_250),
+                origin_cascade_id: Some(fork_id),
+                usage: Some(UsageSpec {
+                    model_enum: 1669,
+                    input_tok: 500,
+                    output_tok: 50,
+                    ..Default::default()
+                }),
+                retry_records: vec![RetrySpec {
+                    error: Some("No capacity available"),
+                    reason_code: 0,
+                    delay_secs: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [encode_gen_blob(GenBlobSpec {
+                step_indices: vec![1],
+                origin_cascade_id: Some(parent_id),
+                model_enum: 1669,
+                resp_model: Some("gemini-4-hydrogen"),
+                input_tok: 99_999,
+                output_tok: 999,
+                dur_secs: 1,
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
+            [encode_gen_blob(GenBlobSpec {
+                step_indices: vec![2],
+                origin_cascade_id: Some(fork_id),
+                model_enum: 1669,
+                resp_model: Some("gemini-4-hydrogen"),
+                input_tok: 1_000_000,
+                output_tok: 100,
+                dur_secs: 2,
+                retry_records: vec![RetrySpec {
+                    error: Some("HTTP 429 quota reached"),
+                    reason_code: 429,
+                    delay_secs: 1,
+                    delay_nanos: 500_000_000,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+
+        let roots = [("cli", cli_root)];
+        let cache_dir = dir.path().join("cache");
+        let pricing = test_pricing_catalog(&cache_dir);
+        let stats_cache = cache_dir.join(STATS_SCAN_CACHE_FILE);
+
+        // Cold scan: miss = 1, hit = 0; foreign parent rows excluded; own turns + diagnostics captured.
+        let first = scan_sqlite_conversations_with_cache(
+            &roots,
+            &TimeZoneSpec::utc(),
+            &pricing,
+            Some(&stats_cache),
+        );
+        assert_eq!(first.cache_misses, 1);
+        assert_eq!(first.cache_hits, 0);
+        assert_eq!(first.events.len(), 2);
+        assert_eq!(first.diagnostics.retry_count, 2);
+        assert_eq!(first.diagnostics.retries_429, 1);
+        assert_eq!(first.diagnostics.retries_503, 1);
+        assert!((first.diagnostics.total_retry_delay_secs - 3.5).abs() < 1e-6);
+        assert_eq!(first.diagnostics.error_steps, 1);
+        assert_eq!(first.diagnostics.compaction_steps, 1);
+        assert!(stats_cache.is_file());
+
+        // Second scan on unchanged DB hits cache and preserves identical events & diagnostics.
+        let second = scan_sqlite_conversations_with_cache(
+            &roots,
+            &TimeZoneSpec::utc(),
+            &pricing,
+            Some(&stats_cache),
+        );
+        assert_eq!(second.cache_hits, 1);
+        assert_eq!(second.cache_misses, 0);
+        assert_eq!(second.events.len(), 2);
+        assert_eq!(second.diagnostics, first.diagnostics);
+
+        // WAL-only mutation (writer stays open so new frame lands in -wal) invalidates cache.
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (3, ?1)",
+            [encode_gen_blob(GenBlobSpec {
+                step_indices: vec![2],
+                origin_cascade_id: Some(fork_id),
+                model_enum: 1669,
+                resp_model: Some("gemini-4-hydrogen"),
+                input_tok: 2_000,
+                output_tok: 200,
+                dur_secs: 2,
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        let third = scan_sqlite_conversations_with_cache(
+            &roots,
+            &TimeZoneSpec::utc(),
+            &pricing,
+            Some(&stats_cache),
+        );
+        assert_eq!(third.cache_hits, 0);
+        assert_eq!(third.cache_misses, 1);
+        assert_eq!(third.events.len(), 3);
+        drop(conn);
+    }
+
+    #[test]
+    fn extract_sqlite_db_data_dedups_mirrored_gen_and_step_retries_while_keeping_compaction_retries(
+    ) {
+        use crate::agy::protobuf::{
+            encode_gen_blob, encode_step_blob, GenBlobSpec, RetrySpec, StepBlobSpec,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mirrored_retries.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB);
+             CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .unwrap();
+
+        // Step 1 is covered by gen_metadata(1), and BOTH mirror the same 429 retry -> count ONCE.
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (1, 15, ?1)",
+            [encode_step_blob(StepBlobSpec {
+                created_at_secs: Some(1_795_000_100),
+                retry_records: vec![RetrySpec {
+                    error: Some("HTTP 429 rate limit"),
+                    reason_code: 429,
+                    delay_secs: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [encode_gen_blob(GenBlobSpec {
+                step_indices: vec![1],
+                model_enum: 1669,
+                input_tok: 1_000,
+                output_tok: 100,
+                dur_secs: 1,
+                retry_records: vec![RetrySpec {
+                    error: Some("HTTP 429 rate limit"),
+                    reason_code: 429,
+                    delay_secs: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+
+        // Step 2 is an uncovered compaction checkpoint (step_type = 23) with a 503 retry -> counted.
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (2, 23, ?1)",
+            [encode_step_blob(StepBlobSpec {
+                created_at_secs: Some(1_795_000_200),
+                retry_records: vec![RetrySpec {
+                    error: Some("HTTP 503 overloaded"),
+                    reason_code: 503,
+                    delay_secs: 3,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+
+        let data = extract_sqlite_db_data(&conn, None, None).unwrap();
+        assert_eq!(data.diagnostics.retry_count, 2);
+        assert_eq!(data.diagnostics.retries_429, 1);
+        assert_eq!(data.diagnostics.retries_503, 1);
+        assert_eq!(data.diagnostics.retries_non_429_503(), 0);
+        assert!((data.diagnostics.total_retry_delay_secs - 5.0).abs() < 1e-6);
+        assert_eq!(data.diagnostics.compaction_steps, 1);
+        assert!(!data.diagnostics.is_empty());
     }
 }
