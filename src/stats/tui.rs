@@ -21,6 +21,7 @@ use ratatui::widgets::{
     TableState,
 };
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use super::metric::{ConversationSort, StatsMetric, StatsTuiPrefs, TurnSort};
 use super::pricing::{
@@ -177,6 +178,125 @@ impl Palette {
 
 pub(super) fn right_cell(text: impl Into<String>, style: Style) -> Cell<'static> {
     Cell::from(Text::from(text.into()).alignment(Alignment::Right)).style(style)
+}
+
+/// Clickable screen rectangle bound to a typed UI action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClickRegion<A> {
+    pub(super) rect: Rect,
+    pub(super) action: A,
+}
+
+/// Clickable screen rectangles derived directly from render geometry.
+#[derive(Debug, Clone)]
+pub(super) struct ClickRegions<A>(Vec<ClickRegion<A>>);
+
+impl<A> Default for ClickRegions<A> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<A> ClickRegions<A> {
+    pub(super) fn push(&mut self, rect: Rect, action: A) {
+        if rect.width > 0 && rect.height > 0 {
+            self.0.push(ClickRegion { rect, action });
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn find(&self, pred: impl Fn(&A) -> bool) -> Option<Rect> {
+        self.0.iter().find(|r| pred(&r.action)).map(|r| r.rect)
+    }
+}
+
+impl<A: Copy> ClickRegions<A> {
+    pub(super) fn hit(&self, pos: Position) -> Option<A> {
+        self.0
+            .iter()
+            .find(|r| r.rect.contains(pos))
+            .map(|r| r.action)
+    }
+}
+
+/// Single-line horizontal span builder that records exact clickable `Rect`s as spans are laid out.
+pub(super) struct SpanBar<A> {
+    area: Rect,
+    used: u16,
+    spans: Vec<Span<'static>>,
+    hits: ClickRegions<A>,
+}
+
+impl<A> SpanBar<A> {
+    pub(super) fn new(area: Rect) -> Self {
+        Self {
+            area,
+            used: 0,
+            spans: Vec::new(),
+            hits: ClickRegions::default(),
+        }
+    }
+
+    pub(super) fn push(&mut self, text: impl Into<String>, style: Style) -> bool {
+        let text = text.into();
+        let w = u16::try_from(text.width()).unwrap_or(u16::MAX);
+        if self.area.height == 0 || self.used.saturating_add(w) > self.area.width {
+            return false;
+        }
+        self.spans.push(Span::styled(text, style));
+        self.used += w;
+        true
+    }
+
+    pub(super) fn push_click(&mut self, text: impl Into<String>, style: Style, action: A) -> bool {
+        let text = text.into();
+        let w = u16::try_from(text.width()).unwrap_or(u16::MAX);
+        if self.area.height == 0 || self.used.saturating_add(w) > self.area.width {
+            return false;
+        }
+        let rect = Rect::new(self.area.x.saturating_add(self.used), self.area.y, w, 1);
+        self.hits.push(rect, action);
+        self.spans.push(Span::styled(text, style));
+        self.used += w;
+        true
+    }
+
+    /// Appends an optional separator followed by a clickable control only when both fit.
+    pub(super) fn push_sep_click(
+        &mut self,
+        sep: &str,
+        sep_style: Style,
+        text: impl Into<String>,
+        style: Style,
+        action: A,
+    ) -> bool {
+        let text = text.into();
+        let need_sep = !self.spans.is_empty();
+        let sep_w = if need_sep {
+            u16::try_from(sep.width()).unwrap_or(u16::MAX)
+        } else {
+            0
+        };
+        let w = u16::try_from(text.width()).unwrap_or(u16::MAX);
+        if self.area.height == 0
+            || self.used.saturating_add(sep_w).saturating_add(w) > self.area.width
+        {
+            return false;
+        }
+        if need_sep {
+            self.spans.push(Span::styled(sep.to_string(), sep_style));
+            self.used += sep_w;
+        }
+        let rect = Rect::new(self.area.x.saturating_add(self.used), self.area.y, w, 1);
+        self.hits.push(rect, action);
+        self.spans.push(Span::styled(text, style));
+        self.used += w;
+        true
+    }
+
+    pub(super) fn finish(self) -> (Line<'static>, ClickRegions<A>) {
+        (Line::from(self.spans), self.hits)
+    }
 }
 
 /// Exact horizontal click zone for a single table header column.
@@ -747,12 +867,10 @@ impl StatsApp {
                                 d.handle_key(key.code, key.modifiers, term_h)
                             })
                         }
-                        Event::Mouse(mouse) => {
-                            if let Some(d) = self.dashboard.as_mut() {
-                                d.handle_mouse(mouse);
-                            }
-                            StatsAction::Continue
-                        }
+                        Event::Mouse(mouse) => self
+                            .dashboard
+                            .as_mut()
+                            .map_or(StatsAction::Continue, |d| d.handle_mouse(mouse, term_h)),
                         _ => StatsAction::Continue,
                     };
                     self.sync_prefs();
@@ -776,7 +894,7 @@ impl StatsApp {
                         Event::Mouse(mouse) => self
                             .picker
                             .as_mut()
-                            .map_or(PickerAction::Continue, |p| p.handle_mouse(mouse)),
+                            .map_or(PickerAction::Continue, |p| p.handle_mouse(mouse, has_back)),
                         _ => PickerAction::Continue,
                     };
                     self.sync_prefs();
@@ -813,12 +931,10 @@ impl StatsApp {
                                 d.handle_key(key.code, key.modifiers, has_back)
                             })
                         }
-                        Event::Mouse(mouse) => {
-                            if let Some(d) = self.detail.as_mut() {
-                                d.handle_mouse(mouse);
-                            }
-                            DetailAction::Continue
-                        }
+                        Event::Mouse(mouse) => self
+                            .detail
+                            .as_mut()
+                            .map_or(DetailAction::Continue, |d| d.handle_mouse(mouse, has_back)),
                         _ => DetailAction::Continue,
                     };
                     self.sync_prefs();

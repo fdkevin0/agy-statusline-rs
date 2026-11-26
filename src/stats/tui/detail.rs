@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{
     compute_header_hits, render_table_with_scrollbar, right_cell, token_breakdown_lines,
-    HeaderHits, Palette, TableChrome, TableHit,
+    ClickRegions, HeaderHits, Palette, SpanBar, TableChrome, TableHit,
 };
 use crate::agy::db::compute_median;
 use crate::stats::metric::{
@@ -43,6 +43,22 @@ pub(super) enum DetailAction {
     Continue,
     Refresh,
     OpenConversations,
+    Back,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailClick {
+    ToggleSortDir,
+    CycleSortField,
+    ToggleMisses,
+    ClearModelFilter,
+    ClearSubagentFilter,
+    ClearAllFilters,
+    ToggleRightTab,
+    TogglePane,
+    OpenConversations,
+    Refresh,
     Back,
     Quit,
 }
@@ -130,6 +146,9 @@ pub(super) struct DetailScreen {
     view: DetailView,
     turns_table: TableState,
     breakdown_table: TableState,
+    header_hits: ClickRegions<DetailClick>,
+    kpi_hits: ClickRegions<DetailClick>,
+    footer_hits: ClickRegions<DetailClick>,
     turns_hit: TableHit,
     turns_header_hits: HeaderHits<TurnCol>,
     breakdown_hit: TableHit,
@@ -166,6 +185,9 @@ impl DetailScreen {
             status_msg: None,
             turns_table: TableState::default(),
             breakdown_table: TableState::default(),
+            header_hits: ClickRegions::default(),
+            kpi_hits: ClickRegions::default(),
+            footer_hits: ClickRegions::default(),
             turns_hit: TableHit::default(),
             turns_header_hits: HeaderHits::default(),
             breakdown_hit: TableHit::default(),
@@ -520,7 +542,60 @@ impl DetailScreen {
         DetailAction::Continue
     }
 
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+    fn apply_click(&mut self, click: DetailClick, has_back: bool) -> DetailAction {
+        match click {
+            DetailClick::ToggleSortDir => {
+                self.sort = self.sort.toggle_dir();
+                self.turn_idx = 0;
+                self.recompute_view();
+            }
+            DetailClick::CycleSortField => self.cycle_sort_field(),
+            DetailClick::ToggleMisses => {
+                self.misses_only = !self.misses_only;
+                self.turn_idx = 0;
+                self.recompute_view();
+            }
+            DetailClick::ClearModelFilter => {
+                self.model_filter = None;
+                self.turn_idx = 0;
+                self.recompute_view();
+            }
+            DetailClick::ClearSubagentFilter => {
+                self.subagent_filter = None;
+                self.turn_idx = 0;
+                self.recompute_view();
+            }
+            DetailClick::ClearAllFilters => {
+                self.misses_only = false;
+                self.model_filter = None;
+                self.subagent_filter = None;
+                self.turn_idx = 0;
+                self.recompute_view();
+            }
+            DetailClick::ToggleRightTab if !self.report.subagents.is_empty() => {
+                self.right_tab = match self.right_tab {
+                    RightTab::Models => RightTab::Subagents,
+                    RightTab::Subagents => RightTab::Models,
+                };
+                self.breakdown_idx = 0;
+            }
+            DetailClick::ToggleRightTab => {}
+            DetailClick::TogglePane => {
+                self.active_pane = match self.active_pane {
+                    DetailPane::Turns => DetailPane::Breakdown,
+                    DetailPane::Breakdown => DetailPane::Turns,
+                };
+            }
+            DetailClick::OpenConversations => return DetailAction::OpenConversations,
+            DetailClick::Refresh => return DetailAction::Refresh,
+            DetailClick::Back if has_back => return DetailAction::Back,
+            DetailClick::Back => {}
+            DetailClick::Quit => return DetailAction::Quit,
+        }
+        DetailAction::Continue
+    }
+
+    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent, has_back: bool) -> DetailAction {
         let pos = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -549,8 +624,22 @@ impl DetailScreen {
                     }
                 }
             }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.header_hits.hit(pos) == Some(DetailClick::ToggleSortDir) {
+                    self.status_msg = None;
+                    self.cycle_sort_field();
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.status_msg = None;
+                if let Some(click) = self
+                    .header_hits
+                    .hit(pos)
+                    .or_else(|| self.kpi_hits.hit(pos))
+                    .or_else(|| self.footer_hits.hit(pos))
+                {
+                    return self.apply_click(click, has_back);
+                }
                 if self.turns_hit.contains(pos) {
                     self.active_pane = DetailPane::Turns;
                     if let Some(col) = self.turns_header_hits.col_at(pos) {
@@ -588,6 +677,7 @@ impl DetailScreen {
             }
             _ => {}
         }
+        DetailAction::Continue
     }
 
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>, has_back: bool, pal: &Palette) {
@@ -602,8 +692,8 @@ impl DetailScreen {
             ])
             .split(area);
 
-        self.draw_header(frame, root[0], pal);
-        self.draw_kpi_strip(frame, root[1], pal);
+        self.header_hits = self.draw_header(frame, root[0], pal);
+        self.kpi_hits = self.draw_kpi_strip(frame, root[1], pal);
 
         let body = root[2];
         self.turns_hit = TableHit::default();
@@ -636,10 +726,15 @@ impl DetailScreen {
             self.breakdown_hit = self.draw_breakdown_pane(frame, stacked[1], pal);
         }
 
-        self.draw_footer(frame, root[3], has_back, pal);
+        self.footer_hits = self.draw_footer(frame, root[3], has_back, pal);
     }
 
-    fn draw_header(&self, frame: &mut Frame<'_>, area: Rect, pal: &Palette) {
+    fn draw_header(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        pal: &Palette,
+    ) -> ClickRegions<DetailClick> {
         let sep = pal.sep();
         let short_id: String = self.report.conversation_id.chars().take(8).collect();
         let model_tag = if self.report.models.len() == 1 {
@@ -653,21 +748,16 @@ impl DetailScreen {
             self.report.source, self.report.timezone
         );
 
-        let inner_w = usize::from(area.width.saturating_sub(2));
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut used = 0usize;
-        let mut push = |text: String, style: Style| -> bool {
-            let w = text.width();
-            if used + w > inner_w {
-                return false;
-            }
-            spans.push(Span::styled(text, style));
-            used += w;
-            true
-        };
+        let block = pal.pane_block(title, false);
+        let inner = block.inner(area);
+        let inner_w = usize::from(inner.width);
+        let mut bar = SpanBar::new(inner);
 
-        let mut controls: Vec<(String, Style)> =
-            vec![(format!(" {} ", self.sort.label(pal.ascii)), pal.pill(true))];
+        let mut controls: Vec<(String, Style, DetailClick)> = vec![(
+            format!(" {} ", self.sort.label(pal.ascii)),
+            pal.pill(true),
+            DetailClick::ToggleSortDir,
+        )];
         if self.misses_only {
             let style = if pal.no_color {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
@@ -677,7 +767,7 @@ impl DetailScreen {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
             };
-            controls.push((" Misses ".to_string(), style));
+            controls.push((" Misses ".to_string(), style, DetailClick::ToggleMisses));
         }
         let badge_style = if pal.no_color {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -693,6 +783,7 @@ impl DetailScreen {
             controls.push((
                 format!(" {close} {} ", truncate_to_width(model, 18, ellipsis)),
                 badge_style,
+                DetailClick::ClearModelFilter,
             ));
         }
         if let Some(sub_id) = self.subagent_filter.as_deref() {
@@ -704,10 +795,15 @@ impl DetailScreen {
             controls.push((
                 format!(" {close} {} ", truncate_to_width(label, 18, ellipsis)),
                 badge_style,
+                DetailClick::ClearSubagentFilter,
             ));
         }
 
-        let controls_w: usize = controls.iter().map(|(s, _)| s.width() + 1).sum::<usize>() + 2;
+        let controls_w: usize = controls
+            .iter()
+            .map(|(s, _, _)| s.width() + 1)
+            .sum::<usize>()
+            + 2;
         let conv_label = self
             .report
             .title
@@ -716,31 +812,35 @@ impl DetailScreen {
             .unwrap_or(&self.report.conversation_id);
         let title_budget = inner_w.saturating_sub(controls_w + 2);
         if title_budget >= 8 {
-            let _ = push(
+            let _ = bar.push(
                 format!(" {}", truncate_to_width(conv_label, title_budget, ellipsis)),
                 pal.bold(Color::White),
             );
-            let _ = push(format!(" {sep} "), pal.dim());
+            let _ = bar.push(format!(" {sep} "), pal.dim());
         } else {
-            let _ = push(" ".to_string(), Style::default());
+            let _ = bar.push(" ", Style::default());
         }
 
-        for (idx, (text, style)) in controls.into_iter().enumerate() {
-            if idx > 0 && !push(" ".to_string(), Style::default()) {
+        for (idx, (text, style, action)) in controls.into_iter().enumerate() {
+            if idx > 0 && !bar.push(" ", Style::default()) {
                 break;
             }
-            if !push(text, style) {
+            if !bar.push_click(text, style, action) {
                 break;
             }
         }
 
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).block(pal.pane_block(title, false)),
-            area,
-        );
+        let (line, hits) = bar.finish();
+        frame.render_widget(Paragraph::new(line).block(block), area);
+        hits
     }
 
-    fn draw_kpi_strip(&self, frame: &mut Frame<'_>, area: Rect, pal: &Palette) {
+    fn draw_kpi_strip(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        pal: &Palette,
+    ) -> ClickRegions<DetailClick> {
         let sep = pal.sep();
         let arrow = if pal.ascii { "->" } else { "→" };
         let filtered = self.has_active_filters();
@@ -761,32 +861,45 @@ impl DetailScreen {
             " Summary ".to_string()
         };
 
-        let inner_w = usize::from(area.width.saturating_sub(2));
+        let block = pal.pane_block(title, false);
+        let inner = block.inner(area);
+        let inner_w = usize::from(inner.width);
         let sep_str = format!(" {sep} ");
         let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut hits = ClickRegions::default();
         let mut used = 0usize;
-        let mut push_segment = |label: &str, value: String, value_style: Style| {
-            let prefix = if spans.is_empty() {
-                " "
-            } else {
-                sep_str.as_str()
-            };
-            let seg_w = prefix.width() + label.width() + value.width();
-            if !spans.is_empty() && used + seg_w > inner_w {
-                return;
-            }
-            spans.push(Span::styled(
-                prefix.to_string(),
-                if spans.is_empty() {
-                    Style::default()
+        let mut push_segment =
+            |label: &str, value: String, value_style: Style, click: Option<DetailClick>| {
+                let prefix = if spans.is_empty() {
+                    " "
                 } else {
-                    pal.dim()
-                },
-            ));
-            spans.push(Span::styled(label.to_string(), pal.dim()));
-            spans.push(Span::styled(value, value_style));
-            used += seg_w;
-        };
+                    sep_str.as_str()
+                };
+                let prefix_w = prefix.width();
+                let label_w = label.width();
+                let val_w = value.width();
+                let seg_w = prefix_w + label_w + val_w;
+                if !spans.is_empty() && used + seg_w > inner_w {
+                    return;
+                }
+                if let Some(action) = click {
+                    if inner.height > 0 {
+                        let x = inner.x.saturating_add((used + prefix_w) as u16);
+                        hits.push(Rect::new(x, inner.y, (label_w + val_w) as u16, 1), action);
+                    }
+                }
+                spans.push(Span::styled(
+                    prefix.to_string(),
+                    if spans.is_empty() {
+                        Style::default()
+                    } else {
+                        pal.dim()
+                    },
+                ));
+                spans.push(Span::styled(label.to_string(), pal.dim()));
+                spans.push(Span::styled(value, value_style));
+                used += seg_w;
+            };
 
         let s = &self.view.summary;
         let turns_val = if filtered {
@@ -794,22 +907,29 @@ impl DetailScreen {
         } else {
             s.requests.to_string()
         };
-        push_segment("Turns ", turns_val, pal.bold(Color::White));
-        push_segment("Total ", fmt_tok(s.total_tokens), pal.bold(Color::Cyan));
+        push_segment("Turns ", turns_val, pal.bold(Color::White), None);
+        push_segment(
+            "Total ",
+            fmt_tok(s.total_tokens),
+            pal.bold(Color::Cyan),
+            None,
+        );
         let hit_pct = s.cache_hit_pct();
         push_segment(
             "Hit ",
             format_pct(hit_pct),
             pal.cache_hit_style(hit_pct).add_modifier(Modifier::BOLD),
+            None,
         );
         if let Some(peak) = self.view.peak_context_tokens {
-            push_segment("Peak ", fmt_tok(peak), pal.bold(Color::White));
+            push_segment("Peak ", fmt_tok(peak), pal.bold(Color::White), None);
         }
         if self.view.show_cost && s.priced_requests > 0 {
             push_segment(
                 "Cost ",
                 format_usd_short(s.priced_usd),
                 pal.bold(Color::Green),
+                None,
             );
         }
         let spd = self
@@ -820,7 +940,12 @@ impl DetailScreen {
             .view
             .median_ttft_secs
             .map_or_else(|| "-".to_string(), format_ttft_compact);
-        push_segment("Med ", format!("{spd}/{ttft}"), pal.bold(Color::White));
+        push_segment(
+            "Med ",
+            format!("{spd}/{ttft}"),
+            pal.bold(Color::White),
+            None,
+        );
 
         if !filtered && self.report.mid_session_misses > 0 {
             let miss_val = if self.report.mid_session_miss_usd > 0.0 {
@@ -832,13 +957,16 @@ impl DetailScreen {
             } else {
                 format!("{} miss", self.report.mid_session_misses)
             };
-            push_segment("", miss_val, pal.bold(Color::Red));
+            push_segment(
+                "",
+                miss_val,
+                pal.bold(Color::Red),
+                Some(DetailClick::ToggleMisses),
+            );
         }
 
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).block(pal.pane_block(title, false)),
-            area,
-        );
+        frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+        hits
     }
 
     fn draw_turns_pane(&mut self, frame: &mut Frame<'_>, area: Rect, pal: &Palette) -> TableHit {
@@ -1284,34 +1412,78 @@ impl DetailScreen {
         )
     }
 
-    fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect, has_back: bool, pal: &Palette) {
+    fn draw_footer(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        has_back: bool,
+        pal: &Palette,
+    ) -> ClickRegions<DetailClick> {
+        if let Some(msg) = &self.status_msg {
+            frame.render_widget(
+                Paragraph::new(Line::styled(format!(" {msg}"), pal.bold(Color::Yellow))),
+                area,
+            );
+            return ClickRegions::default();
+        }
+
+        let inset = Rect::new(
+            area.x.saturating_add(1),
+            area.y,
+            area.width.saturating_sub(1),
+            area.height,
+        );
         let sep = format!(" {} ", pal.sep());
-        let back_hint = if has_back {
-            format!("{sep}b Back")
-        } else {
-            String::new()
-        };
-        let text = if let Some(msg) = &self.status_msg {
-            format!(" {msg}")
-        } else if self.has_active_filters() {
-            format!(" Esc Clear{sep}c Convs{sep}s/S Sort{sep}m Misses{sep}Tab Pane{sep}r Refresh{back_hint}{sep}q Quit")
+        let dim = pal.dim();
+        let mut bar = SpanBar::new(inset);
+
+        if self.has_active_filters() {
+            let _ = bar.push_sep_click(&sep, dim, "Esc Clear", dim, DetailClick::ClearAllFilters);
+            let _ = bar.push_sep_click(&sep, dim, "c Convs", dim, DetailClick::OpenConversations);
+            let _ = bar.push_sep_click(&sep, dim, "s/S Sort", dim, DetailClick::CycleSortField);
+            let _ = bar.push_sep_click(&sep, dim, "m Misses", dim, DetailClick::ToggleMisses);
+            let _ = bar.push_sep_click(&sep, dim, "Tab Pane", dim, DetailClick::TogglePane);
+            let _ = bar.push_sep_click(&sep, dim, "r Refresh", dim, DetailClick::Refresh);
+            if has_back {
+                let _ = bar.push_sep_click(&sep, dim, "b Back", dim, DetailClick::Back);
+            }
+            let _ = bar.push_sep_click(&sep, dim, "q Quit", dim, DetailClick::Quit);
         } else if area.width < 92 {
-            format!(" c Convs{sep}s/S Sort{sep}m Misses{sep}Tab Pane{back_hint}{sep}q Quit")
+            let _ = bar.push_sep_click(&sep, dim, "c Convs", dim, DetailClick::OpenConversations);
+            let _ = bar.push_sep_click(&sep, dim, "s/S Sort", dim, DetailClick::CycleSortField);
+            let _ = bar.push_sep_click(&sep, dim, "m Misses", dim, DetailClick::ToggleMisses);
+            let _ = bar.push_sep_click(&sep, dim, "Tab Pane", dim, DetailClick::TogglePane);
+            if has_back {
+                let _ = bar.push_sep_click(&sep, dim, "b Back", dim, DetailClick::Back);
+            }
+            let _ = bar.push_sep_click(&sep, dim, "q Quit", dim, DetailClick::Quit);
         } else {
-            let sub_hint = if self.report.subagents.is_empty() {
-                String::new()
-            } else {
-                format!("{sep}v Models/Sub")
-            };
             let nav = if pal.ascii { "j/k" } else { "↑↓/jk" };
-            format!(" {nav} Select{sep}c Convs{sep}s/S Sort (click header){sep}m Misses{sub_hint}{sep}Tab Pane{sep}r Refresh{back_hint}{sep}q Quit")
-        };
-        let style = if self.status_msg.is_some() {
-            pal.bold(Color::Yellow)
-        } else {
-            pal.dim()
-        };
-        frame.render_widget(Paragraph::new(Line::styled(text, style)), area);
+            let _ = bar.push(format!("{nav} Select"), dim);
+            let _ = bar.push_sep_click(&sep, dim, "c Convs", dim, DetailClick::OpenConversations);
+            let _ = bar.push_sep_click(
+                &sep,
+                dim,
+                "s/S Sort (click header)",
+                dim,
+                DetailClick::CycleSortField,
+            );
+            let _ = bar.push_sep_click(&sep, dim, "m Misses", dim, DetailClick::ToggleMisses);
+            if !self.report.subagents.is_empty() {
+                let _ =
+                    bar.push_sep_click(&sep, dim, "v Models/Sub", dim, DetailClick::ToggleRightTab);
+            }
+            let _ = bar.push_sep_click(&sep, dim, "Tab Pane", dim, DetailClick::TogglePane);
+            let _ = bar.push_sep_click(&sep, dim, "r Refresh", dim, DetailClick::Refresh);
+            if has_back {
+                let _ = bar.push_sep_click(&sep, dim, "b Back", dim, DetailClick::Back);
+            }
+            let _ = bar.push_sep_click(&sep, dim, "q Quit", dim, DetailClick::Quit);
+        }
+
+        let (line, hits) = bar.finish();
+        frame.render_widget(Paragraph::new(line), inset);
+        hits
     }
 }
 
@@ -1658,11 +1830,14 @@ mod tests {
         };
 
         // Click Cost header -> sorts Cost descending (turn #3 $0.62, #1 $0.10, #2 $0.02).
-        screen.handle_mouse(m(
-            MouseEventKind::Down(MouseButton::Left),
-            cost_hit.x0 + 1,
-            header_y,
-        ));
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                cost_hit.x0 + 1,
+                header_y,
+            ),
+            true,
+        );
         assert_eq!(
             screen.sort,
             TurnSort {
@@ -1673,11 +1848,14 @@ mod tests {
         assert_eq!(screen.view.turn_indices, vec![2, 0, 1]);
 
         // Click Cost header again -> toggles to Cost ascending (turn #2 $0.02, #1 $0.10, #3 $0.62).
-        screen.handle_mouse(m(
-            MouseEventKind::Down(MouseButton::Left),
-            cost_hit.x0 + 1,
-            header_y,
-        ));
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                cost_hit.x0 + 1,
+                header_y,
+            ),
+            true,
+        );
         assert_eq!(
             screen.sort,
             TurnSort {
@@ -1695,36 +1873,273 @@ mod tests {
             .find(|c| c.col == TurnCol::Idx)
             .copied()
             .unwrap();
-        screen.handle_mouse(m(
-            MouseEventKind::Down(MouseButton::Left),
-            idx_hit.x0,
-            header_y,
-        ));
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                idx_hit.x0,
+                header_y,
+            ),
+            true,
+        );
         assert_eq!(screen.sort, TurnSort::default());
         assert_eq!(screen.view.turn_indices, vec![0, 1, 2]);
 
         let tx = screen.turns_hit.pane.x + 4;
         let t2_y = screen.turns_hit.data_y0 + 2;
-        screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), tx, t2_y));
+        screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), tx, t2_y), true);
         assert_eq!(screen.turn_idx, 2);
-        screen.handle_mouse(m(MouseEventKind::ScrollUp, tx, t2_y));
+        screen.handle_mouse(m(MouseEventKind::ScrollUp, tx, t2_y), true);
         assert_eq!(screen.turn_idx, 0);
 
         let bx = screen.breakdown_hit.pane.x + 3;
         let b0_y = screen.breakdown_hit.data_y0;
-        screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), bx, b0_y));
+        screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), bx, b0_y), true);
         assert_eq!(screen.active_pane, DetailPane::Breakdown);
         assert!(screen.model_filter.is_none());
-        screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), bx, b0_y));
+        screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), bx, b0_y), true);
         assert_eq!(screen.model_filter.as_deref(), Some("Model Alpha"));
 
         // Clicking breakdown title toggles Models -> Subagents.
-        screen.handle_mouse(m(
-            MouseEventKind::Down(MouseButton::Left),
-            bx,
-            screen.breakdown_hit.pane.y,
-        ));
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                bx,
+                screen.breakdown_hit.pane.y,
+            ),
+            true,
+        );
         assert_eq!(screen.right_tab, RightTab::Subagents);
+    }
+
+    #[test]
+    fn detail_mouse_clicks_header_badges_kpi_miss_and_footer_actions() {
+        let m = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let rect_text = |buf: &ratatui::buffer::Buffer, r: Rect| -> String {
+            (r.x..r.right()).map(|x| buf[(x, r.y)].symbol()).collect()
+        };
+        let mut screen = DetailScreen::new(sample_report(), TurnSort::default());
+        let pal = Palette {
+            no_color: true,
+            ascii: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        terminal
+            .draw(|frame| screen.draw(frame, true, &pal))
+            .unwrap();
+
+        // Click red KPI "1 miss" badge to filter cache anomalies.
+        let miss_kpi = screen
+            .kpi_hits
+            .find(|c| *c == DetailClick::ToggleMisses)
+            .unwrap();
+        assert!(rect_text(terminal.backend().buffer(), miss_kpi).contains("1 miss"));
+        assert_eq!(
+            screen.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    miss_kpi.x + 1,
+                    miss_kpi.y
+                ),
+                true,
+            ),
+            DetailAction::Continue
+        );
+        assert!(screen.misses_only);
+        assert_eq!(screen.view.turn_indices, vec![2]);
+
+        // Redraw and click red header "Misses" pill to clear misses_only.
+        terminal
+            .draw(|frame| screen.draw(frame, true, &pal))
+            .unwrap();
+        let miss_pill = screen
+            .header_hits
+            .find(|c| *c == DetailClick::ToggleMisses)
+            .unwrap();
+        assert!(rect_text(terminal.backend().buffer(), miss_pill).contains("Misses"));
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                miss_pill.x + 1,
+                miss_pill.y,
+            ),
+            true,
+        );
+        assert!(!screen.misses_only);
+        assert_eq!(screen.view.turn_indices, vec![0, 1, 2]);
+
+        // Left-click header sort pill flips direction; right-click cycles sort field.
+        let sort_pill = screen
+            .header_hits
+            .find(|c| *c == DetailClick::ToggleSortDir)
+            .unwrap();
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                sort_pill.x + 1,
+                sort_pill.y,
+            ),
+            true,
+        );
+        assert_eq!(screen.sort.dir, SortDir::Desc);
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Right),
+                sort_pill.x + 1,
+                sort_pill.y,
+            ),
+            true,
+        );
+        assert_eq!(screen.sort.field, TurnSortField::Time);
+
+        // Clear model & subagent filter badges individually via header clicks.
+        screen.model_filter = Some("Model Alpha".to_string());
+        screen.subagent_filter = Some("9a1482f2-6b16-434c-99cd-fe86aa60ab9c".to_string());
+        screen.recompute_view();
+        terminal
+            .draw(|frame| screen.draw(frame, true, &pal))
+            .unwrap();
+        let clear_model = screen
+            .header_hits
+            .find(|c| *c == DetailClick::ClearModelFilter)
+            .unwrap();
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                clear_model.x + 1,
+                clear_model.y,
+            ),
+            true,
+        );
+        assert_eq!(screen.model_filter, None);
+        assert!(screen.subagent_filter.is_some());
+
+        terminal
+            .draw(|frame| screen.draw(frame, true, &pal))
+            .unwrap();
+        let clear_sub = screen
+            .header_hits
+            .find(|c| *c == DetailClick::ClearSubagentFilter)
+            .unwrap();
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                clear_sub.x + 1,
+                clear_sub.y,
+            ),
+            true,
+        );
+        assert_eq!(screen.subagent_filter, None);
+
+        // Footer actions: TogglePane, ToggleRightTab, OpenConversations, Refresh, Back, Quit.
+        terminal
+            .draw(|frame| screen.draw(frame, true, &pal))
+            .unwrap();
+        let pane_btn = screen
+            .footer_hits
+            .find(|c| *c == DetailClick::TogglePane)
+            .unwrap();
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                pane_btn.x + 1,
+                pane_btn.y,
+            ),
+            true,
+        );
+        assert_eq!(screen.active_pane, DetailPane::Breakdown);
+
+        let tab_btn = screen
+            .footer_hits
+            .find(|c| *c == DetailClick::ToggleRightTab)
+            .unwrap();
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                tab_btn.x + 1,
+                tab_btn.y,
+            ),
+            true,
+        );
+        assert_eq!(screen.right_tab, RightTab::Subagents);
+
+        let convs_btn = screen
+            .footer_hits
+            .find(|c| *c == DetailClick::OpenConversations)
+            .unwrap();
+        assert_eq!(
+            screen.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    convs_btn.x + 1,
+                    convs_btn.y
+                ),
+                true,
+            ),
+            DetailAction::OpenConversations
+        );
+
+        let ref_btn = screen
+            .footer_hits
+            .find(|c| *c == DetailClick::Refresh)
+            .unwrap();
+        assert_eq!(
+            screen.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    ref_btn.x + 1,
+                    ref_btn.y
+                ),
+                true,
+            ),
+            DetailAction::Refresh
+        );
+
+        let back_btn = screen
+            .footer_hits
+            .find(|c| *c == DetailClick::Back)
+            .unwrap();
+        assert_eq!(rect_text(terminal.backend().buffer(), back_btn), "b Back");
+        assert_eq!(
+            screen.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    back_btn.x + 1,
+                    back_btn.y
+                ),
+                true,
+            ),
+            DetailAction::Back
+        );
+
+        let quit_btn = screen
+            .footer_hits
+            .find(|c| *c == DetailClick::Quit)
+            .unwrap();
+        assert_eq!(
+            screen.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    quit_btn.x + 1,
+                    quit_btn.y
+                ),
+                true,
+            ),
+            DetailAction::Quit
+        );
+
+        // When has_back is false, no Back button region is emitted.
+        terminal
+            .draw(|frame| screen.draw(frame, false, &pal))
+            .unwrap();
+        assert!(screen
+            .footer_hits
+            .find(|c| *c == DetailClick::Back)
+            .is_none());
     }
 
     #[test]

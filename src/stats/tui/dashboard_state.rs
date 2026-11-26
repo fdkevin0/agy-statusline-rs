@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::stats::metric::StatsMetric;
-use crate::stats::query::{ModelScope, RangePreset, StatsQuery, StatsView};
+use crate::stats::query::{DailySort, ModelScope, RangePreset, StatsQuery, StatsView};
 use crate::stats::ModelStats;
 
 /// Focused interactive pane inside the `stats` TUI.
@@ -127,8 +127,39 @@ impl StatsTuiState {
         self.status_msg = Some(msg.into());
     }
 
+    pub(super) fn clear_status_msg(&mut self) {
+        self.status_msg = None;
+    }
+
     pub(super) fn focus_daily(&mut self) {
         self.active_pane = StatsPane::Daily;
+    }
+
+    pub(super) fn toggle_pane(&mut self) {
+        self.active_pane = self.active_pane.toggle();
+    }
+
+    pub(super) fn select_sort(&mut self, sort: DailySort) {
+        if self.query.sort != sort {
+            self.query.sort = sort;
+            self.view_dirty = true;
+            self.status_msg = None;
+        }
+    }
+
+    /// Selects a date clicked in the 20-week heatmap, expanding range to `All` if an active day
+    /// falls outside the current rolling window.
+    pub(super) fn select_heatmap_date(&mut self, date: &str, has_activity: bool, view: &StatsView) {
+        if let Some(idx) = view.daily_rows.iter().position(|r| r.date == date) {
+            self.select_daily_row(idx, view);
+        } else if has_activity && self.query.range != RangePreset::All {
+            self.query.range = RangePreset::All;
+            self.active_pane = StatsPane::Daily;
+            self.selected_date = Some(date.to_string());
+            self.model_idx = 0;
+            self.view_dirty = true;
+            self.status_msg = None;
+        }
     }
 
     pub(super) fn click_model_row(&mut self, target: Option<usize>, view: &StatsView) {

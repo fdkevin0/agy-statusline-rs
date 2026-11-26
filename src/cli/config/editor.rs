@@ -231,29 +231,62 @@ impl TuiEditorState {
         }
     }
 
+    /// Switches focus to `pane` and clears Move Mode so `grabbed` is never stranded off-Canvas.
+    pub(super) fn focus_pane(&mut self, pane: ActivePane) {
+        self.active_pane = pane;
+        self.grabbed = false;
+    }
+
     /// Adjusts `setting_idx` by `dir` (`-1` or `+1`).
     pub(super) fn adjust_setting_at(&mut self, idx: usize, dir: isize) {
+        self.focus_pane(ActivePane::Settings);
         if idx < SettingField::ALL.len() {
             self.settings_idx = idx;
             self.adjust_setting(dir);
         }
     }
 
-    /// Selects `ActivePane::Canvas` row `r` and optional pill `col` (toggling Move Mode if re-clicked).
+    /// Selects `ActivePane::Canvas` row `row` and optional pill `col`.
+    /// While a pill is grabbed in Move Mode, clicking another pill or row drops it there.
     pub(super) fn click_canvas(&mut self, row: usize, col: Option<usize>) {
         if row >= MAX_ROWS {
             return;
         }
+        let was_canvas = self.active_pane == ActivePane::Canvas;
         self.active_pane = ActivePane::Canvas;
-        let same_pill = self.canvas_row == row && col == Some(self.canvas_col);
+        let same_pill = was_canvas && self.canvas_row == row && col == Some(self.canvas_col);
+        if self.grabbed {
+            if same_pill || (self.canvas_row == row && col.is_none()) {
+                self.grabbed = false;
+                return;
+            }
+            if self.canvas_col < self.config.rows[self.canvas_row].len() {
+                let w = self.config.rows[self.canvas_row].remove(self.canvas_col);
+                let target_len = self.config.rows[row].len();
+                let insert_idx = col.map_or(target_len, |c| c.min(target_len));
+                self.config.rows[row].insert(insert_idx, w);
+                self.canvas_row = row;
+                self.canvas_col = insert_idx;
+            }
+            self.grabbed = false;
+            return;
+        }
         self.canvas_row = row;
         if let Some(c) = col.filter(|&c| c < self.config.rows[row].len()) {
             self.canvas_col = c;
-            self.grabbed = if same_pill { !self.grabbed } else { false };
+            self.grabbed = same_pill;
         } else {
-            self.grabbed = false;
             self.clamp_canvas_col();
         }
+    }
+
+    /// Moves the Canvas row selection by `delta` (`-1` or `+1`) without moving a grabbed pill.
+    pub(super) fn scroll_canvas(&mut self, delta: isize) {
+        self.active_pane = ActivePane::Canvas;
+        self.grabbed = false;
+        let next = (self.canvas_row as isize + delta).clamp(0, (MAX_ROWS - 1) as isize);
+        self.canvas_row = next as usize;
+        self.clamp_canvas_col();
     }
 
     /// Removes the pill at `(row, col)` if present.
@@ -269,9 +302,8 @@ impl TuiEditorState {
 
     /// Selects and toggles the widget at `idx` in `Catalog`.
     pub(super) fn click_catalog(&mut self, idx: usize) {
+        self.focus_pane(ActivePane::Catalog);
         if idx < WidgetId::ALL.len() {
-            self.active_pane = ActivePane::Catalog;
-            self.grabbed = false;
             self.catalog_idx = idx;
             self.toggle_catalog_widget();
         }
@@ -279,14 +311,14 @@ impl TuiEditorState {
 
     /// Moves `catalog_idx` by `delta` (`-1` or `+1`).
     pub(super) fn scroll_catalog(&mut self, delta: isize) {
-        self.active_pane = ActivePane::Catalog;
+        self.focus_pane(ActivePane::Catalog);
         let next = (self.catalog_idx as isize + delta).clamp(0, (WidgetId::ALL.len() - 1) as isize);
         self.catalog_idx = next as usize;
     }
 
     /// Moves `settings_idx` by `delta` (`-1` or `+1`).
     pub(super) fn scroll_settings(&mut self, delta: isize) {
-        self.active_pane = ActivePane::Settings;
+        self.focus_pane(ActivePane::Settings);
         let next =
             (self.settings_idx as isize + delta).clamp(0, (SettingField::ALL.len() - 1) as isize);
         self.settings_idx = next as usize;
