@@ -15,13 +15,20 @@ use super::metric::{MetricValue, StatsMetric, UsageCounters};
 use super::pricing::{
     fetch_models_dev_via_curl, round_usd_6, PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS,
 };
-use super::scan::{scan_sqlite_conversations, UsageEvent, UsageSource};
+use super::scan::{
+    scan_sqlite_conversations_with_cache, ScanDiagnostics, UsageEvent, UsageSource,
+    STATS_SCAN_CACHE_FILE,
+};
 use super::{
     accumulate_period, activity_week_mondays, build_weekly_usage, finalize_models,
-    ConversationListItem, DailyUsage, ModelAccumulator, ModelStats, PeriodSummary, SqliteStats,
+    ConversationListItem, DailyUsage, ModelAccumulator, ModelStats, PeriodSummary,
+    QuotaCreditReport, QuotaPoolReport, QuotaWindowReport, SqliteStats, StatsQuotaReport,
     StatsReport, WindowSummaries, DAYS_PER_WEEK,
 };
 use crate::agy::db::compute_median;
+use crate::agy::hub::{fetch_or_load_quota_snapshot, HubQuotaResult};
+use crate::agy::quota::QuotaSource;
+use crate::statusline::metrics::{summarize_quota_pools_with_history, CreditSeverity, QuotaView};
 use crate::sys::time::{civil_date_from_unix_day, format_day, unix_secs_to_utc_date, TimeZoneSpec};
 
 pub(super) const WEEKDAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -275,6 +282,8 @@ pub(super) struct StatsDataset {
     pub(super) today_utc: String,
     pub(super) first_active_date: Option<String>,
     pub(super) sqlite: SqliteStats,
+    pub(super) quota: Option<StatsQuotaReport>,
+    pub(super) diagnostics: ScanDiagnostics,
     events: Vec<UsageEvent>,
     pub(super) has_cli: bool,
     pub(super) has_desktop: bool,
@@ -305,11 +314,76 @@ impl StatsDataset {
             today_utc: today_utc.into(),
             first_active_date,
             sqlite,
+            quota: None,
+            diagnostics: ScanDiagnostics::default(),
             events,
             has_cli,
             has_desktop,
         }
     }
+}
+
+fn quota_view_to_report(v: QuotaView) -> QuotaWindowReport {
+    QuotaWindowReport {
+        label: v.label,
+        remaining_pct: v.remaining_pct,
+        remaining_amount: v.remaining_amount,
+        reset_compact: v.reset_compact,
+        pace_behind: v.pace_behind,
+        burn_rate_pct_per_hr: v.burn_rate_pct_per_hr,
+        eta_secs: v.eta_secs,
+        will_exhaust_before_reset: v.will_exhaust_before_reset,
+    }
+}
+
+fn credit_severity_str(severity: CreditSeverity) -> &'static str {
+    match severity {
+        CreditSeverity::Ok => "ok",
+        CreditSeverity::Low => "low",
+        CreditSeverity::Critical => "critical",
+    }
+}
+
+fn build_stats_quota_report(res: HubQuotaResult, now_unix_secs: u64) -> Option<StatsQuotaReport> {
+    let snap = res.snapshot;
+    let summary =
+        summarize_quota_pools_with_history(&snap.quota, Some(&snap.history), now_unix_secs);
+    let pools = summary
+        .pools
+        .into_iter()
+        .map(|p| QuotaPoolReport {
+            name: p.name,
+            short_window: p.short_window.map(quota_view_to_report),
+            long_window: p.long_window.map(quota_view_to_report),
+        })
+        .collect();
+    let credits = summary
+        .credits
+        .into_iter()
+        .map(|c| QuotaCreditReport {
+            key: c.key,
+            label: c.label,
+            remaining_amount: c.remaining_amount,
+            reset_compact: c.reset_compact,
+            severity: credit_severity_str(c.severity).to_string(),
+        })
+        .collect();
+    let source = match snap.source {
+        QuotaSource::HubRpc => "hub_rpc",
+        QuotaSource::Stdin => "stdin",
+    }
+    .to_string();
+    let report = StatsQuotaReport {
+        source,
+        from_cache: res.from_cache,
+        updated_at: snap.updated_at,
+        age_secs: now_unix_secs.saturating_sub(snap.updated_at),
+        plan_tier: snap.display_plan_tier(),
+        ai_credits: snap.ai_credits,
+        pools,
+        credits,
+    };
+    report.has_visible_content().then_some(report)
 }
 
 #[derive(Default)]
@@ -441,11 +515,14 @@ fn finish_day_row(
 }
 
 impl StatsDataset {
-    /// Scans the given AGY SQLite roots using the local timezone and `models.dev` pricing cache.
+    /// Scans the given AGY SQLite roots using the local timezone, persistent per-DB scan cache,
+    /// `models.dev` pricing cache, and opportunistic loopback Hub RPC / cached quota snapshot.
     pub(super) fn collect(
         roots: &[(&'static str, PathBuf)],
+        daemon_dirs: &[PathBuf],
         cache_dir: Option<&Path>,
         now_unix_secs: u64,
+        force_quota_refresh: bool,
     ) -> Self {
         let pricing = PricingCatalog::load_effective_with(
             cache_dir,
@@ -455,15 +532,44 @@ impl StatsDataset {
             fetch_models_dev_via_curl,
         );
         let tz = TimeZoneSpec::local();
-        Self::collect_for_roots(roots, now_unix_secs, &tz, &pricing)
+        let scan_cache_path = cache_dir.map(|dir| dir.join(STATS_SCAN_CACHE_FILE));
+        let mut ds = Self::collect_for_roots_with_cache(
+            roots,
+            now_unix_secs,
+            &tz,
+            &pricing,
+            scan_cache_path.as_deref(),
+        );
+        if !daemon_dirs.is_empty() || cache_dir.is_some() {
+            ds.quota = fetch_or_load_quota_snapshot(
+                daemon_dirs,
+                cache_dir,
+                now_unix_secs,
+                force_quota_refresh,
+            )
+            .and_then(|res| build_stats_quota_report(res, now_unix_secs));
+        }
+        ds
     }
 
-    /// Scans explicit SQLite roots with an explicit timezone and pricing catalog.
+    /// Scans explicit SQLite roots with an explicit timezone and pricing catalog (no disk scan cache).
+    #[cfg(test)]
     pub(super) fn collect_for_roots(
         roots: &[(&'static str, PathBuf)],
         now_unix_secs: u64,
         tz: &TimeZoneSpec,
         pricing: &PricingCatalog,
+    ) -> Self {
+        Self::collect_for_roots_with_cache(roots, now_unix_secs, tz, pricing, None)
+    }
+
+    /// Scans explicit SQLite roots with an explicit timezone, pricing catalog, and optional scan cache path.
+    pub(super) fn collect_for_roots_with_cache(
+        roots: &[(&'static str, PathBuf)],
+        now_unix_secs: u64,
+        tz: &TimeZoneSpec,
+        pricing: &PricingCatalog,
+        scan_cache_path: Option<&Path>,
     ) -> Self {
         let now_i64 = now_unix_secs as i64;
         let today_day_idx = tz.local_day(now_i64);
@@ -471,12 +577,12 @@ impl StatsDataset {
         let timezone = tz.format_offset_at(now_i64);
         let today_utc = unix_secs_to_utc_date(now_i64);
 
-        let (sqlite, events) = scan_sqlite_conversations(roots, tz, pricing);
+        let scan = scan_sqlite_conversations_with_cache(roots, tz, pricing, scan_cache_path);
 
         let mut first_day: Option<i64> = None;
         let mut has_cli = false;
         let mut has_desktop = false;
-        for ev in &events {
+        for ev in &scan.events {
             first_day = Some(match first_day {
                 Some(prev) => prev.min(ev.local_day),
                 None => ev.local_day,
@@ -493,8 +599,10 @@ impl StatsDataset {
             timezone,
             today_utc,
             first_active_date: first_day.map(format_day),
-            sqlite,
-            events,
+            sqlite: scan.sqlite,
+            quota: None,
+            diagnostics: scan.diagnostics,
+            events: scan.events,
             has_cli,
             has_desktop,
         }
@@ -583,6 +691,8 @@ impl StatsDataset {
             weekly,
             models,
             sqlite: self.sqlite.clone(),
+            quota: self.quota.clone(),
+            diagnostics: self.diagnostics,
         }
     }
 
@@ -822,6 +932,8 @@ mod tests {
             today_utc: "2026-11-20".to_string(),
             first_active_date: Some("2026-11-18".to_string()),
             sqlite: SqliteStats::default(),
+            quota: None,
+            diagnostics: ScanDiagnostics::default(),
             has_cli: true,
             has_desktop: true,
             events: vec![

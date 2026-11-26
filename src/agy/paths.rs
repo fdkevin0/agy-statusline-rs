@@ -3,9 +3,10 @@
 use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use crate::sys::fs::canonical_or_self;
 
 fn non_empty_path(val: Option<OsString>) -> Option<PathBuf> {
     val.filter(|v| !v.is_empty()).map(PathBuf::from)
@@ -50,15 +51,29 @@ fn classify_data_dir_source(path: &Path) -> &'static str {
     }
 }
 
-fn push_unique_root(
-    roots: &mut Vec<(&'static str, PathBuf)>,
+fn parse_data_dir_entries(raw: Option<&OsStr>, home: Option<&Path>) -> Vec<PathBuf> {
+    let Some(raw) = raw.filter(|v| !v.is_empty()) else {
+        return Vec::new();
+    };
+    match raw.to_str() {
+        Some(s) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| expand_tilde(entry, home))
+            .collect(),
+        None => vec![PathBuf::from(raw)],
+    }
+}
+
+fn push_unique<T>(
+    out: &mut Vec<T>,
     seen: &mut HashSet<PathBuf>,
-    source: &'static str,
     path: PathBuf,
+    wrap: impl FnOnce(PathBuf) -> T,
 ) {
-    let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-    if seen.insert(key) {
-        roots.push((source, path));
+    if seen.insert(canonical_or_self(&path)) {
+        out.push(wrap(path));
     }
 }
 
@@ -70,41 +85,28 @@ fn resolve_agy_roots_from(
     antigravity_data_dir: Option<&OsStr>,
     antigravity_cli_home: Option<&OsStr>,
 ) -> Vec<(&'static str, PathBuf)> {
-    let mut roots: Vec<(&'static str, PathBuf)> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut has_explicit_cli_home = false;
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    let explicit_cli_home = expand_tilde_os(antigravity_cli_home, home);
+    let has_explicit_cli_home = explicit_cli_home.is_some();
 
-    if let Some(path) = expand_tilde_os(antigravity_cli_home, home) {
-        has_explicit_cli_home = true;
-        push_unique_root(&mut roots, &mut seen, "cli", path);
+    if let Some(path) = explicit_cli_home {
+        push_unique(&mut roots, &mut seen, path, |p| ("cli", p));
     }
-
-    if let Some(raw) = antigravity_data_dir.filter(|v| !v.is_empty()) {
-        match raw.to_str() {
-            Some(s) => {
-                for entry in s.split(',') {
-                    let trimmed = entry.trim();
-                    if !trimmed.is_empty() {
-                        let path = expand_tilde(trimmed, home);
-                        let source = classify_data_dir_source(&path);
-                        push_unique_root(&mut roots, &mut seen, source, path);
-                    }
-                }
-            }
-            None => {
-                let path = PathBuf::from(raw);
-                let source = classify_data_dir_source(&path);
-                push_unique_root(&mut roots, &mut seen, source, path);
-            }
-        }
+    for path in parse_data_dir_entries(antigravity_data_dir, home) {
+        let source = classify_data_dir_source(&path);
+        push_unique(&mut roots, &mut seen, path, |p| (source, p));
     }
-
     if let Some(h) = home {
         let gemini = h.join(".gemini");
         if !has_explicit_cli_home {
-            push_unique_root(&mut roots, &mut seen, "cli", gemini.join("antigravity-cli"));
+            push_unique(&mut roots, &mut seen, gemini.join("antigravity-cli"), |p| {
+                ("cli", p)
+            });
         }
-        push_unique_root(&mut roots, &mut seen, "desktop", gemini.join("antigravity"));
+        push_unique(&mut roots, &mut seen, gemini.join("antigravity"), |p| {
+            ("desktop", p)
+        });
     }
 
     roots
@@ -117,6 +119,47 @@ pub fn resolve_agy_roots() -> Vec<(&'static str, PathBuf)> {
     let data_dir = env::var_os("ANTIGRAVITY_DATA_DIR");
     let cli_home = env::var_os("ANTIGRAVITY_CLI_HOME");
     resolve_agy_roots_from(
+        resolved_home.as_deref(),
+        data_dir.as_deref(),
+        cli_home.as_deref(),
+    )
+}
+
+/// Resolves all candidate AGY `daemon/` directories from explicit environment inputs,
+/// deduplicating canonical/identical paths while preserving priority order:
+/// `$ANTIGRAVITY_CLI_HOME/daemon`, `$ANTIGRAVITY_DATA_DIR/*/daemon`, and
+/// `<home>/.gemini/{antigravity-cli,antigravity,antigravity-ide}/daemon`.
+pub fn resolve_agy_daemon_dirs_from(
+    home: Option<&Path>,
+    antigravity_data_dir: Option<&OsStr>,
+    antigravity_cli_home: Option<&OsStr>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(cli_dir) = expand_tilde_os(antigravity_cli_home, home) {
+        push_unique(&mut dirs, &mut seen, cli_dir.join("daemon"), |p| p);
+    }
+    for base in parse_data_dir_entries(antigravity_data_dir, home) {
+        push_unique(&mut dirs, &mut seen, base.join("daemon"), |p| p);
+    }
+    if let Some(h) = home {
+        let gemini = h.join(".gemini");
+        for sub in ["antigravity-cli", "antigravity", "antigravity-ide"] {
+            push_unique(&mut dirs, &mut seen, gemini.join(sub).join("daemon"), |p| p);
+        }
+    }
+
+    dirs
+}
+
+/// Resolves all candidate AGY `daemon/` directories from `HOME`/`USERPROFILE`,
+/// `ANTIGRAVITY_CLI_HOME`, and `ANTIGRAVITY_DATA_DIR`.
+pub fn resolve_agy_daemon_dirs() -> Vec<PathBuf> {
+    let resolved_home = resolve_home_dir();
+    let data_dir = env::var_os("ANTIGRAVITY_DATA_DIR");
+    let cli_home = env::var_os("ANTIGRAVITY_CLI_HOME");
+    resolve_agy_daemon_dirs_from(
         resolved_home.as_deref(),
         data_dir.as_deref(),
         cli_home.as_deref(),
@@ -203,6 +246,7 @@ pub(crate) fn agy_settings_path_for_home(home: &std::path::Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn os(s: &str) -> Option<OsString> {
         Some(OsString::from(s))
@@ -346,5 +390,30 @@ mod tests {
 
         let roots = resolve_agy_roots_from(Some(home), None, None);
         assert_eq!(roots, vec![("cli", cli_dir)]);
+    }
+
+    #[test]
+    fn resolve_agy_daemon_dirs_from_discovers_and_deduplicates_priority_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        let custom_cli = home.join("custom-cli");
+        let extra_data = home.join("extra-data");
+        fs::create_dir_all(custom_cli.join("daemon")).unwrap();
+        fs::create_dir_all(extra_data.join("daemon")).unwrap();
+
+        let data_val = OsStr::new(" ~/extra-data , , ~/custom-cli ");
+        let dirs =
+            resolve_agy_daemon_dirs_from(Some(home), Some(data_val), Some(custom_cli.as_os_str()));
+        assert_eq!(
+            dirs,
+            vec![
+                custom_cli.join("daemon"),
+                extra_data.join("daemon"),
+                home.join(".gemini").join("antigravity-cli").join("daemon"),
+                home.join(".gemini").join("antigravity").join("daemon"),
+                home.join(".gemini").join("antigravity-ide").join("daemon"),
+            ]
+        );
     }
 }

@@ -9,9 +9,9 @@ use std::process::Output;
 #[cfg(unix)]
 use serde_json::Value;
 
+use common::{isolated_agy_cmd, run_statusline_stdin};
 #[cfg(unix)]
 use common::{isolated_cmd, BIN};
-use common::{isolated_agy_cmd, run_statusline_stdin};
 
 fn stdout(output: Output) -> String {
     assert!(output.status.success(), "{:?}", output);
@@ -227,7 +227,10 @@ fn tier2_doctor_reports_conversations_and_agy_cli_status() {
             .output()
             .unwrap(),
     );
-    assert!(empty.contains("AGY CLI:  not found"), "doctor stdout:\n{empty}");
+    assert!(
+        empty.contains("AGY CLI:  not found"),
+        "doctor stdout:\n{empty}"
+    );
     assert!(
         empty.contains("conversations [not found]"),
         "doctor stdout:\n{empty}"

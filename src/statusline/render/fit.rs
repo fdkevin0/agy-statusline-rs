@@ -10,6 +10,7 @@ const COMPACT_STAGES: &[CompactStage] = &[
     CompactStage::VcsTruncate,
     CompactStage::SubagentsDropLabel,
     CompactStage::CostStripSuffix,
+    CompactStage::SpeedStripRetry,
     CompactStage::QuotaStripReset,
     CompactStage::CtxDropLimit,
     CompactStage::CtxCollapseBar,

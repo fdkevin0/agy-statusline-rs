@@ -12,8 +12,9 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    compute_header_hits, render_table_with_scrollbar, right_cell, token_breakdown_lines,
-    HeaderHits, Palette, TableChrome, TableHit,
+    compute_header_hits, render_footer_bar, render_table_with_scrollbar, right_cell,
+    sort_header_cell, token_breakdown_lines, ClickRegions, HeaderHits, Palette, SpanBar,
+    TableChrome, TableHit,
 };
 use crate::agy::db::compute_median;
 use crate::stats::metric::{
@@ -21,9 +22,13 @@ use crate::stats::metric::{
 };
 use crate::stats::pricing::round_usd_6;
 use crate::stats::render::{
-    format_subagent_short_label, format_time_span, format_ttft_compact, format_turn_time,
+    format_retry_compact, format_subagent_short_label, format_time_span, format_ttft_compact,
+    format_turn_time,
 };
-use crate::stats::{ConversationStatsReport, ConversationTurnStats, PeriodSummary, UsageDelta};
+use crate::stats::{
+    mid_session_miss_flags, ConversationStatsReport, ConversationTurnStats, PeriodSummary,
+    UsageDelta,
+};
 use crate::sys::fmt::{format_tokens_string as fmt_tok, truncate_to_width};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +48,22 @@ pub(super) enum DetailAction {
     Continue,
     Refresh,
     OpenConversations,
+    Back,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailClick {
+    ToggleSortDir,
+    CycleSortField,
+    ToggleMisses,
+    ClearModelFilter,
+    ClearSubagentFilter,
+    ClearAllFilters,
+    ToggleRightTab,
+    TogglePane,
+    OpenConversations,
+    Refresh,
     Back,
     Quit,
 }
@@ -130,6 +151,9 @@ pub(super) struct DetailScreen {
     view: DetailView,
     turns_table: TableState,
     breakdown_table: TableState,
+    header_hits: ClickRegions<DetailClick>,
+    kpi_hits: ClickRegions<DetailClick>,
+    footer_hits: ClickRegions<DetailClick>,
     turns_hit: TableHit,
     turns_header_hits: HeaderHits<TurnCol>,
     breakdown_hit: TableHit,
@@ -166,6 +190,9 @@ impl DetailScreen {
             status_msg: None,
             turns_table: TableState::default(),
             breakdown_table: TableState::default(),
+            header_hits: ClickRegions::default(),
+            kpi_hits: ClickRegions::default(),
+            footer_hits: ClickRegions::default(),
             turns_hit: TableHit::default(),
             turns_header_hits: HeaderHits::default(),
             breakdown_hit: TableHit::default(),
@@ -306,6 +333,31 @@ impl DetailScreen {
         self.misses_only || self.model_filter.is_some() || self.subagent_filter.is_some()
     }
 
+    fn clear_filters(&mut self) {
+        self.misses_only = false;
+        self.model_filter = None;
+        self.subagent_filter = None;
+        self.turn_idx = 0;
+        self.recompute_view();
+    }
+
+    fn toggle_right_tab(&mut self) {
+        if !self.report.subagents.is_empty() {
+            self.right_tab = match self.right_tab {
+                RightTab::Models => RightTab::Subagents,
+                RightTab::Subagents => RightTab::Models,
+            };
+            self.breakdown_idx = 0;
+        }
+    }
+
+    fn toggle_active_pane(&mut self) {
+        self.active_pane = match self.active_pane {
+            DetailPane::Turns => DetailPane::Breakdown,
+            DetailPane::Breakdown => DetailPane::Turns,
+        };
+    }
+
     fn breakdown_len(&self) -> usize {
         match self.right_tab {
             RightTab::Models => self.report.models.len(),
@@ -314,12 +366,13 @@ impl DetailScreen {
     }
 
     fn recompute_view(&mut self) {
+        let miss_flags = mid_session_miss_flags(&self.report.turns);
         let mut turn_indices: Vec<usize> = self
             .report
             .turns
             .iter()
             .enumerate()
-            .filter(|(_, t)| !self.misses_only || t.cache_hit_pct.is_some_and(|p| p < 50.0))
+            .filter(|(idx, _)| !self.misses_only || miss_flags[*idx])
             .filter(|(_, t)| self.model_filter.as_deref().is_none_or(|m| t.model == m))
             .filter(|(_, t)| {
                 self.subagent_filter
@@ -446,7 +499,6 @@ impl DetailScreen {
         }
 
         let page_size = self.turns_hit.data_rows.max(5);
-        let has_subs = !self.report.subagents.is_empty();
         let active_len = match self.active_pane {
             DetailPane::Turns => self.view.turn_indices.len(),
             DetailPane::Breakdown => self.breakdown_len(),
@@ -463,11 +515,7 @@ impl DetailScreen {
             KeyCode::Char('r') => return DetailAction::Refresh,
             KeyCode::Esc => {
                 if self.has_active_filters() {
-                    self.misses_only = false;
-                    self.model_filter = None;
-                    self.subagent_filter = None;
-                    self.turn_idx = 0;
-                    self.recompute_view();
+                    self.clear_filters();
                 } else {
                     return if has_back {
                         DetailAction::Back
@@ -476,15 +524,8 @@ impl DetailScreen {
                     };
                 }
             }
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.active_pane = match self.active_pane {
-                    DetailPane::Turns => DetailPane::Breakdown,
-                    DetailPane::Breakdown => DetailPane::Turns,
-                };
-            }
-            KeyCode::Char('s') => {
-                self.cycle_sort_field();
-            }
+            KeyCode::Tab | KeyCode::BackTab => self.toggle_active_pane(),
+            KeyCode::Char('s') => self.cycle_sort_field(),
             KeyCode::Char('S') => {
                 self.sort = self.sort.toggle_dir();
                 self.turn_idx = 0;
@@ -495,13 +536,7 @@ impl DetailScreen {
                 self.turn_idx = 0;
                 self.recompute_view();
             }
-            KeyCode::Char('v') if has_subs => {
-                self.right_tab = match self.right_tab {
-                    RightTab::Models => RightTab::Subagents,
-                    RightTab::Subagents => RightTab::Models,
-                };
-                self.breakdown_idx = 0;
-            }
+            KeyCode::Char('v') => self.toggle_right_tab(),
             KeyCode::Enter if self.active_pane == DetailPane::Breakdown => {
                 self.toggle_breakdown_filter();
             }
@@ -520,7 +555,42 @@ impl DetailScreen {
         DetailAction::Continue
     }
 
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+    fn apply_click(&mut self, click: DetailClick, has_back: bool) -> DetailAction {
+        match click {
+            DetailClick::ToggleSortDir => {
+                self.sort = self.sort.toggle_dir();
+                self.turn_idx = 0;
+                self.recompute_view();
+            }
+            DetailClick::CycleSortField => self.cycle_sort_field(),
+            DetailClick::ToggleMisses => {
+                self.misses_only = !self.misses_only;
+                self.turn_idx = 0;
+                self.recompute_view();
+            }
+            DetailClick::ClearModelFilter => {
+                self.model_filter = None;
+                self.turn_idx = 0;
+                self.recompute_view();
+            }
+            DetailClick::ClearSubagentFilter => {
+                self.subagent_filter = None;
+                self.turn_idx = 0;
+                self.recompute_view();
+            }
+            DetailClick::ClearAllFilters => self.clear_filters(),
+            DetailClick::ToggleRightTab => self.toggle_right_tab(),
+            DetailClick::TogglePane => self.toggle_active_pane(),
+            DetailClick::OpenConversations => return DetailAction::OpenConversations,
+            DetailClick::Refresh => return DetailAction::Refresh,
+            DetailClick::Back if has_back => return DetailAction::Back,
+            DetailClick::Back => {}
+            DetailClick::Quit => return DetailAction::Quit,
+        }
+        DetailAction::Continue
+    }
+
+    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent, has_back: bool) -> DetailAction {
         let pos = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -549,8 +619,22 @@ impl DetailScreen {
                     }
                 }
             }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.header_hits.hit(pos) == Some(DetailClick::ToggleSortDir) {
+                    self.status_msg = None;
+                    self.cycle_sort_field();
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.status_msg = None;
+                if let Some(click) = self
+                    .header_hits
+                    .hit(pos)
+                    .or_else(|| self.kpi_hits.hit(pos))
+                    .or_else(|| self.footer_hits.hit(pos))
+                {
+                    return self.apply_click(click, has_back);
+                }
                 if self.turns_hit.contains(pos) {
                     self.active_pane = DetailPane::Turns;
                     if let Some(col) = self.turns_header_hits.col_at(pos) {
@@ -564,11 +648,7 @@ impl DetailScreen {
                     }
                 } else if self.breakdown_hit.contains(pos) {
                     if mouse.row == self.breakdown_hit.pane.y && !self.report.subagents.is_empty() {
-                        self.right_tab = match self.right_tab {
-                            RightTab::Models => RightTab::Subagents,
-                            RightTab::Subagents => RightTab::Models,
-                        };
-                        self.breakdown_idx = 0;
+                        self.toggle_right_tab();
                     } else {
                         let was_active = self.active_pane == DetailPane::Breakdown;
                         self.active_pane = DetailPane::Breakdown;
@@ -588,6 +668,7 @@ impl DetailScreen {
             }
             _ => {}
         }
+        DetailAction::Continue
     }
 
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>, has_back: bool, pal: &Palette) {
@@ -602,8 +683,8 @@ impl DetailScreen {
             ])
             .split(area);
 
-        self.draw_header(frame, root[0], pal);
-        self.draw_kpi_strip(frame, root[1], pal);
+        self.header_hits = self.draw_header(frame, root[0], pal);
+        self.kpi_hits = self.draw_kpi_strip(frame, root[1], pal);
 
         let body = root[2];
         self.turns_hit = TableHit::default();
@@ -636,10 +717,15 @@ impl DetailScreen {
             self.breakdown_hit = self.draw_breakdown_pane(frame, stacked[1], pal);
         }
 
-        self.draw_footer(frame, root[3], has_back, pal);
+        self.footer_hits = self.draw_footer(frame, root[3], has_back, pal);
     }
 
-    fn draw_header(&self, frame: &mut Frame<'_>, area: Rect, pal: &Palette) {
+    fn draw_header(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        pal: &Palette,
+    ) -> ClickRegions<DetailClick> {
         let sep = pal.sep();
         let short_id: String = self.report.conversation_id.chars().take(8).collect();
         let model_tag = if self.report.models.len() == 1 {
@@ -653,21 +739,16 @@ impl DetailScreen {
             self.report.source, self.report.timezone
         );
 
-        let inner_w = usize::from(area.width.saturating_sub(2));
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut used = 0usize;
-        let mut push = |text: String, style: Style| -> bool {
-            let w = text.width();
-            if used + w > inner_w {
-                return false;
-            }
-            spans.push(Span::styled(text, style));
-            used += w;
-            true
-        };
+        let block = pal.pane_block(title, false);
+        let inner = block.inner(area);
+        let inner_w = usize::from(inner.width);
+        let mut bar = SpanBar::new(inner);
 
-        let mut controls: Vec<(String, Style)> =
-            vec![(format!(" {} ", self.sort.label(pal.ascii)), pal.pill(true))];
+        let mut controls: Vec<(String, Style, DetailClick)> = vec![(
+            format!(" {} ", self.sort.label(pal.ascii)),
+            pal.pill(true),
+            DetailClick::ToggleSortDir,
+        )];
         if self.misses_only {
             let style = if pal.no_color {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
@@ -677,22 +758,16 @@ impl DetailScreen {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
             };
-            controls.push((" Misses ".to_string(), style));
+            controls.push((" Misses ".to_string(), style, DetailClick::ToggleMisses));
         }
-        let badge_style = if pal.no_color {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-                .bg(Color::Yellow)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        };
+        let badge_style = pal.filter_badge();
         let close = if pal.ascii { "x" } else { "×" };
-        let ellipsis = if pal.ascii { "..." } else { "…" };
+        let ellipsis = pal.ellipsis();
         if let Some(model) = self.model_filter.as_deref() {
             controls.push((
                 format!(" {close} {} ", truncate_to_width(model, 18, ellipsis)),
                 badge_style,
+                DetailClick::ClearModelFilter,
             ));
         }
         if let Some(sub_id) = self.subagent_filter.as_deref() {
@@ -704,10 +779,15 @@ impl DetailScreen {
             controls.push((
                 format!(" {close} {} ", truncate_to_width(label, 18, ellipsis)),
                 badge_style,
+                DetailClick::ClearSubagentFilter,
             ));
         }
 
-        let controls_w: usize = controls.iter().map(|(s, _)| s.width() + 1).sum::<usize>() + 2;
+        let controls_w: usize = controls
+            .iter()
+            .map(|(s, _, _)| s.width() + 1)
+            .sum::<usize>()
+            + 2;
         let conv_label = self
             .report
             .title
@@ -716,31 +796,35 @@ impl DetailScreen {
             .unwrap_or(&self.report.conversation_id);
         let title_budget = inner_w.saturating_sub(controls_w + 2);
         if title_budget >= 8 {
-            let _ = push(
+            let _ = bar.push(
                 format!(" {}", truncate_to_width(conv_label, title_budget, ellipsis)),
                 pal.bold(Color::White),
             );
-            let _ = push(format!(" {sep} "), pal.dim());
+            let _ = bar.push(format!(" {sep} "), pal.dim());
         } else {
-            let _ = push(" ".to_string(), Style::default());
+            let _ = bar.push(" ", Style::default());
         }
 
-        for (idx, (text, style)) in controls.into_iter().enumerate() {
-            if idx > 0 && !push(" ".to_string(), Style::default()) {
+        for (idx, (text, style, action)) in controls.into_iter().enumerate() {
+            if idx > 0 && !bar.push(" ", Style::default()) {
                 break;
             }
-            if !push(text, style) {
+            if !bar.push_click(text, style, action) {
                 break;
             }
         }
 
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).block(pal.pane_block(title, false)),
-            area,
-        );
+        let (line, hits) = bar.finish();
+        frame.render_widget(Paragraph::new(line).block(block), area);
+        hits
     }
 
-    fn draw_kpi_strip(&self, frame: &mut Frame<'_>, area: Rect, pal: &Palette) {
+    fn draw_kpi_strip(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        pal: &Palette,
+    ) -> ClickRegions<DetailClick> {
         let sep = pal.sep();
         let arrow = if pal.ascii { "->" } else { "→" };
         let filtered = self.has_active_filters();
@@ -761,32 +845,10 @@ impl DetailScreen {
             " Summary ".to_string()
         };
 
-        let inner_w = usize::from(area.width.saturating_sub(2));
+        let block = pal.pane_block(title, false);
         let sep_str = format!(" {sep} ");
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut used = 0usize;
-        let mut push_segment = |label: &str, value: String, value_style: Style| {
-            let prefix = if spans.is_empty() {
-                " "
-            } else {
-                sep_str.as_str()
-            };
-            let seg_w = prefix.width() + label.width() + value.width();
-            if !spans.is_empty() && used + seg_w > inner_w {
-                return;
-            }
-            spans.push(Span::styled(
-                prefix.to_string(),
-                if spans.is_empty() {
-                    Style::default()
-                } else {
-                    pal.dim()
-                },
-            ));
-            spans.push(Span::styled(label.to_string(), pal.dim()));
-            spans.push(Span::styled(value, value_style));
-            used += seg_w;
-        };
+        let dim = pal.dim();
+        let mut bar = SpanBar::new(block.inner(area));
 
         let s = &self.view.summary;
         let turns_val = if filtered {
@@ -794,22 +856,49 @@ impl DetailScreen {
         } else {
             s.requests.to_string()
         };
-        push_segment("Turns ", turns_val, pal.bold(Color::White));
-        push_segment("Total ", fmt_tok(s.total_tokens), pal.bold(Color::Cyan));
+        bar.push_sep_kv(
+            &sep_str,
+            dim,
+            "Turns ",
+            turns_val,
+            pal.bold(Color::White),
+            None,
+        );
+        bar.push_sep_kv(
+            &sep_str,
+            dim,
+            "Total ",
+            fmt_tok(s.total_tokens),
+            pal.bold(Color::Cyan),
+            None,
+        );
         let hit_pct = s.cache_hit_pct();
-        push_segment(
+        bar.push_sep_kv(
+            &sep_str,
+            dim,
             "Hit ",
             format_pct(hit_pct),
             pal.cache_hit_style(hit_pct).add_modifier(Modifier::BOLD),
+            None,
         );
         if let Some(peak) = self.view.peak_context_tokens {
-            push_segment("Peak ", fmt_tok(peak), pal.bold(Color::White));
+            bar.push_sep_kv(
+                &sep_str,
+                dim,
+                "Peak ",
+                fmt_tok(peak),
+                pal.bold(Color::White),
+                None,
+            );
         }
         if self.view.show_cost && s.priced_requests > 0 {
-            push_segment(
+            bar.push_sep_kv(
+                &sep_str,
+                dim,
                 "Cost ",
                 format_usd_short(s.priced_usd),
                 pal.bold(Color::Green),
+                None,
             );
         }
         let spd = self
@@ -820,7 +909,14 @@ impl DetailScreen {
             .view
             .median_ttft_secs
             .map_or_else(|| "-".to_string(), format_ttft_compact);
-        push_segment("Med ", format!("{spd}/{ttft}"), pal.bold(Color::White));
+        bar.push_sep_kv(
+            &sep_str,
+            dim,
+            "Med ",
+            format!("{spd}/{ttft}"),
+            pal.bold(Color::White),
+            None,
+        );
 
         if !filtered && self.report.mid_session_misses > 0 {
             let miss_val = if self.report.mid_session_miss_usd > 0.0 {
@@ -832,13 +928,50 @@ impl DetailScreen {
             } else {
                 format!("{} miss", self.report.mid_session_misses)
             };
-            push_segment("", miss_val, pal.bold(Color::Red));
+            bar.push_sep_kv(
+                &sep_str,
+                dim,
+                "",
+                miss_val,
+                pal.bold(Color::Red),
+                Some(DetailClick::ToggleMisses),
+            );
+        }
+        if !filtered {
+            let diag = &self.report.diagnostics.total;
+            if diag.compaction_steps > 0 {
+                bar.push_sep_kv(
+                    &sep_str,
+                    dim,
+                    "",
+                    format!("{} compact", diag.compaction_steps),
+                    pal.bold(Color::Yellow),
+                    None,
+                );
+            }
+            if let Some(retries) = format_retry_compact(diag, pal.ascii) {
+                let color = if diag.retries_429 > 0 {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                };
+                bar.push_sep_kv(&sep_str, dim, "", retries, pal.bold(color), None);
+            }
+            if diag.error_steps > 0 {
+                bar.push_sep_kv(
+                    &sep_str,
+                    dim,
+                    "",
+                    format!("{} err", diag.error_steps),
+                    pal.bold(Color::Red),
+                    None,
+                );
+            }
         }
 
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).block(pal.pane_block(title, false)),
-            area,
-        );
+        let (line, hits) = bar.finish();
+        frame.render_widget(Paragraph::new(line).block(block), area);
+        hits
     }
 
     fn draw_turns_pane(&mut self, frame: &mut Frame<'_>, area: Rect, pal: &Palette) -> TableHit {
@@ -948,7 +1081,7 @@ impl DetailScreen {
             Row::new(cells).style(val_style)
         });
 
-        let ellipsis = if pal.ascii { "..." } else { "…" };
+        let ellipsis = pal.ellipsis();
         let rows: Vec<Row<'static>> = self
             .view
             .turn_indices
@@ -1013,7 +1146,7 @@ impl DetailScreen {
             .block(pal.pane_block(title, active))
             .column_spacing(1)
             .row_highlight_style(pal.selected_row(active))
-            .highlight_symbol(if pal.ascii { "> " } else { "▸ " });
+            .highlight_symbol(pal.highlight_symbol());
         if let Some(footer) = footer_opt {
             table = table.footer(footer);
         }
@@ -1145,6 +1278,50 @@ impl DetailScreen {
         let show_cost = self.report.totals.priced_requests > 0;
         let filter_glyph = if pal.ascii { "* " } else { "● " };
 
+        let make_row = |label: String,
+                        base_style: Style,
+                        counters: &dyn UsageCounters,
+                        is_filtered: bool|
+         -> Row<'static> {
+            let name = if is_filtered {
+                format!("{filter_glyph}{label}")
+            } else {
+                label
+            };
+            let (val_str, val_dim) = if show_cost {
+                if counters.priced_requests() > 0 {
+                    (format_usd_short(counters.priced_usd()), false)
+                } else {
+                    ("-".to_string(), true)
+                }
+            } else {
+                (fmt_tok(counters.total_tokens()), false)
+            };
+            let val_style = if val_dim {
+                pal.dim()
+            } else {
+                pal.bold(if is_filtered {
+                    Color::Yellow
+                } else {
+                    Color::Cyan
+                })
+            };
+            let mut cells = vec![
+                Cell::from(name).style(if is_filtered {
+                    pal.bold(Color::Yellow)
+                } else {
+                    base_style
+                }),
+                right_cell(format!("{}t", counters.requests()), pal.dim()),
+                right_cell(val_str, val_style),
+            ];
+            if show_hit {
+                let hit = counters.cache_hit_pct();
+                cells.push(right_cell(format_pct(hit), pal.cache_hit_style(hit)));
+            }
+            Row::new(cells)
+        };
+
         let rows: Vec<Row<'static>> = match self.right_tab {
             RightTab::Models => self
                 .report
@@ -1152,45 +1329,7 @@ impl DetailScreen {
                 .iter()
                 .map(|m| {
                     let is_filtered = self.model_filter.as_deref() == Some(m.model.as_str());
-                    let name = if is_filtered {
-                        format!("{filter_glyph}{}", m.model)
-                    } else {
-                        m.model.clone()
-                    };
-                    let (val_str, val_dim) = if show_cost {
-                        if m.priced_requests() > 0 {
-                            (format_usd_short(m.priced_usd), false)
-                        } else {
-                            ("-".to_string(), true)
-                        }
-                    } else {
-                        (fmt_tok(m.total_tokens), false)
-                    };
-                    let mut cells = vec![
-                        Cell::from(name).style(if is_filtered {
-                            pal.bold(Color::Yellow)
-                        } else {
-                            Style::default()
-                        }),
-                        right_cell(format!("{}t", m.requests), pal.dim()),
-                        right_cell(
-                            val_str,
-                            if val_dim {
-                                pal.dim()
-                            } else {
-                                pal.bold(if is_filtered {
-                                    Color::Yellow
-                                } else {
-                                    Color::Cyan
-                                })
-                            },
-                        ),
-                    ];
-                    if show_hit {
-                        let hit = m.cache_hit_pct();
-                        cells.push(right_cell(format_pct(hit), pal.cache_hit_style(hit)));
-                    }
-                    Row::new(cells)
+                    make_row(m.model.clone(), Style::default(), m, is_filtered)
                 })
                 .collect(),
             RightTab::Subagents => self
@@ -1200,49 +1339,11 @@ impl DetailScreen {
                 .map(|sub| {
                     let is_filtered =
                         self.subagent_filter.as_deref() == Some(sub.conversation_id.as_str());
-                    let base = format_subagent_short_label(
+                    let label = format_subagent_short_label(
                         &sub.conversation_id,
                         sub.agent_name.as_deref(),
                     );
-                    let name = if is_filtered {
-                        format!("{filter_glyph}{base}")
-                    } else {
-                        base
-                    };
-                    let (val_str, val_dim) = if show_cost {
-                        if sub.summary.priced_requests > 0 {
-                            (format_usd_short(sub.summary.priced_usd), false)
-                        } else {
-                            ("-".to_string(), true)
-                        }
-                    } else {
-                        (fmt_tok(sub.summary.total_tokens), false)
-                    };
-                    let mut cells = vec![
-                        Cell::from(name).style(if is_filtered {
-                            pal.bold(Color::Yellow)
-                        } else {
-                            pal.fg(Color::Magenta)
-                        }),
-                        right_cell(format!("{}t", sub.summary.requests), pal.dim()),
-                        right_cell(
-                            val_str,
-                            if val_dim {
-                                pal.dim()
-                            } else {
-                                pal.bold(if is_filtered {
-                                    Color::Yellow
-                                } else {
-                                    Color::Cyan
-                                })
-                            },
-                        ),
-                    ];
-                    if show_hit {
-                        let hit = sub.summary.cache_hit_pct();
-                        cells.push(right_cell(format_pct(hit), pal.cache_hit_style(hit)));
-                    }
-                    Row::new(cells)
+                    make_row(label, pal.fg(Color::Magenta), &sub.summary, is_filtered)
                 })
                 .collect(),
         };
@@ -1266,7 +1367,7 @@ impl DetailScreen {
             .block(pal.pane_block(title, active))
             .column_spacing(1)
             .row_highlight_style(pal.selected_row(active))
-            .highlight_symbol(if pal.ascii { "> " } else { "▸ " });
+            .highlight_symbol(pal.highlight_symbol());
 
         render_table_with_scrollbar(
             frame,
@@ -1284,34 +1385,98 @@ impl DetailScreen {
         )
     }
 
-    fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect, has_back: bool, pal: &Palette) {
-        let sep = format!(" {} ", pal.sep());
-        let back_hint = if has_back {
-            format!("{sep}b Back")
-        } else {
-            String::new()
-        };
-        let text = if let Some(msg) = &self.status_msg {
-            format!(" {msg}")
-        } else if self.has_active_filters() {
-            format!(" Esc Clear{sep}c Convs{sep}s/S Sort{sep}m Misses{sep}Tab Pane{sep}r Refresh{back_hint}{sep}q Quit")
-        } else if area.width < 92 {
-            format!(" c Convs{sep}s/S Sort{sep}m Misses{sep}Tab Pane{back_hint}{sep}q Quit")
-        } else {
-            let sub_hint = if self.report.subagents.is_empty() {
-                String::new()
-            } else {
-                format!("{sep}v Models/Sub")
-            };
-            let nav = if pal.ascii { "j/k" } else { "↑↓/jk" };
-            format!(" {nav} Select{sep}c Convs{sep}s/S Sort (click header){sep}m Misses{sub_hint}{sep}Tab Pane{sep}r Refresh{back_hint}{sep}q Quit")
-        };
-        let style = if self.status_msg.is_some() {
-            pal.bold(Color::Yellow)
-        } else {
-            pal.dim()
-        };
-        frame.render_widget(Paragraph::new(Line::styled(text, style)), area);
+    fn draw_footer(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        has_back: bool,
+        pal: &Palette,
+    ) -> ClickRegions<DetailClick> {
+        render_footer_bar(
+            frame,
+            area,
+            self.status_msg.as_deref(),
+            pal,
+            |bar, sep, dim| {
+                if self.has_active_filters() {
+                    let _ = bar.push_sep_click(
+                        sep,
+                        dim,
+                        "Esc Clear",
+                        dim,
+                        DetailClick::ClearAllFilters,
+                    );
+                    let _ = bar.push_sep_click(
+                        sep,
+                        dim,
+                        "c Convs",
+                        dim,
+                        DetailClick::OpenConversations,
+                    );
+                    let _ =
+                        bar.push_sep_click(sep, dim, "s/S Sort", dim, DetailClick::CycleSortField);
+                    let _ =
+                        bar.push_sep_click(sep, dim, "m Misses", dim, DetailClick::ToggleMisses);
+                    let _ = bar.push_sep_click(sep, dim, "Tab Pane", dim, DetailClick::TogglePane);
+                    let _ = bar.push_sep_click(sep, dim, "r Refresh", dim, DetailClick::Refresh);
+                    if has_back {
+                        let _ = bar.push_sep_click(sep, dim, "b Back", dim, DetailClick::Back);
+                    }
+                    let _ = bar.push_sep_click(sep, dim, "q Quit", dim, DetailClick::Quit);
+                } else if area.width < 92 {
+                    let _ = bar.push_sep_click(
+                        sep,
+                        dim,
+                        "c Convs",
+                        dim,
+                        DetailClick::OpenConversations,
+                    );
+                    let _ =
+                        bar.push_sep_click(sep, dim, "s/S Sort", dim, DetailClick::CycleSortField);
+                    let _ =
+                        bar.push_sep_click(sep, dim, "m Misses", dim, DetailClick::ToggleMisses);
+                    let _ = bar.push_sep_click(sep, dim, "Tab Pane", dim, DetailClick::TogglePane);
+                    if has_back {
+                        let _ = bar.push_sep_click(sep, dim, "b Back", dim, DetailClick::Back);
+                    }
+                    let _ = bar.push_sep_click(sep, dim, "q Quit", dim, DetailClick::Quit);
+                } else {
+                    let nav = if pal.ascii { "j/k" } else { "↑↓/jk" };
+                    let _ = bar.push(format!("{nav} Select"), dim);
+                    let _ = bar.push_sep_click(
+                        sep,
+                        dim,
+                        "c Convs",
+                        dim,
+                        DetailClick::OpenConversations,
+                    );
+                    let _ = bar.push_sep_click(
+                        sep,
+                        dim,
+                        "s/S Sort (click header)",
+                        dim,
+                        DetailClick::CycleSortField,
+                    );
+                    let _ =
+                        bar.push_sep_click(sep, dim, "m Misses", dim, DetailClick::ToggleMisses);
+                    if !self.report.subagents.is_empty() {
+                        let _ = bar.push_sep_click(
+                            sep,
+                            dim,
+                            "v Models/Sub",
+                            dim,
+                            DetailClick::ToggleRightTab,
+                        );
+                    }
+                    let _ = bar.push_sep_click(sep, dim, "Tab Pane", dim, DetailClick::TogglePane);
+                    let _ = bar.push_sep_click(sep, dim, "r Refresh", dim, DetailClick::Refresh);
+                    if has_back {
+                        let _ = bar.push_sep_click(sep, dim, "b Back", dim, DetailClick::Back);
+                    }
+                    let _ = bar.push_sep_click(sep, dim, "q Quit", dim, DetailClick::Quit);
+                }
+            },
+        )
     }
 }
 
@@ -1366,26 +1531,13 @@ impl TurnCol {
 
     fn header(self, sort: TurnSort, pal: &Palette) -> Cell<'static> {
         let field = self.sort_field();
-        let active = sort.field == field;
-        let label = if active {
-            format!("{} {}", field.header_label(), sort.dir.arrow(pal.ascii))
-        } else {
-            field.header_label().to_string()
-        };
-        let style = if active {
-            if pal.no_color {
-                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                pal.bold(Color::Cyan)
-            }
-        } else {
-            pal.dim()
-        };
-        if self.is_right_aligned() {
-            right_cell(label, style)
-        } else {
-            Cell::from(label).style(style)
-        }
+        sort_header_cell(
+            field.header_label(),
+            sort.field == field,
+            sort.dir,
+            self.is_right_aligned(),
+            pal,
+        )
     }
 }
 
@@ -1658,11 +1810,14 @@ mod tests {
         };
 
         // Click Cost header -> sorts Cost descending (turn #3 $0.62, #1 $0.10, #2 $0.02).
-        screen.handle_mouse(m(
-            MouseEventKind::Down(MouseButton::Left),
-            cost_hit.x0 + 1,
-            header_y,
-        ));
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                cost_hit.x0 + 1,
+                header_y,
+            ),
+            true,
+        );
         assert_eq!(
             screen.sort,
             TurnSort {
@@ -1673,11 +1828,14 @@ mod tests {
         assert_eq!(screen.view.turn_indices, vec![2, 0, 1]);
 
         // Click Cost header again -> toggles to Cost ascending (turn #2 $0.02, #1 $0.10, #3 $0.62).
-        screen.handle_mouse(m(
-            MouseEventKind::Down(MouseButton::Left),
-            cost_hit.x0 + 1,
-            header_y,
-        ));
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                cost_hit.x0 + 1,
+                header_y,
+            ),
+            true,
+        );
         assert_eq!(
             screen.sort,
             TurnSort {
@@ -1695,36 +1853,273 @@ mod tests {
             .find(|c| c.col == TurnCol::Idx)
             .copied()
             .unwrap();
-        screen.handle_mouse(m(
-            MouseEventKind::Down(MouseButton::Left),
-            idx_hit.x0,
-            header_y,
-        ));
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                idx_hit.x0,
+                header_y,
+            ),
+            true,
+        );
         assert_eq!(screen.sort, TurnSort::default());
         assert_eq!(screen.view.turn_indices, vec![0, 1, 2]);
 
         let tx = screen.turns_hit.pane.x + 4;
         let t2_y = screen.turns_hit.data_y0 + 2;
-        screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), tx, t2_y));
+        screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), tx, t2_y), true);
         assert_eq!(screen.turn_idx, 2);
-        screen.handle_mouse(m(MouseEventKind::ScrollUp, tx, t2_y));
+        screen.handle_mouse(m(MouseEventKind::ScrollUp, tx, t2_y), true);
         assert_eq!(screen.turn_idx, 0);
 
         let bx = screen.breakdown_hit.pane.x + 3;
         let b0_y = screen.breakdown_hit.data_y0;
-        screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), bx, b0_y));
+        screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), bx, b0_y), true);
         assert_eq!(screen.active_pane, DetailPane::Breakdown);
         assert!(screen.model_filter.is_none());
-        screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), bx, b0_y));
+        screen.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), bx, b0_y), true);
         assert_eq!(screen.model_filter.as_deref(), Some("Model Alpha"));
 
         // Clicking breakdown title toggles Models -> Subagents.
-        screen.handle_mouse(m(
-            MouseEventKind::Down(MouseButton::Left),
-            bx,
-            screen.breakdown_hit.pane.y,
-        ));
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                bx,
+                screen.breakdown_hit.pane.y,
+            ),
+            true,
+        );
         assert_eq!(screen.right_tab, RightTab::Subagents);
+    }
+
+    #[test]
+    fn detail_mouse_clicks_header_badges_kpi_miss_and_footer_actions() {
+        let m = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let rect_text = |buf: &ratatui::buffer::Buffer, r: Rect| -> String {
+            (r.x..r.right()).map(|x| buf[(x, r.y)].symbol()).collect()
+        };
+        let mut screen = DetailScreen::new(sample_report(), TurnSort::default());
+        let pal = Palette {
+            no_color: true,
+            ascii: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        terminal
+            .draw(|frame| screen.draw(frame, true, &pal))
+            .unwrap();
+
+        // Click red KPI "1 miss" badge to filter cache anomalies.
+        let miss_kpi = screen
+            .kpi_hits
+            .find(|c| *c == DetailClick::ToggleMisses)
+            .unwrap();
+        assert!(rect_text(terminal.backend().buffer(), miss_kpi).contains("1 miss"));
+        assert_eq!(
+            screen.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    miss_kpi.x + 1,
+                    miss_kpi.y
+                ),
+                true,
+            ),
+            DetailAction::Continue
+        );
+        assert!(screen.misses_only);
+        assert_eq!(screen.view.turn_indices, vec![2]);
+
+        // Redraw and click red header "Misses" pill to clear misses_only.
+        terminal
+            .draw(|frame| screen.draw(frame, true, &pal))
+            .unwrap();
+        let miss_pill = screen
+            .header_hits
+            .find(|c| *c == DetailClick::ToggleMisses)
+            .unwrap();
+        assert!(rect_text(terminal.backend().buffer(), miss_pill).contains("Misses"));
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                miss_pill.x + 1,
+                miss_pill.y,
+            ),
+            true,
+        );
+        assert!(!screen.misses_only);
+        assert_eq!(screen.view.turn_indices, vec![0, 1, 2]);
+
+        // Left-click header sort pill flips direction; right-click cycles sort field.
+        let sort_pill = screen
+            .header_hits
+            .find(|c| *c == DetailClick::ToggleSortDir)
+            .unwrap();
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                sort_pill.x + 1,
+                sort_pill.y,
+            ),
+            true,
+        );
+        assert_eq!(screen.sort.dir, SortDir::Desc);
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Right),
+                sort_pill.x + 1,
+                sort_pill.y,
+            ),
+            true,
+        );
+        assert_eq!(screen.sort.field, TurnSortField::Time);
+
+        // Clear model & subagent filter badges individually via header clicks.
+        screen.model_filter = Some("Model Alpha".to_string());
+        screen.subagent_filter = Some("9a1482f2-6b16-434c-99cd-fe86aa60ab9c".to_string());
+        screen.recompute_view();
+        terminal
+            .draw(|frame| screen.draw(frame, true, &pal))
+            .unwrap();
+        let clear_model = screen
+            .header_hits
+            .find(|c| *c == DetailClick::ClearModelFilter)
+            .unwrap();
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                clear_model.x + 1,
+                clear_model.y,
+            ),
+            true,
+        );
+        assert_eq!(screen.model_filter, None);
+        assert!(screen.subagent_filter.is_some());
+
+        terminal
+            .draw(|frame| screen.draw(frame, true, &pal))
+            .unwrap();
+        let clear_sub = screen
+            .header_hits
+            .find(|c| *c == DetailClick::ClearSubagentFilter)
+            .unwrap();
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                clear_sub.x + 1,
+                clear_sub.y,
+            ),
+            true,
+        );
+        assert_eq!(screen.subagent_filter, None);
+
+        // Footer actions: TogglePane, ToggleRightTab, OpenConversations, Refresh, Back, Quit.
+        terminal
+            .draw(|frame| screen.draw(frame, true, &pal))
+            .unwrap();
+        let pane_btn = screen
+            .footer_hits
+            .find(|c| *c == DetailClick::TogglePane)
+            .unwrap();
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                pane_btn.x + 1,
+                pane_btn.y,
+            ),
+            true,
+        );
+        assert_eq!(screen.active_pane, DetailPane::Breakdown);
+
+        let tab_btn = screen
+            .footer_hits
+            .find(|c| *c == DetailClick::ToggleRightTab)
+            .unwrap();
+        screen.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                tab_btn.x + 1,
+                tab_btn.y,
+            ),
+            true,
+        );
+        assert_eq!(screen.right_tab, RightTab::Subagents);
+
+        let convs_btn = screen
+            .footer_hits
+            .find(|c| *c == DetailClick::OpenConversations)
+            .unwrap();
+        assert_eq!(
+            screen.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    convs_btn.x + 1,
+                    convs_btn.y
+                ),
+                true,
+            ),
+            DetailAction::OpenConversations
+        );
+
+        let ref_btn = screen
+            .footer_hits
+            .find(|c| *c == DetailClick::Refresh)
+            .unwrap();
+        assert_eq!(
+            screen.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    ref_btn.x + 1,
+                    ref_btn.y
+                ),
+                true,
+            ),
+            DetailAction::Refresh
+        );
+
+        let back_btn = screen
+            .footer_hits
+            .find(|c| *c == DetailClick::Back)
+            .unwrap();
+        assert_eq!(rect_text(terminal.backend().buffer(), back_btn), "b Back");
+        assert_eq!(
+            screen.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    back_btn.x + 1,
+                    back_btn.y
+                ),
+                true,
+            ),
+            DetailAction::Back
+        );
+
+        let quit_btn = screen
+            .footer_hits
+            .find(|c| *c == DetailClick::Quit)
+            .unwrap();
+        assert_eq!(
+            screen.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    quit_btn.x + 1,
+                    quit_btn.y
+                ),
+                true,
+            ),
+            DetailAction::Quit
+        );
+
+        // When has_back is false, no Back button region is emitted.
+        terminal
+            .draw(|frame| screen.draw(frame, false, &pal))
+            .unwrap();
+        assert!(screen
+            .footer_hits
+            .find(|c| *c == DetailClick::Back)
+            .is_none());
     }
 
     #[test]
@@ -1766,5 +2161,135 @@ mod tests {
         screen.apply_live_report(updated);
         assert_eq!(screen.view.turn_indices.len(), 5);
         assert_eq!(screen.turn_idx, 0);
+    }
+
+    #[test]
+    fn detail_screen_aligns_miss_filter_with_mid_session_misses_and_renders_diagnostics() {
+        use crate::stats::{ConversationDiagnostics, ScanDiagnostics};
+
+        let root_id = "8d0371e1-5a05-423b-a8bc-ed75995f9a8b";
+        let report = ConversationStatsReport {
+            conversation_id: root_id.to_string(),
+            title: Some("Diagnostics & Miss Alignment".to_string()),
+            source: "cli".to_string(),
+            timezone: "UTC".to_string(),
+            first_turn_local: Some("2026-11-24 10:00:00".to_string()),
+            last_turn_local: Some("2026-11-24 10:15:00".to_string()),
+            duration_secs: Some(900),
+            peak_context_tokens: Some(20_000),
+            mid_session_misses: 1,
+            mid_session_miss_usd: 0.40,
+            totals: PeriodSummary {
+                requests: 4,
+                input_tokens: 47_000,
+                cache_read_tokens: 23_000,
+                output_tokens: 2_000,
+                total_tokens: 72_000,
+                priced_usd: 0.85,
+                priced_requests: 4,
+                ..Default::default()
+            },
+            turns: vec![
+                // Turn #1: initial cold turn (0% hit) -> NOT a mid-session miss.
+                make_turn(
+                    1,
+                    root_id,
+                    false,
+                    "2026-11-24 10:00:00",
+                    "Model Alpha",
+                    10_000,
+                    0,
+                    500,
+                    0.20,
+                ),
+                // Turn #2: warm cache hit (90% hit).
+                make_turn(
+                    2,
+                    root_id,
+                    false,
+                    "2026-11-24 10:05:00",
+                    "Model Alpha",
+                    2_000,
+                    18_000,
+                    500,
+                    0.05,
+                ),
+                // Turn #3: partial cache read (25% hit < 50%) -> NOT a mid-session miss.
+                make_turn(
+                    3,
+                    root_id,
+                    false,
+                    "2026-11-24 10:10:00",
+                    "Model Alpha",
+                    15_000,
+                    5_000,
+                    500,
+                    0.20,
+                ),
+                // Turn #4: true mid-session cache miss (0% hit after earlier prompt).
+                make_turn(
+                    4,
+                    root_id,
+                    false,
+                    "2026-11-24 10:15:00",
+                    "Model Alpha",
+                    20_000,
+                    0,
+                    500,
+                    0.40,
+                ),
+            ],
+            diagnostics: ConversationDiagnostics {
+                total: ScanDiagnostics {
+                    retry_count: 3,
+                    retries_429: 2,
+                    retries_503: 1,
+                    total_retry_delay_secs: 12.0,
+                    error_steps: 1,
+                    compaction_steps: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut screen = DetailScreen::new(report, TurnSort::default());
+        let pal = Palette {
+            no_color: true,
+            ascii: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 32)).unwrap();
+        terminal
+            .draw(|frame| screen.draw(frame, false, &pal))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("1 miss (~$0.40)"), "{rendered}");
+        assert!(rendered.contains("2 compact"), "{rendered}");
+        assert!(rendered.contains("2×429 1×503 (12s)"), "{rendered}");
+        assert!(rendered.contains("1 err"), "{rendered}");
+
+        // Clicking KPI "1 miss" badge filters strictly to Turn #4 (index 3), matching count == 1.
+        let miss_kpi = screen
+            .kpi_hits
+            .find(|c| *c == DetailClick::ToggleMisses)
+            .unwrap();
+        screen.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: miss_kpi.x + 1,
+                row: miss_kpi.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            false,
+        );
+        assert!(screen.misses_only);
+        assert_eq!(screen.view.turn_indices, vec![3]);
     }
 }

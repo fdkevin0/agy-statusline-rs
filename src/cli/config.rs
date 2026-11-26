@@ -30,16 +30,30 @@ struct PillHit {
     x1: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigFooterClick {
+    NextPane,
+    CyclePreset,
+    CycleWidth,
+    SaveAndApply,
+    Quit,
+    DropGrabbed,
+}
+
 #[derive(Default)]
 struct UiHitMap {
     preview: Rect,
     canvas: Rect,
     catalog: Rect,
+    catalog_inner: Rect,
     catalog_offset: usize,
     settings: Rect,
+    settings_inner: Rect,
     settings_offset: usize,
-    canvas_line_y: [u16; MAX_ROWS],
+    settings_dec_pos: Option<Position>,
+    canvas_row_ys: Vec<(u16, usize)>,
     canvas_pills: Vec<PillHit>,
+    footer_hits: Vec<(Rect, ConfigFooterClick)>,
 }
 
 /// Launches the 3-pane interactive TUI layout configurator.
@@ -67,7 +81,7 @@ pub fn run_tui_config(config_path: &Path) -> io::Result<()> {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 outcome = state.handle_key(key.code, key.modifiers);
             }
-            Event::Mouse(mouse) => handle_mouse(&mut state, mouse, &hit_map),
+            Event::Mouse(mouse) => outcome = handle_mouse(&mut state, mouse, &hit_map),
             _ => {}
         }
     }
@@ -127,11 +141,26 @@ fn pane_block(title: String, active: bool, grabbed: bool) -> Block<'static> {
         ))
 }
 
-fn handle_mouse(state: &mut TuiEditorState, mouse: MouseEvent, map: &UiHitMap) {
+fn handle_mouse(state: &mut TuiEditorState, mouse: MouseEvent, map: &UiHitMap) -> ExitOutcome {
     let (col, row) = (mouse.column, mouse.row);
     let pos = Position::new(col, row);
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(&(_, action)) = map.footer_hits.iter().find(|(r, _)| r.contains(pos)) {
+                match action {
+                    ConfigFooterClick::NextPane => state.focus_pane(state.active_pane.next()),
+                    ConfigFooterClick::CyclePreset => {
+                        state.apply_preset(state.preset.step(1));
+                    }
+                    ConfigFooterClick::CycleWidth => {
+                        state.preview_width = state.preview_width.next();
+                    }
+                    ConfigFooterClick::SaveAndApply => return ExitOutcome::SaveAndApply,
+                    ConfigFooterClick::Quit => return ExitOutcome::Quit,
+                    ConfigFooterClick::DropGrabbed => state.grabbed = false,
+                }
+                return ExitOutcome::Continue;
+            }
             if map.preview.contains(pos) {
                 state.preview_width = state.preview_width.next();
             } else if map.canvas.contains(pos) {
@@ -141,30 +170,29 @@ fn handle_mouse(state: &mut TuiEditorState, mouse: MouseEvent, map: &UiHitMap) {
                     .find(|p| row == p.y && col >= p.x0 && col < p.x1)
                 {
                     state.click_canvas(hit.row, Some(hit.col));
-                } else if let Some((r, _)) = map
-                    .canvas_line_y
-                    .iter()
-                    .enumerate()
-                    .find(|&(_, &y)| y == row)
-                {
+                } else if let Some(&(_, r)) = map.canvas_row_ys.iter().find(|&&(y, _)| y == row) {
                     state.click_canvas(r, None);
                 } else {
-                    state.active_pane = ActivePane::Canvas;
+                    state.focus_pane(ActivePane::Canvas);
                 }
             } else if map.catalog.contains(pos) {
-                let inner_y = row.saturating_sub(map.catalog.y + 1) as usize;
-                if row > map.catalog.y && row + 1 < map.catalog.y + map.catalog.height {
+                if map.catalog_inner.contains(pos) {
+                    let inner_y = usize::from(row.saturating_sub(map.catalog_inner.y));
                     state.click_catalog(map.catalog_offset + inner_y);
                 } else {
-                    state.active_pane = ActivePane::Catalog;
+                    state.focus_pane(ActivePane::Catalog);
                 }
             } else if map.settings.contains(pos) {
-                let inner_y = row.saturating_sub(map.settings.y + 1) as usize;
-                if row > map.settings.y && row + 1 < map.settings.y + map.settings.height {
-                    state.adjust_setting_at(map.settings_offset + inner_y, 1);
-                    state.active_pane = ActivePane::Settings;
+                if map.settings_inner.contains(pos) {
+                    let inner_y = usize::from(row.saturating_sub(map.settings_inner.y));
+                    let dir = if map.settings_dec_pos == Some(pos) {
+                        -1
+                    } else {
+                        1
+                    };
+                    state.adjust_setting_at(map.settings_offset + inner_y, dir);
                 } else {
-                    state.active_pane = ActivePane::Settings;
+                    state.focus_pane(ActivePane::Settings);
                 }
             }
         }
@@ -177,12 +205,9 @@ fn handle_mouse(state: &mut TuiEditorState, mouse: MouseEvent, map: &UiHitMap) {
                 {
                     state.remove_canvas_pill(hit.row, hit.col);
                 }
-            } else if map.settings.contains(pos) {
-                let inner_y = row.saturating_sub(map.settings.y + 1) as usize;
-                if row > map.settings.y && row + 1 < map.settings.y + map.settings.height {
-                    state.adjust_setting_at(map.settings_offset + inner_y, -1);
-                    state.active_pane = ActivePane::Settings;
-                }
+            } else if map.settings_inner.contains(pos) {
+                let inner_y = usize::from(row.saturating_sub(map.settings_inner.y));
+                state.adjust_setting_at(map.settings_offset + inner_y, -1);
             }
         }
         MouseEventKind::ScrollUp => {
@@ -191,7 +216,7 @@ fn handle_mouse(state: &mut TuiEditorState, mouse: MouseEvent, map: &UiHitMap) {
             } else if map.settings.contains(pos) {
                 state.scroll_settings(-1);
             } else if map.canvas.contains(pos) {
-                state.click_canvas(state.canvas_row.saturating_sub(1), None);
+                state.scroll_canvas(-1);
             }
         }
         MouseEventKind::ScrollDown => {
@@ -200,11 +225,73 @@ fn handle_mouse(state: &mut TuiEditorState, mouse: MouseEvent, map: &UiHitMap) {
             } else if map.settings.contains(pos) {
                 state.scroll_settings(1);
             } else if map.canvas.contains(pos) {
-                state.click_canvas((state.canvas_row + 1).min(MAX_ROWS - 1), None);
+                state.scroll_canvas(1);
             }
         }
         _ => {}
     }
+    ExitOutcome::Continue
+}
+
+fn draw_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiEditorState,
+) -> Vec<(Rect, ConfigFooterClick)> {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    let style = Style::default().fg(if state.grabbed {
+        Color::Yellow
+    } else {
+        Color::Gray
+    });
+    let segments: &[(&str, Option<ConfigFooterClick>)] = if state.grabbed {
+        &[
+            (
+                "MOVE MODE:  ←/→ Swap on line  ·  ↑/↓ Move between Line 1–3  ·  ",
+                None,
+            ),
+            ("Enter/Esc Drop", Some(ConfigFooterClick::DropGrabbed)),
+        ]
+    } else {
+        &[
+            ("Tab/Click Pane", Some(ConfigFooterClick::NextPane)),
+            (
+                "  ·  ↑↓←→/Scroll Nav  ·  Enter/Click Grab/Toggle  ·  RightClick Remove  ·  ",
+                None,
+            ),
+            ("1-4 Preset", Some(ConfigFooterClick::CyclePreset)),
+            ("  ·  ", None),
+            ("w Width", Some(ConfigFooterClick::CycleWidth)),
+            ("  ·  ", None),
+            ("s Save+Apply", Some(ConfigFooterClick::SaveAndApply)),
+            ("  ·  ", None),
+            ("q Quit", Some(ConfigFooterClick::Quit)),
+        ]
+    };
+
+    let mut spans = Vec::with_capacity(segments.len());
+    let mut hits = Vec::new();
+    let mut cur_x = inner.x;
+    for &(text, action) in segments {
+        let w = u16::try_from(text.width()).unwrap_or(u16::MAX);
+        if let Some(act) = action {
+            if inner.height > 0 && cur_x < inner.right() {
+                let clipped_w = w.min(inner.right().saturating_sub(cur_x));
+                if clipped_w > 0 {
+                    hits.push((Rect::new(cur_x, inner.y, clipped_w, 1), act));
+                }
+            }
+        }
+        spans.push(Span::styled(text, style));
+        cur_x = cur_x.saturating_add(w);
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+    hits
 }
 
 fn draw_ui(frame: &mut Frame<'_>, state: &TuiEditorState) -> UiHitMap {
@@ -248,47 +335,37 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiEditorState) -> UiHitMap {
         ])
         .split(chunks[1]);
 
-    let help_text = if state.grabbed {
-        "MOVE MODE:  ←/→ Swap on line  ·  ↑/↓ Move between Line 1–3  ·  Enter/Esc Drop"
-    } else {
-        "Tab/Click Pane  ·  ↑↓←→/Scroll Nav  ·  Enter/Click Grab/Toggle  ·  RightClick Remove  ·  1-4 Preset  ·  w Width  ·  s Save+Apply  ·  q Quit"
-    };
-    let help = Paragraph::new(help_text)
-        .style(Style::default().fg(if state.grabbed {
-            Color::Yellow
-        } else {
-            Color::Gray
-        }))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
-    frame.render_widget(help, chunks[2]);
-
-    let (canvas_line_y, canvas_pills) = draw_canvas_pane(frame, mid[0], state);
-    let catalog_offset = draw_catalog_pane(frame, mid[1], state);
-    let settings_offset = draw_settings_pane(frame, mid[2], state);
+    let footer_hits = draw_footer(frame, chunks[2], state);
+    let (canvas_row_ys, canvas_pills) = draw_canvas_pane(frame, mid[0], state);
+    let (catalog_inner, catalog_offset) = draw_catalog_pane(frame, mid[1], state);
+    let (settings_inner, settings_offset, settings_dec_pos) =
+        draw_settings_pane(frame, mid[2], state);
     UiHitMap {
         preview: chunks[0],
         canvas: mid[0],
         catalog: mid[1],
+        catalog_inner,
         catalog_offset,
         settings: mid[2],
+        settings_inner,
         settings_offset,
-        canvas_line_y,
+        settings_dec_pos,
+        canvas_row_ys,
         canvas_pills,
+        footer_hits,
     }
 }
 
-fn layout_canvas_lines(
-    area: Rect,
-    state: &TuiEditorState,
-) -> (Vec<Line<'static>>, [u16; MAX_ROWS], Vec<PillHit>) {
+struct CanvasLayout {
+    lines: Vec<Line<'static>>,
+    row_ys: Vec<(u16, usize)>,
+    pills: Vec<PillHit>,
+}
+
+fn layout_canvas_lines(area: Rect, state: &TuiEditorState) -> CanvasLayout {
     let active = state.active_pane == ActivePane::Canvas;
     let mut lines = Vec::new();
-    let mut line_y = [0u16; MAX_ROWS];
+    let mut row_ys = Vec::new();
     let mut pills = Vec::new();
     let inner_x = area.x + 1;
     let max_x = area.x + area.width.saturating_sub(1);
@@ -297,7 +374,7 @@ fn layout_canvas_lines(
 
     for r in 0..MAX_ROWS {
         if cur_y < max_y {
-            line_y[r] = cur_y;
+            row_ys.push((cur_y, r));
         }
         let row_focused = active && state.canvas_row == r;
         let label_style = if row_focused {
@@ -349,6 +426,9 @@ fn layout_canvas_lines(
                 if line_has_pill && cur_x + pw > max_x {
                     lines.push(Line::from(spans));
                     cur_y += 1;
+                    if cur_y < max_y {
+                        row_ys.push((cur_y, r));
+                    }
                     spans = vec![Span::raw("        ")];
                     cur_x = inner_x + 8;
                 }
@@ -373,28 +453,35 @@ fn layout_canvas_lines(
         cur_y += 1;
     }
 
-    (lines, line_y, pills)
+    CanvasLayout {
+        lines,
+        row_ys,
+        pills,
+    }
 }
 
 fn draw_canvas_pane(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &TuiEditorState,
-) -> ([u16; MAX_ROWS], Vec<PillHit>) {
+) -> (Vec<(u16, usize)>, Vec<PillHit>) {
     let active = state.active_pane == ActivePane::Canvas;
-    let (lines, line_y, pills) = layout_canvas_lines(area, state);
-    let panel = Paragraph::new(lines).block(pane_block(
+    let layout = layout_canvas_lines(area, state);
+    let panel = Paragraph::new(layout.lines).block(pane_block(
         " 1. Layout Lines ".to_string(),
         active,
         state.grabbed,
     ));
     frame.render_widget(panel, area);
-    (line_y, pills)
+    (layout.row_ys, layout.pills)
 }
 
-fn draw_catalog_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState) -> usize {
+fn draw_catalog_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState) -> (Rect, usize) {
     let active = state.active_pane == ActivePane::Catalog;
-    let inner_h = usize::from(area.height.saturating_sub(2)).max(1);
+    let title = format!(" 2. Catalog (→ L{}) ", state.canvas_row + 1);
+    let block = pane_block(title, active, false);
+    let inner = block.inner(area);
+    let inner_h = usize::from(inner.height).max(1);
     let offset = state.catalog_idx.saturating_sub(inner_h.saturating_sub(1));
     let mut lines = Vec::new();
     for (idx, &w) in WidgetId::ALL.iter().enumerate().skip(offset).take(inner_h) {
@@ -427,10 +514,9 @@ fn draw_catalog_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState) 
             line_style,
         ));
     }
-    let title = format!(" 2. Catalog (→ L{}) ", state.canvas_row + 1);
-    let panel = Paragraph::new(lines).block(pane_block(title, active, false));
+    let panel = Paragraph::new(lines).block(block);
     frame.render_widget(panel, area);
-    offset
+    (inner, offset)
 }
 
 fn setting_row(state: &TuiEditorState, field: SettingField) -> (&'static str, String) {
@@ -483,26 +569,46 @@ fn setting_row(state: &TuiEditorState, field: SettingField) -> (&'static str, St
         ),
         SettingField::SpeedWarn => (
             "Speed warn",
-            format!("{:.0} tok/s", cfg.speed_warn_threshold),
+            if cfg.speed_warn_threshold <= 0.0 {
+                "OFF".to_string()
+            } else {
+                format!("{:.0} tok/s", cfg.speed_warn_threshold)
+            },
         ),
     }
 }
 
-fn draw_settings_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState) -> usize {
+fn draw_settings_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiEditorState,
+) -> (Rect, usize, Option<Position>) {
     let active = state.active_pane == ActivePane::Settings;
-    let inner_h = usize::from(area.height.saturating_sub(2)).max(1);
+    let block = pane_block(" 3. Style & AGY ".to_string(), active, false);
+    let inner = block.inner(area);
+    let inner_h = usize::from(inner.height).max(1);
     let offset = state.settings_idx.saturating_sub(inner_h.saturating_sub(1));
+    let mut dec_pos = None;
     let lines: Vec<Line<'static>> = SettingField::ALL
         .iter()
         .enumerate()
         .skip(offset)
         .take(inner_h)
-        .map(|(idx, &field)| {
+        .enumerate()
+        .map(|(vis_row, (idx, &field))| {
             let (k, v) = setting_row(state, field);
             let is_cur = active && idx == state.settings_idx;
             if is_cur {
+                let prefix = format!("▸ {k:<10} ");
+                let dec_x = inner
+                    .x
+                    .saturating_add(u16::try_from(prefix.width()).unwrap_or(u16::MAX));
+                let row_y = inner.y.saturating_add(vis_row as u16);
+                if dec_x < inner.right() && row_y < inner.bottom() {
+                    dec_pos = Some(Position::new(dec_x, row_y));
+                }
                 Line::styled(
-                    format!("▸ {k:<10} < {v} >"),
+                    format!("{prefix}< {v} >"),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -516,10 +622,9 @@ fn draw_settings_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiEditorState)
         })
         .collect();
 
-    let panel =
-        Paragraph::new(lines).block(pane_block(" 3. Style & AGY ".to_string(), active, false));
+    let panel = Paragraph::new(lines).block(block);
     frame.render_widget(panel, area);
-    offset
+    (inner, offset, dec_pos)
 }
 
 #[cfg(test)]
@@ -531,13 +636,292 @@ mod tests {
     fn canvas_wrapping_updates_line_y_and_pill_hit_coordinates() {
         let state = TuiEditorState::new(LayoutConfig::preset_full());
         let area = Rect::new(0, 0, 48, 18);
-        let (_lines, line_y, pills) = layout_canvas_lines(area, &state);
+        let layout = layout_canvas_lines(area, &state);
 
-        let last_row0 = pills.iter().rfind(|p| p.row == 0).unwrap();
-        let row1_pill = pills.iter().find(|p| p.row == 1).unwrap();
-        assert!(last_row0.y > line_y[0]);
-        assert_eq!(line_y[1], last_row0.y + 2);
-        assert_eq!(row1_pill.y, line_y[1]);
+        let line0_y = layout.row_ys.iter().find(|&&(_, r)| r == 0).unwrap().0;
+        let line1_y = layout.row_ys.iter().find(|&&(_, r)| r == 1).unwrap().0;
+        let last_row0 = layout.pills.iter().rfind(|p| p.row == 0).unwrap();
+        let row1_pill = layout.pills.iter().find(|p| p.row == 1).unwrap();
+        assert!(last_row0.y > line0_y);
+        assert_eq!(line1_y, last_row0.y + 2);
+        assert_eq!(row1_pill.y, line1_y);
+        assert!(layout.row_ys.contains(&(last_row0.y, 0)));
+    }
+
+    #[test]
+    fn config_mouse_clicks_move_mode_drop_setting_arrows_and_footer_actions() {
+        use crate::config::layout::VisualStyle;
+
+        let m = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let mut state = TuiEditorState::new(LayoutConfig::preset_minimal());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 28)).unwrap();
+        let mut map = UiHitMap::default();
+        terminal.draw(|frame| map = draw_ui(frame, &state)).unwrap();
+
+        // Click already-selected pill (0, 0) to grab, then click footer "Enter/Esc Drop" to drop.
+        let p0 = map.canvas_pills[0];
+        assert_eq!(
+            handle_mouse(
+                &mut state,
+                m(MouseEventKind::Down(MouseButton::Left), p0.x0 + 1, p0.y),
+                &map,
+            ),
+            ExitOutcome::Continue
+        );
+        assert!(state.grabbed);
+
+        terminal.draw(|frame| map = draw_ui(frame, &state)).unwrap();
+        let drop_rect = map
+            .footer_hits
+            .iter()
+            .find(|(_, a)| *a == ConfigFooterClick::DropGrabbed)
+            .unwrap()
+            .0;
+        handle_mouse(
+            &mut state,
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                drop_rect.x + 1,
+                drop_rect.y,
+            ),
+            &map,
+        );
+        assert!(!state.grabbed);
+
+        // Grab pill (0, 0) ("State") and click pill (0, 2) to reorder on the same line.
+        terminal.draw(|frame| map = draw_ui(frame, &state)).unwrap();
+        let p0 = map.canvas_pills[0];
+        let p2 = map.canvas_pills[2];
+        handle_mouse(
+            &mut state,
+            m(MouseEventKind::Down(MouseButton::Left), p0.x0 + 1, p0.y),
+            &map,
+        );
+        assert!(state.grabbed);
+        handle_mouse(
+            &mut state,
+            m(MouseEventKind::Down(MouseButton::Left), p2.x0 + 1, p2.y),
+            &map,
+        );
+        assert!(!state.grabbed);
+        assert_eq!(state.config.rows[0][2], WidgetId::State);
+
+        // Grab pill (0, 2) ("State") and click Line 3 to move it across rows.
+        terminal.draw(|frame| map = draw_ui(frame, &state)).unwrap();
+        let moved = map.canvas_pills[2];
+        let line3_y = map.canvas_row_ys.iter().find(|&&(_, r)| r == 2).unwrap().0;
+        handle_mouse(
+            &mut state,
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                moved.x0 + 1,
+                moved.y,
+            ),
+            &map,
+        );
+        assert!(state.grabbed);
+        handle_mouse(
+            &mut state,
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                map.canvas.x + 2,
+                line3_y,
+            ),
+            &map,
+        );
+        assert!(!state.grabbed);
+        assert_eq!(state.canvas_row, 2);
+        assert_eq!(state.config.rows[2], vec![WidgetId::State]);
+
+        // Leaving Canvas while grabbed (via Settings click, Catalog/Settings scroll, or blank Canvas click) always drops Move Mode.
+        terminal.draw(|frame| map = draw_ui(frame, &state)).unwrap();
+        let line3_pill = map
+            .canvas_pills
+            .iter()
+            .find(|p| p.row == 2)
+            .copied()
+            .unwrap();
+        handle_mouse(
+            &mut state,
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                line3_pill.x0 + 1,
+                line3_pill.y,
+            ),
+            &map,
+        );
+        assert!(state.grabbed);
+        handle_mouse(
+            &mut state,
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                map.settings.x + 1,
+                map.settings.y,
+            ),
+            &map,
+        );
+        assert_eq!(state.active_pane, ActivePane::Settings);
+        assert!(!state.grabbed);
+
+        state.click_canvas(2, Some(0));
+        state.click_canvas(2, Some(0));
+        assert!(state.grabbed);
+        handle_mouse(
+            &mut state,
+            m(
+                MouseEventKind::ScrollDown,
+                map.catalog.x + 2,
+                map.catalog.y + 2,
+            ),
+            &map,
+        );
+        assert_eq!(state.active_pane, ActivePane::Catalog);
+        assert!(!state.grabbed);
+
+        state.click_canvas(2, Some(0));
+        state.click_canvas(2, Some(0));
+        assert!(state.grabbed);
+        handle_mouse(
+            &mut state,
+            m(
+                MouseEventKind::ScrollDown,
+                map.settings.x + 2,
+                map.settings.y + 2,
+            ),
+            &map,
+        );
+        assert_eq!(state.active_pane, ActivePane::Settings);
+        assert!(!state.grabbed);
+
+        state.click_canvas(2, Some(0));
+        state.click_canvas(2, Some(0));
+        assert!(state.grabbed);
+        handle_mouse(
+            &mut state,
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                map.canvas.x + 2,
+                map.canvas.bottom() - 2,
+            ),
+            &map,
+        );
+        assert_eq!(state.active_pane, ActivePane::Canvas);
+        assert!(!state.grabbed);
+
+        // Settings pane: clicking '<' on active Style row steps backward; clicking right steps forward.
+        state.active_pane = ActivePane::Settings;
+        state.settings_idx = 1;
+        terminal.draw(|frame| map = draw_ui(frame, &state)).unwrap();
+        let dec = map.settings_dec_pos.unwrap();
+        assert_eq!(terminal.backend().buffer()[(dec.x, dec.y)].symbol(), "<");
+        handle_mouse(
+            &mut state,
+            m(MouseEventKind::Down(MouseButton::Left), dec.x, dec.y),
+            &map,
+        );
+        assert_eq!(state.config.style, VisualStyle::Powerline);
+        handle_mouse(
+            &mut state,
+            m(MouseEventKind::Down(MouseButton::Left), dec.x + 3, dec.y),
+            &map,
+        );
+        assert_eq!(state.config.style, VisualStyle::Plain);
+
+        // Footer actions: NextPane, CycleWidth, CyclePreset, SaveAndApply, Quit.
+        let pane_rect = map
+            .footer_hits
+            .iter()
+            .find(|(_, a)| *a == ConfigFooterClick::NextPane)
+            .unwrap()
+            .0;
+        handle_mouse(
+            &mut state,
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                pane_rect.x + 1,
+                pane_rect.y,
+            ),
+            &map,
+        );
+        assert_eq!(state.active_pane, ActivePane::Canvas);
+
+        let width_rect = map
+            .footer_hits
+            .iter()
+            .find(|(_, a)| *a == ConfigFooterClick::CycleWidth)
+            .unwrap()
+            .0;
+        handle_mouse(
+            &mut state,
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                width_rect.x + 1,
+                width_rect.y,
+            ),
+            &map,
+        );
+        assert_eq!(state.preview_width, PreviewWidth::Wide120);
+
+        let preset_rect = map
+            .footer_hits
+            .iter()
+            .find(|(_, a)| *a == ConfigFooterClick::CyclePreset)
+            .unwrap()
+            .0;
+        handle_mouse(
+            &mut state,
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                preset_rect.x + 1,
+                preset_rect.y,
+            ),
+            &map,
+        );
+        assert_eq!(state.preset, crate::config::layout::Preset::Addon);
+
+        let save_rect = map
+            .footer_hits
+            .iter()
+            .find(|(_, a)| *a == ConfigFooterClick::SaveAndApply)
+            .unwrap()
+            .0;
+        assert_eq!(
+            handle_mouse(
+                &mut state,
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    save_rect.x + 1,
+                    save_rect.y,
+                ),
+                &map,
+            ),
+            ExitOutcome::SaveAndApply
+        );
+
+        let quit_rect = map
+            .footer_hits
+            .iter()
+            .find(|(_, a)| *a == ConfigFooterClick::Quit)
+            .unwrap()
+            .0;
+        assert_eq!(
+            handle_mouse(
+                &mut state,
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    quit_rect.x + 1,
+                    quit_rect.y,
+                ),
+                &map,
+            ),
+            ExitOutcome::Quit
+        );
     }
 
     #[test]

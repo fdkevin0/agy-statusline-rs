@@ -1,6 +1,153 @@
 //! Serializable data models for `agy-statusline stats` and `agy-statusline conversations`.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
+
+use super::scan::ScanDiagnostics;
+
+/// Serializable window summary for a single quota pool in `stats --json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct QuotaWindowReport {
+    /// Window label (e.g. `"5h"`, `"7d"`, `"3p 5h"`).
+    pub label: String,
+    /// Remaining quota percentage (`0.0..=100.0`).
+    pub remaining_pct: f64,
+    /// Remaining discrete credit amount when fraction is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_amount: Option<i64>,
+    /// Compact reset countdown (e.g. `"3h10m"`), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_compact: Option<String>,
+    /// Whether remaining quota is lagging behind remaining window time.
+    #[serde(default)]
+    pub pace_behind: bool,
+    /// Observed consumption rate in percentage points per hour (`%/hr`), if history exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burn_rate_pct_per_hr: Option<f64>,
+    /// Projected seconds until exhaustion at current burn rate, if history exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta_secs: Option<i64>,
+    /// Whether burn rate projects exhaustion before reset (falling back to `pace_behind`).
+    #[serde(default)]
+    pub will_exhaust_before_reset: bool,
+}
+
+/// Serializable multi-pool quota entry (`Gemini`, `Argon`, `Carbon`, `Claude/3P`, etc.).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct QuotaPoolReport {
+    /// Display name of the pool (`"Gemini"`, `"Argon"`, `"Carbon"`, `"Claude/3P"`, etc.).
+    pub name: String,
+    /// Short-window (`< 24h`) bucket summary, if active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_window: Option<QuotaWindowReport>,
+    /// Multi-day (`>= 24h`) bucket summary, if active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_window: Option<QuotaWindowReport>,
+}
+
+/// Serializable non-windowed credit balance entry (`AI credits`, `Prompt credits`, etc.).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaCreditReport {
+    /// Canonical bucket key.
+    pub key: String,
+    /// Display credit label.
+    pub label: String,
+    /// Remaining credit units.
+    pub remaining_amount: i64,
+    /// Compact reset countdown, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_compact: Option<String>,
+    /// Warning severity (`"ok"`, `"low"`, or `"critical"`).
+    pub severity: String,
+}
+
+/// Live or cached multi-pool quota and AI credits summary exposed on [`StatsReport`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StatsQuotaReport {
+    /// Data origin (`"hub_rpc"` or `"stdin"`).
+    pub source: String,
+    /// `true` when returned from `quota_snapshot.json` rather than a fresh live Hub RPC call.
+    pub from_cache: bool,
+    /// Unix epoch timestamp in seconds when the snapshot was last updated.
+    pub updated_at: u64,
+    /// Snapshot age in seconds relative to `now_unix_secs`.
+    pub age_secs: u64,
+    /// Resolved account tier label (e.g. `"Ultra 20x"`, `"Ultra 5x"`, `"Pro"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_tier: Option<String>,
+    /// Available `GOOGLE_ONE_AI` / AI credits balance, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_credits: Option<i64>,
+    /// Grouped active quota pools (`Gemini`, `Argon`, `Carbon`, `Claude/3P`, etc.).
+    #[serde(default)]
+    pub pools: Vec<QuotaPoolReport>,
+    /// Non-windowed credit buckets (`AI credits`, `Prompt credits`, etc.).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credits: Vec<QuotaCreditReport>,
+}
+
+impl StatsQuotaReport {
+    /// Returns `true` when at least one pool, credit balance, or plan tier is available to display.
+    pub fn has_visible_content(&self) -> bool {
+        !self.pools.is_empty()
+            || self.ai_credits.is_some()
+            || !self.credits.is_empty()
+            || self.plan_tier.is_some()
+    }
+
+    /// Credit buckets excluding `google_one_ai`/`ai_credits` when already surfaced via `ai_credits`.
+    pub(super) fn extra_credits(&self) -> impl Iterator<Item = &QuotaCreditReport> {
+        self.credits.iter().filter(|credit| {
+            !(self.ai_credits.is_some()
+                && (credit.key.eq_ignore_ascii_case("google_one_ai")
+                    || credit.key.eq_ignore_ascii_case("ai_credits")))
+        })
+    }
+}
+
+/// Aggregated retry, error-step, and compaction diagnostics for a single conversation
+/// and its descendant subagents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConversationDiagnostics {
+    /// Combined diagnostics across the main conversation and descendant subagents.
+    #[serde(default)]
+    pub total: ScanDiagnostics,
+    /// Diagnostics attributed strictly to the target conversation.
+    #[serde(default)]
+    pub main: ScanDiagnostics,
+    /// Combined diagnostics attributed to descendant subagents.
+    #[serde(default)]
+    pub subagents: ScanDiagnostics,
+}
+
+impl ConversationDiagnostics {
+    /// Returns `true` when neither main nor subagent conversations recorded any anomalies.
+    pub fn is_empty(&self) -> bool {
+        self.total.is_empty()
+    }
+}
+
+/// Computes a chronological boolean mask aligned with `turns` marking each mid-session cache miss
+/// (a turn with prompt tokens and `cache_read_tokens == 0` after an earlier prompt turn in the
+/// same `conversation_id`).
+pub(in crate::stats) fn mid_session_miss_flags(turns: &[ConversationTurnStats]) -> Vec<bool> {
+    let mut seen_prompt_convs: HashSet<&str> = HashSet::new();
+    turns
+        .iter()
+        .map(|t| {
+            let prompt_tokens = t
+                .input_tokens
+                .saturating_add(t.cache_read_tokens)
+                .saturating_add(t.cache_write_tokens);
+            if prompt_tokens == 0 {
+                return false;
+            }
+            let had_earlier_prompt = !seen_prompt_convs.insert(t.conversation_id.as_str());
+            had_earlier_prompt && t.cache_read_tokens == 0
+        })
+        .collect()
+}
 
 /// Aggregated token and optional cost totals for a time window.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -155,6 +302,12 @@ pub struct StatsReport {
     pub models: Vec<ModelStats>,
     /// Aggregate statistics from `conversations/*.db` (`gen_metadata`).
     pub sqlite: SqliteStats,
+    /// Optional live or cached multi-pool quota and AI credits summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<StatsQuotaReport>,
+    /// Aggregated retry, error-step, and compaction-checkpoint diagnostics across scanned DBs.
+    #[serde(default, skip_serializing_if = "ScanDiagnostics::is_empty")]
+    pub diagnostics: ScanDiagnostics,
 }
 
 /// Per-turn usage, cache hit rate, speed, and cost entry for a single conversation.
@@ -258,6 +411,9 @@ pub struct ConversationStatsReport {
     pub turns: Vec<ConversationTurnStats>,
     /// Aggregate SQLite speed/TTFT stats across scanned conversation DBs.
     pub sqlite: SqliteStats,
+    /// Aggregated retry, error-step, and compaction diagnostics across main + subagents.
+    #[serde(default, skip_serializing_if = "ConversationDiagnostics::is_empty")]
+    pub diagnostics: ConversationDiagnostics,
 }
 
 /// Lightweight historical conversation metadata row (`agy-statusline conversations`).

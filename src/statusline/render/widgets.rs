@@ -4,13 +4,20 @@ use std::path::Path;
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::agy::db::RetryAnomalySummary;
+use crate::agy::protobuf::RetryStatusClass;
 use crate::config::layout::{GlyphMode, WidgetId};
-use crate::statusline::metrics::QuotaView;
+use crate::statusline::metrics::{classify_credit_severity, CreditSeverity, CreditView, QuotaView};
 use crate::statusline::theme::Palette;
 use crate::statusline::{
     single_active_subagent_label, subagent_count, workspace_basename, StatuslinePayload,
 };
-use crate::sys::fmt::{format_tokens, format_tokens_string as format_tok_str, truncate_to_width};
+use crate::sys::fmt::{
+    format_duration_compact, format_tokens, format_tokens_string as format_tok_str,
+    sanitize_inline_text, truncate_to_width,
+};
+
+const CACHE_HIT_MIN_CONTEXT_TOKENS: u64 = 10_000;
 
 use super::{
     build_progress_bar_with_chars, CompactStage, RenderContext, Renderer, ResolvedCost, Segment,
@@ -35,7 +42,7 @@ impl Renderer<'_> {
             | WidgetId::Agent
             | WidgetId::Product
             | WidgetId::Session
-            | WidgetId::Transcript => self.render_session_widget(widget, payload),
+            | WidgetId::Transcript => self.render_session_widget(widget, payload, ctx),
             WidgetId::Directory | WidgetId::Vcs | WidgetId::Worktree => {
                 self.render_vcs_widget(widget, payload, ctx)
             }
@@ -48,8 +55,8 @@ impl Renderer<'_> {
             | WidgetId::Ttft
             | WidgetId::Thinking
             | WidgetId::Cost => self.render_usage_widget(widget, payload, ctx),
-            WidgetId::Quota5h => self.render_quota_widget(widget, &ctx.quota_5h, "5h"),
-            WidgetId::QuotaWeekly => self.render_quota_widget(widget, &ctx.quota_weekly, "7d"),
+            WidgetId::Quota5h => self.render_quota_widget(widget, &ctx.quota_5h, "5h", ctx),
+            WidgetId::QuotaWeekly => self.render_quota_widget(widget, &ctx.quota_weekly, "7d", ctx),
             WidgetId::Artifacts
             | WidgetId::Subagents
             | WidgetId::Tasks
@@ -64,6 +71,7 @@ impl Renderer<'_> {
         &self,
         widget: WidgetId,
         payload: &StatuslinePayload,
+        ctx: &RenderContext<'_>,
     ) -> Option<Segment> {
         let pal = self.pal;
         let glyphs = self.glyphs;
@@ -166,9 +174,9 @@ impl Renderer<'_> {
                 Some(Segment::plain(widget, text, pal.muted, false))
             }
             WidgetId::Plan => {
-                let tier = payload
-                    .plan_tier
-                    .as_deref()
+                let tier = ctx
+                    .plan_tier_override
+                    .or(payload.plan_tier.as_deref())
                     .map(sanitize_inline_text)
                     .filter(|s| !s.is_empty())?;
                 Some(Segment::plain(widget, tier, pal.model, true))
@@ -466,16 +474,16 @@ impl Renderer<'_> {
                     || format!("{} --", glyphs.cache_label),
                     |(pct, _)| format!("{} {pct:.1}%", glyphs.cache_label),
                 );
-                Some(Segment::plain(
-                    widget,
-                    text,
-                    if ctx.cache.is_some() {
-                        pal.cache
-                    } else {
-                        pal.muted
-                    },
-                    false,
-                ))
+                let non_trivial_ctx = ctx
+                    .cur_ctx
+                    .is_some_and(|tok| tok >= CACHE_HIT_MIN_CONTEXT_TOKENS);
+                let (fg, bold) = match ctx.cache {
+                    Some((pct, _)) if non_trivial_ctx && pct < 20.0 => (pal.ctx_crit, true),
+                    Some((pct, _)) if non_trivial_ctx && pct < 50.0 => (pal.ctx_warn, false),
+                    Some(_) => (pal.cache, false),
+                    None => (pal.muted, false),
+                };
+                Some(Segment::plain(widget, text, fg, bold))
             }
             WidgetId::CacheRead => ctx.cache.map(|(_, read)| {
                 let mut buf = format!("{} ", glyphs.reset);
@@ -483,25 +491,53 @@ impl Renderer<'_> {
                 Segment::plain(widget, buf, pal.cache, false)
             }),
             WidgetId::Speed => {
-                let slow = ctx.speed.is_some_and(|s| s < ctx.speed_warn_threshold);
-                let text = ctx.speed.map_or_else(
+                let slow = ctx.speed.is_some_and(|s| s < self.cfg.speed_warn_threshold);
+                let base = ctx.speed.map_or_else(
                     || format!("{} --", glyphs.speed),
                     |s| format!("{} {s:.0} tok/s", glyphs.speed),
                 );
-                let fg = match ctx.speed {
-                    Some(_) if slow => pal.speed_slow,
-                    Some(_) => pal.speed_ok,
-                    None => pal.muted,
-                };
-                Some(Segment {
+                let ascii = self.cfg.glyph_mode == GlyphMode::Ascii;
+                let (text, fg, bold, accent_bg, has_retry_suffix) =
+                    if let Some(anom) = ctx.retry_anomaly.as_ref() {
+                        let tag = format_retry_anomaly_tag(anom, ascii);
+                        let full = if ctx.speed.is_some() {
+                            format!("{base} {tag}")
+                        } else {
+                            format!("{} {tag}", glyphs.speed)
+                        };
+                        let retry_fg = if anom.retries_429 > 0 {
+                            pal.ctx_crit
+                        } else {
+                            pal.ctx_warn
+                        };
+                        (full, retry_fg, true, Some(retry_fg), true)
+                    } else {
+                        let fg = match ctx.speed {
+                            Some(_) if slow => pal.speed_slow,
+                            Some(_) => pal.speed_ok,
+                            None => pal.muted,
+                        };
+                        (
+                            base.clone(),
+                            fg,
+                            slow,
+                            slow.then_some(pal.speed_slow),
+                            false,
+                        )
+                    };
+                let mut seg = Segment {
                     widget,
                     text,
                     fg,
-                    accent_bg: slow.then_some(pal.speed_slow),
-                    bold: slow,
+                    accent_bg,
+                    bold,
                     is_spacer: false,
                     fallbacks: Vec::new(),
-                })
+                };
+                if has_retry_suffix {
+                    seg.push_fallback(CompactStage::SpeedStripRetry, base);
+                }
+                Some(seg)
             }
             WidgetId::Ttft => match ctx.ttft_secs {
                 Some(t) if t < 1.0 => Some(Segment::plain(
@@ -580,26 +616,53 @@ impl Renderer<'_> {
         }
     }
 
+    fn render_credit_segment(&self, widget: WidgetId, credit: &CreditView) -> Segment {
+        let pal = self.pal;
+        let glyphs = self.glyphs;
+        let short_label = compact_credit_label(&credit.label);
+        let core = format!("{short_label} {}", credit.remaining_amount);
+        let (fg, bold) = credit_severity_style(credit.severity, pal);
+        let mut full = core.clone();
+        if let Some(reset) = &credit.reset_compact {
+            full.push(' ');
+            full.push_str(glyphs.reset);
+            full.push_str(reset);
+        }
+        let has_reset = full != core;
+        let mut seg = Segment::plain(widget, full, fg, bold);
+        if has_reset {
+            seg.push_fallback(CompactStage::QuotaStripReset, core);
+        }
+        seg
+    }
+
     fn render_quota_widget(
         &self,
         widget: WidgetId,
         view: &Option<QuotaView>,
         fallback_label: &str,
+        ctx: &RenderContext<'_>,
     ) -> Option<Segment> {
         let pal = self.pal;
         let glyphs = self.glyphs;
 
         let Some(q) = view else {
+            let allow_credit_fallback = match widget {
+                WidgetId::Quota5h => true,
+                WidgetId::QuotaWeekly => !ctx.layout_has_quota_5h || ctx.quota_5h.is_some(),
+                _ => false,
+            };
+            if allow_credit_fallback {
+                if let Some(credit) = ctx.primary_credit.as_ref() {
+                    return Some(self.render_credit_segment(widget, credit));
+                }
+            }
             return (!self.cfg.smart_hide)
                 .then(|| Segment::plain(widget, format!("{fallback_label} --"), pal.muted, false));
         };
         let label = &q.label;
-        let (core, fg, bold) = if let Some(amt) = q.remaining_amount {
-            let (fg, bold) = if amt <= 0 {
-                (pal.ctx_crit, true)
-            } else {
-                (pal.ctx_ok, false)
-            };
+        let (core, mut fg, mut bold) = if let Some(amt) = q.remaining_amount {
+            let (fg, bold) = credit_severity_style(classify_credit_severity(amt), pal);
             (format!("{label} {amt}"), fg, bold)
         } else {
             let core = format!(
@@ -608,6 +671,8 @@ impl Renderer<'_> {
             );
             let (fg, bold) = if q.remaining_pct <= 10.0 {
                 (pal.ctx_crit, true)
+            } else if q.will_exhaust_before_reset {
+                (pal.ctx_warn, true)
             } else if q.remaining_pct <= 30.0 || q.pace_behind {
                 (pal.ctx_warn, false)
             } else {
@@ -621,9 +686,38 @@ impl Renderer<'_> {
             full.push_str(glyphs.reset);
             full.push_str(reset);
         }
-        let has_reset = full != core;
+        if q.remaining_amount.is_none() && q.will_exhaust_before_reset && q.remaining_pct > 0.0 {
+            if let Some(eta) = q
+                .eta_secs
+                .filter(|&e| e > 0 && q.burn_rate_pct_per_hr.is_some())
+            {
+                full.push_str(" !");
+                full.push_str(&format_duration_compact(eta as u64));
+            } else {
+                full.push_str(" !");
+            }
+        }
+        // Surface low/critical AI credits alongside Quota5h when QuotaWeekly will not display them.
+        if widget == WidgetId::Quota5h
+            && (!ctx.layout_has_quota_weekly || ctx.quota_weekly.is_some())
+        {
+            if let Some(credit) = ctx
+                .primary_credit
+                .as_ref()
+                .filter(|c| c.severity != CreditSeverity::Ok)
+            {
+                full.push_str(&format!(" cr:{}", credit.remaining_amount));
+                if credit.severity == CreditSeverity::Critical {
+                    fg = pal.ctx_crit;
+                    bold = true;
+                } else if fg == pal.ctx_ok {
+                    fg = pal.ctx_warn;
+                }
+            }
+        }
+        let has_suffix = full != core;
         let mut seg = Segment::plain(widget, full, fg, bold);
-        if has_reset {
+        if has_suffix {
             seg.push_fallback(CompactStage::QuotaStripReset, core);
         }
         Some(seg)
@@ -773,6 +867,48 @@ impl Renderer<'_> {
     }
 }
 
+fn credit_severity_style(severity: CreditSeverity, pal: &Palette) -> (u8, bool) {
+    match severity {
+        CreditSeverity::Critical => (pal.ctx_crit, true),
+        CreditSeverity::Low => (pal.ctx_warn, false),
+        CreditSeverity::Ok => (pal.ctx_ok, false),
+    }
+}
+
+fn compact_credit_label(label: &str) -> &str {
+    if label.eq_ignore_ascii_case("AI credits") {
+        "credits"
+    } else if label.eq_ignore_ascii_case("Prompt credits") {
+        "prompt"
+    } else if label.eq_ignore_ascii_case("Flow credits") {
+        "flow"
+    } else {
+        label
+    }
+}
+
+fn format_retry_anomaly_tag(anom: &RetryAnomalySummary, ascii: bool) -> String {
+    let code = match anom.latest_class {
+        RetryStatusClass::RateLimit429 => "429".to_string(),
+        RetryStatusClass::Capacity503 => "503".to_string(),
+        RetryStatusClass::Upstream5xx => anom
+            .latest_status_code
+            .map_or_else(|| "5xx".to_string(), |c| c.to_string()),
+        RetryStatusClass::Timeout => "timeout".to_string(),
+        RetryStatusClass::Disconnect => "disc".to_string(),
+        RetryStatusClass::ModelOutput => "output".to_string(),
+        RetryStatusClass::Canceled | RetryStatusClass::Other => anom
+            .latest_status_code
+            .map_or_else(|| "retry".to_string(), |c| c.to_string()),
+    };
+    let times = if ascii { "x" } else { "×" };
+    if anom.retry_count > 1 {
+        format!("! {code}{times}{}", anom.retry_count)
+    } else {
+        format!("! {code}")
+    }
+}
+
 fn ctx_color(pct: f64, pal: &Palette) -> u8 {
     if pct >= 85.0 {
         pal.ctx_crit
@@ -862,8 +998,6 @@ fn abbreviate_leading_word(text: &str) -> String {
     }
     text.to_string()
 }
-
-use crate::sys::fmt::sanitize_inline_text;
 
 #[cfg(test)]
 mod tests {

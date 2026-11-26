@@ -1,13 +1,15 @@
 //! Pure AGY `settings.json` statusLine read/write helpers and launcher binary path resolution.
 
 use std::env;
-use std::fs;
 use std::io;
 use std::path::{self, Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use crate::sys::fs::atomic_write_preserving_mode;
+use crate::sys::fs::{atomic_write_preserving_mode, read_bounded_file_to_string};
+
+/// Maximum size accepted when loading AGY `settings.json`.
+const MAX_SETTINGS_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Resolves the preferred binary path to register in AGY `settings.json`.
 ///
@@ -59,7 +61,7 @@ pub(crate) fn read_settings_object(
     settings_path: &Path,
     allow_missing: bool,
 ) -> io::Result<Map<String, Value>> {
-    match fs::read_to_string(settings_path) {
+    match read_bounded_file_to_string(settings_path, MAX_SETTINGS_FILE_BYTES) {
         Ok(content) if content.trim().is_empty() => Ok(Map::new()),
         Ok(content) => {
             let parsed: Value = serde_json::from_str(&content).map_err(|e| {
@@ -121,4 +123,64 @@ pub fn set_statusline_enabled(settings_path: &Path, enabled: bool) -> io::Result
     sl_map.insert("enabled".to_string(), Value::Bool(enabled));
     root.insert("statusLine".to_string(), Value::Object(sl_map));
     write_settings_object(settings_path, root)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn oversized_settings_file_is_rejected_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let oversized = format!(
+            "{}{}",
+            " ".repeat(MAX_SETTINGS_FILE_BYTES as usize),
+            r#"{"theme":"dark"}"#
+        );
+        fs::write(&path, &oversized).unwrap();
+
+        assert_eq!(
+            read_settings_object(&path, true).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            apply_statusline_config(&path, Path::new("/bin/agy-statusline"), false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), oversized.len() as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_settings_file_reads_and_updates_target_in_place() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+        let real = dotfiles.join("settings.json");
+        fs::write(&real, r#"{"existing":true}"#).unwrap();
+
+        let link = dir.path().join("settings.json");
+        symlink(&real, &link).unwrap();
+
+        apply_statusline_config(&link, Path::new("/bin/agy-statusline"), true).unwrap();
+
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let obj = read_settings_object(&link, false).unwrap();
+        assert_eq!(obj.get("existing"), Some(&Value::Bool(true)));
+        assert_eq!(
+            obj["statusLine"]["command"],
+            Value::String("/bin/agy-statusline".to_string())
+        );
+        assert_eq!(obj["statusLine"]["stack_with_default"], Value::Bool(true));
+    }
 }

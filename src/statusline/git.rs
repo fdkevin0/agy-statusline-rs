@@ -5,12 +5,21 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::sys::fs::atomic_write;
+use crate::sys::fs::{
+    atomic_write, is_real_dir, is_safe_cache_target, modified_timestamp,
+    read_bounded_file_to_string, read_bounded_regular_file,
+};
 use crate::sys::process::run_command_stdout_bounded;
-use crate::sys::time::unix_now_secs;
+use crate::sys::time::{unix_now_secs, SECS_PER_DAY, SECS_PER_HOUR};
 
 const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_millis(250);
 const DEFAULT_DIFF_CACHE_TTL_SECS: u64 = 3;
+const MAX_GIT_METADATA_FILE_BYTES: u64 = 8 * 1024;
+const MAX_DIFF_CACHE_FILE_BYTES: u64 = 256;
+const DIFF_CACHE_STALE_SECS: u64 = SECS_PER_DAY as u64;
+const DIFF_CACHE_PRUNE_INTERVAL_SECS: u64 = SECS_PER_HOUR;
+const MAX_DIFF_CACHE_FILES: usize = 32;
+const MAX_DIFF_PRUNE_SCAN: usize = 128;
 
 /// Git metadata probed from the active workspace directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -78,7 +87,8 @@ fn resolve_git_repo(dir: &Path) -> Option<(PathBuf, Option<String>)> {
             return Some((dot_git, None));
         }
         if dot_git.is_file() {
-            let content = fs::read_to_string(&dot_git).ok()?;
+            let content =
+                read_bounded_file_to_string(&dot_git, MAX_GIT_METADATA_FILE_BYTES).ok()?;
             let gitdir_str = content.trim().strip_prefix("gitdir:")?.trim();
             if gitdir_str.is_empty() {
                 return None;
@@ -110,7 +120,8 @@ fn extract_worktree_name(gitdir: &Path) -> Option<String> {
 
 /// Reads the current branch or detached `@<short_sha>` directly from `<gitdir>/HEAD`.
 fn read_head_branch(gitdir: &Path) -> Option<String> {
-    let raw = fs::read_to_string(gitdir.join("HEAD")).ok()?;
+    let raw =
+        read_bounded_file_to_string(&gitdir.join("HEAD"), MAX_GIT_METADATA_FILE_BYTES).ok()?;
     let head = raw.trim();
     if let Some(rest) = head.strip_prefix("ref:") {
         let target = rest.trim();
@@ -143,6 +154,56 @@ fn index_mtime_nanos(gitdir: &Path) -> u128 {
         .map_or(0, |d| d.as_nanos())
 }
 
+fn is_diff_cache_filename(name: &str) -> bool {
+    name.len() == 25
+        && name.starts_with("diff_")
+        && name.ends_with(".txt")
+        && name[5..21].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Opportunistically removes stale or excess `diff_*.txt` cache files on cold/hourly misses
+/// without scanning the directory on hot cache hits or normal 3s TTL refreshes.
+fn prune_stale_diff_caches(cache_dir: &Path, current_file: &str, now_secs: u64) {
+    if !is_real_dir(cache_dir) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    let mut active: Vec<(i64, PathBuf)> = Vec::new();
+    for entry in entries.flatten().take(MAX_DIFF_PRUNE_SCAN) {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str == current_file || !is_diff_cache_filename(name_str) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let ft = meta.file_type();
+        if ft.is_symlink() || !ft.is_file() {
+            continue;
+        }
+        let (mtime_secs, _) = modified_timestamp(&meta);
+        if mtime_secs >= 0 && now_secs.saturating_sub(mtime_secs as u64) >= DIFF_CACHE_STALE_SECS {
+            let _ = fs::remove_file(&path);
+        } else {
+            active.push((mtime_secs, path));
+        }
+    }
+    let max_others = MAX_DIFF_CACHE_FILES.saturating_sub(1);
+    if active.len() > max_others {
+        active.sort_by_key(|(mtime, _)| *mtime);
+        let remove_count = active.len() - max_others;
+        for (_, path) in active.into_iter().take(remove_count) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 /// Reads or refreshes cached diff stats keyed by repo path, `.git/index` mtime, and `ttl_secs`.
 fn probe_diff_cached<F>(
     dir: &Path,
@@ -156,38 +217,51 @@ where
     F: FnOnce() -> Option<(u64, u64)>,
 {
     let hash = fnv1a_64(dir.to_string_lossy().as_bytes());
-    let cache_path = cache_dir.join(format!("diff_{hash:016x}.txt"));
+    let file_name = format!("diff_{hash:016x}.txt");
+    let cache_path = cache_dir.join(&file_name);
     let idx_mtime = index_mtime_nanos(gitdir);
 
-    if let Ok(cached) = fs::read_to_string(&cache_path) {
-        let mut parts = cached.split_whitespace();
-        if let (Some(m), Some(t), Some(first_val)) = (
-            parts.next().and_then(|s| s.parse::<u128>().ok()),
-            parts.next().and_then(|s| s.parse::<u64>().ok()),
-            parts.next(),
-        ) {
-            if m == idx_mtime && now_secs.saturating_sub(t) < ttl_secs {
-                if first_val == "timeout" {
-                    return (0, 0);
-                }
-                if let (Ok(a), Some(d)) = (
-                    first_val.parse::<u64>(),
-                    parts.next().and_then(|s| s.parse::<u64>().ok()),
-                ) {
-                    return (a, d);
+    let mut previous_ts: Option<u64> = None;
+    if let Ok((bytes, _)) = read_bounded_regular_file(&cache_path, MAX_DIFF_CACHE_FILE_BYTES) {
+        if let Ok(cached) = std::str::from_utf8(&bytes) {
+            let mut parts = cached.split_whitespace();
+            if let (Some(m), Some(t), Some(first_val)) = (
+                parts.next().and_then(|s| s.parse::<u128>().ok()),
+                parts.next().and_then(|s| s.parse::<u64>().ok()),
+                parts.next(),
+            ) {
+                previous_ts = Some(t);
+                if m == idx_mtime && now_secs.saturating_sub(t) < ttl_secs {
+                    if first_val == "timeout" {
+                        return (0, 0);
+                    }
+                    if let (Ok(a), Some(d)) = (
+                        first_val.parse::<u64>(),
+                        parts.next().and_then(|s| s.parse::<u64>().ok()),
+                    ) {
+                        return (a, d);
+                    }
                 }
             }
         }
     }
 
-    let Some((added, deleted)) = runner() else {
-        let payload = format!("{idx_mtime} {now_secs} timeout\n");
-        let _ = atomic_write(&cache_path, payload.as_bytes());
-        return (0, 0);
+    let should_prune =
+        previous_ts.is_none_or(|t| now_secs.saturating_sub(t) >= DIFF_CACHE_PRUNE_INTERVAL_SECS);
+    let (payload, result) = match runner() {
+        Some((added, deleted)) => (
+            format!("{idx_mtime} {now_secs} {added} {deleted}\n"),
+            (added, deleted),
+        ),
+        None => (format!("{idx_mtime} {now_secs} timeout\n"), (0, 0)),
     };
-    let payload = format!("{idx_mtime} {now_secs} {added} {deleted}\n");
-    let _ = atomic_write(&cache_path, payload.as_bytes());
-    (added, deleted)
+    if is_safe_cache_target(&cache_path) {
+        let _ = atomic_write(&cache_path, payload.as_bytes());
+        if should_prune {
+            prune_stale_diff_caches(cache_dir, &file_name, now_secs);
+        }
+    }
+    result
 }
 
 fn parse_numstat(bytes: &[u8]) -> (u64, u64) {
@@ -360,5 +434,102 @@ mod tests {
         });
         assert_eq!(recovered, (50, 10));
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn probe_diff_cached_prunes_stale_diff_files_and_preserves_other_cache_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let gitdir = root.join(".git");
+        let cache_dir = root.join("cache");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(gitdir.join("index"), b"v1").unwrap();
+
+        let now_secs = 200_000u64;
+        let stale_diff = cache_dir.join("diff_0000000000000001.txt");
+        let fresh_diff = cache_dir.join("diff_0000000000000002.txt");
+        let unrelated = cache_dir.join("quota_snapshot.json");
+        fs::write(&stale_diff, b"0 100 1 1\n").unwrap();
+        fs::write(&fresh_diff, b"0 199990 2 2\n").unwrap();
+        fs::write(&unrelated, b"{}").unwrap();
+
+        fs::File::options()
+            .write(true)
+            .open(&stale_diff)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(100))
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&fresh_diff)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(now_secs - 60))
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&unrelated)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(100))
+            .unwrap();
+
+        let got = probe_diff_cached(root, &gitdir, &cache_dir, now_secs, 3, || Some((3, 1)));
+        assert_eq!(got, (3, 1));
+        assert!(!stale_diff.exists());
+        assert!(fresh_diff.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn oversized_dot_git_and_head_files_degrade_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt_dir = dir.path().join("oversized_wt");
+        fs::create_dir_all(&wt_dir).unwrap();
+        let oversized_dot_git = format!(
+            "gitdir: /repo/.git/worktrees/feat{}\n",
+            " ".repeat(MAX_GIT_METADATA_FILE_BYTES as usize)
+        );
+        fs::write(wt_dir.join(".git"), oversized_dot_git).unwrap();
+        assert_eq!(resolve_git_repo(&wt_dir), None);
+
+        let repo_git = dir.path().join("repo/.git");
+        fs::create_dir_all(&repo_git).unwrap();
+        let oversized_head = format!(
+            "ref: refs/heads/main{}\n",
+            " ".repeat(MAX_GIT_METADATA_FILE_BYTES as usize)
+        );
+        fs::write(repo_git.join("HEAD"), oversized_head).unwrap();
+        assert_eq!(read_head_branch(&repo_git), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_diff_cached_skips_writes_into_symlinked_cache_dir_or_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let gitdir = root.join(".git");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("index"), b"v1").unwrap();
+
+        let real_cache = dir.path().join("real_cache");
+        fs::create_dir_all(&real_cache).unwrap();
+        let sym_cache = dir.path().join("sym_cache");
+        symlink(&real_cache, &sym_cache).unwrap();
+
+        let got = probe_diff_cached(&root, &gitdir, &sym_cache, 100, 3, || Some((4, 2)));
+        assert_eq!(got, (4, 2));
+        assert_eq!(fs::read_dir(&real_cache).unwrap().count(), 0);
+
+        let hash = fnv1a_64(root.to_string_lossy().as_bytes());
+        let file_name = format!("diff_{hash:016x}.txt");
+        let sentinel = dir.path().join("sentinel.txt");
+        fs::write(&sentinel, b"sentinel").unwrap();
+        symlink(&sentinel, real_cache.join(&file_name)).unwrap();
+
+        let got2 = probe_diff_cached(&root, &gitdir, &real_cache, 100, 3, || Some((6, 1)));
+        assert_eq!(got2, (6, 1));
+        assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
     }
 }

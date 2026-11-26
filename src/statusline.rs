@@ -10,11 +10,14 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agy::db::{
     open_readonly_db, query_session_metadata_from_conn, query_session_metadata_in,
     resolve_conversation_db_path, SessionMetadata, SpeedReader,
+};
+use crate::agy::quota::{
+    load_quota_snapshot, save_quota_snapshot, BucketHistory, QuotaSnapshot, QuotaSource,
 };
 use crate::config::layout::{LayoutConfig, WidgetId};
 use crate::stats::{
@@ -23,7 +26,13 @@ use crate::stats::{
     PricingCatalog, SyncMode,
 };
 use crate::statusline::git::{GitInfo, GitProbe};
-use crate::statusline::render::write_statusline_at;
+use crate::statusline::metrics::resolve_credit_views;
+use crate::statusline::render::{write_statusline_with, RenderExtras};
+use crate::sys::fmt::{ascii_values_conflict, trimmed_non_empty};
+use crate::sys::time::parse_rfc3339_unix_secs;
+
+/// Maximum age (6 hours) for falling back to cached `quota_snapshot.json` on empty statusline ticks.
+pub(crate) const MAX_QUOTA_FALLBACK_AGE_SECS: u64 = 6 * 3_600;
 
 /// Active AI model metadata (`"model": null` before a model is selected).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -153,18 +162,23 @@ pub struct SubagentInfo {
 }
 
 /// Rolling rate-limit bucket from AGY `quota`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QuotaBucket {
     /// Fraction of quota remaining (`0.0..=1.0`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_fraction: Option<f64>,
     /// Remaining credit amount when the bucket reports discrete units instead of a fraction.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_amount: Option<i64>,
     /// Countdown in seconds until the bucket resets (may be negative right after reset).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_in_seconds: Option<i64>,
     /// ISO-8601 reset timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_time: Option<String>,
     /// Whether this bucket is disabled by the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
 }
 
@@ -242,18 +256,7 @@ pub(crate) fn single_active_subagent_label(payload: &StatuslinePayload) -> Optio
     if iter.next().is_some() {
         return None;
     }
-    first
-        .role
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            first
-                .name
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })
+    trimmed_non_empty(first.role.as_deref()).or_else(|| trimmed_non_empty(first.name.as_deref()))
 }
 
 fn active_subagents(payload: &StatuslinePayload) -> impl Iterator<Item = &SubagentInfo> {
@@ -264,31 +267,24 @@ fn active_subagents(payload: &StatuslinePayload) -> impl Iterator<Item = &Subage
     })
 }
 
+fn first_workspace_candidate(payload: &StatuslinePayload, prefer_project: bool) -> Option<&str> {
+    let ws = payload.workspace.as_ref();
+    let cur = ws.and_then(|w| trimmed_non_empty(w.current_dir.as_deref()));
+    let proj = ws.and_then(|w| trimmed_non_empty(w.project_dir.as_deref()));
+    let (first, second) = if prefer_project {
+        (proj, cur)
+    } else {
+        (cur, proj)
+    };
+    first
+        .or(second)
+        .or_else(|| trimmed_non_empty(payload.cwd.as_deref()))
+}
+
 /// Returns the trimmed workspace directory path preferring `workspace.current_dir`,
 /// then `workspace.project_dir`, then top-level `cwd`.
 fn workspace_path(payload: &StatuslinePayload) -> Option<&str> {
-    payload
-        .workspace
-        .as_ref()
-        .and_then(|ws| {
-            ws.current_dir
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    ws.project_dir
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                })
-        })
-        .or_else(|| {
-            payload
-                .cwd
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })
+    first_workspace_candidate(payload, false)
 }
 
 /// Returns a validated non-negative finite `cost.total_usd`, if present.
@@ -303,28 +299,7 @@ pub(crate) fn valid_cost_usd(payload: &StatuslinePayload) -> Option<f64> {
 /// Returns the directory basename preferring `workspace.project_dir`,
 /// then `workspace.current_dir`, then top-level `cwd`.
 pub(crate) fn workspace_basename(payload: &StatuslinePayload) -> Option<&str> {
-    let raw = payload
-        .workspace
-        .as_ref()
-        .and_then(|ws| {
-            ws.project_dir
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    ws.current_dir
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                })
-        })
-        .or_else(|| {
-            payload
-                .cwd
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })?;
+    let raw = first_workspace_candidate(payload, true)?;
     Path::new(raw)
         .file_name()
         .and_then(|n| n.to_str())
@@ -511,6 +486,267 @@ fn layout_needs_session_metadata(cfg: &LayoutConfig) -> bool {
     })
 }
 
+fn layout_needs_quota_or_plan(cfg: &LayoutConfig) -> bool {
+    cfg.rows.iter().flatten().any(|w| {
+        matches!(
+            w,
+            WidgetId::Quota5h | WidgetId::QuotaWeekly | WidgetId::Plan
+        )
+    })
+}
+
+fn filter_fresh_fallback_quota(
+    snap: &QuotaSnapshot,
+    now_unix_secs: u64,
+) -> BTreeMap<String, QuotaBucket> {
+    let elapsed = now_unix_secs.saturating_sub(snap.updated_at);
+    let mut out = BTreeMap::new();
+    for (key, bucket) in &snap.quota {
+        if bucket.disabled == Some(true) {
+            continue;
+        }
+        if let Some(reset_unix) = bucket
+            .reset_time
+            .as_deref()
+            .and_then(parse_rfc3339_unix_secs)
+        {
+            if reset_unix <= now_unix_secs as i64 {
+                continue;
+            }
+            let mut adjusted = bucket.clone();
+            // Drop stale snapshot-relative countdown so renderer derives live remaining time from `reset_time`.
+            adjusted.reset_in_seconds = None;
+            out.insert(key.clone(), adjusted);
+        } else if let Some(secs) = bucket.reset_in_seconds {
+            let rem = secs.saturating_sub(elapsed.min(i64::MAX as u64) as i64);
+            if rem <= 0 {
+                continue;
+            }
+            let mut adjusted = bucket.clone();
+            adjusted.reset_in_seconds = Some(rem);
+            out.insert(key.clone(), adjusted);
+        } else {
+            out.insert(key.clone(), bucket.clone());
+        }
+    }
+    out
+}
+
+fn extract_payload_ai_credits(
+    quota: &BTreeMap<String, QuotaBucket>,
+    now_unix_secs: u64,
+) -> Option<i64> {
+    resolve_credit_views(quota, now_unix_secs)
+        .into_iter()
+        .find(|c| {
+            c.key.eq_ignore_ascii_case("google_one_ai") || c.key.eq_ignore_ascii_case("ai_credits")
+        })
+        .map(|c| c.remaining_amount)
+}
+
+fn should_enrich_plan_with_ultra(payload_tier: Option<&str>, snap: &QuotaSnapshot) -> bool {
+    if snap.ultra_tier_label.is_none() {
+        return false;
+    }
+    match payload_tier {
+        None => true,
+        Some(t) => t.eq_ignore_ascii_case("pro") || t.eq_ignore_ascii_case("ultra"),
+    }
+}
+
+#[derive(Default)]
+struct StatuslineQuotaState {
+    fallback_quota: Option<BTreeMap<String, QuotaBucket>>,
+    history: Option<BTreeMap<String, BucketHistory>>,
+    plan_tier_override: Option<String>,
+    ai_credits_fallback: Option<i64>,
+}
+
+fn new_empty_stdin_snapshot(
+    now_unix_secs: u64,
+    plan_tier: Option<&str>,
+    email: Option<&str>,
+) -> QuotaSnapshot {
+    QuotaSnapshot {
+        updated_at: now_unix_secs,
+        source: QuotaSource::Stdin,
+        plan_tier: plan_tier.map(str::to_string),
+        email: email.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+fn record_stdin_quota_observation(
+    dir: &Path,
+    prev: Option<QuotaSnapshot>,
+    quota_map: &BTreeMap<String, QuotaBucket>,
+    payload_tier: Option<&str>,
+    payload_email: Option<&str>,
+    now_unix_secs: u64,
+) -> StatuslineQuotaState {
+    // Stdin upstream often reports "Pro" for Google AI Ultra users and never carries
+    // `ultra_tier_label`; preserve the cached Hub RPC Ultra multiplier for the same account.
+    let (eff_tier, eff_ultra) = match prev.as_ref() {
+        Some(p)
+            if !ascii_values_conflict(p.email.as_deref(), payload_email)
+                && should_enrich_plan_with_ultra(payload_tier, p) =>
+        {
+            (
+                p.plan_tier.clone().or_else(|| Some("Ultra".to_string())),
+                p.ultra_tier_label.clone(),
+            )
+        }
+        _ => (payload_tier.map(str::to_string), None),
+    };
+    let incoming = QuotaSnapshot {
+        updated_at: now_unix_secs,
+        source: QuotaSource::Stdin,
+        plan_tier: eff_tier,
+        ultra_tier_label: eff_ultra,
+        email: payload_email.map(str::to_string),
+        ai_credits: extract_payload_ai_credits(quota_map, now_unix_secs),
+        quota: quota_map.clone(),
+        history: BTreeMap::new(),
+    };
+    let merged = match prev {
+        Some(mut existing) => {
+            existing.merge_observation(incoming, now_unix_secs);
+            existing
+        }
+        None => {
+            let mut fresh = incoming;
+            fresh.record_bucket_samples(now_unix_secs);
+            fresh
+        }
+    };
+    let _ = save_quota_snapshot(dir, &merged);
+    let plan_tier_override = (merged.ultra_tier_label.is_some() || payload_tier.is_none())
+        .then(|| merged.display_plan_tier())
+        .flatten();
+    StatuslineQuotaState {
+        fallback_quota: None,
+        history: (!merged.history.is_empty()).then_some(merged.history),
+        plan_tier_override,
+        ai_credits_fallback: merged.ai_credits,
+    }
+}
+
+fn resolve_cached_quota_fallback(
+    dir: &Path,
+    prev: Option<QuotaSnapshot>,
+    payload_tier: Option<&str>,
+    payload_email: Option<&str>,
+    has_observation: bool,
+    needs_fallback: bool,
+    now_unix_secs: u64,
+) -> StatuslineQuotaState {
+    // Update account/tier metadata without refreshing stale bucket timestamps, then load a
+    // fresh-enough (<= 6h) cached snapshot as fallback.
+    let active_snap = match prev {
+        Some(existing) if ascii_values_conflict(existing.email.as_deref(), payload_email) => {
+            let fresh = new_empty_stdin_snapshot(now_unix_secs, payload_tier, payload_email);
+            let _ = save_quota_snapshot(dir, &fresh);
+            Some(fresh)
+        }
+        Some(mut existing) => {
+            let mut dirty = false;
+            if let Some(em) = payload_email.filter(|&em| existing.email.as_deref() != Some(em)) {
+                existing.email = Some(em.to_string());
+                dirty = true;
+            }
+            if let Some(tier) = payload_tier {
+                let preserve_ultra = should_enrich_plan_with_ultra(Some(tier), &existing);
+                if !preserve_ultra && existing.plan_tier.as_deref() != Some(tier) {
+                    existing.plan_tier = Some(tier.to_string());
+                    existing.ultra_tier_label = None;
+                    dirty = true;
+                }
+            }
+            if dirty {
+                let _ = save_quota_snapshot(dir, &existing);
+            }
+            Some(existing)
+        }
+        None if has_observation => {
+            let fresh = new_empty_stdin_snapshot(now_unix_secs, payload_tier, payload_email);
+            let _ = save_quota_snapshot(dir, &fresh);
+            Some(fresh)
+        }
+        None => None,
+    };
+
+    let Some(snap) = active_snap else {
+        return StatuslineQuotaState::default();
+    };
+    if now_unix_secs.saturating_sub(snap.updated_at) > MAX_QUOTA_FALLBACK_AGE_SECS {
+        return StatuslineQuotaState::default();
+    }
+
+    let plan_tier_override = (payload_tier.is_none()
+        || should_enrich_plan_with_ultra(payload_tier, &snap))
+    .then(|| snap.display_plan_tier())
+    .flatten();
+    if !needs_fallback {
+        return StatuslineQuotaState {
+            plan_tier_override,
+            ..Default::default()
+        };
+    }
+
+    let filtered = filter_fresh_fallback_quota(&snap, now_unix_secs);
+    let fallback_quota = (!filtered.is_empty()).then_some(filtered);
+    let history = (fallback_quota.is_some() && !snap.history.is_empty()).then_some(snap.history);
+    StatuslineQuotaState {
+        fallback_quota,
+        history,
+        plan_tier_override,
+        ai_credits_fallback: snap.ai_credits,
+    }
+}
+
+fn resolve_statusline_quota_state(
+    payload: &StatuslinePayload,
+    cache_dir: Option<&Path>,
+    now_unix_secs: u64,
+    cfg: &LayoutConfig,
+) -> StatuslineQuotaState {
+    let Some(dir) = cache_dir else {
+        return StatuslineQuotaState::default();
+    };
+
+    let payload_quota = payload.quota.as_ref().filter(|q| !q.is_empty());
+    let payload_tier = trimmed_non_empty(payload.plan_tier.as_deref());
+    let payload_email = trimmed_non_empty(payload.email.as_deref());
+    let has_observation =
+        payload_quota.is_some() || payload_tier.is_some() || payload_email.is_some();
+    let needs_fallback = payload_quota.is_none() && layout_needs_quota_or_plan(cfg);
+
+    if !has_observation && !needs_fallback {
+        return StatuslineQuotaState::default();
+    }
+
+    let prev = load_quota_snapshot(dir).ok().flatten();
+    match payload_quota {
+        Some(quota_map) => record_stdin_quota_observation(
+            dir,
+            prev,
+            quota_map,
+            payload_tier,
+            payload_email,
+            now_unix_secs,
+        ),
+        None => resolve_cached_quota_fallback(
+            dir,
+            prev,
+            payload_tier,
+            payload_email,
+            has_observation,
+            needs_fallback,
+            now_unix_secs,
+        ),
+    }
+}
+
 fn probe_git(payload: &StatuslinePayload, git_probe: &dyn GitProbe, cfg: &LayoutConfig) -> GitInfo {
     let has_vcs = cfg
         .rows
@@ -544,6 +780,109 @@ fn probe_git(payload: &StatuslinePayload, git_probe: &dyn GitProbe, cfg: &Layout
     } else {
         GitInfo::default()
     }
+}
+
+fn resolve_session_metadata_and_cost(
+    payload: &StatuslinePayload,
+    runtime: &StatuslineRuntime<'_>,
+    cfg: &LayoutConfig,
+) -> (SessionMetadata, u64) {
+    let conv_id = trimmed_non_empty(payload.conversation_id.as_deref());
+    let cli_dir = runtime.session.local_cli_dir();
+    let needs_meta = layout_needs_session_metadata(cfg);
+    let needs_cost = cfg
+        .rows
+        .iter()
+        .flatten()
+        .any(|w| matches!(w, WidgetId::Cost))
+        && valid_cost_usd(payload).is_none()
+        && !matches!(runtime.pricing, PricingSource::Disabled);
+
+    // Fast path: check bounded LRU conversation cost cache via lstat before parsing pricing JSON
+    // or opening any SQLite DB for cost scanning.
+    let cached_cost = if needs_cost {
+        match (runtime.pricing, runtime.cache_dir, cli_dir, conv_id) {
+            (PricingSource::Effective(mode), Some(cache_dir), Some(cli_dir), Some(cid)) => {
+                let pricing_fp = pricing_cache_fingerprint(Some(cache_dir));
+                let allow_hit = mode != SyncMode::BlockingIfStale
+                    || is_pricing_fingerprint_fresh(pricing_fp, runtime.now_unix_secs);
+                let hit = allow_hit
+                    .then(|| lookup_cached_conversation_cost(cache_dir, cli_dir, cid, pricing_fp))
+                    .flatten();
+                if hit.is_some() && mode == SyncMode::SpawnIfStale {
+                    maybe_spawn_pricing_sync_if_stale(Some(cache_dir), runtime.now_unix_secs);
+                }
+                hit
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Reuse a single read-only parent SQLite connection when both metadata and uncached SQLite
+    // cost read the same local conversation DB.
+    let shared_parent_conn = (needs_meta && needs_cost && cached_cost.is_none())
+        .then(|| {
+            cli_dir
+                .zip(conv_id)
+                .and_then(|(dir, cid)| resolve_conversation_db_path(dir, cid))
+                .and_then(|db_path| open_readonly_db(&db_path).ok())
+        })
+        .flatten();
+
+    let mut meta = if let Some(conn) = shared_parent_conn.as_ref() {
+        query_session_metadata_from_conn(conn)
+    } else if needs_meta {
+        match (runtime.session, conv_id) {
+            (SessionSource::LocalDir(dir), Some(id)) => query_session_metadata_in(dir, id),
+            (SessionSource::Reader(reader), Some(id)) => reader.session_metadata(id),
+            _ => SessionMetadata::default(),
+        }
+    } else {
+        SessionMetadata::default()
+    };
+
+    let mut unpriced_turns = 0u64;
+    if needs_cost {
+        let resolved = cached_cost.or_else(|| {
+            let (dir, cid) = cli_dir.zip(conv_id)?;
+            match runtime.pricing {
+                PricingSource::Disabled => None,
+                PricingSource::Catalog(pricing) => estimate_conversation_cost_usd_with_parent_conn(
+                    dir,
+                    cid,
+                    pricing,
+                    shared_parent_conn.as_ref(),
+                    None,
+                ),
+                PricingSource::Effective(mode) => {
+                    let pricing = PricingCatalog::load_effective_in(
+                        runtime.cache_dir,
+                        mode,
+                        runtime.now_unix_secs,
+                    );
+                    let cache_target = runtime
+                        .cache_dir
+                        .map(|cdir| (cdir, pricing_cache_fingerprint(Some(cdir))));
+                    estimate_conversation_cost_usd_with_parent_conn(
+                        dir,
+                        cid,
+                        &pricing,
+                        shared_parent_conn.as_ref(),
+                        cache_target,
+                    )
+                }
+            }
+        });
+        if let Some(cost) = resolved {
+            unpriced_turns = cost.unpriced_turns;
+            meta.estimated_cost_usd = cost.usd;
+            meta.estimated_subagent_cost_usd = cost.subagent_usd;
+        }
+    }
+
+    (meta, unpriced_turns)
 }
 
 /// Parses `input` JSON and writes the statusline according to `runtime` and `cfg`.
@@ -586,117 +925,23 @@ pub fn process_statusline<W: Write>(
     out: &mut W,
 ) -> io::Result<()> {
     let payload: StatuslinePayload = serde_json::from_str(input).unwrap_or_default();
-    let conv_id = payload
-        .conversation_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let cli_dir = runtime.session.local_cli_dir();
     let git_info = probe_git(&payload, runtime.git_probe, cfg);
-
-    let needs_meta = layout_needs_session_metadata(cfg);
-    let needs_cost = cfg
-        .rows
-        .iter()
-        .flatten()
-        .any(|w| matches!(w, WidgetId::Cost))
-        && valid_cost_usd(&payload).is_none()
-        && !matches!(runtime.pricing, PricingSource::Disabled);
-
-    let mut unpriced_turns = 0u64;
-
-    // Fast path: check bounded LRU conversation cost cache via lstat before parsing pricing JSON
-    // or opening any SQLite DB for cost scanning.
-    let cached_cost = if needs_cost {
-        match (runtime.pricing, runtime.cache_dir, cli_dir, conv_id) {
-            (PricingSource::Effective(mode), Some(cache_dir), Some(cli_dir), Some(cid)) => {
-                let pricing_fp = pricing_cache_fingerprint(Some(cache_dir));
-                let allow_hit = mode != SyncMode::BlockingIfStale
-                    || is_pricing_fingerprint_fresh(pricing_fp, runtime.now_unix_secs);
-                let hit = allow_hit
-                    .then(|| lookup_cached_conversation_cost(cache_dir, cli_dir, cid, pricing_fp))
-                    .flatten();
-                if hit.is_some() && mode == SyncMode::SpawnIfStale {
-                    maybe_spawn_pricing_sync_if_stale(Some(cache_dir), runtime.now_unix_secs);
-                }
-                hit
-            }
-            _ => None,
-        }
-    } else {
-        None
+    let (meta, unpriced_turns) = resolve_session_metadata_and_cost(&payload, runtime, cfg);
+    let quota_state =
+        resolve_statusline_quota_state(&payload, runtime.cache_dir, runtime.now_unix_secs, cfg);
+    let extras = RenderExtras {
+        unpriced_turns,
+        quota_override: quota_state.fallback_quota.as_ref(),
+        quota_history: quota_state.history.as_ref(),
+        plan_tier_override: quota_state.plan_tier_override.as_deref(),
+        ai_credits_fallback: quota_state.ai_credits_fallback,
     };
 
-    // Reuse a single read-only parent SQLite connection when both metadata and uncached SQLite
-    // cost read the same local conversation DB.
-    let shared_parent_conn = if needs_meta && needs_cost && cached_cost.is_none() {
-        match (cli_dir, conv_id) {
-            (Some(cli_dir), Some(cid)) => resolve_conversation_db_path(cli_dir, cid)
-                .and_then(|db_path| open_readonly_db(&db_path).ok()),
-            _ => None,
-        }
-    } else {
-        None
-    };
-
-    let mut meta = if let Some(conn) = shared_parent_conn.as_ref() {
-        query_session_metadata_from_conn(conn)
-    } else if needs_meta {
-        match (runtime.session, conv_id) {
-            (SessionSource::LocalDir(dir), Some(id)) => query_session_metadata_in(dir, id),
-            (SessionSource::Reader(reader), Some(id)) => reader.session_metadata(id),
-            _ => SessionMetadata::default(),
-        }
-    } else {
-        SessionMetadata::default()
-    };
-
-    if needs_cost {
-        let resolved = if let Some(cost) = cached_cost {
-            Some(cost)
-        } else if let (Some(dir), Some(cid)) = (cli_dir, conv_id) {
-            match runtime.pricing {
-                PricingSource::Disabled => None,
-                PricingSource::Catalog(pricing) => estimate_conversation_cost_usd_with_parent_conn(
-                    dir,
-                    cid,
-                    pricing,
-                    shared_parent_conn.as_ref(),
-                    None,
-                ),
-                PricingSource::Effective(mode) => {
-                    let pricing = PricingCatalog::load_effective_in(
-                        runtime.cache_dir,
-                        mode,
-                        runtime.now_unix_secs,
-                    );
-                    let cache_target = runtime
-                        .cache_dir
-                        .map(|cdir| (cdir, pricing_cache_fingerprint(Some(cdir))));
-                    estimate_conversation_cost_usd_with_parent_conn(
-                        dir,
-                        cid,
-                        &pricing,
-                        shared_parent_conn.as_ref(),
-                        cache_target,
-                    )
-                }
-            }
-        } else {
-            None
-        };
-        if let Some(cost) = resolved {
-            unpriced_turns = cost.unpriced_turns;
-            meta.estimated_cost_usd = cost.usd;
-            meta.estimated_subagent_cost_usd = cost.subagent_usd;
-        }
-    }
-
-    write_statusline_at(
+    write_statusline_with(
         &payload,
         &meta,
         &git_info,
-        unpriced_turns,
+        &extras,
         runtime.now_unix_secs,
         cfg,
         out,
@@ -1184,5 +1429,116 @@ mod tests {
             text_summaries.contains("~$17.50 (sub $10.50)"),
             "summaries invalidation: {text_summaries:?}"
         );
+    }
+
+    #[test]
+    fn quota_snapshot_persists_burn_rate_falls_back_when_empty_and_enriches_ultra_tier() {
+        use crate::agy::quota::BucketHistory;
+        use crate::config::layout::{GlyphMode, ThemeStyle};
+
+        let cache = tempfile::tempdir().unwrap();
+        let t0 = 1_700_000_000u64;
+        // Seed a Hub RPC snapshot with Ultra 20x, low AI credits, one active bucket, and one expired bucket.
+        let mut hist = BucketHistory::default();
+        hist.record_sample(t0, 0.80, Some((t0 + 18_000) as i64));
+        let seeded = QuotaSnapshot {
+            updated_at: t0,
+            source: QuotaSource::HubRpc,
+            plan_tier: Some("Ultra".to_string()),
+            ultra_tier_label: Some("20x".to_string()),
+            email: Some("dev@example.com".to_string()),
+            ai_credits: Some(30),
+            quota: BTreeMap::from([
+                (
+                    "gemini-5h".to_string(),
+                    QuotaBucket {
+                        remaining_fraction: Some(0.80),
+                        reset_in_seconds: Some(18_000),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "3p-5h".to_string(),
+                    QuotaBucket {
+                        remaining_fraction: Some(0.10),
+                        reset_time: Some("2020-01-01T00:00:00Z".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            history: BTreeMap::from([("gemini-5h".to_string(), hist)]),
+        };
+        save_quota_snapshot(cache.path(), &seeded).unwrap();
+
+        let mut cfg = LayoutConfig::preset_minimal();
+        cfg.theme = ThemeStyle::Mono;
+        cfg.glyph_mode = GlyphMode::Ascii;
+        cfg.no_color = true;
+        cfg.responsive = false;
+        cfg.rows = vec![vec![
+            WidgetId::Plan,
+            WidgetId::Quota5h,
+            WidgetId::QuotaWeekly,
+        ]];
+        let reader = StubReader(None);
+        let git = NoopGit;
+
+        // Tick 1: empty quota payload (10 min after Hub RPC) -> falls back to fresh snapshot,
+        // enriches "Pro" -> "Ultra 20x", adjusts reset countdown, skips expired 3p-5h, surfaces credits.
+        let rt1 = StatuslineRuntime {
+            session: SessionSource::Reader(&reader),
+            git_probe: &git,
+            cache_dir: Some(cache.path()),
+            pricing: PricingSource::Disabled,
+            now_unix_secs: t0 + 600,
+        };
+        let idle_json =
+            r#"{"plan_tier":"Pro","email":"dev@example.com","model":{"id":"gemini-4"},"quota":{}}"#;
+        let mut out1 = Vec::new();
+        process_statusline(idle_json, &rt1, &cfg, &mut out1).unwrap();
+        let text1 = String::from_utf8(out1).unwrap();
+        assert!(text1.contains("Ultra 20x"), "text1: {text1:?}");
+        assert!(text1.contains("5h 80% r:4h50m"), "text1: {text1:?}");
+        assert!(text1.contains("credits 30"), "text1: {text1:?}");
+        assert!(!text1.contains("3p 5h"), "expired bucket leaked: {text1:?}");
+
+        // Tick 2: stdin observation 1h later at 60% remaining (20%/hr burn rate -> 3h ETA < 4h reset).
+        let rt2 = StatuslineRuntime {
+            session: SessionSource::Reader(&reader),
+            git_probe: &git,
+            cache_dir: Some(cache.path()),
+            pricing: PricingSource::Disabled,
+            now_unix_secs: t0 + 3_600,
+        };
+        let active_json = r#"{
+            "plan_tier":"Pro",
+            "email":"dev@example.com",
+            "model":{"id":"gemini-4"},
+            "quota":{"gemini-5h":{"remaining_fraction":0.60,"reset_in_seconds":14400}}
+        }"#;
+        let mut out2 = Vec::new();
+        process_statusline(active_json, &rt2, &cfg, &mut out2).unwrap();
+        let text2 = String::from_utf8(out2).unwrap();
+        assert!(text2.contains("Ultra 20x"), "text2: {text2:?}");
+        assert!(text2.contains("5h 60% r:4h !3h"), "text2: {text2:?}");
+
+        let persisted = load_quota_snapshot(cache.path()).unwrap().unwrap();
+        assert_eq!(persisted.source, QuotaSource::Stdin);
+        assert_eq!(persisted.display_plan_tier().as_deref(), Some("Ultra 20x"));
+        assert_eq!(persisted.history["gemini-5h"].samples.len(), 2);
+
+        // Tick 3: > 6h later with empty quota -> stale fallback is skipped cleanly.
+        let rt3 = StatuslineRuntime {
+            session: SessionSource::Reader(&reader),
+            git_probe: &git,
+            cache_dir: Some(cache.path()),
+            pricing: PricingSource::Disabled,
+            now_unix_secs: t0 + 3_600 + MAX_QUOTA_FALLBACK_AGE_SECS + 60,
+        };
+        let empty_json = r#"{"email":"dev@example.com","model":{"id":"gemini-4"}}"#;
+        let mut out3 = Vec::new();
+        process_statusline(empty_json, &rt3, &cfg, &mut out3).unwrap();
+        let text3 = String::from_utf8(out3).unwrap();
+        assert!(!text3.contains("5h 60%"), "stale quota leaked: {text3:?}");
     }
 }

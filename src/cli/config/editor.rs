@@ -2,41 +2,29 @@
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::config::layout::{LayoutConfig, Preset, WidgetId, MAX_ROWS};
+use crate::config::layout::{
+    LayoutConfig, Preset, WidgetId, MAX_BAR_LENGTH, MAX_ROWS, MAX_SPEED_WARN_THRESHOLD,
+    MIN_BAR_LENGTH, MIN_SPEED_WARN_THRESHOLD, SPEED_WARN_STEP,
+};
 
-/// Ordered entries in the Settings pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SettingField {
-    /// Built-in preset selector.
     Preset,
-    /// Visual rendering style (`Plain`, `Pill`, `Powerline`).
     Style,
-    /// Color theme palette.
     Theme,
-    /// Widget separator in `Plain` style.
     Separator,
-    /// Speed calculation method.
     SpeedMode,
-    /// Context percentage display mode (`Used %` vs `Remaining %`).
     CtxMode,
-    /// Automatically hide zero/inactive widgets.
     SmartHide,
-    /// Show working-tree `+ins -del` diff stats alongside `vcs`.
     GitDiff,
-    /// Context progress bar width in columns.
     BarWidth,
-    /// AGY statusline integration mode (`Replace Default` vs `Stack Below`).
     AgyMode,
-    /// Glyph set (`Unicode`, `Nerd Font`, `ASCII`).
     Glyphs,
-    /// Responsive overflow trimming.
     Responsive,
-    /// Speed warning threshold in tokens/s.
     SpeedWarn,
 }
 
 impl SettingField {
-    /// Canonical list of all settings in display order.
     pub(super) const ALL: &'static [Self] = &[
         Self::Preset,
         Self::Style,
@@ -54,19 +42,14 @@ impl SettingField {
     ];
 }
 
-/// Currently focused pane inside the 3-pane configurator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ActivePane {
-    /// Left pane: 3-line layout canvas with pill reordering and Move Mode.
     Canvas,
-    /// Center pane: catalog of all 33 widgets toggled into the target line.
     Catalog,
-    /// Right pane: presets, visual style, theme, separator, thresholds, and AGY mode.
     Settings,
 }
 
 impl ActivePane {
-    /// Cycles forward (`Canvas` -> `Catalog` -> `Settings` -> `Canvas`).
     pub(super) const fn next(self) -> Self {
         match self {
             Self::Canvas => Self::Catalog,
@@ -75,7 +58,6 @@ impl ActivePane {
         }
     }
 
-    /// Cycles backward (`Canvas` -> `Settings` -> `Catalog` -> `Canvas`).
     pub(super) const fn prev(self) -> Self {
         match self {
             Self::Canvas => Self::Settings,
@@ -85,19 +67,14 @@ impl ActivePane {
     }
 }
 
-/// Preview width mode for testing responsive truncation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PreviewWidth {
-    /// Use current terminal width inside the preview box.
     Auto,
-    /// Simulate wide 120-column terminal.
     Wide120,
-    /// Simulate narrow 72-column terminal.
     Narrow72,
 }
 
 impl PreviewWidth {
-    /// Cycles preview width (`Auto` -> `Wide120` -> `Narrow72` -> `Auto`).
     pub(super) const fn next(self) -> Self {
         match self {
             Self::Auto => Self::Wide120,
@@ -106,7 +83,6 @@ impl PreviewWidth {
         }
     }
 
-    /// Label shown in the Live Preview title bar.
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
@@ -115,7 +91,6 @@ impl PreviewWidth {
         }
     }
 
-    /// Effective column budget given the preview pane's inner width.
     pub(super) fn resolve(self, box_inner: u16) -> usize {
         match self {
             Self::Auto => usize::from(box_inner).max(40),
@@ -125,44 +100,29 @@ impl PreviewWidth {
     }
 }
 
-/// Action returned by [`TuiEditorState::handle_key`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExitOutcome {
-    /// Keep running the TUI event loop.
     Continue,
-    /// Exit without saving changes.
     Quit,
-    /// Save XDG `config.json` only and exit.
     SaveOnly,
-    /// Save XDG `config.json` AND sync AGY `settings.json`, then exit.
     SaveAndApply,
 }
 
-/// State for the interactive 3-pane statusline configurator.
 #[derive(Debug, Clone)]
 pub(super) struct TuiEditorState {
-    /// Editable layout configuration.
     pub(super) config: LayoutConfig,
-    /// Active pane (`Canvas`, `Catalog`, `Settings`).
     pub(super) active_pane: ActivePane,
-    /// Active row in Canvas (`0..3`), also the target line when toggling in Catalog.
+    /// Active Canvas row (`0..MAX_ROWS`); also the target row when toggling in Catalog.
     pub(super) canvas_row: usize,
-    /// Active widget index within `config.rows[canvas_row]`.
     pub(super) canvas_col: usize,
-    /// Whether the active Canvas widget is currently grabbed for Move Mode.
     pub(super) grabbed: bool,
-    /// Selected index in `WidgetId::ALL` inside `Catalog`.
     pub(super) catalog_idx: usize,
-    /// Selected index in `SettingField::ALL` inside `Settings`.
     pub(super) settings_idx: usize,
-    /// Active preset cursor.
     pub(super) preset: Preset,
-    /// Current Live Preview width simulation mode.
     pub(super) preview_width: PreviewWidth,
 }
 
 impl TuiEditorState {
-    /// Initializes editor state from `config`.
     pub(super) fn new(mut config: LayoutConfig) -> Self {
         config.normalize_rows();
         let preset = config.matching_preset().unwrap_or(Preset::Full);
@@ -179,15 +139,8 @@ impl TuiEditorState {
         }
     }
 
-    /// Applies one of the built-in presets while preserving non-layout preferences.
     pub(super) fn apply_preset(&mut self, preset: Preset) {
-        let saved_metric = self.config.stats_metric;
-        let saved_turn_sort = self.config.conv_turn_sort;
-        let saved_list_sort = self.config.conv_list_sort;
-        self.config = preset.to_layout();
-        self.config.stats_metric = saved_metric;
-        self.config.conv_turn_sort = saved_turn_sort;
-        self.config.conv_list_sort = saved_list_sort;
+        self.config = self.config.with_preset_preserving_prefs(preset);
         self.preset = preset;
         self.canvas_row = 0;
         self.canvas_col = 0;
@@ -231,29 +184,62 @@ impl TuiEditorState {
         }
     }
 
+    /// Switches focus to `pane` and clears Move Mode so `grabbed` is never stranded off-Canvas.
+    pub(super) fn focus_pane(&mut self, pane: ActivePane) {
+        self.active_pane = pane;
+        self.grabbed = false;
+    }
+
     /// Adjusts `setting_idx` by `dir` (`-1` or `+1`).
     pub(super) fn adjust_setting_at(&mut self, idx: usize, dir: isize) {
+        self.focus_pane(ActivePane::Settings);
         if idx < SettingField::ALL.len() {
             self.settings_idx = idx;
             self.adjust_setting(dir);
         }
     }
 
-    /// Selects `ActivePane::Canvas` row `r` and optional pill `col` (toggling Move Mode if re-clicked).
+    /// Selects `ActivePane::Canvas` row `row` and optional pill `col`.
+    /// While a pill is grabbed in Move Mode, clicking another pill or row drops it there.
     pub(super) fn click_canvas(&mut self, row: usize, col: Option<usize>) {
         if row >= MAX_ROWS {
             return;
         }
+        let was_canvas = self.active_pane == ActivePane::Canvas;
         self.active_pane = ActivePane::Canvas;
-        let same_pill = self.canvas_row == row && col == Some(self.canvas_col);
+        let same_pill = was_canvas && self.canvas_row == row && col == Some(self.canvas_col);
+        if self.grabbed {
+            if same_pill || (self.canvas_row == row && col.is_none()) {
+                self.grabbed = false;
+                return;
+            }
+            if self.canvas_col < self.config.rows[self.canvas_row].len() {
+                let w = self.config.rows[self.canvas_row].remove(self.canvas_col);
+                let target_len = self.config.rows[row].len();
+                let insert_idx = col.map_or(target_len, |c| c.min(target_len));
+                self.config.rows[row].insert(insert_idx, w);
+                self.canvas_row = row;
+                self.canvas_col = insert_idx;
+            }
+            self.grabbed = false;
+            return;
+        }
         self.canvas_row = row;
         if let Some(c) = col.filter(|&c| c < self.config.rows[row].len()) {
             self.canvas_col = c;
-            self.grabbed = if same_pill { !self.grabbed } else { false };
+            self.grabbed = same_pill;
         } else {
-            self.grabbed = false;
             self.clamp_canvas_col();
         }
+    }
+
+    /// Moves the Canvas row selection by `delta` (`-1` or `+1`) without moving a grabbed pill.
+    pub(super) fn scroll_canvas(&mut self, delta: isize) {
+        self.active_pane = ActivePane::Canvas;
+        self.grabbed = false;
+        let next = (self.canvas_row as isize + delta).clamp(0, (MAX_ROWS - 1) as isize);
+        self.canvas_row = next as usize;
+        self.clamp_canvas_col();
     }
 
     /// Removes the pill at `(row, col)` if present.
@@ -269,9 +255,8 @@ impl TuiEditorState {
 
     /// Selects and toggles the widget at `idx` in `Catalog`.
     pub(super) fn click_catalog(&mut self, idx: usize) {
+        self.focus_pane(ActivePane::Catalog);
         if idx < WidgetId::ALL.len() {
-            self.active_pane = ActivePane::Catalog;
-            self.grabbed = false;
             self.catalog_idx = idx;
             self.toggle_catalog_widget();
         }
@@ -279,14 +264,14 @@ impl TuiEditorState {
 
     /// Moves `catalog_idx` by `delta` (`-1` or `+1`).
     pub(super) fn scroll_catalog(&mut self, delta: isize) {
-        self.active_pane = ActivePane::Catalog;
+        self.focus_pane(ActivePane::Catalog);
         let next = (self.catalog_idx as isize + delta).clamp(0, (WidgetId::ALL.len() - 1) as isize);
         self.catalog_idx = next as usize;
     }
 
     /// Moves `settings_idx` by `delta` (`-1` or `+1`).
     pub(super) fn scroll_settings(&mut self, delta: isize) {
-        self.active_pane = ActivePane::Settings;
+        self.focus_pane(ActivePane::Settings);
         let next =
             (self.settings_idx as isize + delta).clamp(0, (SettingField::ALL.len() - 1) as isize);
         self.settings_idx = next as usize;
@@ -327,8 +312,9 @@ impl TuiEditorState {
             SettingField::SmartHide => self.config.smart_hide = !self.config.smart_hide,
             SettingField::GitDiff => self.config.show_git_diff = !self.config.show_git_diff,
             SettingField::BarWidth => {
-                self.config.bar_length =
-                    (self.config.bar_length as isize + dir).clamp(4, 40) as usize;
+                self.config.bar_length = (self.config.bar_length as isize + dir)
+                    .clamp(MIN_BAR_LENGTH as isize, MAX_BAR_LENGTH as isize)
+                    as usize;
             }
             SettingField::AgyMode => {
                 self.config.stack_with_default = !self.config.stack_with_default;
@@ -336,8 +322,9 @@ impl TuiEditorState {
             SettingField::Glyphs => self.config.glyph_mode = self.config.glyph_mode.step(dir),
             SettingField::Responsive => self.config.responsive = !self.config.responsive,
             SettingField::SpeedWarn => {
-                self.config.speed_warn_threshold =
-                    (self.config.speed_warn_threshold + (dir as f64) * 5.0).clamp(10.0, 200.0);
+                self.config.speed_warn_threshold = (self.config.speed_warn_threshold
+                    + (dir as f64) * SPEED_WARN_STEP)
+                    .clamp(MIN_SPEED_WARN_THRESHOLD, MAX_SPEED_WARN_THRESHOLD);
             }
         }
     }
@@ -554,6 +541,11 @@ mod tests {
         assert!(!ed.config.responsive);
         ed.adjust_setting_at(12, 1);
         assert!((ed.config.speed_warn_threshold - 40.0).abs() < 1e-6);
+        ed.config.speed_warn_threshold = 5.0;
+        ed.adjust_setting_at(12, -1);
+        assert_eq!(ed.config.speed_warn_threshold, 0.0);
+        ed.adjust_setting_at(12, -1);
+        assert_eq!(ed.config.speed_warn_threshold, 0.0);
 
         assert_eq!(
             ed.handle_key(KeyCode::Char('s'), KeyModifiers::NONE),

@@ -6,7 +6,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
@@ -14,8 +14,8 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::{
-    compute_header_hits, render_table_with_scrollbar, right_cell, HeaderHits, Palette, TableChrome,
-    TableHit,
+    compute_header_hits, render_footer_bar, render_table_with_scrollbar, right_cell,
+    sort_header_cell, ClickRegions, HeaderHits, Palette, SpanBar, TableChrome, TableHit,
 };
 use crate::stats::metric::{ConversationSort, ConversationSortField, SortDir};
 use crate::stats::query::{filter_and_rank_conversations, SourceFilter};
@@ -28,6 +28,20 @@ pub(super) enum PickerAction {
     Continue,
     Reload,
     Select(String),
+    Back,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerClick {
+    StartSearch,
+    ExitSearch,
+    ClearQuery,
+    CycleSource,
+    OpenSelected,
+    CycleSortField,
+    ToggleSubagents,
+    Reload,
     Back,
     Quit,
 }
@@ -85,6 +99,8 @@ pub(super) struct PickerScreen {
     status_msg: Option<String>,
     table_state: TableState,
     search_bar: Rect,
+    search_hits: ClickRegions<PickerClick>,
+    footer_hits: ClickRegions<PickerClick>,
     table_hit: TableHit,
     header_hits: HeaderHits<ConversationSortField>,
 }
@@ -112,6 +128,8 @@ impl PickerScreen {
             status_msg: None,
             table_state: TableState::default(),
             search_bar: Rect::default(),
+            search_hits: ClickRegions::default(),
+            footer_hits: ClickRegions::default(),
             table_hit: TableHit::default(),
             header_hits: HeaderHits::default(),
         };
@@ -336,7 +354,51 @@ impl PickerScreen {
         PickerAction::Continue
     }
 
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> PickerAction {
+    fn apply_click(&mut self, click: PickerClick, has_back: bool) -> PickerAction {
+        match click {
+            PickerClick::StartSearch => self.searching = true,
+            PickerClick::ExitSearch => self.searching = false,
+            PickerClick::ClearQuery => {
+                self.input.reset();
+                self.searching = false;
+                self.selected = 0;
+                self.recompute_filtered();
+            }
+            PickerClick::CycleSource => {
+                if self.has_cli && self.has_desktop || self.source_filter != SourceFilter::All {
+                    self.source_filter = self.source_filter.next();
+                    self.searching = false;
+                    self.selected = 0;
+                    self.recompute_filtered();
+                }
+            }
+            PickerClick::OpenSelected => {
+                if let Some(&idx) = self.filtered.get(self.selected) {
+                    return PickerAction::Select(self.items[idx].conversation_id.clone());
+                }
+            }
+            PickerClick::CycleSortField => {
+                self.searching = false;
+                self.cycle_sort_field();
+            }
+            PickerClick::ToggleSubagents => {
+                self.searching = false;
+                self.show_subagents = !self.show_subagents;
+                self.selected = 0;
+                self.recompute_filtered();
+            }
+            PickerClick::Reload => {
+                self.searching = false;
+                return PickerAction::Reload;
+            }
+            PickerClick::Back if has_back => return PickerAction::Back,
+            PickerClick::Back => {}
+            PickerClick::Quit => return PickerAction::Quit,
+        }
+        PickerAction::Continue
+    }
+
+    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent, has_back: bool) -> PickerAction {
         let pos = Position::new(mouse.column, mouse.row);
         let len = self.filtered.len();
         match mouse.kind {
@@ -350,6 +412,13 @@ impl PickerScreen {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.status_msg = None;
+                if let Some(click) = self
+                    .search_hits
+                    .hit(pos)
+                    .or_else(|| self.footer_hits.hit(pos))
+                {
+                    return self.apply_click(click, has_back);
+                }
                 if self.search_bar.contains(pos) {
                     self.searching = true;
                     return PickerAction::Continue;
@@ -366,6 +435,8 @@ impl PickerScreen {
                         );
                     }
                     self.selected = target;
+                    self.searching = false;
+                } else {
                     self.searching = false;
                 }
             }
@@ -400,6 +471,8 @@ impl PickerScreen {
         frame.render_widget(block, area);
         if inner.height < 3 || inner.width < 16 {
             self.search_bar = Rect::default();
+            self.search_hits = ClickRegions::default();
+            self.footer_hits = ClickRegions::default();
             self.table_hit = TableHit::default();
             self.header_hits = HeaderHits::default();
             return;
@@ -416,11 +489,12 @@ impl PickerScreen {
 
         self.draw_search_bar(frame, chunks[0], pal);
         self.draw_list(frame, chunks[1], area, pal);
-        self.draw_footer(frame, chunks[2], has_back, pal);
+        self.footer_hits = self.draw_footer(frame, chunks[2], has_back, pal);
     }
 
     fn draw_search_bar(&mut self, frame: &mut Frame<'_>, area: Rect, pal: &Palette) {
         self.search_bar = area;
+        self.search_hits = ClickRegions::default();
         let query_val = self.input.value();
         if self.searching {
             let prefix_w = 3u16.min(area.width);
@@ -452,24 +526,42 @@ impl PickerScreen {
             frame.set_cursor_position(Position::new(cursor_x, area.y));
             return;
         }
-        let mut bar_spans: Vec<Span<'static>> = Vec::new();
+        let mut bar = SpanBar::new(area);
+        let src_badge = (self.source_filter != SourceFilter::All)
+            .then(|| format!("[Src:{}]", self.source_filter.label()));
         if !query_val.is_empty() {
-            bar_spans.push(Span::styled(" / ", pal.bold(Color::Yellow)));
-            bar_spans.push(Span::styled(query_val.to_string(), pal.bold(Color::Yellow)));
-            bar_spans.push(Span::styled("  (Esc clear)", pal.dim()));
+            let ellipsis = pal.ellipsis();
+            let clear_label = "(Esc clear)";
+            let reserved =
+                3 + 2 + clear_label.len() + src_badge.as_ref().map_or(0, |s| 2 + s.len());
+            let total_w = usize::from(area.width);
+            let query_budget = total_w
+                .checked_sub(reserved)
+                .filter(|&b| b > 0)
+                .unwrap_or_else(|| total_w.saturating_sub(3));
+            let shown_query = truncate_to_width(query_val, query_budget, ellipsis);
+            let _ = bar.push_click(" / ", pal.bold(Color::Yellow), PickerClick::StartSearch);
+            let _ = bar.push_click(
+                shown_query,
+                pal.bold(Color::Yellow),
+                PickerClick::StartSearch,
+            );
+            let _ = bar.push("  ", Style::default());
+            let _ = bar.push_click(clear_label, pal.dim(), PickerClick::ClearQuery);
         } else {
-            bar_spans.push(Span::styled(
+            let _ = bar.push_click(
                 " Press / to fuzzy-search by title, workspace, or ID",
                 pal.dim(),
-            ));
+                PickerClick::StartSearch,
+            );
         }
-        if self.source_filter != SourceFilter::All {
-            bar_spans.push(Span::styled(
-                format!("  [Src:{}]", self.source_filter.label()),
-                pal.bold(Color::Yellow),
-            ));
+        if let Some(badge) = src_badge {
+            let _ = bar.push("  ", Style::default());
+            let _ = bar.push_click(badge, pal.bold(Color::Yellow), PickerClick::CycleSource);
         }
-        frame.render_widget(Paragraph::new(Line::from(bar_spans)), area);
+        let (line, hits) = bar.finish();
+        self.search_hits = hits;
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     fn draw_list(
@@ -500,7 +592,7 @@ impl PickerScreen {
         let show_info = inner_w >= 58;
         let show_sub_col = inner_w >= 92;
         let show_src_col = self.has_cli && self.has_desktop && inner_w >= 98;
-        let ellipsis = if pal.ascii { "..." } else { "…" };
+        let ellipsis = pal.ellipsis();
         let active_mark = if pal.ascii { "*" } else { "●" };
 
         let mut cols = vec![
@@ -532,29 +624,16 @@ impl PickerScreen {
         let hdr_cells: Vec<Cell<'static>> = cols
             .iter()
             .map(|&col| {
-                let active = self.sort.field == col;
-                let label = if active {
-                    format!("{} {}", col.header_label(), self.sort.dir.arrow(pal.ascii))
-                } else {
-                    col.header_label().to_string()
-                };
-                let style = if active {
-                    if pal.no_color {
-                        Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                    } else {
-                        pal.bold(Color::Cyan)
-                    }
-                } else {
-                    pal.dim()
-                };
-                if matches!(
-                    col,
-                    ConversationSortField::Steps | ConversationSortField::Subagents
-                ) {
-                    right_cell(label, style)
-                } else {
-                    Cell::from(label).style(style)
-                }
+                sort_header_cell(
+                    col.header_label(),
+                    self.sort.field == col,
+                    self.sort.dir,
+                    matches!(
+                        col,
+                        ConversationSortField::Steps | ConversationSortField::Subagents
+                    ),
+                    pal,
+                )
             })
             .collect();
         let chrome = TableChrome {
@@ -644,7 +723,7 @@ impl PickerScreen {
             .header(Row::new(hdr_cells).style(pal.dim()))
             .column_spacing(1)
             .row_highlight_style(pal.selected_row(true))
-            .highlight_symbol(if pal.ascii { "> " } else { "▸ " });
+            .highlight_symbol(pal.highlight_symbol());
 
         let sb_area = Rect::new(
             outer_area.x,
@@ -663,36 +742,52 @@ impl PickerScreen {
         );
     }
 
-    fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect, has_back: bool, pal: &Palette) {
-        let sep_s = format!(" {} ", pal.sep());
-        let (hint, hint_style) = if let Some(msg) = &self.status_msg {
-            (format!(" {msg}"), pal.bold(Color::Yellow))
-        } else if self.searching {
-            let nav = if pal.ascii { "Up/Dn" } else { "↑↓" };
-            (
-                format!(" Type to search{sep_s}{nav} Select{sep_s}Enter Open{sep_s}Esc Done"),
-                pal.dim(),
-            )
-        } else {
-            let nav = if pal.ascii { "j/k" } else { "↑↓/jk" };
-            let src_hint = if self.has_cli && self.has_desktop {
-                format!("{sep_s}f Src")
-            } else {
-                String::new()
-            };
-            let back_hint = if has_back {
-                format!("{sep_s}b Back")
-            } else {
-                String::new()
-            };
-            (
-                format!(
-                    " {nav} Select{sep_s}/ Search{sep_s}Enter Open{sep_s}s/S Sort{sep_s}a Subagents{src_hint}{sep_s}r Reload{back_hint}{sep_s}q Quit"
-                ),
-                pal.dim(),
-            )
-        };
-        frame.render_widget(Paragraph::new(Line::styled(hint, hint_style)), area);
+    fn draw_footer(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        has_back: bool,
+        pal: &Palette,
+    ) -> ClickRegions<PickerClick> {
+        render_footer_bar(
+            frame,
+            area,
+            self.status_msg.as_deref(),
+            pal,
+            |bar, sep, dim| {
+                if self.searching {
+                    let nav = if pal.ascii { "Up/Dn" } else { "↑↓" };
+                    let _ = bar.push(format!("Type to search{sep}{nav} Select"), dim);
+                    let _ =
+                        bar.push_sep_click(sep, dim, "Enter Open", dim, PickerClick::OpenSelected);
+                    let _ = bar.push_sep_click(sep, dim, "Esc Done", dim, PickerClick::ExitSearch);
+                } else {
+                    let nav = if pal.ascii { "j/k" } else { "↑↓/jk" };
+                    let _ = bar.push(format!("{nav} Select"), dim);
+                    let _ = bar.push_sep_click(sep, dim, "/ Search", dim, PickerClick::StartSearch);
+                    let _ =
+                        bar.push_sep_click(sep, dim, "Enter Open", dim, PickerClick::OpenSelected);
+                    let _ =
+                        bar.push_sep_click(sep, dim, "s/S Sort", dim, PickerClick::CycleSortField);
+                    let _ = bar.push_sep_click(
+                        sep,
+                        dim,
+                        "a Subagents",
+                        dim,
+                        PickerClick::ToggleSubagents,
+                    );
+                    if self.has_cli && self.has_desktop {
+                        let _ =
+                            bar.push_sep_click(sep, dim, "f Src", dim, PickerClick::CycleSource);
+                    }
+                    let _ = bar.push_sep_click(sep, dim, "r Reload", dim, PickerClick::Reload);
+                    if has_back {
+                        let _ = bar.push_sep_click(sep, dim, "b Back", dim, PickerClick::Back);
+                    }
+                    let _ = bar.push_sep_click(sep, dim, "q Quit", dim, PickerClick::Quit);
+                }
+            },
+        )
     }
 }
 
@@ -842,20 +937,26 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        p.handle_mouse(m(MouseEventKind::ScrollDown, 20, 10));
+        p.handle_mouse(m(MouseEventKind::ScrollDown, 20, 10), true);
         assert_eq!(p.selected, 2);
-        p.handle_mouse(m(MouseEventKind::ScrollUp, 20, 10));
+        p.handle_mouse(m(MouseEventKind::ScrollUp, 20, 10), true);
         assert_eq!(p.selected, 0);
 
         let row1_y = p.table_hit.data_y0 + 1;
         let list_x = p.table_hit.pane.x + 2;
         assert_eq!(
-            p.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), list_x, row1_y)),
+            p.handle_mouse(
+                m(MouseEventKind::Down(MouseButton::Left), list_x, row1_y),
+                true
+            ),
             PickerAction::Continue
         );
         assert_eq!(p.selected, 1);
         assert_eq!(
-            p.handle_mouse(m(MouseEventKind::Down(MouseButton::Left), list_x, row1_y)),
+            p.handle_mouse(
+                m(MouseEventKind::Down(MouseButton::Left), list_x, row1_y),
+                true
+            ),
             PickerAction::Select("9a1482f2-6b16-434c-99cd-fe86aa60ab9c".to_string())
         );
 
@@ -871,11 +972,14 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, p.header_hits.y)].symbol())
             .collect();
         assert!(title_hdr.contains("Title"), "{title_hdr:?}");
-        p.handle_mouse(m(
-            MouseEventKind::Down(MouseButton::Left),
-            title_hit.x0 + 1,
-            p.header_hits.y,
-        ));
+        p.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                title_hit.x0 + 1,
+                p.header_hits.y,
+            ),
+            true,
+        );
         assert_eq!(
             p.sort,
             ConversationSort {
@@ -887,11 +991,14 @@ mod tests {
             p.items[p.filtered[0]].title.as_deref(),
             Some("Cache Hit Investigation")
         );
-        p.handle_mouse(m(
-            MouseEventKind::Down(MouseButton::Left),
-            title_hit.x0 + 1,
-            p.header_hits.y,
-        ));
+        p.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                title_hit.x0 + 1,
+                p.header_hits.y,
+            ),
+            true,
+        );
         assert_eq!(
             p.sort,
             ConversationSort {
@@ -945,5 +1052,240 @@ mod tests {
             .collect();
         assert!(footer_row.contains("Up/Dn Select"), "{footer_row}");
         assert!(footer_row.is_ascii(), "{footer_row}");
+    }
+
+    #[test]
+    fn picker_mouse_clicks_search_badges_and_footer_actions() {
+        let m = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let rect_text = |buf: &ratatui::buffer::Buffer, r: Rect| -> String {
+            (r.x..r.right()).map(|x| buf[(x, r.y)].symbol()).collect()
+        };
+        let mut p = PickerScreen::new(
+            sample_items(),
+            None,
+            Some("Cache"),
+            false,
+            ConversationSort::default(),
+        );
+        let pal = Palette {
+            no_color: true,
+            ascii: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        terminal
+            .draw(|frame| p.draw(frame, frame.area(), "UTC+08:00", true, &pal))
+            .unwrap();
+        assert_eq!(p.filtered.len(), 1);
+
+        // Clicking "(Esc clear)" in search bar clears the active query.
+        let clear_rect = p
+            .search_hits
+            .find(|c| *c == PickerClick::ClearQuery)
+            .unwrap();
+        assert_eq!(
+            rect_text(terminal.backend().buffer(), clear_rect),
+            "(Esc clear)"
+        );
+        assert_eq!(
+            p.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    clear_rect.x + 1,
+                    clear_rect.y
+                ),
+                true,
+            ),
+            PickerAction::Continue
+        );
+        assert_eq!(p.input.value(), "");
+        assert_eq!(p.filtered.len(), 2);
+
+        // Footer toggles: Subagents and Source filter.
+        terminal
+            .draw(|frame| p.draw(frame, frame.area(), "UTC+08:00", true, &pal))
+            .unwrap();
+        let sub_btn = p
+            .footer_hits
+            .find(|c| *c == PickerClick::ToggleSubagents)
+            .unwrap();
+        p.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                sub_btn.x + 1,
+                sub_btn.y,
+            ),
+            true,
+        );
+        assert!(p.show_subagents);
+        assert_eq!(p.filtered.len(), 3);
+
+        let src_btn = p
+            .footer_hits
+            .find(|c| *c == PickerClick::CycleSource)
+            .unwrap();
+        p.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                src_btn.x + 1,
+                src_btn.y,
+            ),
+            true,
+        );
+        assert_eq!(p.source_filter, SourceFilter::Cli);
+        assert_eq!(p.filtered.len(), 2);
+
+        // Clicking "[Src:CLI]" badge in search bar cycles to Desktop.
+        terminal
+            .draw(|frame| p.draw(frame, frame.area(), "UTC+08:00", true, &pal))
+            .unwrap();
+        let src_badge = p
+            .search_hits
+            .find(|c| *c == PickerClick::CycleSource)
+            .unwrap();
+        assert_eq!(
+            rect_text(terminal.backend().buffer(), src_badge),
+            "[Src:CLI]"
+        );
+        p.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                src_badge.x + 1,
+                src_badge.y,
+            ),
+            true,
+        );
+        assert_eq!(p.source_filter, SourceFilter::Desktop);
+        assert_eq!(p.filtered.len(), 1);
+
+        // Footer "Enter Open" opens selected Desktop conversation.
+        let open_btn = p
+            .footer_hits
+            .find(|c| *c == PickerClick::OpenSelected)
+            .unwrap();
+        assert_eq!(
+            p.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    open_btn.x + 1,
+                    open_btn.y
+                ),
+                true,
+            ),
+            PickerAction::Select("deadbeef-1111-4111-8111-111111111111".to_string())
+        );
+
+        // Footer "/ Search" enters search mode; "Esc Done" exits search mode.
+        let search_btn = p
+            .footer_hits
+            .find(|c| *c == PickerClick::StartSearch)
+            .unwrap();
+        p.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                search_btn.x + 1,
+                search_btn.y,
+            ),
+            true,
+        );
+        assert!(p.searching);
+
+        terminal
+            .draw(|frame| p.draw(frame, frame.area(), "UTC+08:00", true, &pal))
+            .unwrap();
+        let done_btn = p
+            .footer_hits
+            .find(|c| *c == PickerClick::ExitSearch)
+            .unwrap();
+        assert_eq!(rect_text(terminal.backend().buffer(), done_btn), "Esc Done");
+        p.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                done_btn.x + 1,
+                done_btn.y,
+            ),
+            true,
+        );
+        assert!(!p.searching);
+
+        // Footer Reload, Back, Quit; and Back hidden when has_back is false.
+        terminal
+            .draw(|frame| p.draw(frame, frame.area(), "UTC+08:00", true, &pal))
+            .unwrap();
+        let reload_btn = p.footer_hits.find(|c| *c == PickerClick::Reload).unwrap();
+        assert_eq!(
+            p.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    reload_btn.x + 1,
+                    reload_btn.y,
+                ),
+                true,
+            ),
+            PickerAction::Reload
+        );
+        let back_btn = p.footer_hits.find(|c| *c == PickerClick::Back).unwrap();
+        assert_eq!(rect_text(terminal.backend().buffer(), back_btn), "b Back");
+        assert_eq!(
+            p.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    back_btn.x + 1,
+                    back_btn.y
+                ),
+                true,
+            ),
+            PickerAction::Back
+        );
+        let quit_btn = p.footer_hits.find(|c| *c == PickerClick::Quit).unwrap();
+        assert_eq!(
+            p.handle_mouse(
+                m(
+                    MouseEventKind::Down(MouseButton::Left),
+                    quit_btn.x + 1,
+                    quit_btn.y
+                ),
+                true,
+            ),
+            PickerAction::Quit
+        );
+
+        terminal
+            .draw(|frame| p.draw(frame, frame.area(), "UTC+08:00", false, &pal))
+            .unwrap();
+        assert!(p.footer_hits.find(|c| *c == PickerClick::Back).is_none());
+
+        // Long query on a narrow viewport truncates cleanly so both query and "(Esc clear)" stay visible/clickable.
+        let mut narrow_p = PickerScreen::new(
+            sample_items(),
+            None,
+            Some("super-long-search-query-that-exceeds-narrow-terminal-width-by-far"),
+            false,
+            ConversationSort::default(),
+        );
+        let mut narrow_term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        narrow_term
+            .draw(|frame| narrow_p.draw(frame, frame.area(), "UTC+08:00", false, &pal))
+            .unwrap();
+        let search_line = rect_text(narrow_term.backend().buffer(), narrow_p.search_bar);
+        assert!(search_line.contains("super-long"), "{search_line}");
+        assert!(search_line.contains("(Esc clear)"), "{search_line}");
+        let narrow_clear = narrow_p
+            .search_hits
+            .find(|c| *c == PickerClick::ClearQuery)
+            .unwrap();
+        narrow_p.handle_mouse(
+            m(
+                MouseEventKind::Down(MouseButton::Left),
+                narrow_clear.x + 1,
+                narrow_clear.y,
+            ),
+            false,
+        );
+        assert_eq!(narrow_p.input.value(), "");
     }
 }

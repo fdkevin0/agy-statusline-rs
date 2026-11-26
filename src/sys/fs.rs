@@ -1,9 +1,155 @@
-//! Atomic file write helpers with optional permission and symlink target preservation.
+//! Symlink-safe bounded file reads, metadata helpers, and atomic file writes.
 
 use std::fs;
-use std::io::{self, Write};
-use std::path::Path;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+
+/// Error returned by symlink-safe, size-bounded regular-file inspection and reads.
+#[derive(Debug)]
+pub(crate) enum BoundedReadError {
+    /// Target file (or its parent directory) does not exist.
+    Missing,
+    /// Target file or its immediate parent directory is a symlink.
+    Symlink,
+    /// Target is not a regular file (or its immediate parent is not a directory).
+    NotAFile,
+    /// Regular file size exceeded the caller-supplied byte cap.
+    Oversized(u64),
+    /// Underlying filesystem I/O error.
+    Io(io::Error),
+}
+
+/// Returns `fs::canonicalize(path)` when resolvable, falling back to `path` unchanged.
+pub(crate) fn canonical_or_self(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Returns `true` when `path` is an existing non-symlink directory.
+pub(crate) fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| {
+        let ft = meta.file_type();
+        !ft.is_symlink() && ft.is_dir()
+    })
+}
+
+/// Returns `true` when `path` is absent or an existing non-symlink regular file.
+pub(crate) fn is_absent_or_real_file(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            !ft.is_symlink() && ft.is_file()
+        }
+        Err(err) => err.kind() == io::ErrorKind::NotFound,
+    }
+}
+
+/// Returns `true` when `path`'s immediate parent (if any) is absent or a non-symlink directory,
+/// and `path` itself is absent or a non-symlink regular file.
+pub(crate) fn is_safe_cache_target(path: &Path) -> bool {
+    matches!(
+        safe_regular_metadata(path),
+        Ok(_) | Err(BoundedReadError::Missing)
+    )
+}
+
+/// Inspects `path` via `symlink_metadata`, rejecting symlinked immediate parent directories,
+/// symlinked files, and non-regular files.
+pub(crate) fn safe_regular_metadata(path: &Path) -> Result<fs::Metadata, BoundedReadError> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        match fs::symlink_metadata(parent) {
+            Ok(meta) => {
+                let ft = meta.file_type();
+                if ft.is_symlink() {
+                    return Err(BoundedReadError::Symlink);
+                }
+                if !ft.is_dir() {
+                    return Err(BoundedReadError::NotAFile);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Err(BoundedReadError::Missing);
+            }
+            Err(err) => return Err(BoundedReadError::Io(err)),
+        }
+    }
+
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(BoundedReadError::Missing),
+        Err(err) => return Err(BoundedReadError::Io(err)),
+    };
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(BoundedReadError::Symlink);
+    }
+    if !ft.is_file() {
+        return Err(BoundedReadError::NotAFile);
+    }
+    Ok(meta)
+}
+
+/// Reads a non-symlink regular file under a non-symlink parent directory up to `max_bytes`,
+/// enforcing the size cap both via `symlink_metadata` and a bounded `Read::take(max_bytes + 1)`.
+pub(crate) fn read_bounded_regular_file(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, fs::Metadata), BoundedReadError> {
+    let meta = safe_regular_metadata(path)?;
+    if meta.len() > max_bytes {
+        return Err(BoundedReadError::Oversized(meta.len()));
+    }
+    let file = fs::File::open(path).map_err(BoundedReadError::Io)?;
+    let cap = meta.len().min(max_bytes).min(64 * 1024) as usize;
+    let mut bytes = Vec::with_capacity(cap);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(BoundedReadError::Io)?;
+    if (bytes.len() as u64) > max_bytes {
+        return Err(BoundedReadError::Oversized(bytes.len() as u64));
+    }
+    Ok((bytes, meta))
+}
+
+/// Reads a regular file (following symlinks, e.g. Stow/Nix dotfiles) up to `max_bytes`
+/// into a UTF-8 string.
+///
+/// Rejects non-regular targets (directories, FIFOs, sockets, devices) before opening
+/// and enforces `max_bytes` via both `fs::metadata` and `Read::take(max_bytes + 1)`.
+pub(crate) fn read_bounded_file_to_string(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let meta = fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    if meta.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds size limit ({} > {max_bytes} bytes)",
+                path.display(),
+                meta.len()
+            ),
+        ));
+    }
+    let file = fs::File::open(path)?;
+    let cap = meta.len().min(max_bytes).min(64 * 1024) as usize;
+    let mut bytes = Vec::with_capacity(cap);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if (bytes.len() as u64) > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds size limit (> {max_bytes} bytes)",
+                path.display()
+            ),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
 
 /// Extracts a file's modification time as signed Unix `(secs, nanos)`.
 pub(crate) fn modified_timestamp(meta: &fs::Metadata) -> (i64, u32) {
@@ -77,6 +223,69 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"second");
     }
 
+    #[test]
+    fn read_bounded_regular_file_enforces_size_missing_and_non_file_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.json");
+        fs::write(&file, b"12345").unwrap();
+
+        let (bytes, meta) = read_bounded_regular_file(&file, 5).unwrap();
+        assert_eq!(bytes, b"12345");
+        assert_eq!(meta.len(), 5);
+
+        assert!(matches!(
+            read_bounded_regular_file(&file, 4),
+            Err(BoundedReadError::Oversized(5))
+        ));
+        assert!(matches!(
+            read_bounded_regular_file(&dir.path().join("absent.json"), 64),
+            Err(BoundedReadError::Missing)
+        ));
+        let sub = dir.path().join("subdir");
+        fs::create_dir(&sub).unwrap();
+        assert!(matches!(
+            read_bounded_regular_file(&sub, 64),
+            Err(BoundedReadError::NotAFile)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_regular_metadata_and_read_reject_symlinked_file_and_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        let real_file = real_dir.join("cache.json");
+        fs::write(&real_file, b"{}").unwrap();
+
+        let link_file = real_dir.join("link.json");
+        symlink(&real_file, &link_file).unwrap();
+        assert!(matches!(
+            safe_regular_metadata(&link_file),
+            Err(BoundedReadError::Symlink)
+        ));
+        assert!(matches!(
+            read_bounded_regular_file(&link_file, 64),
+            Err(BoundedReadError::Symlink)
+        ));
+        assert!(!is_safe_cache_target(&link_file));
+
+        let link_dir = dir.path().join("sym_dir");
+        symlink(&real_dir, &link_dir).unwrap();
+        let via_link_dir = link_dir.join("cache.json");
+        assert!(matches!(
+            safe_regular_metadata(&via_link_dir),
+            Err(BoundedReadError::Symlink)
+        ));
+        assert!(matches!(
+            read_bounded_regular_file(&via_link_dir, 64),
+            Err(BoundedReadError::Symlink)
+        ));
+        assert!(!is_safe_cache_target(&via_link_dir));
+    }
+
     #[cfg(unix)]
     #[test]
     fn atomic_write_preserving_mode_keeps_existing_permissions() {
@@ -119,5 +328,61 @@ mod tests {
         assert_eq!(fs::read(&link_path).unwrap(), b"updated");
         let mode = fs::metadata(&real_target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640);
+    }
+
+    #[test]
+    fn read_bounded_file_to_string_enforces_size_missing_utf8_and_non_file_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cfg.json");
+        fs::write(&file, "hello").unwrap();
+
+        assert_eq!(read_bounded_file_to_string(&file, 5).unwrap(), "hello");
+        assert_eq!(
+            read_bounded_file_to_string(&file, 4).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_bounded_file_to_string(&dir.path().join("missing.json"), 64)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+
+        let sub = dir.path().join("subdir");
+        fs::create_dir(&sub).unwrap();
+        assert_eq!(
+            read_bounded_file_to_string(&sub, 64).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let invalid_utf8 = dir.path().join("bad.bin");
+        fs::write(&invalid_utf8, [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            read_bounded_file_to_string(&invalid_utf8, 64)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_bounded_file_to_string_follows_symlinks_and_enforces_cap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        fs::write(&real, "{\"ok\":true}").unwrap();
+        let link = dir.path().join("link.json");
+        symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            read_bounded_file_to_string(&link, 64).unwrap(),
+            "{\"ok\":true}"
+        );
+        assert_eq!(
+            read_bounded_file_to_string(&link, 4).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

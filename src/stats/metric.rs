@@ -411,87 +411,99 @@ impl FromStr for TurnSortField {
     }
 }
 
-/// Active sort column and direction for the single-conversation Turns table (defaults to `# ↑`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TurnSort {
-    pub field: TurnSortField,
-    pub dir: SortDir,
-}
-
-impl Default for TurnSort {
-    fn default() -> Self {
-        Self {
-            field: TurnSortField::Turn,
-            dir: SortDir::Asc,
+macro_rules! impl_table_sort {
+    ($(#[$doc:meta])* $name:ident, $field_ty:ty, $default_field:expr, $default_dir:expr) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub struct $name {
+            pub field: $field_ty,
+            pub dir: SortDir,
         }
-    }
-}
 
-impl TurnSort {
-    /// Selects `field` with its natural direction, or toggles direction if already active.
-    pub const fn click(self, field: TurnSortField) -> Self {
-        if self.field as u8 == field as u8 {
-            Self {
-                field,
-                dir: self.dir.toggle(),
-            }
-        } else {
-            Self {
-                field,
-                dir: field.default_dir(),
+        impl Default for $name {
+            fn default() -> Self {
+                Self {
+                    field: $default_field,
+                    dir: $default_dir,
+                }
             }
         }
-    }
 
-    pub const fn toggle_dir(self) -> Self {
-        Self {
-            field: self.field,
-            dir: self.dir.toggle(),
+        impl $name {
+            /// Selects `field` with its natural direction, or toggles direction if already active.
+            pub const fn click(self, field: $field_ty) -> Self {
+                if self.field as u8 == field as u8 {
+                    Self {
+                        field,
+                        dir: self.dir.toggle(),
+                    }
+                } else {
+                    Self {
+                        field,
+                        dir: field.default_dir(),
+                    }
+                }
+            }
+
+            pub const fn toggle_dir(self) -> Self {
+                Self {
+                    field: self.field,
+                    dir: self.dir.toggle(),
+                }
+            }
+
+            pub fn label(self, ascii: bool) -> String {
+                format!("{} {}", self.field.header_label(), self.dir.arrow(ascii))
+            }
         }
-    }
 
-    pub fn label(self, ascii: bool) -> String {
-        format!("{} {}", self.field.header_label(), self.dir.arrow(ascii))
-    }
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}:{}", self.field, self.dir)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = String;
+
+            fn from_str(raw: &str) -> Result<Self, Self::Err> {
+                let trimmed = raw.trim();
+                let (field_raw, dir_raw) = match trimmed.split_once(':') {
+                    Some((f, d)) => (f, Some(d)),
+                    None => (trimmed, None),
+                };
+                let field = field_raw.parse::<$field_ty>()?;
+                let dir = match dir_raw {
+                    Some(d) => d.parse::<SortDir>()?,
+                    None => field.default_dir(),
+                };
+                Ok(Self { field, dir })
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(&self.to_string())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                String::deserialize(deserializer)?
+                    .parse()
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+    };
 }
 
-impl fmt::Display for TurnSort {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.field, self.dir)
-    }
-}
-
-impl FromStr for TurnSort {
-    type Err = String;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        let trimmed = raw.trim();
-        let (field_raw, dir_raw) = match trimmed.split_once(':') {
-            Some((f, d)) => (f, Some(d)),
-            None => (trimmed, None),
-        };
-        let field = field_raw.parse::<TurnSortField>()?;
-        let dir = match dir_raw {
-            Some(d) => d.parse::<SortDir>()?,
-            None => field.default_dir(),
-        };
-        Ok(Self { field, dir })
-    }
-}
-
-impl Serialize for TurnSort {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for TurnSort {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
-}
+impl_table_sort!(
+    /// Active sort column and direction for the single-conversation Turns table (defaults to `# ↑`).
+    TurnSort,
+    TurnSortField,
+    TurnSortField::Turn,
+    SortDir::Asc
+);
 
 /// Sortable column in the historical conversations list table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -558,86 +570,13 @@ impl FromStr for ConversationSortField {
     }
 }
 
-/// Active sort column and direction for the conversations picker (defaults to `Modified ↓`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ConversationSort {
-    pub field: ConversationSortField,
-    pub dir: SortDir,
-}
-
-impl Default for ConversationSort {
-    fn default() -> Self {
-        Self {
-            field: ConversationSortField::Modified,
-            dir: SortDir::Desc,
-        }
-    }
-}
-
-impl ConversationSort {
-    pub const fn click(self, field: ConversationSortField) -> Self {
-        if self.field as u8 == field as u8 {
-            Self {
-                field,
-                dir: self.dir.toggle(),
-            }
-        } else {
-            Self {
-                field,
-                dir: field.default_dir(),
-            }
-        }
-    }
-
-    pub const fn toggle_dir(self) -> Self {
-        Self {
-            field: self.field,
-            dir: self.dir.toggle(),
-        }
-    }
-
-    pub fn label(self, ascii: bool) -> String {
-        format!("{} {}", self.field.header_label(), self.dir.arrow(ascii))
-    }
-}
-
-impl fmt::Display for ConversationSort {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.field, self.dir)
-    }
-}
-
-impl FromStr for ConversationSort {
-    type Err = String;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        let trimmed = raw.trim();
-        let (field_raw, dir_raw) = match trimmed.split_once(':') {
-            Some((f, d)) => (f, Some(d)),
-            None => (trimmed, None),
-        };
-        let field = field_raw.parse::<ConversationSortField>()?;
-        let dir = match dir_raw {
-            Some(d) => d.parse::<SortDir>()?,
-            None => field.default_dir(),
-        };
-        Ok(Self { field, dir })
-    }
-}
-
-impl Serialize for ConversationSort {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for ConversationSort {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
-}
+impl_table_sort!(
+    /// Active sort column and direction for the conversations picker (defaults to `Modified ↓`).
+    ConversationSort,
+    ConversationSortField,
+    ConversationSortField::Modified,
+    SortDir::Desc
+);
 
 /// Persisted interactive TUI preferences shared across `stats` and `conversations`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

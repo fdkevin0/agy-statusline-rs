@@ -4,19 +4,28 @@
 //! `$XDG_CONFIG_HOME/agy-statusline/config.json` (defaulting to
 //! `~/.config/agy-statusline/config.json`).
 
-use std::fs;
 use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::stats::{ConversationSort, StatsMetric, StatsTuiPrefs, TurnSort};
-use crate::sys::fs::atomic_write;
+use crate::sys::fs::{atomic_write, read_bounded_file_to_string};
+
+/// Maximum size accepted when loading `config.json`.
+const MAX_CONFIG_FILE_BYTES: u64 = 256 * 1024;
 
 /// Maximum number of configurable statusline rows.
 pub const MAX_ROWS: usize = 3;
 
-/// Default speed threshold (tokens/s) below which speed highlights in warning amber.
+/// Valid character width bounds for `ctx_bar`.
+pub const MIN_BAR_LENGTH: usize = 4;
+pub const MAX_BAR_LENGTH: usize = 40;
+
+/// Valid range, step, and default for `speed_warn_threshold` (`0.0` disables the slow warning).
+pub const MIN_SPEED_WARN_THRESHOLD: f64 = 0.0;
+pub const MAX_SPEED_WARN_THRESHOLD: f64 = 200.0;
+pub const SPEED_WARN_STEP: f64 = 5.0;
 pub const DEFAULT_SPEED_WARN_THRESHOLD: f64 = 35.0;
 
 macro_rules! define_widgets {
@@ -534,17 +543,32 @@ impl LayoutConfig {
         cfg
     }
 
-    /// Ensures `rows` always has exactly [`MAX_ROWS`] slots, `bar_length` is clamped,
-    /// and `speed_warn_threshold` is finite and non-negative.
+    /// Ensures `rows` always has exactly [`MAX_ROWS`] slots and clamps `bar_length`
+    /// and `speed_warn_threshold` to their valid bounds.
     pub fn normalize_rows(&mut self) {
         while self.rows.len() < MAX_ROWS {
             self.rows.push(Vec::new());
         }
         self.rows.truncate(MAX_ROWS);
-        self.bar_length = self.bar_length.clamp(4, 40);
-        if !self.speed_warn_threshold.is_finite() || self.speed_warn_threshold < 0.0 {
+        self.bar_length = self.bar_length.clamp(MIN_BAR_LENGTH, MAX_BAR_LENGTH);
+        if !self.speed_warn_threshold.is_finite()
+            || self.speed_warn_threshold < MIN_SPEED_WARN_THRESHOLD
+        {
             self.speed_warn_threshold = DEFAULT_SPEED_WARN_THRESHOLD;
+        } else {
+            self.speed_warn_threshold = self
+                .speed_warn_threshold
+                .clamp(MIN_SPEED_WARN_THRESHOLD, MAX_SPEED_WARN_THRESHOLD);
         }
+    }
+
+    /// Returns `preset`'s layout while preserving persisted `stats`/`conversations` TUI preferences.
+    pub fn with_preset_preserving_prefs(&self, preset: Preset) -> Self {
+        let mut layout = preset.to_layout();
+        layout.stats_metric = self.stats_metric;
+        layout.conv_turn_sort = self.conv_turn_sort;
+        layout.conv_list_sort = self.conv_list_sort;
+        layout
     }
 
     /// Finds which row (`0..3`) currently hosts `widget`, if any.
@@ -603,7 +627,7 @@ pub fn load_layout_config(path: &Path) -> LayoutConfig {
 }
 
 pub(crate) fn try_load_layout_config(path: &Path) -> io::Result<LayoutConfig> {
-    let content = fs::read_to_string(path)?;
+    let content = read_bounded_file_to_string(path, MAX_CONFIG_FILE_BYTES)?;
     let mut cfg: LayoutConfig = serde_json::from_str(&content)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     cfg.normalize_rows();
@@ -679,6 +703,8 @@ pub fn save_stats_tui_prefs(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -739,6 +765,10 @@ mod tests {
         cfg.speed_warn_threshold = 35.5;
         cfg.normalize_rows();
         assert_eq!(cfg.speed_warn_threshold, 35.5);
+
+        cfg.speed_warn_threshold = 500.0;
+        cfg.normalize_rows();
+        assert_eq!(cfg.speed_warn_threshold, MAX_SPEED_WARN_THRESHOLD);
     }
 
     #[test]
@@ -853,5 +883,44 @@ mod tests {
         fs::write(&path, "{broken").unwrap();
         save_stats_tui_prefs(&path, Some(StatsMetric::Turns), Some(cost_desc), None).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "{broken");
+    }
+
+    #[test]
+    fn oversized_config_file_falls_back_to_defaults_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let oversized = format!(
+            "{}{}",
+            " ".repeat(MAX_CONFIG_FILE_BYTES as usize),
+            r#"{"style":"powerline"}"#
+        );
+        fs::write(&path, &oversized).unwrap();
+
+        assert_eq!(
+            try_load_layout_config(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(load_layout_config(&path), LayoutConfig::default());
+
+        save_stats_tui_prefs(&path, Some(StatsMetric::Cost), None, None).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), oversized.len() as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_file_loads_custom_layout() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+        let real_cfg = dotfiles.join("config.json");
+        let expected = LayoutConfig::preset_powerline();
+        save_layout_config(&real_cfg, &expected).unwrap();
+
+        let link_cfg = dir.path().join("config.json");
+        symlink(&real_cfg, &link_cfg).unwrap();
+
+        assert_eq!(load_layout_config(&link_cfg), expected);
     }
 }

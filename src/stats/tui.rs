@@ -17,12 +17,13 @@ use ratatui::layout::{Alignment, Constraint, Flex, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
-    TableState,
+    Block, BorderType, Borders, Cell, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Table, TableState,
 };
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
-use super::metric::{ConversationSort, StatsMetric, StatsTuiPrefs, TurnSort};
+use super::metric::{ConversationSort, SortDir, StatsMetric, StatsTuiPrefs, TurnSort};
 use super::pricing::{
     fetch_models_dev_via_curl, PricingCatalog, SyncMode, DEFAULT_PRICING_TTL_SECS,
 };
@@ -146,6 +147,41 @@ impl Palette {
         }
     }
 
+    pub(super) fn ellipsis(&self) -> &'static str {
+        if self.ascii {
+            "..."
+        } else {
+            "…"
+        }
+    }
+
+    pub(super) fn highlight_symbol(&self) -> &'static str {
+        if self.ascii {
+            "> "
+        } else {
+            "▸ "
+        }
+    }
+
+    pub(super) fn active_header(&self) -> Style {
+        if self.no_color {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            self.bold(Color::Cyan)
+        }
+    }
+
+    pub(super) fn filter_badge(&self) -> Style {
+        if self.no_color {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
     pub(super) fn pane_block(&self, title: String, active: bool) -> Block<'static> {
         let border_style = if self.no_color {
             Style::default().add_modifier(if active {
@@ -177,6 +213,242 @@ impl Palette {
 
 pub(super) fn right_cell(text: impl Into<String>, style: Style) -> Cell<'static> {
     Cell::from(Text::from(text.into()).alignment(Alignment::Right)).style(style)
+}
+
+/// Builds a sortable table column header cell with active-column arrow and alignment.
+pub(super) fn sort_header_cell(
+    label: &str,
+    active: bool,
+    dir: SortDir,
+    right_align: bool,
+    pal: &Palette,
+) -> Cell<'static> {
+    let text = if active {
+        format!("{label} {}", dir.arrow(pal.ascii))
+    } else {
+        label.to_string()
+    };
+    let style = if active {
+        pal.active_header()
+    } else {
+        pal.dim()
+    };
+    if right_align {
+        right_cell(text, style)
+    } else {
+        Cell::from(text).style(style)
+    }
+}
+
+/// Renders either an active yellow status message or a clickable single-line footer bar.
+pub(super) fn render_footer_bar<A>(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    status_msg: Option<&str>,
+    pal: &Palette,
+    build: impl FnOnce(&mut SpanBar<A>, &str, Style),
+) -> ClickRegions<A> {
+    if let Some(msg) = status_msg {
+        frame.render_widget(
+            Paragraph::new(Line::styled(format!(" {msg}"), pal.bold(Color::Yellow))),
+            area,
+        );
+        return ClickRegions::default();
+    }
+    let inset = Rect::new(
+        area.x.saturating_add(1),
+        area.y,
+        area.width.saturating_sub(1),
+        area.height,
+    );
+    let sep = format!(" {} ", pal.sep());
+    let mut bar = SpanBar::new(inset);
+    build(&mut bar, &sep, pal.dim());
+    let (line, hits) = bar.finish();
+    frame.render_widget(Paragraph::new(line), inset);
+    hits
+}
+
+/// Clickable screen rectangle bound to a typed UI action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClickRegion<A> {
+    pub(super) rect: Rect,
+    pub(super) action: A,
+}
+
+/// Clickable screen rectangles derived directly from render geometry.
+#[derive(Debug, Clone)]
+pub(super) struct ClickRegions<A>(Vec<ClickRegion<A>>);
+
+impl<A> Default for ClickRegions<A> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<A> ClickRegions<A> {
+    pub(super) fn push(&mut self, rect: Rect, action: A) {
+        if rect.width > 0 && rect.height > 0 {
+            self.0.push(ClickRegion { rect, action });
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn find(&self, pred: impl Fn(&A) -> bool) -> Option<Rect> {
+        self.0.iter().find(|r| pred(&r.action)).map(|r| r.rect)
+    }
+}
+
+impl<A: Copy> ClickRegions<A> {
+    pub(super) fn hit(&self, pos: Position) -> Option<A> {
+        self.0
+            .iter()
+            .find(|r| r.rect.contains(pos))
+            .map(|r| r.action)
+    }
+}
+
+/// Single-line horizontal span builder that records exact clickable `Rect`s as spans are laid out.
+pub(super) struct SpanBar<A> {
+    area: Rect,
+    used: u16,
+    spans: Vec<Span<'static>>,
+    hits: ClickRegions<A>,
+}
+
+impl<A> SpanBar<A> {
+    pub(super) fn new(area: Rect) -> Self {
+        Self {
+            area,
+            used: 0,
+            spans: Vec::new(),
+            hits: ClickRegions::default(),
+        }
+    }
+
+    pub(super) fn push(&mut self, text: impl Into<String>, style: Style) -> bool {
+        let text = text.into();
+        let w = u16::try_from(text.width()).unwrap_or(u16::MAX);
+        if self.area.height == 0 || self.used.saturating_add(w) > self.area.width {
+            return false;
+        }
+        self.spans.push(Span::styled(text, style));
+        self.used += w;
+        true
+    }
+
+    pub(super) fn push_click(&mut self, text: impl Into<String>, style: Style, action: A) -> bool {
+        let text = text.into();
+        let w = u16::try_from(text.width()).unwrap_or(u16::MAX);
+        if self.area.height == 0 || self.used.saturating_add(w) > self.area.width {
+            return false;
+        }
+        let rect = Rect::new(self.area.x.saturating_add(self.used), self.area.y, w, 1);
+        self.hits.push(rect, action);
+        self.spans.push(Span::styled(text, style));
+        self.used += w;
+        true
+    }
+
+    /// Appends an optional separator followed by a clickable control only when both fit.
+    pub(super) fn push_sep_click(
+        &mut self,
+        sep: &str,
+        sep_style: Style,
+        text: impl Into<String>,
+        style: Style,
+        action: A,
+    ) -> bool {
+        let text = text.into();
+        let need_sep = !self.spans.is_empty();
+        let sep_w = if need_sep {
+            u16::try_from(sep.width()).unwrap_or(u16::MAX)
+        } else {
+            0
+        };
+        let w = u16::try_from(text.width()).unwrap_or(u16::MAX);
+        if self.area.height == 0
+            || self.used.saturating_add(sep_w).saturating_add(w) > self.area.width
+        {
+            return false;
+        }
+        if need_sep {
+            self.spans.push(Span::styled(sep.to_string(), sep_style));
+            self.used += sep_w;
+        }
+        let rect = Rect::new(self.area.x.saturating_add(self.used), self.area.y, w, 1);
+        self.hits.push(rect, action);
+        self.spans.push(Span::styled(text, style));
+        self.used += w;
+        true
+    }
+
+    /// Appends a leading `" "` (for the first item) or `sep` followed by `group` spans when
+    /// it fits (the first item is always emitted), optionally recording a click region over `group`.
+    pub(super) fn push_sep_spans(
+        &mut self,
+        sep: &str,
+        sep_style: Style,
+        group: Vec<Span<'static>>,
+        action: Option<A>,
+    ) -> bool {
+        let is_first = self.spans.is_empty();
+        let prefix = if is_first { " " } else { sep };
+        let prefix_w = u16::try_from(prefix.width()).unwrap_or(u16::MAX);
+        let group_w: u16 = group
+            .iter()
+            .map(|s| u16::try_from(s.content.width()).unwrap_or(u16::MAX))
+            .fold(0u16, u16::saturating_add);
+        let total_w = prefix_w.saturating_add(group_w);
+        if !is_first && self.used.saturating_add(total_w) > self.area.width {
+            return false;
+        }
+        if let Some(act) = action {
+            if self.area.height > 0 && group_w > 0 {
+                let x = self
+                    .area
+                    .x
+                    .saturating_add(self.used.saturating_add(prefix_w));
+                self.hits.push(Rect::new(x, self.area.y, group_w, 1), act);
+            }
+        }
+        self.spans.push(Span::styled(
+            prefix.to_string(),
+            if is_first {
+                Style::default()
+            } else {
+                sep_style
+            },
+        ));
+        self.spans.extend(group);
+        self.used = self.used.saturating_add(total_w);
+        true
+    }
+
+    pub(super) fn push_sep_kv(
+        &mut self,
+        sep: &str,
+        dim_style: Style,
+        label: &str,
+        value: String,
+        value_style: Style,
+        action: Option<A>,
+    ) -> bool {
+        let mut group = Vec::with_capacity(2);
+        if !label.is_empty() {
+            group.push(Span::styled(label.to_string(), dim_style));
+        }
+        group.push(Span::styled(value, value_style));
+        self.push_sep_spans(sep, dim_style, group, action)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub(super) fn finish(self) -> (Line<'static>, ClickRegions<A>) {
+        (Line::from(self.spans), self.hits)
+    }
 }
 
 /// Exact horizontal click zone for a single table header column.
@@ -463,6 +735,7 @@ type PrefsChangeCallback =
 
 struct StatsApp {
     roots: Vec<(&'static str, PathBuf)>,
+    daemon_dirs: Vec<PathBuf>,
     cache_dir: Option<PathBuf>,
     tz: TimeZoneSpec,
     timezone: String,
@@ -481,6 +754,42 @@ struct StatsApp {
 }
 
 impl StatsApp {
+    fn new<F>(
+        roots: Vec<(&'static str, PathBuf)>,
+        opts: &super::StatsOptions<'_>,
+        tz: TimeZoneSpec,
+        prefs: StatsTuiPrefs,
+        on_prefs_change: F,
+        origin: Screen,
+    ) -> Self
+    where
+        F: FnMut(Option<StatsMetric>, Option<TurnSort>, Option<ConversationSort>) + 'static,
+    {
+        let timezone = tz.format_offset_at(opts.now_unix_secs as i64);
+        Self {
+            roots,
+            daemon_dirs: opts.daemon_dirs.to_vec(),
+            cache_dir: opts.cache_dir.map(Path::to_path_buf),
+            tz,
+            timezone,
+            prefs: StatsTuiPrefs {
+                metric: opts.metric,
+                ..prefs
+            },
+            on_prefs_change: Some(Box::new(on_prefs_change)),
+            pricing: None,
+            screen: origin,
+            origin,
+            opened_from_picker: false,
+            dashboard: None,
+            picker: None,
+            detail: None,
+            last_watch_check: Instant::now(),
+            detail_watch_fp: None,
+            picker_watch_fp: None,
+        }
+    }
+
     fn active_metric(&self) -> StatsMetric {
         self.dashboard
             .as_ref()
@@ -747,12 +1056,10 @@ impl StatsApp {
                                 d.handle_key(key.code, key.modifiers, term_h)
                             })
                         }
-                        Event::Mouse(mouse) => {
-                            if let Some(d) = self.dashboard.as_mut() {
-                                d.handle_mouse(mouse);
-                            }
-                            StatsAction::Continue
-                        }
+                        Event::Mouse(mouse) => self
+                            .dashboard
+                            .as_mut()
+                            .map_or(StatsAction::Continue, |d| d.handle_mouse(mouse, term_h)),
                         _ => StatsAction::Continue,
                     };
                     self.sync_prefs();
@@ -761,7 +1068,11 @@ impl StatsApp {
                         StatsAction::OpenConversations => self.open_conversations(),
                         StatsAction::Refresh => {
                             if let Some(d) = self.dashboard.as_mut() {
-                                d.trigger_refresh(&self.roots, self.cache_dir.as_deref());
+                                d.trigger_refresh(
+                                    &self.roots,
+                                    &self.daemon_dirs,
+                                    self.cache_dir.as_deref(),
+                                );
                             }
                         }
                         StatsAction::Continue => {}
@@ -776,7 +1087,7 @@ impl StatsApp {
                         Event::Mouse(mouse) => self
                             .picker
                             .as_mut()
-                            .map_or(PickerAction::Continue, |p| p.handle_mouse(mouse)),
+                            .map_or(PickerAction::Continue, |p| p.handle_mouse(mouse, has_back)),
                         _ => PickerAction::Continue,
                     };
                     self.sync_prefs();
@@ -813,12 +1124,10 @@ impl StatsApp {
                                 d.handle_key(key.code, key.modifiers, has_back)
                             })
                         }
-                        Event::Mouse(mouse) => {
-                            if let Some(d) = self.detail.as_mut() {
-                                d.handle_mouse(mouse);
-                            }
-                            DetailAction::Continue
-                        }
+                        Event::Mouse(mouse) => self
+                            .detail
+                            .as_mut()
+                            .map_or(DetailAction::Continue, |d| d.handle_mouse(mouse, has_back)),
                         _ => DetailAction::Continue,
                     };
                     self.sync_prefs();
@@ -889,9 +1198,9 @@ where
 {
     require_tty("interactive stats requires a TTY (use --plain or --json)")?;
     let tz = TimeZoneSpec::local();
-    let timezone = tz.format_offset_at(opts.now_unix_secs as i64);
     let dashboard = DashboardScreen::new(
         &roots,
+        opts.daemon_dirs,
         opts.cache_dir,
         opts.days,
         opts.metric,
@@ -901,28 +1210,9 @@ where
         no_color: opts.no_color,
         ascii: opts.ascii,
     };
-    StatsApp {
-        roots,
-        cache_dir: opts.cache_dir.map(Path::to_path_buf),
-        tz,
-        timezone,
-        prefs: StatsTuiPrefs {
-            metric: opts.metric,
-            ..prefs
-        },
-        on_prefs_change: Some(Box::new(on_prefs_change)),
-        pricing: None,
-        screen: Screen::Dashboard,
-        origin: Screen::Dashboard,
-        opened_from_picker: false,
-        dashboard: Some(dashboard),
-        picker: None,
-        detail: None,
-        last_watch_check: Instant::now(),
-        detail_watch_fp: None,
-        picker_watch_fp: None,
-    }
-    .run(&pal)
+    let mut app = StatsApp::new(roots, opts, tz, prefs, on_prefs_change, Screen::Dashboard);
+    app.dashboard = Some(dashboard);
+    app.run(&pal)
 }
 
 /// Launches the interactive single-conversation stats TUI (`agy-statusline stats <CONVERSATION_ID>`).
@@ -947,7 +1237,6 @@ where
         fetch_models_dev_via_curl,
     );
     let tz = TimeZoneSpec::local();
-    let timezone = tz.format_offset_at(opts.now_unix_secs as i64);
     let report = collect_conversation_stats_report(
         roots,
         conversation_query,
@@ -963,28 +1252,18 @@ where
         no_color: opts.no_color,
         ascii: opts.ascii,
     };
-    StatsApp {
-        roots: roots.to_vec(),
-        cache_dir: opts.cache_dir.map(Path::to_path_buf),
+    let mut app = StatsApp::new(
+        roots.to_vec(),
+        opts,
         tz,
-        timezone,
-        prefs: StatsTuiPrefs {
-            metric: opts.metric,
-            ..prefs
-        },
-        on_prefs_change: Some(Box::new(on_prefs_change)),
-        pricing: Some(pricing),
-        screen: Screen::Detail,
-        origin: Screen::Detail,
-        opened_from_picker: false,
-        dashboard: None,
-        picker: None,
-        detail: Some(detail),
-        last_watch_check: Instant::now(),
-        detail_watch_fp: Some(detail_fp),
-        picker_watch_fp: None,
-    }
-    .run(&pal)
+        prefs,
+        on_prefs_change,
+        Screen::Detail,
+    );
+    app.pricing = Some(pricing);
+    app.detail = Some(detail);
+    app.detail_watch_fp = Some(detail_fp);
+    app.run(&pal)
 }
 
 /// Launches the full-screen historical conversation picker TUI (`agy-statusline conversations`).
@@ -1001,41 +1280,29 @@ where
 {
     require_tty("interactive conversations requires a TTY (use --plain or --json)")?;
     let tz = TimeZoneSpec::local();
-    let timezone = tz.format_offset_at(opts.now_unix_secs as i64);
     let items = list_conversations(roots, &tz);
     let picker_fp = conversations_list_fingerprint(roots);
     let pal = Palette {
         no_color: opts.no_color,
         ascii: opts.ascii,
     };
-    StatsApp {
-        roots: roots.to_vec(),
-        cache_dir: opts.cache_dir.map(Path::to_path_buf),
+    let mut app = StatsApp::new(
+        roots.to_vec(),
+        opts,
         tz,
-        timezone,
-        prefs: StatsTuiPrefs {
-            metric: opts.metric,
-            ..prefs
-        },
-        on_prefs_change: Some(Box::new(on_prefs_change)),
-        pricing: None,
-        screen: Screen::Conversations,
-        origin: Screen::Conversations,
-        opened_from_picker: false,
-        dashboard: None,
-        picker: Some(PickerScreen::new(
-            items,
-            None,
-            initial_query,
-            show_subagents,
-            prefs.conv_sort,
-        )),
-        detail: None,
-        last_watch_check: Instant::now(),
-        detail_watch_fp: None,
-        picker_watch_fp: Some(picker_fp),
-    }
-    .run(&pal)
+        prefs,
+        on_prefs_change,
+        Screen::Conversations,
+    );
+    app.picker = Some(PickerScreen::new(
+        items,
+        None,
+        initial_query,
+        show_subagents,
+        prefs.conv_sort,
+    ));
+    app.picker_watch_fp = Some(picker_fp);
+    app.run(&pal)
 }
 
 #[cfg(test)]
@@ -1055,6 +1322,7 @@ mod tests {
     fn test_app(origin: Screen) -> StatsApp {
         StatsApp {
             roots: Vec::new(),
+            daemon_dirs: Vec::new(),
             cache_dir: None,
             tz: TimeZoneSpec::utc(),
             timezone: "UTC".to_string(),

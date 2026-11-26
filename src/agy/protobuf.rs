@@ -28,20 +28,28 @@
 //!         - `max_context_tokens`: field `4`
 //!     - `time_to_first_token` (`google.protobuf.Duration`): field `11` (`seconds=1`, `nanos=2`)
 //!     - `streaming_duration` (`google.protobuf.Duration`): field `12` (`seconds=1`, `nanos=2`)
-//!     - `retries` (repeated `RetryAttempt` -> `usage=2`): field `17`
+//!     - `retries` (repeated `RetryAttempt` -> `usage=2`, `error=3`, `reason_code=5`, `retry_delay=7`): field `17`
 //!     - `response_model`: field `19` (`string`)
+//!     - `extra_meta` (`map<string, string>` -> `key=1`, `value=2`; `cascade_id`): field `20`
 //!     - `model_display_name`: field `21` (`string`)
 //!   - `step_indices`: field `2` (`repeated uint32`, packed or unpacked)
 //! - `CortexStepMetadata` (`steps.metadata`):
 //!   - `created_at` (`google.protobuf.Timestamp`): field `1` (`seconds=1`)
 //!   - `secondary_created_at` (`google.protobuf.Timestamp`): field `8` (`seconds=1`)
 //!   - `usage` (`ModelUsageStats`): field `9`
+//!   - `source_trajectory_step_info` (`cascade_id=4`): field `20`
 //!   - `model_info` (`StepModelInfo`): field `24` (`model_enum=1`, `model_display_name=8`, `response_model=12`)
-//!   - `retries` (repeated `RetryAttempt` -> `usage=2`): field `28`
+//!   - `retries` (repeated `RetryAttempt` -> `usage=2`, `error=3`, `reason_code=5`, `retry_delay=7`): field `28`
 //! - `TrajectoryMetadataBlob` (`trajectory_metadata_blob.data`):
 //!   - `created_at` (`google.protobuf.Timestamp`): field `2` (`seconds=1`)
 
 use prost::Message;
+use serde::{Deserialize, Serialize};
+
+use crate::sys::fmt::{ascii_values_conflict, trimmed_non_empty};
+
+/// Maximum character length preserved for decoded `RetryAttempt.error` excerpts.
+const MAX_RETRY_ERROR_CHARS: usize = 320;
 
 /// Minimum streaming decode duration (seconds) accepted as a valid turn speed sample.
 const MIN_TURN_DECODE_SECS: f64 = 0.01;
@@ -66,6 +74,21 @@ struct GenMetadataBlob {
 struct RetryAttempt {
     #[prost(message, optional, tag = "2")]
     usage: Option<ModelUsage>,
+    #[prost(string, optional, tag = "3")]
+    error: Option<String>,
+    #[prost(uint32, tag = "5")]
+    reason_code: u32,
+    #[prost(message, optional, tag = "7")]
+    retry_delay: Option<ProtoDuration>,
+}
+
+/// Wire-compatible protobuf `map<string, string>` entry (`key = 1`, `value = 2`).
+#[derive(Clone, PartialEq, Message)]
+struct ProtoStringMapEntry {
+    #[prost(string, tag = "1")]
+    key: String,
+    #[prost(string, tag = "2")]
+    value: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -86,6 +109,8 @@ struct ChatModelMetadata {
     retries: Vec<RetryAttempt>,
     #[prost(string, optional, tag = "19")]
     response_model: Option<String>,
+    #[prost(message, repeated, tag = "20")]
+    extra_meta: Vec<ProtoStringMapEntry>,
     #[prost(string, optional, tag = "21")]
     model_display_name: Option<String>,
 }
@@ -201,6 +226,12 @@ struct StepModelInfo {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct SourceTrajectoryStepInfo {
+    #[prost(string, optional, tag = "4")]
+    cascade_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct StepMetadataBlob {
     #[prost(message, optional, tag = "1")]
     created_at: Option<ProtoTimestamp>,
@@ -208,6 +239,8 @@ struct StepMetadataBlob {
     secondary_created_at: Option<ProtoTimestamp>,
     #[prost(message, optional, tag = "9")]
     usage: Option<ModelUsage>,
+    #[prost(message, optional, tag = "20")]
+    source_trajectory_step_info: Option<SourceTrajectoryStepInfo>,
     #[prost(message, optional, tag = "24")]
     model_info: Option<StepModelInfo>,
     #[prost(message, repeated, tag = "28")]
@@ -257,6 +290,248 @@ pub struct UsageAttemptRecord {
     pub identity: UsageIdentity,
 }
 
+/// Normalized retry/error status classification extracted from `RetryAttempt`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryStatusClass {
+    /// HTTP 429 / `RESOURCE_EXHAUSTED` / rate-limit / quota exhaustion.
+    RateLimit429,
+    /// HTTP 503 / `UNAVAILABLE` / capacity / overloaded / high demand.
+    Capacity503,
+    /// HTTP 500 / 502 / 504 / `INTERNAL` / `BAD_GATEWAY` upstream errors.
+    Upstream5xx,
+    /// Stream idle / TLS / I/O / deadline timeout.
+    Timeout,
+    /// Connection reset / EOF / broken pipe / interrupted stream.
+    Disconnect,
+    /// Model produced invalid output / tool call (`reason_code == 2`).
+    ModelOutput,
+    /// User-initiated cancellation (`context canceled`).
+    Canceled,
+    /// Unclassified retry or error.
+    #[default]
+    Other,
+}
+
+/// Decoded error, status classification, and backoff delay from a `RetryAttempt` protobuf message.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetryAttemptRecord {
+    /// Trimmed error excerpt (`RetryAttempt` field `3`), capped at 320 chars.
+    pub error: Option<String>,
+    /// Raw proto `reason_code` (`RetryAttempt` field `5`).
+    pub reason_code: u32,
+    /// Extracted HTTP status code (`429`, `503`, `500`, `502`, `504`, etc.) when identified.
+    pub status_code: Option<u16>,
+    /// Normalized retry/error category.
+    pub status_class: RetryStatusClass,
+    /// Retry backoff delay in seconds (`RetryAttempt` field `7`), if valid and non-negative.
+    pub retry_delay_secs: Option<f64>,
+}
+
+impl RetryAttemptRecord {
+    /// Returns `true` when this retry attempt represents an actionable non-canceled anomaly
+    /// (error message, non-terminal reason code, explicit HTTP code, or positive backoff delay).
+    pub fn is_anomaly(&self) -> bool {
+        self.status_class != RetryStatusClass::Canceled
+            && (self.error.is_some()
+                || (self.reason_code > 0 && self.reason_code != 3)
+                || self.status_code.is_some()
+                || self
+                    .retry_delay_secs
+                    .is_some_and(|d| d.is_finite() && d > 0.0))
+    }
+}
+
+/// Returns `true` when `origin_cascade_id` is non-empty and differs (ASCII case-insensitively)
+/// from `expected_conversation_id`.
+pub(crate) fn is_foreign_cascade_id(
+    origin_cascade_id: Option<&str>,
+    expected_conversation_id: Option<&str>,
+) -> bool {
+    ascii_values_conflict(origin_cascade_id, expected_conversation_id)
+}
+
+fn has_ascii_word(haystack_lower: &str, needle: &str) -> bool {
+    let h = haystack_lower.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(pos) = haystack_lower[start..].find(needle) {
+        let abs = start + pos;
+        let left_ok = abs == 0 || !h[abs - 1].is_ascii_alphanumeric();
+        let right_idx = abs + n.len();
+        let right_ok = right_idx == h.len() || !h[right_idx].is_ascii_alphanumeric();
+        if left_ok && right_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+/// Classifies a `RetryAttempt`'s `error` text and `reason_code` into a [`RetryStatusClass`]
+/// and optional HTTP status code (`429`, `503`, `500`, `502`, `504`, etc.).
+pub fn classify_retry_attempt(
+    error: Option<&str>,
+    reason_code: u32,
+) -> (RetryStatusClass, Option<u16>) {
+    let lower = error.map(str::trim).unwrap_or("").to_ascii_lowercase();
+
+    if lower.contains("context canceled by user")
+        || (lower.contains("stream reading error:") && lower.contains("context canceled"))
+    {
+        return (RetryStatusClass::Canceled, None);
+    }
+
+    if reason_code == 2
+        || contains_any(
+            &lower,
+            &[
+                "model output error",
+                "model produced invalid output",
+                "invalid tool call",
+            ],
+        )
+    {
+        return (RetryStatusClass::ModelOutput, None);
+    }
+
+    if reason_code == 429
+        || has_ascii_word(&lower, "429")
+        || contains_any(
+            &lower,
+            &[
+                "resource_exhausted",
+                "quota reached",
+                "rate limit",
+                "rate-limit",
+                "rate_limit",
+                "ratelimit",
+            ],
+        )
+    {
+        return (RetryStatusClass::RateLimit429, Some(429));
+    }
+
+    if reason_code == 503
+        || has_ascii_word(&lower, "503")
+        || contains_any(
+            &lower,
+            &[
+                "unavailable",
+                "no capacity available",
+                "overloaded",
+                "high demand",
+            ],
+        )
+    {
+        return (RetryStatusClass::Capacity503, Some(503));
+    }
+
+    for (code, word) in [(500u16, "500"), (502, "502"), (504, "504")] {
+        if reason_code == u32::from(code) || has_ascii_word(&lower, word) {
+            return (RetryStatusClass::Upstream5xx, Some(code));
+        }
+    }
+
+    if has_ascii_word(&lower, "timeout")
+        || contains_any(
+            &lower,
+            &[
+                "stream idle timeout",
+                "tls handshake timeout",
+                "i/o timeout",
+                "context deadline exceeded",
+            ],
+        )
+    {
+        return (RetryStatusClass::Timeout, None);
+    }
+
+    if lower.contains("bad_gateway") || has_ascii_word(&lower, "internal") {
+        return (RetryStatusClass::Upstream5xx, None);
+    }
+
+    if contains_any(
+        &lower,
+        &[
+            "wsarecv",
+            "wsasend",
+            "forcibly closed",
+            "connection reset",
+            "broken pipe",
+            "econnreset",
+            "unexpected eof",
+            "the stream was interrupted",
+            "no such host",
+            "dial tcp",
+        ],
+    ) {
+        return (RetryStatusClass::Disconnect, None);
+    }
+
+    let explicit_http = (400..=599)
+        .contains(&reason_code)
+        .then_some(reason_code as u16);
+    (RetryStatusClass::Other, explicit_http)
+}
+
+fn truncate_error_excerpt(value: Option<String>) -> Option<String> {
+    let trimmed = trim_non_empty(value)?;
+    if trimmed.chars().count() <= MAX_RETRY_ERROR_CHARS {
+        Some(trimmed)
+    } else {
+        let mut out: String = trimmed.chars().take(MAX_RETRY_ERROR_CHARS - 1).collect();
+        out.push('…');
+        Some(out)
+    }
+}
+
+fn extract_origin_cascade_id(entries: &[ProtoStringMapEntry]) -> Option<String> {
+    entries
+        .iter()
+        .rev()
+        .find_map(|entry| {
+            (entry.key == "cascade_id")
+                .then(|| trimmed_non_empty(Some(&entry.value)))
+                .flatten()
+        })
+        .map(str::to_string)
+}
+
+fn decode_retry_attempts(
+    retries: Vec<RetryAttempt>,
+) -> (Vec<UsageAttemptRecord>, Vec<RetryAttemptRecord>) {
+    let mut usages = Vec::new();
+    let mut attempts = Vec::with_capacity(retries.len());
+    for retry in retries {
+        if let Some(usage) = retry.usage {
+            usages.push(usage.into_attempt_record());
+        }
+        let error = truncate_error_excerpt(retry.error);
+        let (status_class, status_code) =
+            classify_retry_attempt(error.as_deref(), retry.reason_code);
+        let retry_delay_secs = retry
+            .retry_delay
+            .and_then(|d| d.to_secs())
+            .filter(|d| d.is_finite() && *d >= 0.0);
+        attempts.push(RetryAttemptRecord {
+            error,
+            reason_code: retry.reason_code,
+            status_code,
+            status_class,
+            retry_delay_secs,
+        });
+    }
+    (usages, attempts)
+}
+
 /// Timing and output token metrics extracted from one `gen_metadata` turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct TurnMetrics {
@@ -271,7 +546,7 @@ pub(crate) struct TurnMetrics {
 }
 
 /// Single-pass summary extracted from one `gen_metadata.data` Protobuf blob.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct GenMetadataSummary {
     /// Completed turn timing/output metrics when sanity bounds are satisfied.
     pub(crate) turn: Option<TurnMetrics>,
@@ -279,6 +554,10 @@ pub(crate) struct GenMetadataSummary {
     pub(crate) max_context_tokens: Option<u64>,
     /// Server-estimated `estimated_tokens_used` when `> 0`.
     pub(crate) estimated_context_tokens: Option<u64>,
+    /// Originating conversation UUID (`chat(1).extra_meta(20)["cascade_id"]`), if present.
+    pub(crate) origin_cascade_id: Option<String>,
+    /// Decoded retry attempts (`chat(1).retries(17)`).
+    pub(crate) retry_attempts: Vec<RetryAttemptRecord>,
 }
 
 /// Full generation record decoded from `CortexStepGeneratorMetadata` (`gen_metadata.data`).
@@ -310,10 +589,14 @@ pub struct GenMetadataRecord {
     pub response_model: Option<String>,
     /// Human-readable display model name (`chat(1).model_display_name(21)`).
     pub model_display_name: Option<String>,
+    /// Originating conversation UUID (`chat(1).extra_meta(20)["cascade_id"]`), if present.
+    pub origin_cascade_id: Option<String>,
     /// Non-empty trimmed deduplication identity keys from `chat(1).usage(4)`.
     pub identity: UsageIdentity,
     /// Usage attempts recorded on `chat(1).retries(17)`.
     pub retry_usages: Vec<UsageAttemptRecord>,
+    /// Decoded retry error/delay metadata recorded on `chat(1).retries(17)`.
+    pub retry_attempts: Vec<RetryAttemptRecord>,
 }
 
 impl GenMetadataRecord {
@@ -329,7 +612,7 @@ impl GenMetadataRecord {
 }
 
 /// Decoded step timestamps, model info, and usage attempts from `CortexStepMetadata` (`steps.metadata`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StepMetadataRecord {
     /// Primary step creation timestamp (`created_at`, field `1`).
     pub created_at_secs: Option<i64>,
@@ -341,10 +624,14 @@ pub struct StepMetadataRecord {
     pub response_model: Option<String>,
     /// Human-readable display model name (`model_info(24).model_display_name(8)`).
     pub model_display_name: Option<String>,
+    /// Originating conversation UUID (`source_trajectory_step_info(20).cascade_id(4)`), if present.
+    pub origin_cascade_id: Option<String>,
     /// Step-level usage record (`field 9`), e.g. compaction turns (`step_type = 23`).
     pub usage: Option<UsageAttemptRecord>,
-    /// Step-level retry attempts (`field 28 -> usage(2)`).
+    /// Step-level retry usage attempts (`field 28 -> usage(2)`).
     pub retry_usages: Vec<UsageAttemptRecord>,
+    /// Step-level retry error/delay metadata (`field 28`).
+    pub retry_attempts: Vec<RetryAttemptRecord>,
 }
 
 pub(crate) fn is_sane_decode_speed(output_tokens: u64, decode_secs: f64) -> bool {
@@ -374,6 +661,8 @@ fn trim_non_empty(value: Option<String>) -> Option<String> {
 /// and `0.0 < output_tokens / decode_secs < 10_000.0`.
 pub(crate) fn extract_gen_metadata_summary(data: &[u8]) -> Option<GenMetadataSummary> {
     let chat = GenMetadataBlob::decode(data).ok()?.chat_model?;
+    let origin_cascade_id = extract_origin_cascade_id(&chat.extra_meta);
+    let (_, retry_attempts) = decode_retry_attempts(chat.retries);
     let turn = match (
         chat.usage,
         chat.streaming_duration.and_then(|d| d.to_secs()),
@@ -408,6 +697,8 @@ pub(crate) fn extract_gen_metadata_summary(data: &[u8]) -> Option<GenMetadataSum
         turn,
         max_context_tokens,
         estimated_context_tokens,
+        origin_cascade_id,
+        retry_attempts,
     })
 }
 
@@ -429,6 +720,7 @@ pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord> {
     let blob = GenMetadataBlob::decode(data).ok()?;
     let step_indices = blob.step_indices;
     let chat = blob.chat_model?;
+    let origin_cascade_id = extract_origin_cascade_id(&chat.extra_meta);
     let usage = chat
         .usage
         .map(ModelUsage::into_attempt_record)
@@ -438,11 +730,7 @@ pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord> {
     } else {
         chat.model
     };
-    let retry_usages = chat
-        .retries
-        .into_iter()
-        .filter_map(|r| r.usage.map(ModelUsage::into_attempt_record))
-        .collect();
+    let (retry_usages, retry_attempts) = decode_retry_attempts(chat.retries);
 
     let model_cost_usd = chat
         .model_cost
@@ -478,8 +766,10 @@ pub fn extract_gen_metadata_record(data: &[u8]) -> Option<GenMetadataRecord> {
         decode_secs,
         response_model: trim_non_empty(chat.response_model),
         model_display_name: trim_non_empty(chat.model_display_name),
+        origin_cascade_id,
         identity: usage.identity,
         retry_usages,
+        retry_attempts,
     })
 }
 
@@ -488,12 +778,11 @@ pub fn extract_step_metadata_record(data: &[u8]) -> Option<StepMetadataRecord> {
     let blob = StepMetadataBlob::decode(data).ok()?;
     let created_at_secs = blob.created_at.and_then(|ts| ts.valid_secs());
     let secondary_created_at_secs = blob.secondary_created_at.and_then(|ts| ts.valid_secs());
+    let origin_cascade_id = blob
+        .source_trajectory_step_info
+        .and_then(|info| trim_non_empty(info.cascade_id));
     let usage = blob.usage.map(ModelUsage::into_attempt_record);
-    let retry_usages = blob
-        .retries
-        .into_iter()
-        .filter_map(|r| r.usage.map(ModelUsage::into_attempt_record))
-        .collect();
+    let (retry_usages, retry_attempts) = decode_retry_attempts(blob.retries);
     let (info_model_enum, response_model, model_display_name) = match blob.model_info {
         Some(info) => (
             info.model_enum,
@@ -514,8 +803,10 @@ pub fn extract_step_metadata_record(data: &[u8]) -> Option<StepMetadataRecord> {
         model_enum,
         response_model,
         model_display_name,
+        origin_cascade_id,
         usage,
         retry_usages,
+        retry_attempts,
     })
 }
 
@@ -562,6 +853,33 @@ impl UsageSpec<'_> {
 }
 
 #[cfg(test)]
+#[derive(Default, Clone)]
+pub(crate) struct RetrySpec<'a> {
+    pub(crate) usage: Option<UsageSpec<'a>>,
+    pub(crate) error: Option<&'a str>,
+    pub(crate) reason_code: u32,
+    pub(crate) delay_secs: i64,
+    pub(crate) delay_nanos: i64,
+}
+
+#[cfg(test)]
+impl RetrySpec<'_> {
+    fn to_proto(&self) -> RetryAttempt {
+        let retry_delay =
+            (self.delay_secs != 0 || self.delay_nanos != 0).then_some(ProtoDuration {
+                seconds: self.delay_secs,
+                nanos: self.delay_nanos,
+            });
+        RetryAttempt {
+            usage: self.usage.as_ref().map(UsageSpec::to_proto),
+            error: self.error.map(str::to_string),
+            reason_code: self.reason_code,
+            retry_delay,
+        }
+    }
+}
+
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct GenBlobSpec<'a> {
     pub(crate) step_indices: Vec<u64>,
@@ -569,6 +887,7 @@ pub(crate) struct GenBlobSpec<'a> {
     pub(crate) usage_model_enum: u64,
     pub(crate) resp_model: Option<&'a str>,
     pub(crate) disp_name: Option<&'a str>,
+    pub(crate) origin_cascade_id: Option<&'a str>,
     pub(crate) model_cost: Option<f32>,
     pub(crate) input_tok: u64,
     pub(crate) output_tok: u64,
@@ -580,6 +899,7 @@ pub(crate) struct GenBlobSpec<'a> {
     pub(crate) id_12: Option<&'a str>,
     pub(crate) id_7: Option<&'a str>,
     pub(crate) retries: Vec<UsageSpec<'a>>,
+    pub(crate) retry_records: Vec<RetrySpec<'a>>,
     pub(crate) created_at_secs: Option<i64>,
     pub(crate) estimated_context_tokens: i64,
     pub(crate) max_context_tokens: i64,
@@ -590,7 +910,33 @@ pub(crate) struct GenBlobSpec<'a> {
 }
 
 #[cfg(test)]
+fn encode_test_retries(usages: &[UsageSpec<'_>], records: &[RetrySpec<'_>]) -> Vec<RetryAttempt> {
+    usages
+        .iter()
+        .map(|u| RetryAttempt {
+            usage: Some(u.to_proto()),
+            error: None,
+            reason_code: 0,
+            retry_delay: None,
+        })
+        .chain(records.iter().map(RetrySpec::to_proto))
+        .collect()
+}
+
+#[cfg(test)]
 pub(crate) fn encode_gen_blob(spec: GenBlobSpec<'_>) -> Vec<u8> {
+    let retries = encode_test_retries(&spec.retries, &spec.retry_records);
+
+    let extra_meta = spec
+        .origin_cascade_id
+        .map(|cid| {
+            vec![ProtoStringMapEntry {
+                key: "cascade_id".to_string(),
+                value: cid.to_string(),
+            }]
+        })
+        .unwrap_or_default();
+
     GenMetadataBlob {
         chat_model: Some(ChatModelMetadata {
             model: spec.model_enum,
@@ -624,14 +970,9 @@ pub(crate) fn encode_gen_blob(spec: GenBlobSpec<'_>) -> Vec<u8> {
                 seconds: spec.dur_secs,
                 nanos: spec.dur_nanos,
             }),
-            retries: spec
-                .retries
-                .iter()
-                .map(|u| RetryAttempt {
-                    usage: Some(u.to_proto()),
-                })
-                .collect(),
+            retries,
             response_model: spec.resp_model.map(str::to_string),
+            extra_meta,
             model_display_name: spec.disp_name.map(str::to_string),
         }),
         step_indices: spec.step_indices,
@@ -644,11 +985,13 @@ pub(crate) fn encode_gen_blob(spec: GenBlobSpec<'_>) -> Vec<u8> {
 pub(crate) struct StepBlobSpec<'a> {
     pub(crate) created_at_secs: Option<i64>,
     pub(crate) secondary_created_at_secs: Option<i64>,
+    pub(crate) origin_cascade_id: Option<&'a str>,
     pub(crate) usage: Option<UsageSpec<'a>>,
     pub(crate) model_info_enum: u64,
     pub(crate) model_display_name: Option<&'a str>,
     pub(crate) response_model: Option<&'a str>,
     pub(crate) retries: Vec<UsageSpec<'a>>,
+    pub(crate) retry_records: Vec<RetrySpec<'a>>,
 }
 
 #[cfg(test)]
@@ -656,6 +999,7 @@ pub(crate) fn encode_step_blob(spec: StepBlobSpec<'_>) -> Vec<u8> {
     let has_info = spec.model_info_enum != 0
         || spec.model_display_name.is_some()
         || spec.response_model.is_some();
+    let retries = encode_test_retries(&spec.retries, &spec.retry_records);
     StepMetadataBlob {
         created_at: spec
             .created_at_secs
@@ -664,18 +1008,15 @@ pub(crate) fn encode_step_blob(spec: StepBlobSpec<'_>) -> Vec<u8> {
             .secondary_created_at_secs
             .map(|seconds| ProtoTimestamp { seconds }),
         usage: spec.usage.map(|u| u.to_proto()),
+        source_trajectory_step_info: spec.origin_cascade_id.map(|cid| SourceTrajectoryStepInfo {
+            cascade_id: Some(cid.to_string()),
+        }),
         model_info: has_info.then(|| StepModelInfo {
             model_enum: spec.model_info_enum,
             model_display_name: spec.model_display_name.map(str::to_string),
             response_model: spec.response_model.map(str::to_string),
         }),
-        retries: spec
-            .retries
-            .iter()
-            .map(|u| RetryAttempt {
-                usage: Some(u.to_proto()),
-            })
-            .collect(),
+        retries,
     }
     .encode_to_vec()
 }
@@ -1003,6 +1344,7 @@ mod tests {
                 id_12: Some("step-retry-12"),
                 ..Default::default()
             }],
+            ..Default::default()
         });
 
         let step = extract_step_metadata_record(&step_blob).unwrap();
@@ -1122,5 +1464,145 @@ mod tests {
         assert_eq!(decode_chat_start(1_763_400_000), Some(1_763_400_000));
         assert_eq!(decode_chat_start(-62_135_596_801), None);
         assert_eq!(decode_chat_start(253_402_300_800), None);
+    }
+
+    #[test]
+    fn decodes_origin_cascade_ids_and_retry_error_classifications() {
+        let gen_blob = encode_gen_blob(GenBlobSpec {
+            step_indices: vec![10],
+            origin_cascade_id: Some("  AAAA1111-1111-4111-8111-111111111111  "),
+            output_tok: 200,
+            dur_secs: 2,
+            retry_records: vec![
+                RetrySpec {
+                    error: Some("API error (attempt 1): HTTP 429 RESOURCE_EXHAUSTED"),
+                    reason_code: 429,
+                    delay_secs: 1,
+                    delay_nanos: 500_000_000,
+                    ..Default::default()
+                },
+                RetrySpec {
+                    error: Some("No capacity available, overloaded"),
+                    reason_code: 0,
+                    delay_secs: 2,
+                    delay_nanos: 0,
+                    ..Default::default()
+                },
+                RetrySpec {
+                    error: Some("HTTP 502 BAD_GATEWAY"),
+                    reason_code: 0,
+                    delay_secs: 0,
+                    delay_nanos: 500_000_000,
+                    ..Default::default()
+                },
+                RetrySpec {
+                    error: Some("stream idle timeout"),
+                    reason_code: 0,
+                    delay_secs: 3,
+                    delay_nanos: 0,
+                    ..Default::default()
+                },
+                RetrySpec {
+                    error: Some("context canceled by user"),
+                    reason_code: 0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let rec = extract_gen_metadata_record(&gen_blob).unwrap();
+        assert_eq!(
+            rec.origin_cascade_id.as_deref(),
+            Some("AAAA1111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(rec.retry_attempts.len(), 5);
+        assert_eq!(
+            rec.retry_attempts[0].status_class,
+            RetryStatusClass::RateLimit429
+        );
+        assert_eq!(rec.retry_attempts[0].status_code, Some(429));
+        assert!((rec.retry_attempts[0].retry_delay_secs.unwrap() - 1.5).abs() < 1e-6);
+        assert!(rec.retry_attempts[0].is_anomaly());
+
+        assert_eq!(
+            rec.retry_attempts[1].status_class,
+            RetryStatusClass::Capacity503
+        );
+        assert_eq!(rec.retry_attempts[1].status_code, Some(503));
+        assert!((rec.retry_attempts[1].retry_delay_secs.unwrap() - 2.0).abs() < 1e-6);
+
+        assert_eq!(
+            rec.retry_attempts[2].status_class,
+            RetryStatusClass::Upstream5xx
+        );
+        assert_eq!(rec.retry_attempts[2].status_code, Some(502));
+        assert!((rec.retry_attempts[2].retry_delay_secs.unwrap() - 0.5).abs() < 1e-6);
+
+        assert_eq!(
+            rec.retry_attempts[3].status_class,
+            RetryStatusClass::Timeout
+        );
+        assert_eq!(rec.retry_attempts[3].status_code, None);
+        assert!((rec.retry_attempts[3].retry_delay_secs.unwrap() - 3.0).abs() < 1e-6);
+
+        assert_eq!(
+            rec.retry_attempts[4].status_class,
+            RetryStatusClass::Canceled
+        );
+        assert!(!rec.retry_attempts[4].is_anomaly());
+
+        let summary = extract_gen_metadata_summary(&gen_blob).unwrap();
+        assert_eq!(
+            summary.origin_cascade_id.as_deref(),
+            Some("AAAA1111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(summary.retry_attempts.len(), 5);
+
+        let step_blob = encode_step_blob(StepBlobSpec {
+            created_at_secs: Some(1_795_000_000),
+            origin_cascade_id: Some("bbbb2222-2222-4222-8222-222222222222"),
+            retry_records: vec![RetrySpec {
+                error: Some("504 Gateway Timeout"),
+                reason_code: 504,
+                delay_secs: 4,
+                delay_nanos: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let step = extract_step_metadata_record(&step_blob).unwrap();
+        assert_eq!(
+            step.origin_cascade_id.as_deref(),
+            Some("bbbb2222-2222-4222-8222-222222222222")
+        );
+        assert_eq!(step.retry_attempts.len(), 1);
+        assert_eq!(
+            step.retry_attempts[0].status_class,
+            RetryStatusClass::Upstream5xx
+        );
+        assert_eq!(step.retry_attempts[0].status_code, Some(504));
+        assert!((step.retry_attempts[0].retry_delay_secs.unwrap() - 4.0).abs() < 1e-6);
+
+        assert_eq!(
+            classify_retry_attempt(Some("HTTP 500 Internal Server Error"), 0),
+            (RetryStatusClass::Upstream5xx, Some(500))
+        );
+        assert_eq!(
+            classify_retry_attempt(Some("rate-limit exceeded"), 0),
+            (RetryStatusClass::RateLimit429, Some(429))
+        );
+        assert!(!is_foreign_cascade_id(
+            Some("AAAA1111-1111-4111-8111-111111111111"),
+            Some("aaaa1111-1111-4111-8111-111111111111")
+        ));
+        assert!(is_foreign_cascade_id(
+            Some("bbbb2222-2222-4222-8222-222222222222"),
+            Some("aaaa1111-1111-4111-8111-111111111111")
+        ));
+        assert!(!is_foreign_cascade_id(
+            None,
+            Some("aaaa1111-1111-4111-8111-111111111111")
+        ));
     }
 }

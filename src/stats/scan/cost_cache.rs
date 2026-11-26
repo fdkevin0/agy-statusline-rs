@@ -1,6 +1,5 @@
 //! Per-conversation SQLite cost estimation and bounded LRU cost cache (`conv_cost_cache.json`).
 
-use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -12,7 +11,7 @@ use super::{
 };
 use crate::agy::db::{is_valid_uuid, resolve_conversation_db_path};
 use crate::stats::pricing::{round_usd_6, PricingCatalog, PricingFileFingerprint};
-use crate::sys::fs::atomic_write;
+use crate::sys::fs::{atomic_write, is_safe_cache_target, read_bounded_regular_file};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ConversationCost {
@@ -22,7 +21,7 @@ pub(crate) struct ConversationCost {
 }
 
 const CONV_COST_CACHE_FILE: &str = "conv_cost_cache.json";
-const CONV_COST_CACHE_SCHEMA_VERSION: u32 = 1;
+const CONV_COST_CACHE_SCHEMA_VERSION: u32 = 2;
 const CONV_COST_CACHE_MAX_ENTRIES: usize = 32;
 const MAX_CONV_COST_CACHE_BYTES: u64 = 512 * 1024;
 
@@ -55,12 +54,7 @@ fn summaries_db_fingerprint(cli_dir: &Path) -> Option<DbFileFingerprint> {
 
 fn read_conv_cost_cache_file(cache_dir: &Path) -> Option<ConvCostCacheFile> {
     let path = cache_dir.join(CONV_COST_CACHE_FILE);
-    let meta = fs::symlink_metadata(&path).ok()?;
-    let ft = meta.file_type();
-    if ft.is_symlink() || !ft.is_file() || meta.len() > MAX_CONV_COST_CACHE_BYTES {
-        return None;
-    }
-    let bytes = fs::read(&path).ok()?;
+    let (bytes, _) = read_bounded_regular_file(&path, MAX_CONV_COST_CACHE_BYTES).ok()?;
     let parsed = serde_json::from_slice::<ConvCostCacheFile>(&bytes).ok()?;
     (parsed.schema_version == CONV_COST_CACHE_SCHEMA_VERSION).then_some(parsed)
 }
@@ -70,6 +64,10 @@ fn write_conv_cost_cache_entry_with_limit(
     entry: ConvCostCacheEntry,
     max_entries: usize,
 ) {
+    let cache_path = cache_dir.join(CONV_COST_CACHE_FILE);
+    if !is_safe_cache_target(&cache_path) {
+        return;
+    }
     let mut file = read_conv_cost_cache_file(cache_dir).unwrap_or(ConvCostCacheFile {
         schema_version: CONV_COST_CACHE_SCHEMA_VERSION,
         entries: Vec::new(),
@@ -79,7 +77,7 @@ fn write_conv_cost_cache_entry_with_limit(
     file.entries.insert(0, entry);
     file.entries.truncate(max_entries);
     if let Ok(bytes) = serde_json::to_vec(&file) {
-        let _ = atomic_write(&cache_dir.join(CONV_COST_CACHE_FILE), &bytes);
+        let _ = atomic_write(&cache_path, &bytes);
     }
 }
 
@@ -202,11 +200,11 @@ pub(crate) fn estimate_conversation_cost_usd_with_parent_conn(
 
     let mut tagged_turns: Vec<(bool, RawTurn)> = Vec::new();
     if let Some(conn) = parent_conn {
-        for turn in extract_sqlite_db_turns(conn, None)? {
+        for turn in extract_sqlite_db_turns(conn, None, Some(conversation_id))? {
             tagged_turns.push((false, turn));
         }
     } else if let Some(db_path) = parent_db_path.as_deref() {
-        for turn in read_single_db_turns(db_path)? {
+        for turn in read_single_db_turns(db_path, Some(conversation_id))? {
             tagged_turns.push((false, turn));
         }
     }
@@ -218,7 +216,10 @@ pub(crate) fn estimate_conversation_cost_usd_with_parent_conn(
         let desc_db_path = resolve_conversation_db_path(cli_dir, &desc_id);
         let desc_fp = desc_db_path.as_deref().and_then(db_file_fingerprint);
         descendants.push((desc_id.to_ascii_lowercase(), desc_fp));
-        if let Some(turns) = desc_db_path.as_deref().and_then(read_single_db_turns) {
+        if let Some(turns) = desc_db_path
+            .as_deref()
+            .and_then(|p| read_single_db_turns(p, Some(&desc_id)))
+        {
             for turn in turns {
                 tagged_turns.push((true, turn));
             }
@@ -580,5 +581,86 @@ mod tests {
             "22222222-2222-4222-8222-222222222222"
         );
         assert_eq!(after_promote.entries[1].cost.usd, Some(2.5));
+    }
+
+    #[test]
+    fn estimate_conversation_cost_excludes_cloned_fork_turns() {
+        use crate::agy::protobuf::{encode_gen_blob, GenBlobSpec};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cli_dir = dir.path().join(".gemini/antigravity-cli");
+        let pricing = PricingCatalog::default();
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let fork_id = "22222222-2222-4222-8222-222222222222";
+
+        seed_cost_db(
+            &cli_dir,
+            fork_id,
+            1,
+            encode_gen_blob(GenBlobSpec {
+                origin_cascade_id: Some(parent_id),
+                model_enum: 10,
+                resp_model: Some("m-parent"),
+                input_tok: 100,
+                output_tok: 50,
+                model_cost: Some(9.00),
+                ..Default::default()
+            }),
+        );
+        seed_cost_db(
+            &cli_dir,
+            fork_id,
+            2,
+            encode_gen_blob(GenBlobSpec {
+                origin_cascade_id: Some(fork_id),
+                model_enum: 10,
+                resp_model: Some("m-fork"),
+                input_tok: 100,
+                output_tok: 50,
+                model_cost: Some(0.25),
+                ..Default::default()
+            }),
+        );
+
+        let est = estimate_conversation_cost_usd(&cli_dir, fork_id, &pricing).unwrap();
+        assert_eq!(est.usd, Some(0.25));
+        assert_eq!(est.subagent_usd, None);
+        assert_eq!(est.unpriced_turns, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conv_cost_cache_skips_writes_into_symlinked_cache_dir_or_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_cache = dir.path().join("real_cache");
+        fs::create_dir_all(&real_cache).unwrap();
+        let sym_cache = dir.path().join("sym_cache");
+        symlink(&real_cache, &sym_cache).unwrap();
+
+        let entry = ConvCostCacheEntry {
+            cli_dir: "/isolated/cli".to_string(),
+            conversation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            parent_fp: None,
+            summaries_fp: None,
+            descendants: Vec::new(),
+            pricing_fp: PricingFileFingerprint::default(),
+            cost: ConversationCost {
+                usd: Some(1.0),
+                subagent_usd: None,
+                unpriced_turns: 0,
+            },
+        };
+
+        write_conv_cost_cache_entry_with_limit(&sym_cache, entry.clone(), 4);
+        assert!(!real_cache.join(CONV_COST_CACHE_FILE).exists());
+
+        let sentinel = dir.path().join("sentinel.json");
+        fs::write(&sentinel, b"sentinel").unwrap();
+        symlink(&sentinel, real_cache.join(CONV_COST_CACHE_FILE)).unwrap();
+
+        write_conv_cost_cache_entry_with_limit(&real_cache, entry, 4);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"sentinel");
     }
 }
