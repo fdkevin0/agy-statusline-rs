@@ -5,13 +5,38 @@
 //! and context window metadata.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::agy::protobuf::{extract_gen_metadata_summary, TurnMetrics};
+use crate::agy::protobuf::{
+    extract_gen_metadata_summary, is_foreign_cascade_id, RetryStatusClass, TurnMetrics,
+};
+
+const SQLITE_HEADER_BYTES: usize = 100;
+const SQLITE_WAL_HEADER_BYTES: u64 = 32;
+const SQLITE_MAGIC_PREFIX: &[u8; 16] = b"SQLite format 3\0";
+
+/// Compact summary of recent retry anomalies sniffed from `gen_metadata` (`chat.17`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RetryAnomalySummary {
+    /// Total actionable retry attempts observed across recent own turns.
+    pub retry_count: u64,
+    /// Actionable retries classified as HTTP 429 / rate-limit / quota exhaustion.
+    pub retries_429: u64,
+    /// Actionable retries classified as HTTP 503 / capacity / overload.
+    pub retries_503: u64,
+    /// Actionable retries in all other non-canceled categories (5xx, timeout, disconnect, etc.).
+    pub retries_other: u64,
+    /// Cumulative retry backoff delay in seconds across recent retries.
+    pub total_retry_delay_secs: f64,
+    /// Classification of the most recent actionable retry anomaly.
+    pub latest_class: RetryStatusClass,
+    /// Explicit HTTP status code (`429`, `503`, `500`, `502`, `504`, etc.) of the latest anomaly.
+    pub latest_status_code: Option<u16>,
+}
 
 /// Session generation metadata sniffed from `gen_metadata`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -36,6 +61,8 @@ pub struct SessionMetadata {
     pub estimated_cost_usd: Option<f64>,
     /// Locally estimated subagent spend in USD (subset of `estimated_cost_usd`).
     pub estimated_subagent_cost_usd: Option<f64>,
+    /// Recent retry anomaly summary (`429`/`503`/timeout/5xx) sniffed from `gen_metadata`.
+    pub retry_anomaly: Option<RetryAnomalySummary>,
 }
 
 /// Trait abstracting session generation metadata lookup for testability.
@@ -195,8 +222,69 @@ pub fn is_valid_uuid(id: &str) -> bool {
     true
 }
 
-/// Opens a SQLite database in read-only, no-mutex mode with a 25ms busy timeout.
+/// Extracts the canonical lowercase UUID from a `<uuid>.db` file path when its stem is a valid UUID.
+pub(crate) fn conversation_id_from_db_path(db_path: &Path) -> Option<String> {
+    let stem = db_path.file_stem()?.to_str()?.trim();
+    is_valid_uuid(stem).then(|| stem.to_ascii_lowercase())
+}
+
+/// Zero-lock 100-byte SQLite header readiness check run before `sqlite3_open_v2`.
+///
+/// Rejects symlinks, files shorter than 100 bytes, non-SQLite magic headers, non-empty or
+/// symlinked rollback `<db>-journal` sidecars, and uninitialized databases whose schema has
+/// neither been committed to the main DB (`page_count >= 2 && schema_cookie > 0`) nor written
+/// to a non-empty WAL sidecar (`wal_size > 32`).
+pub fn is_sqlite_db_ready_for_read(db_path: &Path) -> bool {
+    let Some(meta) = safe_sqlite_metadata(db_path) else {
+        return false;
+    };
+    if meta.len() < SQLITE_HEADER_BYTES as u64 {
+        return false;
+    }
+
+    match fs::symlink_metadata(sidecar_path(db_path, "-journal")) {
+        Ok(journal_meta) => {
+            let ft = journal_meta.file_type();
+            if ft.is_symlink() || !ft.is_file() || journal_meta.len() > 0 {
+                return false;
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return false,
+    }
+
+    let Ok(mut file) = fs::File::open(db_path) else {
+        return false;
+    };
+    let mut header = [0u8; SQLITE_HEADER_BYTES];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    if &header[0..16] != SQLITE_MAGIC_PREFIX {
+        return false;
+    }
+
+    let page_count = u32::from_be_bytes([header[28], header[29], header[30], header[31]]);
+    let schema_cookie = u32::from_be_bytes([header[40], header[41], header[42], header[43]]);
+    if page_count >= 2 && schema_cookie > 0 {
+        return true;
+    }
+
+    match fs::symlink_metadata(sidecar_path(db_path, "-wal")) {
+        Ok(wal_meta) => {
+            let ft = wal_meta.file_type();
+            !ft.is_symlink() && ft.is_file() && wal_meta.len() > SQLITE_WAL_HEADER_BYTES
+        }
+        Err(_) => false,
+    }
+}
+
+/// Opens a SQLite database in read-only, no-mutex mode with a 25ms busy timeout,
+/// guarded by the zero-lock 100-byte header readiness check.
 pub(crate) fn open_readonly_db(path: &Path) -> rusqlite::Result<Connection> {
+    if !is_sqlite_db_ready_for_read(path) {
+        return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
+    }
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
     let _ = conn.busy_timeout(Duration::from_millis(25));
@@ -218,11 +306,23 @@ pub(crate) fn compute_median(values: &[f64]) -> Option<f64> {
     }
 }
 
-/// Extracts speed, TTFT, and context window metadata from an already-open read-only connection.
+/// Extracts speed, TTFT, context window, and retry anomaly metadata from an already-open
+/// read-only connection, inferring the expected conversation UUID from the DB filename to skip
+/// cloned fork/side-question rows.
 pub(crate) fn query_session_metadata_from_conn(conn: &Connection) -> SessionMetadata {
+    let expected_id = conn
+        .path()
+        .and_then(|p| conversation_id_from_db_path(Path::new(p)));
+    query_session_metadata_from_conn_for_id(conn, expected_id.as_deref())
+}
+
+fn query_session_metadata_from_conn_for_id(
+    conn: &Connection,
+    expected_conversation_id: Option<&str>,
+) -> SessionMetadata {
     let mut meta = SessionMetadata::default();
     let Ok(mut stmt) = conn
-        .prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx DESC LIMIT 9")
+        .prepare("SELECT data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx DESC LIMIT 32")
     else {
         return meta;
     };
@@ -231,18 +331,65 @@ pub(crate) fn query_session_metadata_from_conn(conn: &Connection) -> SessionMeta
     };
 
     let mut turns: Vec<TurnMetrics> = Vec::with_capacity(9);
+    let mut own_rows_seen = 0usize;
+    let mut retry_summary = RetryAnomalySummary::default();
     while let Ok(Some(row)) = rows.next() {
-        if let Ok(blob) = row.get::<_, Vec<u8>>(0) {
-            if let Some(summary) = extract_gen_metadata_summary(&blob) {
-                if let Some(tm) = summary.turn {
-                    turns.push(tm);
+        let Ok(blob) = row.get::<_, Vec<u8>>(0) else {
+            continue;
+        };
+        let Some(summary) = extract_gen_metadata_summary(&blob) else {
+            continue;
+        };
+        if is_foreign_cascade_id(
+            summary.origin_cascade_id.as_deref(),
+            expected_conversation_id,
+        ) {
+            continue;
+        }
+        own_rows_seen += 1;
+        if let Some(tm) = summary.turn {
+            turns.push(tm);
+        }
+        meta.max_context_tokens = meta.max_context_tokens.or(summary.max_context_tokens);
+        meta.estimated_context_tokens = meta
+            .estimated_context_tokens
+            .or(summary.estimated_context_tokens);
+
+        for attempt in summary.retry_attempts.iter().rev() {
+            if !attempt.is_anomaly() {
+                continue;
+            }
+            if retry_summary.retry_count == 0 {
+                retry_summary.latest_class = attempt.status_class;
+                retry_summary.latest_status_code = attempt.status_code;
+            }
+            retry_summary.retry_count = retry_summary.retry_count.saturating_add(1);
+            match attempt.status_class {
+                RetryStatusClass::RateLimit429 => {
+                    retry_summary.retries_429 = retry_summary.retries_429.saturating_add(1);
                 }
-                meta.max_context_tokens = meta.max_context_tokens.or(summary.max_context_tokens);
-                meta.estimated_context_tokens = meta
-                    .estimated_context_tokens
-                    .or(summary.estimated_context_tokens);
+                RetryStatusClass::Capacity503 => {
+                    retry_summary.retries_503 = retry_summary.retries_503.saturating_add(1);
+                }
+                _ => {
+                    retry_summary.retries_other = retry_summary.retries_other.saturating_add(1);
+                }
+            }
+            if let Some(delay) = attempt
+                .retry_delay_secs
+                .filter(|d| d.is_finite() && *d > 0.0)
+            {
+                retry_summary.total_retry_delay_secs += delay;
             }
         }
+
+        if own_rows_seen >= 9 {
+            break;
+        }
+    }
+
+    if retry_summary.retry_count > 0 {
+        meta.retry_anomaly = Some(retry_summary);
     }
 
     if let Some(first) = turns.first() {
@@ -280,7 +427,7 @@ pub(crate) fn query_session_metadata_in(cli_dir: &Path, conversation_id: &str) -
     let Ok(conn) = open_readonly_db(&db_path) else {
         return SessionMetadata::default();
     };
-    query_session_metadata_from_conn(&conn)
+    query_session_metadata_from_conn_for_id(&conn, Some(conversation_id))
 }
 
 #[cfg(test)]
@@ -605,5 +752,79 @@ mod tests {
             inspect_sqlite_path(&poisoned_missing),
             SqlitePathStatus::Unsafe
         ));
+    }
+
+    #[test]
+    fn query_session_metadata_skips_foreign_fork_rows_and_tracks_retry_anomaly() {
+        use crate::agy::protobuf::RetrySpec;
+
+        let (dir, conn, uuid) = create_temp_conv_db();
+        let parent_uuid = "11111111-1111-4111-8111-111111111111";
+
+        let own_blob = encode_gen_blob(GenBlobSpec {
+            origin_cascade_id: Some(uuid),
+            output_tok: 200,
+            dur_secs: 2,
+            ttft_secs: 1,
+            max_context_tokens: 256_000,
+            estimated_context_tokens: 32_000,
+            retry_records: vec![
+                RetrySpec {
+                    error: Some("HTTP 429 rate limit"),
+                    reason_code: 429,
+                    delay_secs: 1,
+                    delay_nanos: 0,
+                    ..Default::default()
+                },
+                RetrySpec {
+                    error: Some("HTTP 503 overloaded"),
+                    reason_code: 503,
+                    delay_secs: 2,
+                    delay_nanos: 500_000_000,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let foreign_blob = encode_gen_blob(GenBlobSpec {
+            origin_cascade_id: Some(parent_uuid),
+            output_tok: 900,
+            dur_secs: 1,
+            max_context_tokens: 999_000,
+            estimated_context_tokens: 888_000,
+            retry_records: vec![RetrySpec {
+                error: Some("HTTP 500 internal"),
+                reason_code: 500,
+                delay_secs: 9,
+                delay_nanos: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
+            [own_blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (2, ?1)",
+            [foreign_blob],
+        )
+        .unwrap();
+        drop(conn);
+
+        let reader = SqliteSpeedReader::new(dir.path());
+        let meta = reader.session_metadata(uuid);
+        assert_eq!(meta.speed, Some(100.0));
+        assert_eq!(meta.max_context_tokens, Some(256_000));
+        assert_eq!(meta.estimated_context_tokens, Some(32_000));
+        let anomaly = meta.retry_anomaly.unwrap();
+        assert_eq!(anomaly.retry_count, 2);
+        assert_eq!(anomaly.retries_429, 1);
+        assert_eq!(anomaly.retries_503, 1);
+        assert_eq!(anomaly.retries_other, 0);
+        assert!((anomaly.total_retry_delay_secs - 3.5).abs() < 1e-6);
+        assert_eq!(anomaly.latest_class, RetryStatusClass::Capacity503);
+        assert_eq!(anomaly.latest_status_code, Some(503));
     }
 }
