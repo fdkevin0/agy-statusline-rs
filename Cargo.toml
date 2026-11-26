@@ -1,8 +1,8 @@
 [package]
 name = "agy-statusline"
-version = "0.4.7"
+version = "0.5.0"
 edition = "2021"
-description = "Safe Rust statusline for Antigravity CLI (agy) with quota pacing, compaction sniffing, git worktree awareness, and a 3-pane TUI configurator."
+description = "Safe Rust statusline and local usage analytics CLI/TUI for Antigravity CLI (agy) with quota pacing, scan cache, git worktree awareness, and a 3-pane configurator."
 license = "MIT"
 repository = "https://github.com/fdkevin0/agy-statusline-rs"
 readme = "README.md"
