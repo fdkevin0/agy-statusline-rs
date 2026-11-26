@@ -14,7 +14,7 @@ use crate::statusline::{
 };
 use crate::sys::fmt::{
     format_duration_compact, format_tokens, format_tokens_string as format_tok_str,
-    truncate_to_width,
+    sanitize_inline_text, truncate_to_width,
 };
 
 const CACHE_HIT_MIN_CONTEXT_TOKENS: u64 = 10_000;
@@ -998,8 +998,6 @@ fn abbreviate_leading_word(text: &str) -> String {
     }
     text.to_string()
 }
-
-use crate::sys::fmt::sanitize_inline_text;
 
 #[cfg(test)]
 mod tests {

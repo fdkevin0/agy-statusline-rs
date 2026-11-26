@@ -95,6 +95,15 @@ impl StatsQuotaReport {
             || !self.credits.is_empty()
             || self.plan_tier.is_some()
     }
+
+    /// Credit buckets excluding `google_one_ai`/`ai_credits` when already surfaced via `ai_credits`.
+    pub(super) fn extra_credits(&self) -> impl Iterator<Item = &QuotaCreditReport> {
+        self.credits.iter().filter(|credit| {
+            !(self.ai_credits.is_some()
+                && (credit.key.eq_ignore_ascii_case("google_one_ai")
+                    || credit.key.eq_ignore_ascii_case("ai_credits")))
+        })
+    }
 }
 
 /// Aggregated retry, error-step, and compaction diagnostics for a single conversation

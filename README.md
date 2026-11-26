@@ -6,13 +6,13 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A `#![forbid(unsafe_code)]` Rust statusline and local usage dashboard for Antigravity CLI (`agy >= 1.5.15`), with burn-rate quota pacing & multi-pool/AI credits visibility, real compaction-threshold sniffing, fork-deduplicated SQLite stats with persistent scan caching & retry/compaction diagnostics, subagent-aware `models.dev` cost estimation, pure-Rust `.git/HEAD` + worktree awareness, and an interactive 3-pane TUI configurator.
+Safe Rust (`#![forbid(unsafe_code)]`) statusline and local usage analytics dashboard for Antigravity CLI (`agy`).
 
 ![agy-statusline built-in presets](docs/assets/presets.png)
 
 ## Requirements
 
-- **Antigravity CLI `>= 1.5.15`** (and **Antigravity Desktop `>= 2.35.0`** for shared `~/.gemini/antigravity` stats), where upstream 500-conversation startup pruning is disabled and `conversations/*.db` serves as the single authoritative usage store.
+- **Antigravity CLI `>= 1.5.15`** (and **Antigravity Desktop `>= 2.35.0`** to include `~/.gemini/antigravity` desktop sessions).
 
 ## Install
 
@@ -20,7 +20,7 @@ A `#![forbid(unsafe_code)]` Rust statusline and local usage dashboard for Antigr
 cargo install agy-statusline
 ```
 
-Or download a prebuilt binary from [GitHub Releases](https://github.com/fdkevin0/agy-statusline-rs/releases), or build from source (requires Rust 2021; `libsqlite3` is bundled by default, pass `--no-default-features` to link system `libsqlite3`):
+Or download a binary from [GitHub Releases](https://github.com/fdkevin0/agy-statusline-rs/releases), or build from source (Rust 2021; bundles `libsqlite3` by default, pass `--no-default-features` for system `libsqlite3`):
 
 ```sh
 git clone https://github.com/fdkevin0/agy-statusline-rs.git
@@ -30,7 +30,7 @@ cargo install --path . --locked
 
 ## Quick Start
 
-1. Configure your layout interactively (keyboard + mouse; press `s` to save and apply in one step):
+1. Customize rows, widgets, and theme interactively (`s` saves and registers with AGY):
 
 ```sh
 agy-statusline config
@@ -38,14 +38,14 @@ agy-statusline config
 
 ![agy-statusline interactive TUI configurator](docs/assets/config-tui.png)
 
-2. Register with AGY (`~/.gemini/antigravity-cli/settings.json`) and verify your setup:
+2. Register in AGY `settings.json` and run diagnostics:
 
 ```sh
 agy-statusline apply --yes
 agy-statusline doctor
 ```
 
-3. Inspect local CLI & desktop daily/model token usage, live/cached multi-pool quota & AI credits, cache hit rates, speed, TTFT, retry/compaction diagnostics, and estimated API cost interactively (or pass `--plain` / `--json` for static output):
+3. Explore local usage, multi-pool quota, speed, cost, and conversation turn breakdowns (interactive TUI on a TTY; `--plain` or `--json` for static output):
 
 ```sh
 agy-statusline stats
@@ -58,7 +58,7 @@ agy-statusline stats <conversation-id>
 
 ## Documentation
 
-- [Configuration, Widgets & TUI Guide](docs/configuration.md)
+- [Configuration, Widgets, TUI & Storage Reference](docs/configuration.md) — CLI flags, 33 widgets, 4 presets, 7 themes, keyboard/mouse controls, quota/Hub RPC, pricing, and XDG cache files.
 - [Contributing](CONTRIBUTING.md) · [Code of Conduct](CODE_OF_CONDUCT.md) · [Security Policy](SECURITY.md)
 
 ## License

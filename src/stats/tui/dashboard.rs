@@ -15,8 +15,8 @@ use unicode_width::UnicodeWidthStr;
 
 use super::dashboard_state::{StatsAction, StatsPane, StatsTuiState};
 use super::{
-    compute_header_hits, render_table_with_scrollbar, right_cell, token_breakdown_lines,
-    ClickRegions, HeaderHits, Palette, SpanBar, TableChrome, TableHit,
+    compute_header_hits, render_footer_bar, render_table_with_scrollbar, right_cell,
+    token_breakdown_lines, ClickRegions, HeaderHits, Palette, SpanBar, TableChrome, TableHit,
 };
 use crate::stats::metric::{
     format_grouped_u64, format_pct, format_usd_short, heatmap_level_f64, StatsMetric, UsageCounters,
@@ -521,36 +521,14 @@ fn draw_quota_strip(frame: &mut Frame<'_>, area: Rect, q: &StatsQuotaReport, pal
     header_meta.push(format_quota_source_age(q));
 
     let bordered = area.height >= 3;
-    let inner_w = if bordered {
-        usize::from(area.width.saturating_sub(2))
-    } else {
-        usize::from(area.width)
-    };
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut used = 0usize;
-
-    let mut try_push_group = |group: Vec<Span<'static>>| {
-        let prefix = if spans.is_empty() {
-            " "
-        } else {
-            sep_spaced.as_str()
-        };
-        let group_w: usize = group.iter().map(|s| s.content.width()).sum();
-        let total_w = prefix.width() + group_w;
-        if !spans.is_empty() && used + total_w > inner_w {
-            return;
-        }
-        spans.push(Span::styled(
-            prefix.to_string(),
-            if spans.is_empty() {
-                Style::default()
-            } else {
-                pal.dim()
-            },
-        ));
-        spans.extend(group);
-        used += total_w;
-    };
+    let block = bordered.then(|| {
+        pal.pane_block(
+            format!(" Quota ({}) ", header_meta.join(&sep_spaced)),
+            false,
+        )
+    });
+    let inner = block.as_ref().map_or(area, |b| b.inner(area));
+    let mut bar: SpanBar<()> = SpanBar::new(inner);
 
     if !bordered {
         let mut head = vec![Span::styled("Quota ", pal.bold(Color::Cyan))];
@@ -574,7 +552,7 @@ fn draw_quota_strip(frame: &mut Frame<'_>, area: Rect, q: &StatsQuotaReport, pal
             format!("[{}]", format_quota_source_age(q)),
             pal.dim(),
         ));
-        try_push_group(head);
+        bar.push_sep_spans(&sep_spaced, pal.dim(), head, None);
     }
 
     for pool in &q.pools {
@@ -601,44 +579,40 @@ fn draw_quota_strip(frame: &mut Frame<'_>, area: Rect, q: &StatsQuotaReport, pal
             added_win = true;
         }
         if added_win {
-            try_push_group(group);
+            bar.push_sep_spans(&sep_spaced, pal.dim(), group, None);
         }
     }
 
-    for credit in &q.credits {
-        if q.ai_credits.is_some()
-            && (credit.key.eq_ignore_ascii_case("google_one_ai")
-                || credit.key.eq_ignore_ascii_case("ai_credits"))
-        {
-            continue;
-        }
+    for credit in q.extra_credits() {
         let style = match credit.severity.as_str() {
             "critical" => pal.bold(Color::Red),
             "low" => pal.fg(Color::Yellow),
             _ => pal.fg(Color::Green),
         };
-        try_push_group(vec![
-            Span::styled(format!("{} ", credit.label), pal.dim()),
-            Span::styled(credit.remaining_amount.to_string(), style),
-        ]);
+        bar.push_sep_spans(
+            &sep_spaced,
+            pal.dim(),
+            vec![
+                Span::styled(format!("{} ", credit.label), pal.dim()),
+                Span::styled(credit.remaining_amount.to_string(), style),
+            ],
+            None,
+        );
     }
 
-    if spans.is_empty() {
-        spans.push(Span::styled(
+    if bar.is_empty() {
+        let _ = bar.push(
             format!(" {}", header_meta.join(&sep_spaced)),
             pal.fg(Color::White),
-        ));
+        );
     }
 
-    if bordered {
-        let title = format!(" Quota ({}) ", header_meta.join(&sep_spaced));
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).block(pal.pane_block(title, false)),
-            area,
-        );
-    } else {
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    }
+    let (line, _) = bar.finish();
+    let para = match block {
+        Some(b) => Paragraph::new(line).block(b),
+        None => Paragraph::new(line),
+    };
+    frame.render_widget(para, area);
 }
 
 fn draw_control_bar(
@@ -725,18 +699,10 @@ fn draw_control_bar(
 
     if let Some(model) = state.query().model_filter.as_deref() {
         let close = if pal.ascii { "x" } else { "×" };
-        let style = if pal.no_color {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-                .bg(Color::Yellow)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        };
-        let label = truncate_to_width(model, 18, if pal.ascii { "..." } else { "…" });
+        let label = truncate_to_width(model, 18, pal.ellipsis());
         let _ = bar.push_click(
             format!(" {close} {label} "),
-            style,
+            pal.filter_badge(),
             DashboardClick::ClearModelFilter,
         );
     }
@@ -872,52 +838,51 @@ fn draw_compact_summary(
         None => "-".to_string(),
     };
     let hit_pct = view.summary.cache_hit_pct();
-    let inner_w = usize::from(area.width.saturating_sub(2));
+    let title = format!(
+        " Summary ({} {} {}) ",
+        state.query().range.label(),
+        pal.sep(),
+        metric.label()
+    );
+    let block = pal.pane_block(title, false);
+    let mut bar: SpanBar<()> = SpanBar::new(block.inner(area));
+    let dim = pal.dim();
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut used = 0usize;
-    let mut push_segment = |label: &str, value: String, value_style: Style| {
-        let prefix = if spans.is_empty() { " " } else { sep.as_str() };
-        let seg_w = prefix.width() + label.width() + value.width();
-        if !spans.is_empty() && used + seg_w > inner_w {
-            return;
-        }
-        spans.push(Span::styled(
-            prefix.to_string(),
-            if spans.is_empty() {
-                Style::default()
-            } else {
-                pal.dim()
-            },
-        ));
-        spans.push(Span::styled(label.to_string(), pal.dim()));
-        spans.push(Span::styled(value, value_style));
-        used += seg_w;
-    };
-
-    push_segment(
+    bar.push_sep_kv(
+        &sep,
+        dim,
         "Total ",
         metric.format_display(view.total_value, true),
         pal.bold(Color::Cyan),
+        None,
     );
-    push_segment(
+    bar.push_sep_kv(
+        &sep,
+        dim,
         "Avg ",
         format!(
             "{}/d",
             metric.format_average(view.total_value, view.active_days)
         ),
         pal.bold(Color::Green),
+        None,
     );
-    push_segment("Peak ", peak_str, pal.bold(Color::Yellow));
-    push_segment(
+    bar.push_sep_kv(&sep, dim, "Peak ", peak_str, pal.bold(Color::Yellow), None);
+    bar.push_sep_kv(
+        &sep,
+        dim,
         "Hit ",
         format_pct(hit_pct),
         pal.cache_hit_style(hit_pct).add_modifier(Modifier::BOLD),
+        None,
     );
-    push_segment(
+    bar.push_sep_kv(
+        &sep,
+        dim,
         "Active ",
         format!("{}/{}d", view.active_days, view.span_days),
         pal.bold(Color::White),
+        None,
     );
     if let Some(diag_str) = format_diagnostics_compact(diag, pal.ascii) {
         let color = if diag.retries_429 > 0 || diag.error_steps > 0 {
@@ -925,19 +890,11 @@ fn draw_compact_summary(
         } else {
             Color::Yellow
         };
-        push_segment("Diag ", diag_str, pal.bold(color));
+        bar.push_sep_kv(&sep, dim, "Diag ", diag_str, pal.bold(color), None);
     }
 
-    let title = format!(
-        " Summary ({} {} {}) ",
-        state.query().range.label(),
-        pal.sep(),
-        metric.label()
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).block(pal.pane_block(title, false)),
-        area,
-    );
+    let (line, _) = bar.finish();
+    frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
 fn draw_heatmap_pane(
@@ -1080,11 +1037,7 @@ impl DailyCol {
     }
 
     fn header(self, metric_hdr: &'static str, sort: DailySort, pal: &Palette) -> Cell<'static> {
-        let active_style = if pal.no_color {
-            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            pal.bold(Color::Cyan)
-        };
+        let active_style = pal.active_header();
         let arrow = |asc: bool| match (asc, pal.ascii) {
             (true, false) => "↑",
             (true, true) => "^",
@@ -1274,7 +1227,7 @@ fn draw_daily_pane(
         .block(pal.pane_block(title, active))
         .column_spacing(1)
         .row_highlight_style(pal.selected_row(active))
-        .highlight_symbol(if pal.ascii { "> " } else { "▸ " });
+        .highlight_symbol(pal.highlight_symbol());
     if let Some(footer) = footer_opt {
         table = table.footer(footer);
     }
@@ -1411,7 +1364,7 @@ fn draw_models_pane(
         .block(pal.pane_block(title, active))
         .column_spacing(1)
         .row_highlight_style(pal.selected_row(active))
-        .highlight_symbol(if pal.ascii { "> " } else { "▸ " });
+        .highlight_symbol(pal.highlight_symbol());
 
     render_table_with_scrollbar(
         frame,
@@ -1436,71 +1389,41 @@ fn draw_footer_bar(
     dataset: Option<&StatsDataset>,
     pal: &Palette,
 ) -> ClickRegions<DashboardClick> {
-    if let Some(msg) = state.status_msg() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(format!(" {msg}"), pal.bold(Color::Yellow))),
-            area,
-        );
-        return ClickRegions::default();
-    }
-
-    let inset = Rect::new(
-        area.x.saturating_add(1),
-        area.y,
-        area.width.saturating_sub(1),
-        area.height,
-    );
-    let sep = format!(" {} ", pal.sep());
-    let dim = pal.dim();
-    let mut bar = SpanBar::new(inset);
-
-    if let Some(model) = state.query().model_filter.as_deref() {
-        let _ = bar.push(format!("Filtered: {model}"), dim);
-        let _ = bar.push_sep_click(
-            &sep,
-            dim,
-            "Esc Clear",
-            dim,
-            DashboardClick::ClearModelFilter,
-        );
-        let _ = bar.push_sep_click(&sep, dim, "1-5 Metric", dim, DashboardClick::CycleMetric);
-        let _ = bar.push_sep_click(&sep, dim, "t Range", dim, DashboardClick::CycleRange);
-        let _ = bar.push_sep_click(&sep, dim, "c Convs", dim, DashboardClick::OpenConversations);
-        let _ = bar.push_sep_click(&sep, dim, "s Sort", dim, DashboardClick::CycleSort);
-        let _ = bar.push_sep_click(&sep, dim, "r Refresh", dim, DashboardClick::Refresh);
-        let _ = bar.push_sep_click(&sep, dim, "q Quit", dim, DashboardClick::Quit);
-    } else if area.width < 92 {
-        let _ = bar.push_sep_click(&sep, dim, "1-5 Metric", dim, DashboardClick::CycleMetric);
-        let _ = bar.push_sep_click(&sep, dim, "t Range", dim, DashboardClick::CycleRange);
-        let _ = bar.push_sep_click(&sep, dim, "c Convs", dim, DashboardClick::OpenConversations);
-        let _ = bar.push_sep_click(&sep, dim, "s Sort", dim, DashboardClick::CycleSort);
-        let _ = bar.push_sep_click(&sep, dim, "Tab Pane", dim, DashboardClick::TogglePane);
-        let _ = bar.push_sep_click(&sep, dim, "q Quit", dim, DashboardClick::Quit);
-    } else {
-        let _ = bar.push_sep_click(&sep, dim, "1-5 Metric", dim, DashboardClick::CycleMetric);
-        let _ = bar.push_sep_click(&sep, dim, "t Range", dim, DashboardClick::CycleRange);
-        let _ = bar.push_sep_click(&sep, dim, "c Convs", dim, DashboardClick::OpenConversations);
-        let _ = bar.push_sep_click(&sep, dim, "s Sort", dim, DashboardClick::CycleSort);
-        let _ = bar.push_sep_click(
-            &sep,
-            dim,
-            "v Day/Win",
-            dim,
-            DashboardClick::ToggleModelScope,
-        );
-        let _ = bar.push_sep_click(&sep, dim, "z Gaps", dim, DashboardClick::ToggleFillEmpty);
-        let _ = bar.push_sep_click(&sep, dim, "g Heatmap", dim, DashboardClick::ToggleHeatmap);
-        if dataset.is_some_and(|d| d.has_cli && d.has_desktop) {
-            let _ = bar.push_sep_click(&sep, dim, "f Src", dim, DashboardClick::CycleSource);
+    render_footer_bar(frame, area, state.status_msg(), pal, |bar, sep, dim| {
+        if let Some(model) = state.query().model_filter.as_deref() {
+            let _ = bar.push(format!("Filtered: {model}"), dim);
+            let _ =
+                bar.push_sep_click(sep, dim, "Esc Clear", dim, DashboardClick::ClearModelFilter);
+            let _ = bar.push_sep_click(sep, dim, "1-5 Metric", dim, DashboardClick::CycleMetric);
+            let _ = bar.push_sep_click(sep, dim, "t Range", dim, DashboardClick::CycleRange);
+            let _ = bar.push_sep_click(sep, dim, "c Convs", dim, DashboardClick::OpenConversations);
+            let _ = bar.push_sep_click(sep, dim, "s Sort", dim, DashboardClick::CycleSort);
+            let _ = bar.push_sep_click(sep, dim, "r Refresh", dim, DashboardClick::Refresh);
+            let _ = bar.push_sep_click(sep, dim, "q Quit", dim, DashboardClick::Quit);
+        } else if area.width < 92 {
+            let _ = bar.push_sep_click(sep, dim, "1-5 Metric", dim, DashboardClick::CycleMetric);
+            let _ = bar.push_sep_click(sep, dim, "t Range", dim, DashboardClick::CycleRange);
+            let _ = bar.push_sep_click(sep, dim, "c Convs", dim, DashboardClick::OpenConversations);
+            let _ = bar.push_sep_click(sep, dim, "s Sort", dim, DashboardClick::CycleSort);
+            let _ = bar.push_sep_click(sep, dim, "Tab Pane", dim, DashboardClick::TogglePane);
+            let _ = bar.push_sep_click(sep, dim, "q Quit", dim, DashboardClick::Quit);
+        } else {
+            let _ = bar.push_sep_click(sep, dim, "1-5 Metric", dim, DashboardClick::CycleMetric);
+            let _ = bar.push_sep_click(sep, dim, "t Range", dim, DashboardClick::CycleRange);
+            let _ = bar.push_sep_click(sep, dim, "c Convs", dim, DashboardClick::OpenConversations);
+            let _ = bar.push_sep_click(sep, dim, "s Sort", dim, DashboardClick::CycleSort);
+            let _ =
+                bar.push_sep_click(sep, dim, "v Day/Win", dim, DashboardClick::ToggleModelScope);
+            let _ = bar.push_sep_click(sep, dim, "z Gaps", dim, DashboardClick::ToggleFillEmpty);
+            let _ = bar.push_sep_click(sep, dim, "g Heatmap", dim, DashboardClick::ToggleHeatmap);
+            if dataset.is_some_and(|d| d.has_cli && d.has_desktop) {
+                let _ = bar.push_sep_click(sep, dim, "f Src", dim, DashboardClick::CycleSource);
+            }
+            let _ = bar.push_sep_click(sep, dim, "Tab Pane", dim, DashboardClick::TogglePane);
+            let _ = bar.push_sep_click(sep, dim, "r Refresh", dim, DashboardClick::Refresh);
+            let _ = bar.push_sep_click(sep, dim, "q Quit", dim, DashboardClick::Quit);
         }
-        let _ = bar.push_sep_click(&sep, dim, "Tab Pane", dim, DashboardClick::TogglePane);
-        let _ = bar.push_sep_click(&sep, dim, "r Refresh", dim, DashboardClick::Refresh);
-        let _ = bar.push_sep_click(&sep, dim, "q Quit", dim, DashboardClick::Quit);
-    }
-
-    let (line, hits) = bar.finish();
-    frame.render_widget(Paragraph::new(line), inset);
-    hits
+    })
 }
 
 #[cfg(test)]

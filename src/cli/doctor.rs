@@ -28,15 +28,31 @@ use crate::sys::time::unix_now_secs;
 
 const AGY_VERSION_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_AGY_VERSION_BYTES: u64 = 4096;
+const DEFAULT_PREVIEW_WIDTH: usize = 100;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DoctorEnv<'a> {
     roots: Vec<(&'static str, PathBuf)>,
     daemon_dirs: Vec<PathBuf>,
     cache_dir: Option<&'a Path>,
     path_env: Option<&'a OsStr>,
     now_unix_secs: u64,
+    preview_width: usize,
     no_color: bool,
+}
+
+impl Default for DoctorEnv<'_> {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            daemon_dirs: Vec::new(),
+            cache_dir: None,
+            path_env: None,
+            now_unix_secs: 0,
+            preview_width: DEFAULT_PREVIEW_WIDTH,
+            no_color: false,
+        }
+    }
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -110,18 +126,11 @@ fn command_executable_exists_in_path(cmd: &str, path_env: Option<&OsStr>) -> boo
     path_env.is_some_and(|paths| which::which_in(&exe, Some(paths), ".").is_ok())
 }
 
-fn sanitized_nonempty_lines(bytes: &[u8]) -> Vec<String> {
-    let raw = String::from_utf8_lossy(bytes);
-    raw.lines()
-        .map(sanitize_inline_text)
-        .filter(|line| !line.is_empty())
-        .collect()
-}
-
 fn format_version_output(bytes: &[u8]) -> String {
-    sanitized_nonempty_lines(bytes)
-        .into_iter()
-        .next()
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(sanitize_inline_text)
+        .find(|line| !line.is_empty())
         .unwrap_or_else(|| "unknown (empty output)".to_string())
 }
 
@@ -442,7 +451,7 @@ fn run_doctor_with<W: Write>(
     write_quota_section(env, out)?;
 
     writeln!(out, "Preview:")?;
-    let sample = sample_preview_payload(100);
+    let sample = sample_preview_payload(env.preview_width);
     let meta = sample_preview_metadata();
     let git = sample_preview_git();
     write_statusline(&sample, &meta, &git, &cfg, out)?;
@@ -460,12 +469,18 @@ pub fn run_doctor<W: Write>(
     no_color: bool,
     out: &mut W,
 ) -> io::Result<()> {
+    let preview_width = crossterm::terminal::size()
+        .ok()
+        .map_or(DEFAULT_PREVIEW_WIDTH, |(w, _)| {
+            usize::from(w).clamp(40, 120)
+        });
     let doctor_env = DoctorEnv {
         roots: collect_doctor_roots(settings_path),
         daemon_dirs: resolve_agy_daemon_dirs(),
         cache_dir,
         path_env,
         now_unix_secs: unix_now_secs(),
+        preview_width,
         no_color,
     };
     run_doctor_with(config_path, settings_path, &doctor_env, out)
@@ -501,6 +516,7 @@ mod tests {
             cache_dir: Some(&cache_dir),
             path_env: None,
             now_unix_secs: 1_700_000_000,
+            preview_width: DEFAULT_PREVIEW_WIDTH,
             no_color: true,
         };
         let mut out = Vec::new();
@@ -577,6 +593,7 @@ mod tests {
             cache_dir: None,
             path_env: Some(path_env.as_os_str()),
             now_unix_secs: 1_700_000_000,
+            preview_width: DEFAULT_PREVIEW_WIDTH,
             no_color: true,
         };
         let mut out = Vec::new();
@@ -836,6 +853,7 @@ mod tests {
             cache_dir: Some(&cache_dir),
             path_env: Some(path_env.as_os_str()),
             now_unix_secs: 1_700_000_000,
+            preview_width: DEFAULT_PREVIEW_WIDTH,
             no_color: true,
         };
         let mut out = Vec::new();
