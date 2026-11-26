@@ -5,12 +5,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::sys::fs::{atomic_write, is_real_dir, modified_timestamp, read_bounded_regular_file};
+use crate::sys::fs::{
+    atomic_write, is_real_dir, modified_timestamp, read_bounded_file_to_string,
+    read_bounded_regular_file,
+};
 use crate::sys::process::run_command_stdout_bounded;
 use crate::sys::time::{unix_now_secs, SECS_PER_DAY, SECS_PER_HOUR};
 
 const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_millis(250);
 const DEFAULT_DIFF_CACHE_TTL_SECS: u64 = 3;
+const MAX_GIT_METADATA_FILE_BYTES: u64 = 8 * 1024;
 const MAX_DIFF_CACHE_FILE_BYTES: u64 = 256;
 const DIFF_CACHE_STALE_SECS: u64 = SECS_PER_DAY as u64;
 const DIFF_CACHE_PRUNE_INTERVAL_SECS: u64 = SECS_PER_HOUR;
@@ -83,7 +87,8 @@ fn resolve_git_repo(dir: &Path) -> Option<(PathBuf, Option<String>)> {
             return Some((dot_git, None));
         }
         if dot_git.is_file() {
-            let content = fs::read_to_string(&dot_git).ok()?;
+            let content =
+                read_bounded_file_to_string(&dot_git, MAX_GIT_METADATA_FILE_BYTES).ok()?;
             let gitdir_str = content.trim().strip_prefix("gitdir:")?.trim();
             if gitdir_str.is_empty() {
                 return None;
@@ -115,7 +120,8 @@ fn extract_worktree_name(gitdir: &Path) -> Option<String> {
 
 /// Reads the current branch or detached `@<short_sha>` directly from `<gitdir>/HEAD`.
 fn read_head_branch(gitdir: &Path) -> Option<String> {
-    let raw = fs::read_to_string(gitdir.join("HEAD")).ok()?;
+    let raw =
+        read_bounded_file_to_string(&gitdir.join("HEAD"), MAX_GIT_METADATA_FILE_BYTES).ok()?;
     let head = raw.trim();
     if let Some(rest) = head.strip_prefix("ref:") {
         let target = rest.trim();
@@ -470,5 +476,27 @@ mod tests {
         assert!(!stale_diff.exists());
         assert!(fresh_diff.exists());
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn oversized_dot_git_and_head_files_degrade_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt_dir = dir.path().join("oversized_wt");
+        fs::create_dir_all(&wt_dir).unwrap();
+        let oversized_dot_git = format!(
+            "gitdir: /repo/.git/worktrees/feat{}\n",
+            " ".repeat(MAX_GIT_METADATA_FILE_BYTES as usize)
+        );
+        fs::write(wt_dir.join(".git"), oversized_dot_git).unwrap();
+        assert_eq!(resolve_git_repo(&wt_dir), None);
+
+        let repo_git = dir.path().join("repo/.git");
+        fs::create_dir_all(&repo_git).unwrap();
+        let oversized_head = format!(
+            "ref: refs/heads/main{}\n",
+            " ".repeat(MAX_GIT_METADATA_FILE_BYTES as usize)
+        );
+        fs::write(repo_git.join("HEAD"), oversized_head).unwrap();
+        assert_eq!(read_head_branch(&repo_git), None);
     }
 }

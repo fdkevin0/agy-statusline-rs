@@ -111,6 +111,46 @@ pub(crate) fn read_bounded_regular_file(
     Ok((bytes, meta))
 }
 
+/// Reads a regular file (following symlinks, e.g. Stow/Nix dotfiles) up to `max_bytes`
+/// into a UTF-8 string.
+///
+/// Rejects non-regular targets (directories, FIFOs, sockets, devices) before opening
+/// and enforces `max_bytes` via both `fs::metadata` and `Read::take(max_bytes + 1)`.
+pub(crate) fn read_bounded_file_to_string(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let meta = fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    if meta.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds size limit ({} > {max_bytes} bytes)",
+                path.display(),
+                meta.len()
+            ),
+        ));
+    }
+    let file = fs::File::open(path)?;
+    let cap = meta.len().min(max_bytes).min(64 * 1024) as usize;
+    let mut bytes = Vec::with_capacity(cap);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if (bytes.len() as u64) > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds size limit (> {max_bytes} bytes)",
+                path.display()
+            ),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 /// Extracts a file's modification time as signed Unix `(secs, nanos)`.
 pub(crate) fn modified_timestamp(meta: &fs::Metadata) -> (i64, u32) {
     match meta.modified() {
@@ -288,5 +328,61 @@ mod tests {
         assert_eq!(fs::read(&link_path).unwrap(), b"updated");
         let mode = fs::metadata(&real_target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640);
+    }
+
+    #[test]
+    fn read_bounded_file_to_string_enforces_size_missing_utf8_and_non_file_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cfg.json");
+        fs::write(&file, "hello").unwrap();
+
+        assert_eq!(read_bounded_file_to_string(&file, 5).unwrap(), "hello");
+        assert_eq!(
+            read_bounded_file_to_string(&file, 4).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_bounded_file_to_string(&dir.path().join("missing.json"), 64)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+
+        let sub = dir.path().join("subdir");
+        fs::create_dir(&sub).unwrap();
+        assert_eq!(
+            read_bounded_file_to_string(&sub, 64).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let invalid_utf8 = dir.path().join("bad.bin");
+        fs::write(&invalid_utf8, [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            read_bounded_file_to_string(&invalid_utf8, 64)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_bounded_file_to_string_follows_symlinks_and_enforces_cap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        fs::write(&real, "{\"ok\":true}").unwrap();
+        let link = dir.path().join("link.json");
+        symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            read_bounded_file_to_string(&link, 64).unwrap(),
+            "{\"ok\":true}"
+        );
+        assert_eq!(
+            read_bounded_file_to_string(&link, 4).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }
