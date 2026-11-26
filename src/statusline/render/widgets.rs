@@ -14,7 +14,7 @@ use crate::statusline::{
 };
 use crate::sys::fmt::{
     format_duration_compact, format_tokens, format_tokens_string as format_tok_str,
-    truncate_to_width,
+    sanitize_inline_text, truncate_to_width,
 };
 
 const CACHE_HIT_MIN_CONTEXT_TOKENS: u64 = 10_000;
@@ -491,7 +491,7 @@ impl Renderer<'_> {
                 Segment::plain(widget, buf, pal.cache, false)
             }),
             WidgetId::Speed => {
-                let slow = ctx.speed.is_some_and(|s| s < ctx.speed_warn_threshold);
+                let slow = ctx.speed.is_some_and(|s| s < self.cfg.speed_warn_threshold);
                 let base = ctx.speed.map_or_else(
                     || format!("{} --", glyphs.speed),
                     |s| format!("{} {s:.0} tok/s", glyphs.speed),
@@ -998,8 +998,6 @@ fn abbreviate_leading_word(text: &str) -> String {
     }
     text.to_string()
 }
-
-use crate::sys::fmt::sanitize_inline_text;
 
 #[cfg(test)]
 mod tests {

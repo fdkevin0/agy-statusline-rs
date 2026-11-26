@@ -400,11 +400,7 @@ fn run_subcommand(command: Command, no_color: bool) -> io::Result<()> {
                 return Ok(());
             }
             if let Some(preset) = args.preset {
-                let existing = load_layout_config(&config_path);
-                let mut layout = preset.to_layout();
-                layout.stats_metric = existing.stats_metric;
-                layout.conv_turn_sort = existing.conv_turn_sort;
-                layout.conv_list_sort = existing.conv_list_sort;
+                let layout = load_layout_config(&config_path).with_preset_preserving_prefs(preset);
                 save_layout_config(&config_path, &layout)?;
                 println!(
                     "Applied preset '{}' to {}",

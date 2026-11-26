@@ -569,7 +569,11 @@ fn setting_row(state: &TuiEditorState, field: SettingField) -> (&'static str, St
         ),
         SettingField::SpeedWarn => (
             "Speed warn",
-            format!("{:.0} tok/s", cfg.speed_warn_threshold),
+            if cfg.speed_warn_threshold <= 0.0 {
+                "OFF".to_string()
+            } else {
+                format!("{:.0} tok/s", cfg.speed_warn_threshold)
+            },
         ),
     }
 }

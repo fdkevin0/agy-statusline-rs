@@ -12,8 +12,8 @@ use super::metric::{
 };
 use super::query::{HeatmapWeek, WEEKDAY_NAMES};
 use super::{
-    ConversationListItem, ConversationStatsReport, DailyUsage, PeriodSummary, QuotaWindowReport,
-    ScanDiagnostics, StatsQuotaReport, StatsReport, ACTIVITY_WEEKS,
+    ConversationListItem, ConversationStatsReport, DailyUsage, ModelStats, PeriodSummary,
+    QuotaWindowReport, ScanDiagnostics, StatsQuotaReport, StatsReport, ACTIVITY_WEEKS,
 };
 use crate::statusline::metrics::format_quota_pct;
 use crate::sys::fmt::{
@@ -29,26 +29,6 @@ pub(super) const ASCII_HEATMAP: [&str; 5] = ["..", "==", "--", "##", "**"];
 const HEATMAP_ANSI_CODES: [&str; 5] = ["2", "38;5;29", "38;5;36", "38;5;42", "1;38;5;78"];
 const DEFAULT_STATIC_DAILY_LIMIT: usize = 14;
 const DEFAULT_STATIC_TURN_LIMIT: usize = 20;
-
-#[derive(Clone, Copy)]
-struct TextStyle {
-    no_color: bool,
-    ascii: bool,
-}
-
-impl TextStyle {
-    fn sep(self) -> &'static str {
-        if self.ascii {
-            "|"
-        } else {
-            "·"
-        }
-    }
-}
-
-fn fmt_usd(usd: f64, priced_requests: u64, unpriced_requests: u64) -> String {
-    format_usd_full(usd, priced_requests, unpriced_requests)
-}
 
 pub(super) fn build_month_header(week_dates: &[Option<Date>]) -> String {
     let week_months: Vec<Option<usize>> = week_dates
@@ -134,7 +114,7 @@ fn write_window_row<W: Write>(
         write!(
             out,
             "  {}",
-            fmt_usd(
+            format_usd_full(
                 summary.priced_usd,
                 summary.priced_requests,
                 summary.unpriced_requests,
@@ -400,13 +380,13 @@ pub(super) fn format_quota_window_brief(
     out
 }
 
-/// Compact retry anomaly label for tight TUI strips (e.g. `2×429 1×503 (12s)`).
-pub(super) fn format_retry_compact(diag: &ScanDiagnostics, ascii: bool) -> Option<String> {
-    if diag.retry_count == 0 {
-        return None;
-    }
+fn push_retry_class_parts(
+    diag: &ScanDiagnostics,
+    ascii: bool,
+    other_label: &str,
+    parts: &mut Vec<String>,
+) {
     let times = if ascii { "x" } else { "×" };
-    let mut parts = Vec::new();
     if diag.retries_429 > 0 {
         parts.push(format!("{}{times}429", diag.retries_429));
     }
@@ -415,8 +395,17 @@ pub(super) fn format_retry_compact(diag: &ScanDiagnostics, ascii: bool) -> Optio
     }
     let other = diag.retries_non_429_503();
     if other > 0 {
-        parts.push(format!("{other}{times}err"));
+        parts.push(format!("{other}{times}{other_label}"));
     }
+}
+
+/// Compact retry anomaly label for tight TUI strips (e.g. `2×429 1×503 (12s)`).
+pub(super) fn format_retry_compact(diag: &ScanDiagnostics, ascii: bool) -> Option<String> {
+    if diag.retry_count == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    push_retry_class_parts(diag, ascii, "err", &mut parts);
     let mut out = if parts.is_empty() {
         format!("{} retry", diag.retry_count)
     } else {
@@ -452,18 +441,8 @@ pub(super) fn format_retry_breakdown(diag: &ScanDiagnostics, ascii: bool) -> Opt
     if diag.retry_count == 0 {
         return None;
     }
-    let times = if ascii { "x" } else { "×" };
     let mut parts = Vec::new();
-    if diag.retries_429 > 0 {
-        parts.push(format!("{}{times}429", diag.retries_429));
-    }
-    if diag.retries_503 > 0 {
-        parts.push(format!("{}{times}503", diag.retries_503));
-    }
-    let other = diag.retries_non_429_503();
-    if other > 0 {
-        parts.push(format!("{other}{times}other"));
-    }
+    push_retry_class_parts(diag, ascii, "other", &mut parts);
     if diag.total_retry_delay_secs.is_finite() && diag.total_retry_delay_secs >= 0.5 {
         let secs = diag.total_retry_delay_secs;
         let delay = if secs >= 60.0 {
@@ -592,13 +571,7 @@ fn write_quota_section<W: Write>(
             ));
         }
     }
-    for credit in &q.credits {
-        if q.ai_credits.is_some()
-            && (credit.key.eq_ignore_ascii_case("google_one_ai")
-                || credit.key.eq_ignore_ascii_case("ai_credits"))
-        {
-            continue;
-        }
+    for credit in q.extra_credits() {
         let code = match credit.severity.as_str() {
             "critical" => "1;38;5;203",
             "low" => "38;5;221",
@@ -613,6 +586,66 @@ fn write_quota_section<W: Write>(
 
     if !items.is_empty() {
         writeln!(out, "  {}", items.join(sep))?;
+    }
+    Ok(())
+}
+
+fn write_models_table<W: Write>(
+    out: &mut W,
+    models: &[ModelStats],
+    section_title: Option<&str>,
+    width_bounds: (usize, usize),
+    show_cost: bool,
+    no_color: bool,
+    ascii: bool,
+) -> io::Result<()> {
+    let cost_hdr = if show_cost { "  Est. Cost" } else { "" };
+    if let Some(title) = section_title {
+        writeln!(out, "\n{}", style_wrap(no_color, "38;5;117", title))?;
+    } else {
+        writeln!(out)?;
+    }
+    let (min_w, max_w) = width_bounds;
+    let model_w = models
+        .iter()
+        .map(|m| m.model.width())
+        .max()
+        .unwrap_or(min_w)
+        .clamp(min_w, max_w);
+    let model_hdr = format!(
+        "  {:<model_w$} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>9}  {:>8}{cost_hdr}",
+        "Model", "Turns", "Tokens", "Output", "Thinking", "Cache Hit", "Med tok/s", "Med TTFT"
+    );
+    writeln!(out, "{}", style_wrap(no_color, "2", &model_hdr))?;
+
+    for m in models {
+        let model_cell = pad_model_cell(&m.model, model_w, ascii);
+        let hit = format_styled_cache_hit(m.cache_hit_pct(), 9, no_color);
+        let speed_str = m
+            .median_tok_per_sec
+            .map_or_else(|| "-".to_string(), |s| format!("{s:.1}"));
+        let ttft_str = format_styled_ttft(m.median_ttft_secs, 8, no_color);
+        write!(
+            out,
+            "  {} {:>6}  {:>8}  {:>8}  {:>8}  {}  {:>9}  {}",
+            model_cell,
+            m.requests,
+            fmt_tok(m.total_tokens),
+            fmt_tok(m.output_tokens),
+            fmt_tok(m.thinking_tokens),
+            hit,
+            speed_str,
+            ttft_str
+        )?;
+        if show_cost {
+            let priced_reqs = m.requests.saturating_sub(m.unpriced_requests);
+            write!(
+                out,
+                "  {:>9}",
+                format_usd_full(m.priced_usd, priced_reqs, m.unpriced_requests)
+            )?;
+        }
+        writeln!(out)?;
     }
     Ok(())
 }
@@ -677,48 +710,15 @@ pub(super) fn render_stats_report_with_metric<W: Write>(
     if report.models.is_empty() {
         writeln!(out, "\nModels: none recorded")?;
     } else {
-        let model_w = report
-            .models
-            .iter()
-            .map(|m| m.model.width())
-            .max()
-            .unwrap_or(24)
-            .clamp(24, 38);
-        let model_hdr = format!(
-            "  {:<model_w$} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}{cost_hdr}",
-            "Model", "Turns", "Tokens", "Output", "Thinking", "Med tok/s", "Med TTFT"
-        );
-        writeln!(out, "\n{}", style_wrap(no_color, "2", &model_hdr))?;
-
-        for m in &report.models {
-            let model_cell = pad_model_cell(&m.model, model_w, ascii);
-            let speed_str = m
-                .median_tok_per_sec
-                .map_or_else(|| "-".to_string(), |s| format!("{s:.1}"));
-            let ttft_str = m
-                .median_ttft_secs
-                .map_or_else(|| "-".to_string(), |t| format!("{t:.2}s"));
-            write!(
-                out,
-                "  {} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>8}",
-                model_cell,
-                m.requests,
-                fmt_tok(m.total_tokens),
-                fmt_tok(m.output_tokens),
-                fmt_tok(m.thinking_tokens),
-                speed_str,
-                ttft_str
-            )?;
-            if show_cost {
-                let priced_reqs = m.requests.saturating_sub(m.unpriced_requests);
-                write!(
-                    out,
-                    "  {}",
-                    fmt_usd(m.priced_usd, priced_reqs, m.unpriced_requests)
-                )?;
-            }
-            writeln!(out)?;
-        }
+        write_models_table(
+            out,
+            &report.models,
+            None,
+            (20, 36),
+            show_cost,
+            no_color,
+            ascii,
+        )?;
     }
 
     let db_speed = report
@@ -884,7 +884,7 @@ fn write_conv_summary_row<W: Write>(
         )?;
     }
     if show_cost {
-        let cost = fmt_usd(
+        let cost = format_usd_full(
             summary.priced_usd,
             summary.priced_requests,
             summary.unpriced_requests,
@@ -1122,7 +1122,7 @@ pub(super) fn render_conversation_stats_report<W: Write>(
                 write!(
                     out,
                     "  {:>9}",
-                    fmt_usd(
+                    format_usd_full(
                         sub.summary.priced_usd,
                         sub.summary.priced_requests,
                         sub.summary.unpriced_requests,
@@ -1136,57 +1136,16 @@ pub(super) fn render_conversation_stats_report<W: Write>(
     if report.models.is_empty() {
         writeln!(out, "\nModels: none recorded")?;
     } else if report.models.len() > 1 {
-        writeln!(
+        let title = format!("Models ({}):", report.models.len());
+        write_models_table(
             out,
-            "\n{}",
-            style_wrap(
-                no_color,
-                "38;5;117",
-                &format!("Models ({}):", report.models.len()),
-            )
+            &report.models,
+            Some(&title),
+            (16, 36),
+            show_cost,
+            no_color,
+            ascii,
         )?;
-        let model_w = report
-            .models
-            .iter()
-            .map(|m| m.model.width())
-            .max()
-            .unwrap_or(16)
-            .clamp(16, 36);
-        let model_hdr = format!(
-            "  {:<model_w$} {:>6}  {:>8}  {:>8}  {:>8}  {:>9}  {:>9}  {:>8}{cost_hdr}",
-            "Model", "Turns", "Tokens", "Output", "Thinking", "Cache Hit", "Med tok/s", "Med TTFT"
-        );
-        writeln!(out, "{}", style_wrap(no_color, "2", &model_hdr))?;
-
-        for m in &report.models {
-            let model_cell = pad_model_cell(&m.model, model_w, ascii);
-            let hit = format_styled_cache_hit(m.cache_hit_pct(), 9, no_color);
-            let speed_str = m
-                .median_tok_per_sec
-                .map_or_else(|| "-".to_string(), |s| format!("{s:.1}"));
-            let ttft_str = format_styled_ttft(m.median_ttft_secs, 8, no_color);
-            write!(
-                out,
-                "  {} {:>6}  {:>8}  {:>8}  {:>8}  {}  {:>9}  {}",
-                model_cell,
-                m.requests,
-                fmt_tok(m.total_tokens),
-                fmt_tok(m.output_tokens),
-                fmt_tok(m.thinking_tokens),
-                hit,
-                speed_str,
-                ttft_str
-            )?;
-            if show_cost {
-                let priced_reqs = m.requests.saturating_sub(m.unpriced_requests);
-                write!(
-                    out,
-                    "  {:>9}",
-                    fmt_usd(m.priced_usd, priced_reqs, m.unpriced_requests)
-                )?;
-            }
-            writeln!(out)?;
-        }
     }
 
     if !report.turns.is_empty() {
@@ -1337,11 +1296,8 @@ pub(super) fn render_conversations_list<W: Write>(
     opts: &super::StatsOptions<'_>,
     out: &mut W,
 ) -> io::Result<()> {
-    let style = TextStyle {
-        no_color: opts.no_color,
-        ascii: opts.ascii,
-    };
-    let (no_color, ascii, sep) = (style.no_color, style.ascii, style.sep());
+    let (no_color, ascii) = (opts.no_color, opts.ascii);
+    let sep = if ascii { "|" } else { "·" };
     let mut header = format!(
         "agy-statusline conversations {sep} {} found {sep} {timezone}",
         items.len()
@@ -1577,6 +1533,8 @@ mod tests {
                 ModelStats {
                     model: "extremely-long-model-display-name-45-chars-xy".to_string(),
                     requests: 3,
+                    input_tokens: 300,
+                    cache_read_tokens: 1_000,
                     total_tokens: 1_500,
                     output_tokens: 200,
                     thinking_tokens: 50,
@@ -1610,6 +1568,12 @@ mod tests {
         let hdr_col = lines[hdr_idx].find(" Turns").unwrap();
         let row1_col = lines[hdr_idx + 1].find("     3").unwrap();
         let row2_col = lines[hdr_idx + 2].find("     1").unwrap();
+        assert!(lines[hdr_idx].contains("Cache Hit"), "{}", lines[hdr_idx]);
+        assert!(
+            lines[hdr_idx + 1].contains("76.9%"),
+            "{}",
+            lines[hdr_idx + 1]
+        );
         assert_eq!(
             lines[hdr_idx][..hdr_col].width(),
             lines[hdr_idx + 1][..row1_col].width()

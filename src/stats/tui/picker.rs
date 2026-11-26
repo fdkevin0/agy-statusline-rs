@@ -6,7 +6,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
@@ -14,8 +14,8 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::{
-    compute_header_hits, render_table_with_scrollbar, right_cell, ClickRegions, HeaderHits,
-    Palette, SpanBar, TableChrome, TableHit,
+    compute_header_hits, render_footer_bar, render_table_with_scrollbar, right_cell,
+    sort_header_cell, ClickRegions, HeaderHits, Palette, SpanBar, TableChrome, TableHit,
 };
 use crate::stats::metric::{ConversationSort, ConversationSortField, SortDir};
 use crate::stats::query::{filter_and_rank_conversations, SourceFilter};
@@ -530,7 +530,7 @@ impl PickerScreen {
         let src_badge = (self.source_filter != SourceFilter::All)
             .then(|| format!("[Src:{}]", self.source_filter.label()));
         if !query_val.is_empty() {
-            let ellipsis = if pal.ascii { "..." } else { "…" };
+            let ellipsis = pal.ellipsis();
             let clear_label = "(Esc clear)";
             let reserved =
                 3 + 2 + clear_label.len() + src_badge.as_ref().map_or(0, |s| 2 + s.len());
@@ -592,7 +592,7 @@ impl PickerScreen {
         let show_info = inner_w >= 58;
         let show_sub_col = inner_w >= 92;
         let show_src_col = self.has_cli && self.has_desktop && inner_w >= 98;
-        let ellipsis = if pal.ascii { "..." } else { "…" };
+        let ellipsis = pal.ellipsis();
         let active_mark = if pal.ascii { "*" } else { "●" };
 
         let mut cols = vec![
@@ -624,29 +624,16 @@ impl PickerScreen {
         let hdr_cells: Vec<Cell<'static>> = cols
             .iter()
             .map(|&col| {
-                let active = self.sort.field == col;
-                let label = if active {
-                    format!("{} {}", col.header_label(), self.sort.dir.arrow(pal.ascii))
-                } else {
-                    col.header_label().to_string()
-                };
-                let style = if active {
-                    if pal.no_color {
-                        Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                    } else {
-                        pal.bold(Color::Cyan)
-                    }
-                } else {
-                    pal.dim()
-                };
-                if matches!(
-                    col,
-                    ConversationSortField::Steps | ConversationSortField::Subagents
-                ) {
-                    right_cell(label, style)
-                } else {
-                    Cell::from(label).style(style)
-                }
+                sort_header_cell(
+                    col.header_label(),
+                    self.sort.field == col,
+                    self.sort.dir,
+                    matches!(
+                        col,
+                        ConversationSortField::Steps | ConversationSortField::Subagents
+                    ),
+                    pal,
+                )
             })
             .collect();
         let chrome = TableChrome {
@@ -736,7 +723,7 @@ impl PickerScreen {
             .header(Row::new(hdr_cells).style(pal.dim()))
             .column_spacing(1)
             .row_highlight_style(pal.selected_row(true))
-            .highlight_symbol(if pal.ascii { "> " } else { "▸ " });
+            .highlight_symbol(pal.highlight_symbol());
 
         let sb_area = Rect::new(
             outer_area.x,
@@ -762,49 +749,45 @@ impl PickerScreen {
         has_back: bool,
         pal: &Palette,
     ) -> ClickRegions<PickerClick> {
-        if let Some(msg) = &self.status_msg {
-            frame.render_widget(
-                Paragraph::new(Line::styled(format!(" {msg}"), pal.bold(Color::Yellow))),
-                area,
-            );
-            return ClickRegions::default();
-        }
-
-        let inset = Rect::new(
-            area.x.saturating_add(1),
-            area.y,
-            area.width.saturating_sub(1),
-            area.height,
-        );
-        let sep = format!(" {} ", pal.sep());
-        let dim = pal.dim();
-        let mut bar = SpanBar::new(inset);
-
-        if self.searching {
-            let nav = if pal.ascii { "Up/Dn" } else { "↑↓" };
-            let _ = bar.push(format!("Type to search{sep}{nav} Select"), dim);
-            let _ = bar.push_sep_click(&sep, dim, "Enter Open", dim, PickerClick::OpenSelected);
-            let _ = bar.push_sep_click(&sep, dim, "Esc Done", dim, PickerClick::ExitSearch);
-        } else {
-            let nav = if pal.ascii { "j/k" } else { "↑↓/jk" };
-            let _ = bar.push(format!("{nav} Select"), dim);
-            let _ = bar.push_sep_click(&sep, dim, "/ Search", dim, PickerClick::StartSearch);
-            let _ = bar.push_sep_click(&sep, dim, "Enter Open", dim, PickerClick::OpenSelected);
-            let _ = bar.push_sep_click(&sep, dim, "s/S Sort", dim, PickerClick::CycleSortField);
-            let _ = bar.push_sep_click(&sep, dim, "a Subagents", dim, PickerClick::ToggleSubagents);
-            if self.has_cli && self.has_desktop {
-                let _ = bar.push_sep_click(&sep, dim, "f Src", dim, PickerClick::CycleSource);
-            }
-            let _ = bar.push_sep_click(&sep, dim, "r Reload", dim, PickerClick::Reload);
-            if has_back {
-                let _ = bar.push_sep_click(&sep, dim, "b Back", dim, PickerClick::Back);
-            }
-            let _ = bar.push_sep_click(&sep, dim, "q Quit", dim, PickerClick::Quit);
-        }
-
-        let (line, hits) = bar.finish();
-        frame.render_widget(Paragraph::new(line), inset);
-        hits
+        render_footer_bar(
+            frame,
+            area,
+            self.status_msg.as_deref(),
+            pal,
+            |bar, sep, dim| {
+                if self.searching {
+                    let nav = if pal.ascii { "Up/Dn" } else { "↑↓" };
+                    let _ = bar.push(format!("Type to search{sep}{nav} Select"), dim);
+                    let _ =
+                        bar.push_sep_click(sep, dim, "Enter Open", dim, PickerClick::OpenSelected);
+                    let _ = bar.push_sep_click(sep, dim, "Esc Done", dim, PickerClick::ExitSearch);
+                } else {
+                    let nav = if pal.ascii { "j/k" } else { "↑↓/jk" };
+                    let _ = bar.push(format!("{nav} Select"), dim);
+                    let _ = bar.push_sep_click(sep, dim, "/ Search", dim, PickerClick::StartSearch);
+                    let _ =
+                        bar.push_sep_click(sep, dim, "Enter Open", dim, PickerClick::OpenSelected);
+                    let _ =
+                        bar.push_sep_click(sep, dim, "s/S Sort", dim, PickerClick::CycleSortField);
+                    let _ = bar.push_sep_click(
+                        sep,
+                        dim,
+                        "a Subagents",
+                        dim,
+                        PickerClick::ToggleSubagents,
+                    );
+                    if self.has_cli && self.has_desktop {
+                        let _ =
+                            bar.push_sep_click(sep, dim, "f Src", dim, PickerClick::CycleSource);
+                    }
+                    let _ = bar.push_sep_click(sep, dim, "r Reload", dim, PickerClick::Reload);
+                    if has_back {
+                        let _ = bar.push_sep_click(sep, dim, "b Back", dim, PickerClick::Back);
+                    }
+                    let _ = bar.push_sep_click(sep, dim, "q Quit", dim, PickerClick::Quit);
+                }
+            },
+        )
     }
 }
 

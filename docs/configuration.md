@@ -1,109 +1,157 @@
 # Configuration & Reference
 
-Requires **Antigravity CLI `>= 1.5.15`** (and **Antigravity Desktop `>= 2.35.0`** when aggregating desktop `~/.gemini/antigravity` sessions).
+Requires **Antigravity CLI `>= 1.5.15`** (and **Antigravity Desktop `>= 2.35.0`** to aggregate desktop `~/.gemini/antigravity` sessions).
 
-`agy-statusline` stores its layout configuration at `$XDG_CONFIG_HOME/agy-statusline/config.json` (default: `<home>/.config/agy-statusline/config.json`, resolving `<home>` from `HOME` or `USERPROFILE` on Windows). AGY CLI data paths honor `$ANTIGRAVITY_CLI_HOME`, defaulting to `<home>/.gemini/antigravity-cli`; `stats` also scans desktop `<home>/.gemini/antigravity` and any comma-separated roots in `$ANTIGRAVITY_DATA_DIR`. Rendering respects the [`NO_COLOR`](https://no-color.org/) environment variable.
+**Sections:** [CLI Commands](#cli-commands) · [Presets & Settings](#presets--settings) · [Widgets (33)](#widgets-33) · [Styles, Themes & Compaction](#styles-themes--compaction) · [Interactive TUI Controls](#interactive-tui-controls) · [Pricing, Storage & Cache Files](#pricing-storage--cache-files)
+
+## Environment Variables
+
+| Variable | Purpose | Default |
+| :--- | :--- | :--- |
+| `XDG_CONFIG_HOME` | Root for `agy-statusline/config.json` | `<home>/.config` |
+| `XDG_CACHE_HOME` | Root for `agy-statusline/` cache files | `<home>/.cache` |
+| `ANTIGRAVITY_CLI_HOME` | AGY CLI data & `settings.json` directory | `<home>/.gemini/antigravity-cli` |
+| `ANTIGRAVITY_DATA_DIR` | Optional comma-separated extra AGY roots scanned by `stats`, `conversations` & `doctor` (also probes `<dir>/daemon` for Hub RPC) | *(unset)* |
+| `NO_COLOR` | Disables ANSI color escapes when non-empty | *(unset)* |
+
+`<home>` resolves from `HOME` (or `USERPROFILE` on Windows).
 
 ## CLI Commands
 
-- `agy-statusline [--preset <full|powerline|minimal|addon>|--full]` — Render statusline from `stdin` JSON (prints help when run on an empty interactive TTY).
-- `agy-statusline config` — Launch the 3-pane `ratatui` TUI editor.
-- `agy-statusline config --preset <name>` — Apply a built-in preset non-interactively.
-- `agy-statusline config --show` — Print active JSON configuration.
-- `agy-statusline config --reset` — Remove `config.json` and restore defaults.
-- `agy-statusline apply [--yes|-y] [--stack|--replace]` — Write `statusLine` into `<agy_cli_dir>/settings.json` (`$ANTIGRAVITY_CLI_HOME` or `~/.gemini/antigravity-cli/settings.json`) while preserving existing custom keys such as `padding` and recording the invoked launcher/symlink path rather than dereferencing symlinks.
-- `agy-statusline apply --disable` — Set `statusLine.enabled = false` in `settings.json` and retain your hook configuration. Both `apply` commands preserve existing Unix file permissions.
-- `agy-statusline doctor` — Report whether the layout config loaded, is missing, is invalid, or could not be read. Probe `agy --version`, `git`, and `curl` on `PATH`, inspect AGY `settings.json` wiring, all discovered AGY roots' `conversations/*.db` counts, `models_dev_pricing.json` cache status, live loopback Hub RPC / cached `quota_snapshot.json` multi-pool quota, tier, and AI credits, and `NO_COLOR`, and render a sample preview.
-- `agy-statusline stats [<CONVERSATION_ID>] [--all] [--days <N>] [--metric <METRIC>] [--tui|--plain|--json] [--ascii]` — Inspect local AGY CLI (`$ANTIGRAVITY_CLI_HOME` / `~/.gemini/antigravity-cli`), desktop (`~/.gemini/antigravity`), and optional `$ANTIGRAVITY_DATA_DIR` SQLite sessions for daily & per-model usage in the host local timezone (backed by a persistent per-DB scan cache `stats_scan_cache.json` and excluding cloned fork rows). Also surfaces live loopback Hub RPC / cached multi-pool quota (`Gemini`, `Argon`, `Carbon`, `Claude/3P`), AI credits, tier, and retry (`429`/`503`) / compaction / error diagnostics. Launches an interactive `ratatui` TUI automatically on a TTY (or outputs a static report when piped or passed `--plain`; `--json` outputs machine-readable JSON). Pass a `<CONVERSATION_ID>` (full UUID or unique `>=4`-char hex prefix) to inspect a single conversation including descendant subagents, peak context, mid-session cache misses, retry/compaction diagnostics, per-model cache hit rates, and turn-by-turn breakdown (`--all` prints all turns statically instead of only the latest 20; `--json` outputs `ConversationStatsReport`). Global `stats` supports selectable metrics (`total`, `cost`, `io`, `output`, `turns`) and remembers the last interactively selected metric in `config.json` (`stats_metric`). `NO_COLOR` disables ANSI escapes.
-- `agy-statusline conversations [QUERY] [--subagents] [--limit <N>] [--tui|--plain|--json] [--ascii]` *(aliases: `conv`, `sessions`)* — Browse and search historical conversations in a full-screen interactive picker on a TTY (without scanning all conversation DBs upfront); press `Enter` to open per-turn stats and `b` / `Esc` to return to the list. Pass an optional `[QUERY]` to pre-filter by title, workspace, agent name, or ID; pass `--plain`, `--limit <N>`, `--json`, or pipe stdout for non-interactive listing.
-- `agy-statusline pricing [status|sync [--if-stale]]` — Inspect the local `models.dev` pricing cache status (`status`, default), or refresh cached pricing from `models.dev` (`sync`, or `sync --if-stale` to fetch only when missing or past the 24h TTL).
-- `agy-statusline version | --version | -V` — Print version information (`agy-statusline <version>`).
+| Command | Flags & Notes |
+| :--- | :--- |
+| `agy-statusline` | Render statusline from `stdin` JSON (prints help on an empty TTY). Always exits `0` on `stdin` runs to avoid tripping AGY's circuit breaker. Flags: `--preset <full\|powerline\|minimal\|addon>` or `--full`. |
+| `agy-statusline config` | Launch 3-pane interactive TUI editor. Non-interactive flags (mutually exclusive): `--show`, `--reset`, `--preset <NAME>`. |
+| `agy-statusline apply` | Register `statusLine` in `<agy_cli_dir>/settings.json`, preserving existing keys (e.g. `padding`), Unix file mode, and invoked launcher symlink. Flags: `-y`/`--yes`, `--stack`/`--replace`, or `--disable` (sets `enabled = false`). |
+| `agy-statusline doctor` | Inspect `config.json`, `NO_COLOR`, `agy --version`, `git`/`curl`, AGY hook wiring, all AGY roots' `conversations/*.db` counts, pricing cache, live Hub RPC / cached `quota_snapshot.json` pools & AI credits, and render a live sample preview. |
+| `agy-statusline stats [<CONVERSATION_ID>]` | Local CLI + Desktop usage dashboard in host local timezone (interactive TUI on a TTY). Flags: `--days <N>` (`>= 1`, global only), `--metric <total\|cost\|io\|output\|turns>` (non-JSON), `--all` (all turns statically for a single conversation), `--tui\|--plain\|--json`, `--ascii`. `<CONVERSATION_ID>` accepts a full UUID or unique `>=4`-char hex prefix. |
+| `agy-statusline conversations [QUERY]` | *(Aliases: `conv`, `sessions`)* Full-screen fuzzy conversation browser (interactive TUI on a TTY). Flags: `--subagents`, `--limit <N>` (`>= 1`, non-TUI), `--tui\|--plain\|--json`, `--ascii`. |
+| `agy-statusline pricing [status\|sync]` | Show pricing cache status (`status`, default) or refresh from `models.dev` (`sync`, or `sync --if-stale` to refresh only when missing/expired past 24h TTL). |
+| `agy-statusline version` | Print `agy-statusline <version>` (also `--version` / `-V`). |
 
-## Usage Pricing
+## Presets & Settings
 
-Native AGY costs take precedence. For estimates, the CLI uses the `models.dev` catalog cached for 24 hours. `stats` refreshes stale rates before reporting, and the statusline can refresh them in the background.
+### Built-in Presets
 
-Catalog lookup checks exact model names case-insensitively, then names with normalized punctuation and spacing, then the longest matching substring. Within each exact-match stage, the model ID precedes the display name, and canonical provider rates take precedence over reseller punctuation variants. When prompt context tokens exceed a `models.dev` context-length tier threshold (`tiers` / `context_over_200k`), the corresponding tier rates are applied. When direct matching finds no rate for an Orchestrator name, explicit post-`orchestrator` codenames are resolved dynamically against canonical unprefixed `gemini-<major>[.<minor>]-<codename>` catalog entries (honoring any explicit pre-`orchestrator` generation or selecting the latest generation, without cross-tier fallback). In `stats`, turns with generic display names can additionally inherit a rate when the same `response_model` unambiguously resolves to a single catalog entry elsewhere in the dataset.
+| Preset | Style / Theme | Stack | Rows |
+| :--- | :--- | :---: | :--- |
+| `full` *(default)* | `Plain` / `Default` | Replace | **R1:** `state`, `mode`, `model`, `directory`, `vcs`, `worktree`, `queue`, `vim`, `battle`, `version`<br>**R2:** `ctx_bar`, `cache_hit`, `speed`, `cost`, `quota_5h`, `quota_weekly`, `subagents` |
+| `powerline` | `Powerline` / `Catppuccin` | Replace | **R1:** `state`, `mode`, `model`, `directory`, `vcs`<br>**R2:** `ctx_bar`, `cache_hit`, `speed`, `cost`, `quota_5h` |
+| `minimal` | `Plain` / `Default` | Replace | **R1:** `state`, `model`, `vcs`, `ctx_pct`, `cache_hit`, `speed` |
+| `addon` | `Pill` (`Space`) / `Default` | Stack | **R1:** `cache_hit`, `cache_read`, `speed`, `cost` |
 
-## Interactive TUI Controls
+### `config.json` Options
 
-- **Pan & Select**: `Tab` or left-click switches panes (`1. Layout Lines`, `2. Catalog`, `3. Style & AGY`); `↑↓←→` / mouse wheel navigates. Click `<` on the active setting (or right-click any setting row) to step backward.
-- **Move Mode**: Press `Enter` (or click a selected pill) to grab (`⇄`), move within or across `Line 1–3` with arrow keys or by clicking the destination pill/line, and press `Enter` (or click the grabbed pill / `Enter/Esc Drop`) to drop. Right-click a pill to remove it.
-- **Multi-Group Alignment**: Toggle `spacer` per line (or press `+` on `spacer` in `Catalog` for two spacers) to align `Left | Center | Right`.
-- **Live Preview**: Click the preview panel or press `w` to cycle `Auto` / `120col` / `72col`.
-- **Presets & Exit**: `1`–`4` apply presets; `s` saves `config.json` and updates AGY `settings.json`; `S` saves `config.json` only; `q` / `Esc` quits without saving. Footer actions (`Tab/Click Pane`, `1-4 Preset`, `w Width`, `s Save+Apply`, `q Quit`) are clickable.
-
-### Interactive Stats TUI (`agy-statusline stats`)
-
-- **Metrics & Daily Cache Rate**: Press `1`–`5` (or `[` / `]`, or click top-bar metric pills) to switch presets (`Total`, `Cost ($)`, `In+Out`, `Output`, `Turns`). Both `1. Daily Usage` (with window total in the footer) and `3. Models` display color-coded `Cache%` (green `>=80%`, yellow `50%–79%`, red `<50%`). The last selected metric is saved to `config.json` (`stats_metric`) immediately on change.
-- **Range, Sorting & Filtering**: `t` / `T` or clicking top-bar range pills (`7d` / `14d` / `30d` / `90d` / `All`) switches time windows; `s` or clicking the `Date` / `Cache%` / metric column headers (or the `1. Daily Usage` title bar) changes daily sort (`Date ↓`, `Date ↑`, `Value ↓`, `Cache% ↑`); `z` toggles zero-usage calendar gaps; `f` (or clicking `Src:...`) filters `All` / `CLI` / `Desktop`; `g` toggles the 20-week activity heatmap (click any active heatmap cell to jump to that day).
-- **Drill-Down, Mouse, Conversations & Refresh**: `↑↓` / `j` / `k` / `PgUp` / `PgDn` / `Home` / `End` or mouse wheel/click navigates daily rows or models; `Tab` switches between `1. Daily Usage` and `3. Models`; `v` (or clicking the `3. Models` title bar) toggles `Selected Day` vs `Window`; `Enter` (or clicking the selected model again) cross-filters the dashboard (`Esc` or clicking the yellow `× <model>` pill clears it); `c` (or clicking footer controls such as `c Convs`, `r Refresh`, `q Quit`) switches to the full-screen **Conversations** browser (`/` or click search bar for fuzzy search with cursor editing, click `(Esc clear)` / `[Src:...]` / footer actions, wheel/click to select, click selected row or `Enter` to inspect, `b` / `Esc` or click `b Back` to return).
-
-### Interactive Conversation TUI (`agy-statusline stats <CONVERSATION_ID>` / `conversations`)
-
-- **Turn Inspection, Clickable Sorting & Live Watch**: `↑↓` / `j` / `k` / `PgUp` / `PgDn` / `g` / `G` (`Home` / `End`) or mouse wheel/click browses every turn with live `2. Turn Detail` (timestamp, model/subagent, cost, tok/s, TTFT, prompt context, and token composition bar). Defaults to turn ascending (`# ↑`); click any column header (`#`, `Time`, `Model`, `Ctx`, `Input`, `Cache`, `Out`, `Hit%`, `tok/s`, `TTFT`, `Cost`) to sort by that field or toggle `↑`/`↓` (`s` cycles columns, `S` or clicking the header sort pill flips direction). Both the conversation list and detail view watch local SQLite `.db` / `-wal` metadata (`● Live`) for automatic updates (following the tail in `# ↑` mode while pinning mid-list inspection), and remember the last selected sort order across sessions and restarts in `config.json` (`conv_turn_sort`, `conv_list_sort`).
-- **Switch Conversations, Anomaly & Subagent Filtering**: Press `c` (or click footer `c Convs`) to switch to the full-screen **Conversations** browser (or launch `agy-statusline conversations` / `conv` / `sessions` directly) with fuzzy relevance ranking (`/` live search, click any column header or press `s` / `S` to sort, `a` include subagents, `f` source filter, `r` reload list, `Enter` or re-click selected row to open, click `b Back` to return); `m` (or clicking the red `N miss` KPI badge / `Misses` pill) filters to mid-session cache misses (exact match with the KPI miss count); the KPI strip also surfaces compaction checkpoints and retry anomalies (`429`/`503`/delay) when present; `Tab` switches between `1. Turns` and `3. Models / Subagents`; `v` (or clicking the pane title bar) toggles `Models` vs `Subagents`; `Enter` (or clicking the selected row again) cross-filters turns (`Esc` or clicking active `×` filter pills clears filters first, then returns/quits); footer controls (`c Convs`, `m Misses`, `v Models/Sub`, `Tab Pane`, `r Refresh`, `b Back`, `q Quit`) are clickable.
-
-## Presets & Defaults
-
-- **`full`** *(default, replaces AGY's built-in bar)*: 2-row `Plain` layout (`Default` theme)
-  - **Row 1**: `state`, `mode`, `model`, `directory`, `vcs`, `worktree`, `queue`, `vim`, `battle`, `version`
-  - **Row 2**: `ctx_bar`, `cache_hit`, `speed`, `cost`, `quota_5h`, `quota_weekly`, `subagents`
-- **`powerline`**: 2-row `Powerline` layout (`Catppuccin` theme) — Row 1: `state`, `mode`, `model`, `directory`, `vcs`; Row 2: `ctx_bar`, `cache_hit`, `speed`, `cost`, `quota_5h`.
-- **`minimal`**: 1-row `Plain` layout — `state`, `model`, `vcs`, `ctx_pct`, `cache_hit`, `speed`.
-- **`addon`**: 1-row `Pill` metrics bar stacked under AGY's built-in statusline (`stack_with_default: true`) — `cache_hit`, `cache_read`, `speed`, `cost`.
-- **Defaults**: `bar_length: 8` (`4..=40`), `speed_warn_threshold: 35.0` tok/s, `style: "plain"`, `theme: "default"`, `separator: "dot"`, `glyph_mode: "unicode"`, `speed_mode: "weighted"`, `responsive: true`, `smart_hide: true`, `show_git_diff: true`, `ctx_remaining: false`.
+| Key | Default | Values / Range |
+| :--- | :--- | :--- |
+| `rows` | *(preset)* | Up to 3 rows (`MAX_ROWS = 3`) of widget IDs |
+| `style` | `"plain"` | `plain`, `pill`, `powerline` |
+| `theme` | `"default"` | `default`, `nord`, `catppuccin`, `tokyo_night`, `gruvbox`, `light`, `mono` |
+| `separator` | `"dot"` | `dot` (`·`), `pipe` (`│`), `slash` (`╱`), `space` (used in `Plain`, `Mono`, `NO_COLOR`) |
+| `glyph_mode` | `"unicode"` | `unicode`, `nerd`, `ascii` |
+| `speed_mode` | `"weighted"` | `weighted` (5-turn token-weighted), `median` (up to 9 turns), `instant`, `e2e` (+TTFT) |
+| `bar_length` | `8` | `4..=40` columns (`ctx_bar`) |
+| `speed_warn_threshold` | `35.0` | `0.0..=200.0` tok/s (TUI step `5`; `0` = `OFF`) |
+| `ctx_remaining` | `false` | Show remaining `%` (`rem`) instead of used `%` (`ctx`) |
+| `smart_hide` | `true` | Hide zero/absent/inactive optional widgets |
+| `show_git_diff` | `true` | Show cached `+ins -del` diff counts on `vcs` |
+| `responsive` | `true` | Compact and priority-drop segments to fit terminal width |
+| `stack_with_default` | `false` | Stack below AGY's built-in statusline (`true`) or replace it (`false`) |
+| `stats_metric`, `conv_turn_sort`, `conv_list_sort` | *(omitted)* | Persisted `stats` / `conversations` TUI preferences (preserved across preset changes) |
 
 ## Widgets (33)
 
-Every widget reads from AGY's `stdin` JSON payload (`StatuslinePayload`), local SQLite `conversations/<conversation_id>.db` protobuf metadata (`gen_metadata`), or pure-Rust `.git` probing. `Prio` is the responsive drop priority (`5` = anchor kept last, `1` = auxiliary dropped first):
+`Prio` is the responsive drop priority (`5` = anchor kept last, `1` = auxiliary dropped first).
 
-| ID | Prio | Description | Data Source & Calculation |
+| ID | Prio | Description | Source & Behavior |
 | :--- | :---: | :--- | :--- |
-| `state` | 5 | Agent state | `tool_confirmation_pending` (takes precedence as `CONFIRM`) -> `agent_state` (`idle` -> `READY`, `thinking` -> `THINKING`, `working` -> `WORKING`, `tool_use` -> `TOOL`, `reviewing` -> `REVIEW`, `authenticating` -> `AUTH`, `initializing` -> `INIT`, `completed` -> `DONE`, `error` -> `ERROR`, fallback uppercase) |
-| `model` | 4 | Model + effort | `model.display_name` + `model.effort`; appends effort only when not already matched structurally in a trailing group or suffix (including `x`/`extra` equivalence) |
-| `directory` | 2 | Workspace dir | Basename of `workspace.project_dir`, falling back to `workspace.current_dir`, then top-level `cwd` |
-| `vcs` | 3 | VCS branch + diff | `vcs.branch`, falling back to `vcs.client` (non-Git VCS such as CitC/Perforce), then pure-Rust `.git/HEAD` probe; dirty `*` from `vcs.dirty` or non-zero diff; optional bounded/cached `+ins -del` from `git diff --numstat` when `show_git_diff` is enabled |
-| `worktree` | 2 | Git worktree | Probed from `.git` file `gitdir:` pointer (supports relative `gitdir:` paths); renders `wt:<name>` inside linked worktrees (`wt:main` or hidden when `smart_hide` is enabled) |
-| `ctx_bar` | 4 | Context progress bar | Effective limit prefers SQLite `max_context_tokens` (`1 -> 9 -> 10 -> 4`) over `context_window.context_window_size`; percentage computed as `current_tokens / limit * 100` (using `current_usage` sum or SQLite `estimated_tokens_used` `1 -> 9 -> 10 -> 1`, else `context_window.used_percentage`). Displays `(current/limit)` (or `(remaining/limit)` when `ctx_remaining` is enabled, falling back to `(limit)` if current tokens are absent); visual bar clamps `0..=100%` while numeric `%` displays `>100%` overflow |
-| `ctx_pct` | 4 | Context % only | Same context calculation as `ctx_bar`; supports `ctx_remaining` (`100 - used` as `rem` vs `ctx`) and `>100%` overflow |
-| `ctx_tokens` | 2 | Context tokens | Renders `current/limit` (from `current_usage` / SQLite `estimated_tokens_used` and effective limit) or cumulative `context_window.total_input_tokens + total_output_tokens`, formatted with `K` (`1,000..999,500`, tenth-K below `10K`), `M` (`999,500..999,500,000`), and `B` (`>= 999,500,000`) symmetric boundary promotion (`999_500 -> 1M`, `999_500_000 -> 1B`) |
-| `cache_hit` | 3 | Cache hit % | From `context_window.current_usage`: `cache_read_input_tokens / (input_tokens + cache_read_input_tokens + cache_creation_input_tokens) * 100`; warns (`< 50%`) / alerts (`< 20%`) when context `>= 10K` tokens |
-| `cache_read` | 1 | Cache read tokens | `context_window.current_usage.cache_read_input_tokens` formatted with `K` / `M` / `B` symmetric boundary promotion |
-| `speed` | 3 | Output speed | From SQLite `gen_metadata` (`ORDER BY idx DESC LIMIT 9`, excluding foreign forked rows, valid turns with decode duration `>= 0.01s` and `< 10,000 tok/s`): `Weighted 5t`, `Median`, `Instant`, or `E2E (+TTFT)`; appends compact retry anomaly badge (`! 429`, `! 429×2`, `! 503`, etc.) when recent turns hit retries |
-| `ttft` | 1 | First token latency | Latest turn time-to-first-token extracted from SQLite `gen_metadata` (`1 -> 11`); hidden when absent if `smart_hide` is enabled |
-| `thinking` | 1 | Thinking tokens | Latest turn thinking output tokens extracted from SQLite `gen_metadata` (`1 -> 4 -> 9`); hidden when absent/zero if `smart_hide` is enabled |
-| `cost` | 3 | Session cost | Prefers payload `cost.total_usd` (with `(sub $...)` when `cost.subagent_usd >= 0.01`); otherwise sums native turn costs or cached `models.dev` rates across the active conversation DB and any descendant subagent DBs linked in `conversation_summaries.db`, rendering `(sub $...)` when subagent spend is `>= $0.01`, and `(N unpriced)` / `(sub $..., N unpriced)` for partial coverage |
-| `mode` | 3 | Cycle mode | `cycle_mode` uppercased (`PLAN` / `AUTO` / `EDIT`, etc.), plus `>200K` badge when `exceeds_200k_tokens` is true |
-| `quota_5h` | 4 | 5h quota + pace | Canonical JSON ID `"quota_5h"`; selects short-window (`<24h`) non-`disabled` bucket from `quota` (or fresh `<= 6h` `quota_snapshot.json` fallback) via model token-affinity scoring; supports sub-1% precision, Proto3 `0%` recovery, burn-rate depletion ETA (`!<eta>` / `!`), `CreditSeverity` (`<= 50` warn, `<= 0` critical), and standalone `ai_credits` fallback; hidden when absent if `smart_hide` is enabled |
-| `quota_weekly` | 3 | Weekly quota | Selects multi-day (`>=24h`) non-`disabled` bucket from `quota` (or fresh `<= 6h` `quota_snapshot.json` fallback) via token-affinity scoring; dynamic qualifier/window labeling, burn-rate depletion ETA, `CreditSeverity`, and standalone `ai_credits` fallback; hidden when absent if `smart_hide` is enabled |
-| `artifacts` | 1 | Artifact count | `artifact_count` rendered as `art <n>`; hidden when `0` if `smart_hide` is enabled |
-| `subagents` | 1 | Subagent count | Counts entries in `subagents` array where `status != "completed"`; when exactly 1 active subagent has a `role` or `name`, renders `sub 1 (<label>)` (capped at 20 cols); hidden when `0` if `smart_hide` is enabled |
-| `tasks` | 1 | Task count | `task_count` rendered as `tasks <n>`; hidden when `0` if `smart_hide` is enabled |
-| `queue` | 2 | Queued inputs | `pending_input_count` rendered as `queue <n>`; hidden when `0` if `smart_hide` is enabled |
-| `vim` | 2 | Vim mode | `vim.mode` uppercased as `vim <MODE>` (`NORMAL`, `INSERT`, `VISUAL`, `COMMAND`, etc.); hidden when absent if `smart_hide` is enabled |
-| `battle` | 1 | Battle mode | `battle.status` uppercased as `battle <STATUS>` (with optional `#<battle.focused_arm>`); hidden when absent if `smart_hide` is enabled |
-| `sandbox` | 1 | Sandbox badge | `sandbox.enabled` + `sandbox.allow_network`: `sandbox ON+net` when network is allowed, `sandbox ON` otherwise; hidden when `off` if `smart_hide` is enabled |
-| `version` | 1 | AGY version | `version` trimmed and prefixed with `v` unless already prefixed (`v1.5.16`); omitted when absent or empty |
-| `plan` | 1 | Plan tier | `plan_tier` trimmed (`Pro`, `Ultra`, etc.), enriched with cached Hub RPC Ultra multiplier (`Ultra 5x` / `Ultra 20x`) when available; omitted when absent or empty |
-| `account` | 1 | Account email | `email` trimmed (`alice@example.com`); compacts to local-part (`alice`) on narrow rows; omitted when absent or empty |
-| `title` | 2 | Conversation title | `conversation_title` whitespace-collapsed and truncated to 32 display columns (16 columns under responsive compaction); omitted when absent or empty |
-| `agent` | 2 | Active agent | `agent.name` whitespace-collapsed as `agent <name>`; omitted when absent or empty |
-| `product` | 1 | Product name | `product` trimmed (`Antigravity`); omitted when absent or empty |
-| `session` | 1 | Session ID | First 8 characters of `session_id` rendered as `sid:<prefix>`; omitted when absent or empty |
-| `transcript` | 1 | Transcript file | Basename of `transcript_path` rendered as `log:<filename>`; omitted when absent or empty |
-| `spacer` | 5 | Flex spacer | Layout primitive (no payload data); splits row into `Left | Right` or `Left | Center | Right` groups |
+| `state` | 5 | Agent state | `tool_confirmation_pending` -> `CONFIRM`; else `agent_state` (`READY`, `THINKING`, `WORKING`, `TOOL`, `REVIEW`, `AUTH`, `INIT`, `DONE`, `ERROR`, or uppercased fallback) |
+| `model` | 4 | Model + effort | `model.display_name` + `model.effort` (dedupes trailing effort suffixes and `x`/`extra` equivalence) |
+| `directory` | 2 | Workspace dir | Basename of `workspace.project_dir` -> `workspace.current_dir` -> `cwd` |
+| `vcs` | 3 | VCS branch + diff | `vcs.branch` -> `vcs.client` -> `.git/HEAD`; dirty `*`; optional cached `+ins -del` when `show_git_diff` is on |
+| `worktree` | 2 | Git worktree | `.git` `gitdir:` pointer -> `wt:<name>` (`wt:main` when `smart_hide: false`) |
+| `ctx_bar` | 4 | Context bar | Progress bar + `%` + `(current/limit)`; prefers SQLite `max_context_tokens` over payload size; bar clamps `0..=100%`, `%` shows overflow |
+| `ctx_pct` | 4 | Context % | Same context calculation without the bar (`ctx` or `rem`) |
+| `ctx_tokens` | 2 | Session tokens | `current/limit` or cumulative `total_input_tokens + total_output_tokens` (`K`/`M`/`B`) |
+| `cache_hit` | 3 | Cache hit % | `cache_read / (input + cache_read + cache_creation)`; warns `<50%` / alerts `<20%` when context `>= 10K` |
+| `cache_read` | 1 | Cache read tokens | `current_usage.cache_read_input_tokens` (`K`/`M`/`B`) |
+| `speed` | 3 | Output speed | SQLite `gen_metadata` (last 9 non-fork turns, `>= 0.01s`, `< 10,000 tok/s`) + recent retry badge (`! 429`, `! 503`, etc.) |
+| `ttft` | 1 | First token latency | Latest turn TTFT from SQLite `gen_metadata`; hidden when absent if `smart_hide` |
+| `thinking` | 1 | Thinking tokens | Latest turn thinking tokens from SQLite `gen_metadata`; hidden when absent/zero if `smart_hide` |
+| `cost` | 3 | Session cost | Payload `cost.total_usd`, else native/catalog estimate across active DB + descendant subagents; appends `(sub $...)` and `(N unpriced)` |
+| `mode` | 3 | Cycle mode | Uppercased `cycle_mode` (`PLAN`/`AUTO`/`EDIT`), plus `>200K` badge when `exceeds_200k_tokens` |
+| `quota_5h` | 4 | 5h quota + pace | Short-window (`<24h`) bucket from payload or `<=6h` `quota_snapshot.json`; model token-affinity matching, Proto3 `0%` recovery, burn-rate ETA (`!<eta>`/`!`), low/critical AI credits (`<=50` warn, `<=0` critical) |
+| `quota_weekly` | 3 | Weekly quota | Multi-day (`>=24h`) bucket with token-affinity matching, burn-rate ETA, and credit fallback |
+| `artifacts` | 1 | Artifact count | `art <n>`; hidden at `0` if `smart_hide` |
+| `subagents` | 1 | Active subagents | Non-completed `subagents` count (`sub <n>`, plus single active `(<label>)` up to 20 cols); hidden at `0` if `smart_hide` |
+| `tasks` | 1 | Task count | `tasks <n>`; hidden at `0` if `smart_hide` |
+| `queue` | 2 | Queued inputs | `queue <n>`; hidden at `0` if `smart_hide` |
+| `vim` | 2 | Vim mode | `vim <MODE>`; hidden when absent if `smart_hide` |
+| `battle` | 1 | Battle mode | `battle <STATUS>` (plus optional `#<focused_arm>`); hidden when absent if `smart_hide` |
+| `sandbox` | 1 | Sandbox status | `sandbox ON+net` / `sandbox ON` / `sandbox off`; hidden when off if `smart_hide` |
+| `version` | 1 | AGY version | `v<version>`; omitted when absent |
+| `plan` | 1 | Plan tier | `plan_tier` enriched with cached Hub RPC Ultra multiplier (`Ultra 5x` / `Ultra 20x`) |
+| `account` | 1 | Account email | `email` (compacts to local-part on narrow rows) |
+| `title` | 2 | Conversation title | `conversation_title` capped to 32 cols (16 cols under compaction) |
+| `agent` | 2 | Active agent | `agent <name>` |
+| `product` | 1 | Product name | `product` (`Antigravity`) |
+| `session` | 1 | Session ID | `sid:<first-8-chars>` |
+| `transcript` | 1 | Transcript file | `log:<filename>` |
+| `spacer` | 5 | Flex spacer | Layout primitive; 1 spacer aligns `Left \| Right`, 2 spacers align `Left \| Center \| Right` |
 
-## Styles, Themes, Glyphs & Data Sources
+## Styles, Themes & Compaction
 
-- **Styles**: `Plain`, `Pill` (256-color capsules, rounded in `Nerd` mode), `Powerline` (`` / `>` segments).
+- **Styles**: `Plain`, `Pill` (256-color capsules; rounded caps in `Nerd` mode), `Powerline` (`` / `>` segments).
 - **Themes**: `Default`, `Nord`, `Catppuccin`, `Tokyo Night`, `Gruvbox`, `Light`, `Mono`.
-- **Glyph Modes**: `Unicode` (default), `Nerd Font`, `ASCII` (pure 7-bit ASCII).
-- **Responsive Compaction**: When `responsive` is enabled and a row overflows terminal width, segments compact progressively before dropping lower-priority widgets: `vcs` diff strip -> `vcs` 20-col cap -> `subagents` label strip -> `cost` suffix strip (`(sub ...)`, `(N unpriced)`) -> `speed` retry anomaly strip -> `quota_*` reset/ETA/credit suffix strip -> `ctx_*` limit strip -> `ctx_bar` collapse to `%` -> `model` leading-word abbreviation (including parenthesized names such as `Orchestrator (Carbon) · high` -> `O (Carbon) · high`) -> `model` 20-col cap -> `account` `@domain` strip -> `title` 16-col cap.
-- **SQLite Sniffing & Direct Stats Scanning**: Statusline queries `$ANTIGRAVITY_CLI_HOME/conversations/<conversation_id>.db` (defaulting to `<home>/.gemini/antigravity-cli/conversations/<conversation_id>.db`) in read-only mode (guarded by a zero-lock 100-byte SQLite header readiness check and a 25ms `busy_timeout`) to extract `max_context_tokens` (`1 -> 9 -> 10 -> 4`), `estimated_tokens_used` (`1 -> 9 -> 10 -> 1`), output token decode speed (5-turn weighted average and up to 9-turn median, `>= 0.01s` and `< 10,000 tok/s`), thinking output tokens (`1 -> 4 -> 9`), TTFT (`1 -> 11`), and recent retry anomalies (`1 -> 17`), skipping foreign forked rows (`origin_cascade_id != conversation_id`). `agy-statusline stats` directly scans CLI and desktop `<home>/.gemini/antigravity` SQLite `conversations/*.db` files in parallel (with per-DB fingerprint caching in `stats_scan_cache.json` and fork exclusion), decoding `gen_metadata`, `steps.metadata`, `steps.step_type` (`17` errors, `23` compactions), and `trajectory_metadata_blob` with transitive Union-Find turn deduplication.
-- **Cache Files (`$XDG_CACHE_HOME/agy-statusline/`)**: Defaults to `<home>/.cache/agy-statusline/` (using `HOME` or `USERPROFILE`):
-  - `models_dev_pricing.json` / `models_dev_pricing.err` — 24h TTL auto-fetched `models.dev` pricing cache and fetch-failure backoff marker.
-  - `stats_scan_cache.json` — persistent per-DB unpriced SQLite scan cache for global `stats`, invalidated by DB/WAL file fingerprints while preserving dynamic pricing evaluation.
-  - `quota_snapshot.json` — atomic multi-pool quota, AI credits, Ultra tier, and per-bucket burn-rate ring-buffer snapshot shared across statusline, `stats`, and `doctor` (populated from stdin payloads and opportunistic loopback `daemon/hub_*.json` RPC probes in `stats`/`doctor`).
-  - `conv_cost_cache.json` — bounded LRU per-conversation cost cache invalidated by DB/WAL/pricing file fingerprints.
-  - `diff_*.txt` — short-TTL per-repository `git diff --numstat` cache files.
+- **Glyph Modes**: `Unicode`, `Nerd Font`, `ASCII`.
+- **Responsive Compaction Order** (applied before dropping lowest-priority widgets):
+  1. `vcs` diff strip -> 2. `vcs` 20-col cap -> 3. `subagents` label strip -> 4. `cost` suffix strip -> 5. `speed` retry strip -> 6. `quota_*` reset/ETA/credit suffix strip -> 7. `ctx_*` limit strip -> 8. `ctx_bar` collapse to `%` -> 9. `model` leading-word abbreviation -> 10. `model` 20-col cap -> 11. `account` `@domain` strip -> 12. `title` 16-col cap.
+
+## Interactive TUI Controls
+
+### Layout Configurator (`agy-statusline config`)
+
+| Action | Keyboard | Mouse |
+| :--- | :--- | :--- |
+| Switch panes / navigate | `Tab`, `Shift+Tab`, `↑↓←→` / `hjkl` | Left-click pane, scroll wheel |
+| Move Mode (Canvas) | `Enter` / `m` grab (`⇄`), arrows/`hjkl` move across Line 1–3, `Enter` / `Esc` drop (`[` / `]` swaps directly) | Click selected pill to grab, click target pill/line to move, click grabbed pill or `Enter/Esc Drop` to drop |
+| Add / remove widget | `Enter` / `Space` in Catalog (`+` adds 2nd `spacer`); `Space` / `Backspace` / `Delete` / `x` in Canvas | Left-click Catalog row; right-click Canvas pill to remove |
+| Adjust setting | `←→` / `hl` / `Space` / `Enter` in Settings | Left-click row (`+1`), click `<` or right-click row (`-1`) |
+| Presets, preview & exit | `1`–`4` presets, `w` preview width (`Auto`/`120col`/`72col`), `s` save+apply, `S`/`Ctrl+S` save only, `q`/`Esc`/`Ctrl+C` quit | Click preview box or footer actions |
+
+### Stats Dashboard (`agy-statusline stats`)
+
+| Action | Keyboard | Mouse |
+| :--- | :--- | :--- |
+| Switch metric (persisted) | `1`–`5`, `[` / `]` (`Total`, `Cost ($)`, `In+Out`, `Output`, `Turns`) | Click top-bar metric pills |
+| Range, sort, gaps, source, heatmap | `t`/`T` range, `s` sort (`Date ↓/↑`, `Value ↓`, `Cache% ↑`), `z` zero-day gaps, `f` source (`All`/`CLI`/`Desk`), `g` 20w heatmap | Click range pills (right-click compact range = prev), click column headers / `1. Daily Usage` title, click `Src:...`, click any heatmap cell to jump |
+| Navigate & cross-filter | `↑↓`/`jk`/`PgUp`/`PgDn`/`Home`/`End`, `Tab` pane, `v` (`Day` vs `Window`), `Enter` filter model, `Esc` clear/quit | Wheel/click rows, click `3. Models` title, re-click selected model to filter, click `× <model>` pill to clear |
+| Conversations, refresh & exit | `c` Conversations, `r` refresh, `q`/`Ctrl+C` quit | Click footer actions |
+
+### Conversations Browser & Detail (`conversations` / `stats <ID>`)
+
+Both screens watch local SQLite `.db` / `-wal` metadata (`● Live`) and persist sort orders (`conv_list_sort`, `conv_turn_sort`).
+
+| Screen | Action | Keyboard / Mouse |
+| :--- | :--- | :--- |
+| **Conversations** | Search & filter | `/` or click search bar (`Ctrl+N/P`/`↑↓` select while typing, `Enter` open, `Esc` exit search), click `(Esc clear)`, `a` subagents, `f` / click `[Src:...]` source |
+| **Conversations** | Sort, open & return | `s`/`S` or click any column header (`Modified`, `ID`, `Title`, `Workspace`, `Steps`, `Sub`, `Src`); `Enter` or re-click selected row to inspect; `r` reload; `b`/`Esc` back; `q` quit |
+| **Detail** | Sort & inspect turns | `↑↓`/`jk`/`PgUp`/`PgDn`/`g`/`G` or wheel/click; `s`/`S` or click any column header (`#`, `Time`, `Model`, `Ctx`, `Input`, `Cache`, `Out`, `Hit%`, `tok/s`, `TTFT`, `Cost`) or header sort pill (right-click cycles field); auto-follows tail in `# ↑` mode |
+| **Detail** | Filter & navigate | `m` or click `N miss` KPI badge / `Misses` pill; `Tab` switch to `3. Models / Subagents`; `v` or click title to toggle; `Enter` or re-click row to cross-filter; `Esc` or click `×` pills to clear; `c` Conversations; `r` refresh; `b` back; `q` quit |
+
+## Pricing, Storage & Cache Files
+
+- **Pricing Resolution**: Native AGY turn costs take precedence; otherwise estimates use the 24h `models.dev` catalog (`stats` refreshes stale rates before reporting; statusline refreshes in the background). Lookup order: case-insensitive exact match (ID before display name, canonical provider over reseller punctuation) -> normalized punctuation/spacing -> longest substring -> dynamic `orchestrator` codename matching -> unambiguous `response_model` inheritance in `stats`. Context-length tiers (`tiers` / `context_over_200k`) are applied when prompt tokens exceed the threshold.
+- **Read-Only SQLite & Fork Deduplication**: Statusline reads `$ANTIGRAVITY_CLI_HOME/conversations/<id>.db` read-only (zero-lock 100-byte header readiness check, 25ms `busy_timeout`), skipping foreign forked rows (`origin_cascade_id != conversation_id`). `stats` scans CLI and Desktop `conversations/*.db` in parallel with transitive Union-Find turn deduplication, decoding `gen_metadata`, `steps.metadata`, `steps.step_type` (`17` errors, `23` compactions), and `trajectory_metadata_blob`.
+- **Quota & Loopback Hub RPC**: Statusline hot path performs zero network I/O and persists stdin quota updates to `quota_snapshot.json` (with a 16-point per-bucket burn-rate ring buffer). `stats` and `doctor` opportunistically probe active local `daemon/hub_*.json` processes over `127.0.0.1` (`10s` fresh RPC TTL) for multi-pool quota, `GOOGLE_ONE_AI` credits, and Ultra `5x`/`20x` tier labels.
+
+### XDG Files
+
+| Path | Role |
+| :--- | :--- |
+| `$XDG_CONFIG_HOME/agy-statusline/config.json` | Layout rows, style/theme settings, and persisted `stats`/`conversations` TUI preferences |
+| `$XDG_CACHE_HOME/agy-statusline/models_dev_pricing.json` | 24h TTL cached `models.dev` rate catalog (`.err` marker records fetch failure backoff) |
+| `$XDG_CACHE_HOME/agy-statusline/stats_scan_cache.json` | Persistent per-DB unpriced SQLite scan cache for global `stats` (invalidated by DB/WAL fingerprints) |
+| `$XDG_CACHE_HOME/agy-statusline/quota_snapshot.json` | Atomic multi-pool quota, AI credits, Ultra tier, and burn-rate history snapshot |
+| `$XDG_CACHE_HOME/agy-statusline/conv_cost_cache.json` | Bounded LRU per-conversation cost cache for the statusline `cost` widget |
+| `$XDG_CACHE_HOME/agy-statusline/diff_*.txt` | Short-TTL per-repository `git diff --numstat` cache |

@@ -12,8 +12,9 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    compute_header_hits, render_table_with_scrollbar, right_cell, token_breakdown_lines,
-    ClickRegions, HeaderHits, Palette, SpanBar, TableChrome, TableHit,
+    compute_header_hits, render_footer_bar, render_table_with_scrollbar, right_cell,
+    sort_header_cell, token_breakdown_lines, ClickRegions, HeaderHits, Palette, SpanBar,
+    TableChrome, TableHit,
 };
 use crate::agy::db::compute_median;
 use crate::stats::metric::{
@@ -332,6 +333,31 @@ impl DetailScreen {
         self.misses_only || self.model_filter.is_some() || self.subagent_filter.is_some()
     }
 
+    fn clear_filters(&mut self) {
+        self.misses_only = false;
+        self.model_filter = None;
+        self.subagent_filter = None;
+        self.turn_idx = 0;
+        self.recompute_view();
+    }
+
+    fn toggle_right_tab(&mut self) {
+        if !self.report.subagents.is_empty() {
+            self.right_tab = match self.right_tab {
+                RightTab::Models => RightTab::Subagents,
+                RightTab::Subagents => RightTab::Models,
+            };
+            self.breakdown_idx = 0;
+        }
+    }
+
+    fn toggle_active_pane(&mut self) {
+        self.active_pane = match self.active_pane {
+            DetailPane::Turns => DetailPane::Breakdown,
+            DetailPane::Breakdown => DetailPane::Turns,
+        };
+    }
+
     fn breakdown_len(&self) -> usize {
         match self.right_tab {
             RightTab::Models => self.report.models.len(),
@@ -473,7 +499,6 @@ impl DetailScreen {
         }
 
         let page_size = self.turns_hit.data_rows.max(5);
-        let has_subs = !self.report.subagents.is_empty();
         let active_len = match self.active_pane {
             DetailPane::Turns => self.view.turn_indices.len(),
             DetailPane::Breakdown => self.breakdown_len(),
@@ -490,11 +515,7 @@ impl DetailScreen {
             KeyCode::Char('r') => return DetailAction::Refresh,
             KeyCode::Esc => {
                 if self.has_active_filters() {
-                    self.misses_only = false;
-                    self.model_filter = None;
-                    self.subagent_filter = None;
-                    self.turn_idx = 0;
-                    self.recompute_view();
+                    self.clear_filters();
                 } else {
                     return if has_back {
                         DetailAction::Back
@@ -503,15 +524,8 @@ impl DetailScreen {
                     };
                 }
             }
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.active_pane = match self.active_pane {
-                    DetailPane::Turns => DetailPane::Breakdown,
-                    DetailPane::Breakdown => DetailPane::Turns,
-                };
-            }
-            KeyCode::Char('s') => {
-                self.cycle_sort_field();
-            }
+            KeyCode::Tab | KeyCode::BackTab => self.toggle_active_pane(),
+            KeyCode::Char('s') => self.cycle_sort_field(),
             KeyCode::Char('S') => {
                 self.sort = self.sort.toggle_dir();
                 self.turn_idx = 0;
@@ -522,13 +536,7 @@ impl DetailScreen {
                 self.turn_idx = 0;
                 self.recompute_view();
             }
-            KeyCode::Char('v') if has_subs => {
-                self.right_tab = match self.right_tab {
-                    RightTab::Models => RightTab::Subagents,
-                    RightTab::Subagents => RightTab::Models,
-                };
-                self.breakdown_idx = 0;
-            }
+            KeyCode::Char('v') => self.toggle_right_tab(),
             KeyCode::Enter if self.active_pane == DetailPane::Breakdown => {
                 self.toggle_breakdown_filter();
             }
@@ -570,27 +578,9 @@ impl DetailScreen {
                 self.turn_idx = 0;
                 self.recompute_view();
             }
-            DetailClick::ClearAllFilters => {
-                self.misses_only = false;
-                self.model_filter = None;
-                self.subagent_filter = None;
-                self.turn_idx = 0;
-                self.recompute_view();
-            }
-            DetailClick::ToggleRightTab if !self.report.subagents.is_empty() => {
-                self.right_tab = match self.right_tab {
-                    RightTab::Models => RightTab::Subagents,
-                    RightTab::Subagents => RightTab::Models,
-                };
-                self.breakdown_idx = 0;
-            }
-            DetailClick::ToggleRightTab => {}
-            DetailClick::TogglePane => {
-                self.active_pane = match self.active_pane {
-                    DetailPane::Turns => DetailPane::Breakdown,
-                    DetailPane::Breakdown => DetailPane::Turns,
-                };
-            }
+            DetailClick::ClearAllFilters => self.clear_filters(),
+            DetailClick::ToggleRightTab => self.toggle_right_tab(),
+            DetailClick::TogglePane => self.toggle_active_pane(),
             DetailClick::OpenConversations => return DetailAction::OpenConversations,
             DetailClick::Refresh => return DetailAction::Refresh,
             DetailClick::Back if has_back => return DetailAction::Back,
@@ -658,11 +648,7 @@ impl DetailScreen {
                     }
                 } else if self.breakdown_hit.contains(pos) {
                     if mouse.row == self.breakdown_hit.pane.y && !self.report.subagents.is_empty() {
-                        self.right_tab = match self.right_tab {
-                            RightTab::Models => RightTab::Subagents,
-                            RightTab::Subagents => RightTab::Models,
-                        };
-                        self.breakdown_idx = 0;
+                        self.toggle_right_tab();
                     } else {
                         let was_active = self.active_pane == DetailPane::Breakdown;
                         self.active_pane = DetailPane::Breakdown;
@@ -774,16 +760,9 @@ impl DetailScreen {
             };
             controls.push((" Misses ".to_string(), style, DetailClick::ToggleMisses));
         }
-        let badge_style = if pal.no_color {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-                .bg(Color::Yellow)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        };
+        let badge_style = pal.filter_badge();
         let close = if pal.ascii { "x" } else { "×" };
-        let ellipsis = if pal.ascii { "..." } else { "…" };
+        let ellipsis = pal.ellipsis();
         if let Some(model) = self.model_filter.as_deref() {
             controls.push((
                 format!(" {close} {} ", truncate_to_width(model, 18, ellipsis)),
@@ -867,44 +846,9 @@ impl DetailScreen {
         };
 
         let block = pal.pane_block(title, false);
-        let inner = block.inner(area);
-        let inner_w = usize::from(inner.width);
         let sep_str = format!(" {sep} ");
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut hits = ClickRegions::default();
-        let mut used = 0usize;
-        let mut push_segment =
-            |label: &str, value: String, value_style: Style, click: Option<DetailClick>| {
-                let prefix = if spans.is_empty() {
-                    " "
-                } else {
-                    sep_str.as_str()
-                };
-                let prefix_w = prefix.width();
-                let label_w = label.width();
-                let val_w = value.width();
-                let seg_w = prefix_w + label_w + val_w;
-                if !spans.is_empty() && used + seg_w > inner_w {
-                    return;
-                }
-                if let Some(action) = click {
-                    if inner.height > 0 {
-                        let x = inner.x.saturating_add((used + prefix_w) as u16);
-                        hits.push(Rect::new(x, inner.y, (label_w + val_w) as u16, 1), action);
-                    }
-                }
-                spans.push(Span::styled(
-                    prefix.to_string(),
-                    if spans.is_empty() {
-                        Style::default()
-                    } else {
-                        pal.dim()
-                    },
-                ));
-                spans.push(Span::styled(label.to_string(), pal.dim()));
-                spans.push(Span::styled(value, value_style));
-                used += seg_w;
-            };
+        let dim = pal.dim();
+        let mut bar = SpanBar::new(block.inner(area));
 
         let s = &self.view.summary;
         let turns_val = if filtered {
@@ -912,25 +856,45 @@ impl DetailScreen {
         } else {
             s.requests.to_string()
         };
-        push_segment("Turns ", turns_val, pal.bold(Color::White), None);
-        push_segment(
+        bar.push_sep_kv(
+            &sep_str,
+            dim,
+            "Turns ",
+            turns_val,
+            pal.bold(Color::White),
+            None,
+        );
+        bar.push_sep_kv(
+            &sep_str,
+            dim,
             "Total ",
             fmt_tok(s.total_tokens),
             pal.bold(Color::Cyan),
             None,
         );
         let hit_pct = s.cache_hit_pct();
-        push_segment(
+        bar.push_sep_kv(
+            &sep_str,
+            dim,
             "Hit ",
             format_pct(hit_pct),
             pal.cache_hit_style(hit_pct).add_modifier(Modifier::BOLD),
             None,
         );
         if let Some(peak) = self.view.peak_context_tokens {
-            push_segment("Peak ", fmt_tok(peak), pal.bold(Color::White), None);
+            bar.push_sep_kv(
+                &sep_str,
+                dim,
+                "Peak ",
+                fmt_tok(peak),
+                pal.bold(Color::White),
+                None,
+            );
         }
         if self.view.show_cost && s.priced_requests > 0 {
-            push_segment(
+            bar.push_sep_kv(
+                &sep_str,
+                dim,
                 "Cost ",
                 format_usd_short(s.priced_usd),
                 pal.bold(Color::Green),
@@ -945,7 +909,9 @@ impl DetailScreen {
             .view
             .median_ttft_secs
             .map_or_else(|| "-".to_string(), format_ttft_compact);
-        push_segment(
+        bar.push_sep_kv(
+            &sep_str,
+            dim,
             "Med ",
             format!("{spd}/{ttft}"),
             pal.bold(Color::White),
@@ -962,7 +928,9 @@ impl DetailScreen {
             } else {
                 format!("{} miss", self.report.mid_session_misses)
             };
-            push_segment(
+            bar.push_sep_kv(
+                &sep_str,
+                dim,
                 "",
                 miss_val,
                 pal.bold(Color::Red),
@@ -972,7 +940,9 @@ impl DetailScreen {
         if !filtered {
             let diag = &self.report.diagnostics.total;
             if diag.compaction_steps > 0 {
-                push_segment(
+                bar.push_sep_kv(
+                    &sep_str,
+                    dim,
                     "",
                     format!("{} compact", diag.compaction_steps),
                     pal.bold(Color::Yellow),
@@ -985,10 +955,12 @@ impl DetailScreen {
                 } else {
                     Color::Yellow
                 };
-                push_segment("", retries, pal.bold(color), None);
+                bar.push_sep_kv(&sep_str, dim, "", retries, pal.bold(color), None);
             }
             if diag.error_steps > 0 {
-                push_segment(
+                bar.push_sep_kv(
+                    &sep_str,
+                    dim,
                     "",
                     format!("{} err", diag.error_steps),
                     pal.bold(Color::Red),
@@ -997,7 +969,8 @@ impl DetailScreen {
             }
         }
 
-        frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+        let (line, hits) = bar.finish();
+        frame.render_widget(Paragraph::new(line).block(block), area);
         hits
     }
 
@@ -1108,7 +1081,7 @@ impl DetailScreen {
             Row::new(cells).style(val_style)
         });
 
-        let ellipsis = if pal.ascii { "..." } else { "…" };
+        let ellipsis = pal.ellipsis();
         let rows: Vec<Row<'static>> = self
             .view
             .turn_indices
@@ -1173,7 +1146,7 @@ impl DetailScreen {
             .block(pal.pane_block(title, active))
             .column_spacing(1)
             .row_highlight_style(pal.selected_row(active))
-            .highlight_symbol(if pal.ascii { "> " } else { "▸ " });
+            .highlight_symbol(pal.highlight_symbol());
         if let Some(footer) = footer_opt {
             table = table.footer(footer);
         }
@@ -1305,6 +1278,50 @@ impl DetailScreen {
         let show_cost = self.report.totals.priced_requests > 0;
         let filter_glyph = if pal.ascii { "* " } else { "● " };
 
+        let make_row = |label: String,
+                        base_style: Style,
+                        counters: &dyn UsageCounters,
+                        is_filtered: bool|
+         -> Row<'static> {
+            let name = if is_filtered {
+                format!("{filter_glyph}{label}")
+            } else {
+                label
+            };
+            let (val_str, val_dim) = if show_cost {
+                if counters.priced_requests() > 0 {
+                    (format_usd_short(counters.priced_usd()), false)
+                } else {
+                    ("-".to_string(), true)
+                }
+            } else {
+                (fmt_tok(counters.total_tokens()), false)
+            };
+            let val_style = if val_dim {
+                pal.dim()
+            } else {
+                pal.bold(if is_filtered {
+                    Color::Yellow
+                } else {
+                    Color::Cyan
+                })
+            };
+            let mut cells = vec![
+                Cell::from(name).style(if is_filtered {
+                    pal.bold(Color::Yellow)
+                } else {
+                    base_style
+                }),
+                right_cell(format!("{}t", counters.requests()), pal.dim()),
+                right_cell(val_str, val_style),
+            ];
+            if show_hit {
+                let hit = counters.cache_hit_pct();
+                cells.push(right_cell(format_pct(hit), pal.cache_hit_style(hit)));
+            }
+            Row::new(cells)
+        };
+
         let rows: Vec<Row<'static>> = match self.right_tab {
             RightTab::Models => self
                 .report
@@ -1312,45 +1329,7 @@ impl DetailScreen {
                 .iter()
                 .map(|m| {
                     let is_filtered = self.model_filter.as_deref() == Some(m.model.as_str());
-                    let name = if is_filtered {
-                        format!("{filter_glyph}{}", m.model)
-                    } else {
-                        m.model.clone()
-                    };
-                    let (val_str, val_dim) = if show_cost {
-                        if m.priced_requests() > 0 {
-                            (format_usd_short(m.priced_usd), false)
-                        } else {
-                            ("-".to_string(), true)
-                        }
-                    } else {
-                        (fmt_tok(m.total_tokens), false)
-                    };
-                    let mut cells = vec![
-                        Cell::from(name).style(if is_filtered {
-                            pal.bold(Color::Yellow)
-                        } else {
-                            Style::default()
-                        }),
-                        right_cell(format!("{}t", m.requests), pal.dim()),
-                        right_cell(
-                            val_str,
-                            if val_dim {
-                                pal.dim()
-                            } else {
-                                pal.bold(if is_filtered {
-                                    Color::Yellow
-                                } else {
-                                    Color::Cyan
-                                })
-                            },
-                        ),
-                    ];
-                    if show_hit {
-                        let hit = m.cache_hit_pct();
-                        cells.push(right_cell(format_pct(hit), pal.cache_hit_style(hit)));
-                    }
-                    Row::new(cells)
+                    make_row(m.model.clone(), Style::default(), m, is_filtered)
                 })
                 .collect(),
             RightTab::Subagents => self
@@ -1360,49 +1339,11 @@ impl DetailScreen {
                 .map(|sub| {
                     let is_filtered =
                         self.subagent_filter.as_deref() == Some(sub.conversation_id.as_str());
-                    let base = format_subagent_short_label(
+                    let label = format_subagent_short_label(
                         &sub.conversation_id,
                         sub.agent_name.as_deref(),
                     );
-                    let name = if is_filtered {
-                        format!("{filter_glyph}{base}")
-                    } else {
-                        base
-                    };
-                    let (val_str, val_dim) = if show_cost {
-                        if sub.summary.priced_requests > 0 {
-                            (format_usd_short(sub.summary.priced_usd), false)
-                        } else {
-                            ("-".to_string(), true)
-                        }
-                    } else {
-                        (fmt_tok(sub.summary.total_tokens), false)
-                    };
-                    let mut cells = vec![
-                        Cell::from(name).style(if is_filtered {
-                            pal.bold(Color::Yellow)
-                        } else {
-                            pal.fg(Color::Magenta)
-                        }),
-                        right_cell(format!("{}t", sub.summary.requests), pal.dim()),
-                        right_cell(
-                            val_str,
-                            if val_dim {
-                                pal.dim()
-                            } else {
-                                pal.bold(if is_filtered {
-                                    Color::Yellow
-                                } else {
-                                    Color::Cyan
-                                })
-                            },
-                        ),
-                    ];
-                    if show_hit {
-                        let hit = sub.summary.cache_hit_pct();
-                        cells.push(right_cell(format_pct(hit), pal.cache_hit_style(hit)));
-                    }
-                    Row::new(cells)
+                    make_row(label, pal.fg(Color::Magenta), &sub.summary, is_filtered)
                 })
                 .collect(),
         };
@@ -1426,7 +1367,7 @@ impl DetailScreen {
             .block(pal.pane_block(title, active))
             .column_spacing(1)
             .row_highlight_style(pal.selected_row(active))
-            .highlight_symbol(if pal.ascii { "> " } else { "▸ " });
+            .highlight_symbol(pal.highlight_symbol());
 
         render_table_with_scrollbar(
             frame,
@@ -1451,71 +1392,91 @@ impl DetailScreen {
         has_back: bool,
         pal: &Palette,
     ) -> ClickRegions<DetailClick> {
-        if let Some(msg) = &self.status_msg {
-            frame.render_widget(
-                Paragraph::new(Line::styled(format!(" {msg}"), pal.bold(Color::Yellow))),
-                area,
-            );
-            return ClickRegions::default();
-        }
-
-        let inset = Rect::new(
-            area.x.saturating_add(1),
-            area.y,
-            area.width.saturating_sub(1),
-            area.height,
-        );
-        let sep = format!(" {} ", pal.sep());
-        let dim = pal.dim();
-        let mut bar = SpanBar::new(inset);
-
-        if self.has_active_filters() {
-            let _ = bar.push_sep_click(&sep, dim, "Esc Clear", dim, DetailClick::ClearAllFilters);
-            let _ = bar.push_sep_click(&sep, dim, "c Convs", dim, DetailClick::OpenConversations);
-            let _ = bar.push_sep_click(&sep, dim, "s/S Sort", dim, DetailClick::CycleSortField);
-            let _ = bar.push_sep_click(&sep, dim, "m Misses", dim, DetailClick::ToggleMisses);
-            let _ = bar.push_sep_click(&sep, dim, "Tab Pane", dim, DetailClick::TogglePane);
-            let _ = bar.push_sep_click(&sep, dim, "r Refresh", dim, DetailClick::Refresh);
-            if has_back {
-                let _ = bar.push_sep_click(&sep, dim, "b Back", dim, DetailClick::Back);
-            }
-            let _ = bar.push_sep_click(&sep, dim, "q Quit", dim, DetailClick::Quit);
-        } else if area.width < 92 {
-            let _ = bar.push_sep_click(&sep, dim, "c Convs", dim, DetailClick::OpenConversations);
-            let _ = bar.push_sep_click(&sep, dim, "s/S Sort", dim, DetailClick::CycleSortField);
-            let _ = bar.push_sep_click(&sep, dim, "m Misses", dim, DetailClick::ToggleMisses);
-            let _ = bar.push_sep_click(&sep, dim, "Tab Pane", dim, DetailClick::TogglePane);
-            if has_back {
-                let _ = bar.push_sep_click(&sep, dim, "b Back", dim, DetailClick::Back);
-            }
-            let _ = bar.push_sep_click(&sep, dim, "q Quit", dim, DetailClick::Quit);
-        } else {
-            let nav = if pal.ascii { "j/k" } else { "↑↓/jk" };
-            let _ = bar.push(format!("{nav} Select"), dim);
-            let _ = bar.push_sep_click(&sep, dim, "c Convs", dim, DetailClick::OpenConversations);
-            let _ = bar.push_sep_click(
-                &sep,
-                dim,
-                "s/S Sort (click header)",
-                dim,
-                DetailClick::CycleSortField,
-            );
-            let _ = bar.push_sep_click(&sep, dim, "m Misses", dim, DetailClick::ToggleMisses);
-            if !self.report.subagents.is_empty() {
-                let _ =
-                    bar.push_sep_click(&sep, dim, "v Models/Sub", dim, DetailClick::ToggleRightTab);
-            }
-            let _ = bar.push_sep_click(&sep, dim, "Tab Pane", dim, DetailClick::TogglePane);
-            let _ = bar.push_sep_click(&sep, dim, "r Refresh", dim, DetailClick::Refresh);
-            if has_back {
-                let _ = bar.push_sep_click(&sep, dim, "b Back", dim, DetailClick::Back);
-            }
-            let _ = bar.push_sep_click(&sep, dim, "q Quit", dim, DetailClick::Quit);
-        }
-
-        let (line, hits) = bar.finish();
-        frame.render_widget(Paragraph::new(line), inset);
-        hits
+        render_footer_bar(
+            frame,
+            area,
+            self.status_msg.as_deref(),
+            pal,
+            |bar, sep, dim| {
+                if self.has_active_filters() {
+                    let _ = bar.push_sep_click(
+                        sep,
+                        dim,
+                        "Esc Clear",
+                        dim,
+                        DetailClick::ClearAllFilters,
+                    );
+                    let _ = bar.push_sep_click(
+                        sep,
+                        dim,
+                        "c Convs",
+                        dim,
+                        DetailClick::OpenConversations,
+                    );
+                    let _ =
+                        bar.push_sep_click(sep, dim, "s/S Sort", dim, DetailClick::CycleSortField);
+                    let _ =
+                        bar.push_sep_click(sep, dim, "m Misses", dim, DetailClick::ToggleMisses);
+                    let _ = bar.push_sep_click(sep, dim, "Tab Pane", dim, DetailClick::TogglePane);
+                    let _ = bar.push_sep_click(sep, dim, "r Refresh", dim, DetailClick::Refresh);
+                    if has_back {
+                        let _ = bar.push_sep_click(sep, dim, "b Back", dim, DetailClick::Back);
+                    }
+                    let _ = bar.push_sep_click(sep, dim, "q Quit", dim, DetailClick::Quit);
+                } else if area.width < 92 {
+                    let _ = bar.push_sep_click(
+                        sep,
+                        dim,
+                        "c Convs",
+                        dim,
+                        DetailClick::OpenConversations,
+                    );
+                    let _ =
+                        bar.push_sep_click(sep, dim, "s/S Sort", dim, DetailClick::CycleSortField);
+                    let _ =
+                        bar.push_sep_click(sep, dim, "m Misses", dim, DetailClick::ToggleMisses);
+                    let _ = bar.push_sep_click(sep, dim, "Tab Pane", dim, DetailClick::TogglePane);
+                    if has_back {
+                        let _ = bar.push_sep_click(sep, dim, "b Back", dim, DetailClick::Back);
+                    }
+                    let _ = bar.push_sep_click(sep, dim, "q Quit", dim, DetailClick::Quit);
+                } else {
+                    let nav = if pal.ascii { "j/k" } else { "↑↓/jk" };
+                    let _ = bar.push(format!("{nav} Select"), dim);
+                    let _ = bar.push_sep_click(
+                        sep,
+                        dim,
+                        "c Convs",
+                        dim,
+                        DetailClick::OpenConversations,
+                    );
+                    let _ = bar.push_sep_click(
+                        sep,
+                        dim,
+                        "s/S Sort (click header)",
+                        dim,
+                        DetailClick::CycleSortField,
+                    );
+                    let _ =
+                        bar.push_sep_click(sep, dim, "m Misses", dim, DetailClick::ToggleMisses);
+                    if !self.report.subagents.is_empty() {
+                        let _ = bar.push_sep_click(
+                            sep,
+                            dim,
+                            "v Models/Sub",
+                            dim,
+                            DetailClick::ToggleRightTab,
+                        );
+                    }
+                    let _ = bar.push_sep_click(sep, dim, "Tab Pane", dim, DetailClick::TogglePane);
+                    let _ = bar.push_sep_click(sep, dim, "r Refresh", dim, DetailClick::Refresh);
+                    if has_back {
+                        let _ = bar.push_sep_click(sep, dim, "b Back", dim, DetailClick::Back);
+                    }
+                    let _ = bar.push_sep_click(sep, dim, "q Quit", dim, DetailClick::Quit);
+                }
+            },
+        )
     }
 }
 
@@ -1570,26 +1531,13 @@ impl TurnCol {
 
     fn header(self, sort: TurnSort, pal: &Palette) -> Cell<'static> {
         let field = self.sort_field();
-        let active = sort.field == field;
-        let label = if active {
-            format!("{} {}", field.header_label(), sort.dir.arrow(pal.ascii))
-        } else {
-            field.header_label().to_string()
-        };
-        let style = if active {
-            if pal.no_color {
-                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                pal.bold(Color::Cyan)
-            }
-        } else {
-            pal.dim()
-        };
-        if self.is_right_aligned() {
-            right_cell(label, style)
-        } else {
-            Cell::from(label).style(style)
-        }
+        sort_header_cell(
+            field.header_label(),
+            sort.field == field,
+            sort.dir,
+            self.is_right_aligned(),
+            pal,
+        )
     }
 }
 
